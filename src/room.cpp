@@ -134,12 +134,20 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
   void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override {
     try {
       auto track = transceiver->receiver()->track();
-      auto sink = std::make_unique<TrackSink>(track, record_, playout_, frames_);
+      Json streams = Json::array();
+      auto sid = track->id();
+      for (const auto& stream : transceiver->receiver()->streams()) {
+        const auto id = stream->id(); streams.push_back(id);
+        // LiveKit encodes participant SID|track SID in the stream ID. A reused
+        // receiver retains its original native track ID across renegotiation.
+        const auto separator = id.find('|');
+        if (separator != std::string::npos && id.starts_with("PA_") && id.substr(separator + 1).starts_with("TR_"))
+          sid = id.substr(separator + 1);
+      }
+      auto sink = std::make_unique<TrackSink>(track, record_, playout_, frames_, sid);
       sink->attach();
       std::lock_guard lock(mutex_); sinks_.push_back(std::move(sink));
-      Json streams = Json::array();
-      for (const auto& stream : transceiver->receiver()->streams()) streams.push_back(stream->id());
-      event("track-subscribed", {{"track", track->id()}, {"kind", track->kind()}, {"mid", transceiver->mid().value_or("")}, {"streams", streams}});
+      event("track-subscribed", {{"track", sid}, {"kind", track->kind()}, {"mid", transceiver->mid().value_or("")}, {"streams", streams}});
     } catch (const std::exception& e) { event("media-error", {{"message", e.what()}}); failed = true; }
   }
   void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override {
@@ -148,9 +156,9 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
   void OnRemoveTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) override {
     std::lock_guard lock(mutex_);
     for (auto it = sinks_.begin(); it != sinks_.end();) {
-      if ((*it)->track_id() == receiver->track()->id()) {
+      if ((*it)->owns_track(receiver->track().get())) {
         (*it)->detach(); event("track-summary", (*it)->stats());
-        event("track-unsubscribed", {{"track", receiver->track()->id()}});
+        event("track-unsubscribed", {{"track", (*it)->track_id()}});
         it = sinks_.erase(it);
       } else ++it;
     }

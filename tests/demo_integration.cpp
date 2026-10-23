@@ -25,8 +25,12 @@ int main(int argc, char** argv) {
       o.token = api.room().create_token().set_identity(identity).set_name(identity)
         .set_video_grant({{"roomJoin", true}, {"room", name}, {"canPublish", true}, {"canSubscribe", true}}).to_jwt(); return o;
     };
+    std::mutex received_mutex;
+    std::map<std::string, uint64_t> received;
     sdk::Room first, second;
-    auto one = options("Alice"); first.join_with_token(url, one.token, one);
+    auto one = options("Alice");
+    one.video_frame_handler = [&](const sdk::VideoFrame& frame) { std::lock_guard lock(received_mutex); ++received[frame.track_id]; };
+    first.join_with_token(url, one.token, one);
     sdk::MediaSpec video; video.demo = true;
     sdk::MediaSpec tone; tone.demo = true; tone.video = false;
     auto first_video = first.local_participant().publish_track(video, {"Test video"}).get();
@@ -38,14 +42,14 @@ int main(int argc, char** argv) {
     view.audio_playout = env("LIVEKIT_DEMO_TEST_AUDIO") == "1";
     viewer.start(view);
     until([&] { auto s = viewer.snapshot(); return s.state == demo::State::Connected && s.frames.contains(first_video.sid()); }, "Initial participant/frame absent");
-    check(demo::tiles(viewer.snapshot()).front().label == "Alice", "Initial typed participant mapping");
+    check(demo::tiles(viewer.snapshot()).front().label == "Alice / Test video", "Initial typed participant mapping");
     auto two = options("Bob"); second.join_with_token(url, two.token, two);
     auto second_video = second.local_participant().publish_track(video).get();
     until([&] { auto s = viewer.snapshot(); return s.participants.size() == 3 && s.frames.contains(first_video.sid()) && s.frames.contains(second_video.sid()) && s.received_frames > 120; }, "Two simultaneous video tracks missing");
     first_video.set_muted(true).get();
-    until([&] { for (const auto& t : demo::tiles(viewer.snapshot())) if (t.label == "Alice" && t.status == "Video muted") return true; return false; }, "Remote mute missing");
+    until([&] { for (const auto& t : demo::tiles(viewer.snapshot())) if (t.id == first_video.sid() && t.status == "Video muted") return true; return false; }, "Remote mute missing");
     first_video.set_muted(false).get();
-    until([&] { for (const auto& t : demo::tiles(viewer.snapshot())) if (t.label == "Alice" && t.frame) return true; return false; }, "Remote unmute missing");
+    until([&] { for (const auto& t : demo::tiles(viewer.snapshot())) if (t.id == first_video.sid() && t.frame) return true; return false; }, "Remote unmute missing");
     second.local_participant().unpublish_track(second_video.sid()).get();
     until([&] { auto s = viewer.snapshot(); return !s.frames.contains(second_video.sid()); }, "Unpublished frame retained");
     second.disconnect(); second.wait();
@@ -54,10 +58,54 @@ int main(int argc, char** argv) {
     check(viewer.snapshot().frames.empty() && viewer.snapshot().participants.empty(), "Old state after disconnect");
     view = options("Viewer");
     // Fresh join with test publishing uses LocalParticipant::publish_track futures.
-    view.media = {video}; viewer.start(view);
+    view.media = {video, video, tone}; viewer.start(view);
     until([&] { auto s = viewer.snapshot(); return s.state == demo::State::Connected && s.frames.contains(first_video.sid()); }, "Viewer reuse");
-    until([&] { auto p = first.participant_by_identity("Viewer"); return p && !p->track_publications().empty(); }, "Demo test video publication");
+    auto local_videos = [&] {
+      std::vector<sdk::TrackInfo> videos; const auto s = viewer.snapshot();
+      if (auto p = s.participants.find(s.local_sid); p != s.participants.end())
+        for (const auto& t : p->second.tracks) if (t.kind == sdk::TrackKind::video) videos.push_back(t);
+      return videos;
+    };
+    auto remote_tracks = [&] { auto p = first.participant_by_identity("Viewer"); return p ? p->info().tracks : std::vector<sdk::TrackInfo>{}; };
+    until([&] { return remote_tracks().size() == 3 && local_videos().size() == 2; }, "Demo multiple publications missing");
+    auto initial = local_videos();
+    check(initial[0].sid != initial[1].sid && initial[0].name != initial[1].name, "Video identities are not distinct");
+    try {
+      until([&] { std::lock_guard lock(received_mutex); return received[initial[0].sid] >= 3 && received[initial[1].sid] >= 3; }, "Same participant videos did not both decode");
+    } catch (...) {
+      std::lock_guard lock(received_mutex);
+      for (const auto& t : remote_tracks()) std::cerr << t.sid << ' ' << t.name << " subscribed=" << t.subscribed << " frames=" << received[t.sid] << '\n';
+      std::cerr << "Receiver: " << first.last_error() << " Sender: " << viewer.snapshot().error << '\n';
+      throw;
+    }
+    check(!viewer.remove_video(first_video.sid()), "Accepted remote track removal");
+    check(viewer.add_video(), "Dynamic add rejected");
+    until([&] { return !viewer.snapshot().changing_video && local_videos().size() == 3 && remote_tracks().size() == 4; }, "Dynamic video missing");
+    auto three = local_videos();
+    until([&] { std::lock_guard lock(received_mutex); for (const auto& t : three) if (received[t.sid] < 3) return false; return true; }, "Dynamic video did not decode");
+    check(viewer.remove_video(initial[0].sid), "Dynamic remove rejected");
+    until([&] {
+      if (viewer.snapshot().changing_video || local_videos().size() != 2) return false;
+      const auto tracks = remote_tracks(); if (tracks.size() != 3) return false;
+      for (const auto& t : tracks) if (t.sid == initial[0].sid) return false;
+      return true;
+    }, "Removed video retained");
+    auto remaining = local_videos(); std::map<std::string, uint64_t> before;
+    { std::lock_guard lock(received_mutex); before = received; }
+    until([&] { std::lock_guard lock(received_mutex); for (const auto& t : remaining) if (received[t.sid] <= before[t.sid] + 3) return false; return true; }, "Other videos stalled after removal");
+    for (const auto& t : remaining) {
+      check(viewer.remove_video(t.sid), "Stop remaining video rejected");
+      until([&] { return !viewer.snapshot().changing_video; }, "Stop remaining video timeout");
+      check(viewer.snapshot().video_error.empty(), "Stop remaining video failed");
+    }
+    until([&] { const auto tracks = remote_tracks(); return tracks.size() == 1 && tracks[0].kind == sdk::TrackKind::audio && local_videos().empty(); }, "Stopping videos affected tone");
+    check(viewer.add_video(), "Restart video rejected");
+    until([&] { return !viewer.snapshot().changing_video && local_videos().size() == 1; }, "Restart video timeout");
+    auto restarted = local_videos().front(); check(restarted.name == "Test video 4", "Reused video name");
+    until([&] { std::lock_guard lock(received_mutex); return received[restarted.sid] >= 3; }, "Restarted video did not decode");
+    check(viewer.add_video(), "Add before stop rejected");
     viewer.stop(); until([&] { return viewer.snapshot().finished; }, "Reused viewer stop");
+    check(!viewer.snapshot().changing_video && !viewer.add_video() && !viewer.remove_video(restarted.sid), "Video operations survived disconnect");
     // Cancelling immediately must work even before join has prepared its stop source.
     for (int i = 0; i < 3; ++i) { viewer.start(view); viewer.stop(); until([&] { return viewer.snapshot().finished; }, "Immediate cancellation", 5); }
     auto wrong = options("WrongRoom"); wrong.room = "wrong-room"; viewer.start(wrong);
@@ -91,6 +139,6 @@ int main(int argc, char** argv) {
     until([&] { return viewer.snapshot().finished; }, "Server removal not observed");
     check(viewer.snapshot().state == demo::State::Error && viewer.snapshot().frames.empty(), "Server removal state");
     first.disconnect(); first.wait();
-    std::cout << sdk::Json{{"ok", true}, {"simultaneousVideos", 2}, {"typedAPI", true}, {"reusedSessions", 2}, {"immediateCancellations", 3}}.dump() << '\n';
+    std::cout << sdk::Json{{"ok", true}, {"simultaneousVideos", 2}, {"videosPerParticipant", 3}, {"dynamicVideoPublishing", true}, {"typedAPI", true}, {"reusedSessions", 2}, {"immediateCancellations", 3}}.dump() << '\n';
   } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

@@ -43,6 +43,17 @@ int main(int argc, char** argv) {
       check(demo::tiles(state).size() == 3, "roster tile count");
       state.frames["TR_two"] = pixels("TR_two");
       demo::View view;
+      view.video_count = 3; view.tone = true;
+      auto publishing = view.options();
+      check(publishing.media.size() == 4 && publishing.media[0].video && publishing.media[2].video && !publishing.media[3].video, "Multiple videos and independent tone");
+      view.video_count = -1; check(view.options().media.size() == 1, "Negative video count");
+      view.video_count = 99; check(view.options().media.size() == demo::max_test_videos + 1, "Video count limit");
+      view.video_count = 2; view.tone = false;
+      auto extra = t; extra.sid = "TR_three"; extra.name = "Test video 2";
+      alice.tracks[0].name = "Test video 1"; alice.tracks.push_back(extra);
+      local.tracks = alice.tracks; local.tracks[0].sid = "TR_local1"; local.tracks[1].sid = "TR_local2";
+      state.update(local, {alice, bob, guest}); state.frames[extra.sid] = pixels(extra.sid);
+      check(demo::tiles(state).size() == 4 && demo::tiles(state)[0].label == "Alice / Test video 1" && demo::tiles(state)[1].label == "Alice / Test video 2", "Same participant video labels");
       auto render = [&](demo::Snapshot snapshot) {
         ImGui_ImplSDLRenderer2_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
         view.draw(renderer, snapshot); ImGui::Render(); SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer);
@@ -58,6 +69,9 @@ int main(int argc, char** argv) {
       }
       alice.tracks[0].muted = true; state.update(local, {alice, bob, guest});
       check(demo::tiles(state)[0].status == "Video muted", "mute placeholder"); render(state);
+      alice.tracks.erase(alice.tracks.begin()); state.update(local, {alice, bob, guest});
+      check(!state.frames.contains("TR_one") && state.frames.contains("TR_three"), "Stopping one stream removed another");
+      state.changing_video = true; render(state); state.changing_video = false;
       state.update(local, {bob, guest}); check(!state.frames.contains("TR_one"), "departed pixels retained"); render(state);
       SDL_SetWindowSize(window, 640, 480); render(state);
       render({}); // idle view and texture teardown

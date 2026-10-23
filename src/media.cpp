@@ -116,15 +116,15 @@ static std::string safe_name(const std::string& value) {
   std::string result; for (unsigned char c : value) result += (std::isalnum(c) || c == '-' || c == '_') ? c : '_';
   return result.empty() ? "track" : result;
 }
-TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout, VideoFrames* frames)
-    : track_(std::move(track)), playout_(playout), frame_output_(frames) {
-  if (!directory.empty()) { std::filesystem::create_directories(directory); base_ = directory / safe_name(track_->id()); }
+TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout, VideoFrames* frames, std::string track_id)
+    : track_(std::move(track)), track_id_(track_id.empty() ? track_->id() : std::move(track_id)), playout_(playout), frame_output_(frames) {
+  if (!directory.empty()) { std::filesystem::create_directories(directory); base_ = directory / safe_name(track_id_); }
 }
 TrackSink::~TrackSink() { detach(); close_audio(); }
 void TrackSink::attach() {
   if (track_->kind() == "video") {
-    if (playout_) playout_->add_track(track_->id());
-    if (frame_output_) frame_output_->add(track_->id());
+    if (playout_) playout_->add_track(track_id_);
+    if (frame_output_) frame_output_->add(track_id_);
     static_cast<webrtc::VideoTrackInterface*>(track_.get())->AddOrUpdateSink(this, webrtc::VideoSinkWants{});
   }
   else static_cast<webrtc::AudioTrackInterface*>(track_.get())->AddSink(this);
@@ -134,8 +134,8 @@ void TrackSink::detach() {
   if (!attached_) return;
   if (track_->kind() == "video") {
     static_cast<webrtc::VideoTrackInterface*>(track_.get())->RemoveSink(this);
-    if (playout_) playout_->remove_track(track_->id());
-    if (frame_output_) frame_output_->remove(track_->id());
+    if (playout_) playout_->remove_track(track_id_);
+    if (frame_output_) frame_output_->remove(track_id_);
   }
   else static_cast<webrtc::AudioTrackInterface*>(track_.get())->RemoveSink(this);
   attached_ = false;
@@ -153,8 +153,8 @@ void TrackSink::OnFrame(const webrtc::VideoFrame& frame) {
   std::lock_guard lock(mutex_);
   try {
     ++frames_;
-    if (playout_) playout_->submit(track_->id(), frame);
-    if (frame_output_) frame_output_->submit(track_->id(), frame);
+    if (playout_) playout_->submit(track_id_, frame);
+    if (frame_output_) frame_output_->submit(track_id_, frame);
     if (base_.empty() || !error_.empty()) return;
     auto b = frame.video_frame_buffer()->ToI420();
     if (!b) throw std::runtime_error("Video frame cannot convert to I420");
@@ -191,5 +191,5 @@ void TrackSink::OnData(const void* data, int bits, int rate, size_t channels, si
   } catch (const std::exception& e) { error_ = e.what(); }
 }
 std::string TrackSink::error() const { std::lock_guard lock(mutex_); return error_; }
-Json TrackSink::stats() const { std::lock_guard lock(mutex_); return {{"track", track_->id()}, {"kind", track_->kind()}, {"frames", frames_}}; }
+Json TrackSink::stats() const { std::lock_guard lock(mutex_); return {{"track", track_id_}, {"kind", track_->kind()}, {"frames", frames_}}; }
 }

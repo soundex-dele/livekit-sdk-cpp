@@ -56,7 +56,7 @@ class MediaPump {
 };
 class TrackSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame>, public webrtc::AudioTrackSinkInterface {
  public:
-  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr);
+  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {});
   ~TrackSink();
   void attach();
   void detach();
@@ -64,11 +64,13 @@ class TrackSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame>, public 
   void OnData(const void* data, int bits, int rate, size_t channels, size_t frames) override;
   std::string error() const;
   Json stats() const;
-  std::string track_id() const { return track_->id(); }
+  std::string track_id() const { return track_id_; }
+  bool owns_track(const webrtc::MediaStreamTrackInterface* track) const { return track_.get() == track; }
  private:
   void open_video(int width, int height);
   void close_audio();
   webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track_;
+  std::string track_id_;
   VideoPlayout* playout_ = nullptr;
   VideoFrames* frame_output_ = nullptr;
   std::filesystem::path base_;

@@ -8,7 +8,7 @@ namespace demo {
 View::View() { std::snprintf(url.data(), url.size(), "ws://127.0.0.1:7880"); std::snprintf(room.data(), room.size(), "demo"); }
 sdk::RoomOptions View::options() const {
   sdk::RoomOptions o; o.url = url.data(); o.room = room.data(); o.token = token.data(); o.audio_playout = audio;
-  if (video) { sdk::MediaSpec m; m.demo = true; o.media.push_back(m); }
+  for (int i = 0; i < std::clamp(video_count, 0, max_test_videos); ++i) { sdk::MediaSpec m; m.demo = true; o.media.push_back(m); }
   if (tone) { sdk::MediaSpec m; m.demo = true; m.video = false; o.media.push_back(m); }
   return o;
 }
@@ -30,13 +30,14 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
   ImGui::SetNextWindowPos(viewport->WorkPos); ImGui::SetNextWindowSize(viewport->WorkSize);
   ImGui::Begin("Conference", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
   Action action = Action::None;
+  remove_video_sid.clear();
   ImGui::TextUnformatted("LIVEKIT  /  CONFERENCE");
   ImGui::SameLine(); ImGui::TextDisabled("%s", state_name(snapshot.state));
   ImGui::Separator();
   if (snapshot.finished) {
     textures_.clear();
     ImGui::TextUnformatted("Join a room");
-    ImGui::TextWrapped("Watch participants together, or publish a test pattern to try multiple clients.");
+    ImGui::TextWrapped("Watch participants together, or publish multiple test videos from one participant.");
     ImGui::SetNextItemWidth(std::min(620.0f * scale, ImGui::GetContentRegionAvail().x * .75f));
     ImGui::InputText("Server URL", url.data(), url.size());
     ImGui::SetNextItemWidth(std::min(620.0f * scale, ImGui::GetContentRegionAvail().x * .75f));
@@ -44,7 +45,8 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
     ImGui::SetNextItemWidth(std::min(620.0f * scale, ImGui::GetContentRegionAvail().x * .75f));
     ImGui::InputText("Token", token.data(), token.size(), ImGuiInputTextFlags_Password);
     ImGui::Checkbox("Play remote audio", &audio);
-    ImGui::Checkbox("Publish test video", &video);
+    ImGui::SetNextItemWidth(200 * scale);
+    ImGui::SliderInt("Test video streams", &video_count, 0, max_test_videos, "%d", ImGuiSliderFlags_AlwaysClamp);
     ImGui::Checkbox("Publish test tone", &tone);
     ImGui::TextDisabled("Test tone: 440 Hz. Each client needs its own participant token.");
     ImGui::BeginDisabled(!url[0] || !room[0] || !token[0]);
@@ -61,6 +63,28 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
     if (snapshot.state == State::Disconnecting) ImGui::TextUnformatted("Leaving room. Waiting for media and network cleanup...");
     const float available = ImGui::GetContentRegionAvail().x;
     ImGui::BeginChild("Members", {std::min(220 * scale, available * .28f), 0}, ImGuiChildFlags_Borders);
+    ImGui::TextUnformatted("YOUR VIDEO STREAMS");
+    const auto local = snapshot.participants.find(snapshot.local_sid);
+    int video_count = 0;
+    if (local != snapshot.participants.end()) for (const auto& t : local->second.tracks) if (t.kind == sdk::TrackKind::video) ++video_count;
+    ImGui::TextDisabled("%d / %d active", video_count, max_test_videos);
+    const bool changing = snapshot.state != State::Connected || snapshot.changing_video || action != Action::None;
+    ImGui::BeginDisabled(changing || video_count >= max_test_videos);
+    if (ImGui::Button("Add test video")) action = Action::AddVideo;
+    ImGui::EndDisabled();
+    if (local != snapshot.participants.end()) for (const auto& t : local->second.tracks) {
+      if (t.kind != sdk::TrackKind::video) continue;
+      ImGui::PushID(t.sid.c_str());
+      ImGui::TextWrapped("%s", t.name.c_str());
+      ImGui::TextWrapped("%s", t.sid.c_str());
+      ImGui::BeginDisabled(changing || action != Action::None);
+      if (ImGui::SmallButton("Stop stream")) { remove_video_sid = t.sid; action = Action::RemoveVideo; }
+      ImGui::EndDisabled(); ImGui::PopID();
+    }
+    if (snapshot.changing_video) ImGui::TextWrapped("Updating video streams...");
+    if (!snapshot.video_error.empty()) ImGui::TextWrapped("Video error: %s", snapshot.video_error.c_str());
+    ImGui::TextWrapped("Test videos are visible to other participants.");
+    ImGui::Separator();
     ImGui::TextUnformatted("PARTICIPANTS"); ImGui::Separator();
     for (const auto& [sid, p] : snapshot.participants) {
       ImGui::PushID(sid.c_str());

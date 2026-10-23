@@ -51,6 +51,8 @@ int main() {
         ImGui_ImplSDLRenderer2_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
         const auto action = view.draw(renderer, snapshot);
         if (action == demo::Action::Leave) session.stop();
+        if (action == demo::Action::AddVideo && !closing) session.add_video();
+        if (action == demo::Action::RemoveVideo && !closing) session.remove_video(view.remove_video_sid);
         if (action == demo::Action::Join && !closing) {
           try { session.start(view.options()); }
           catch (const std::exception& e) { view.error = e.what(); }
