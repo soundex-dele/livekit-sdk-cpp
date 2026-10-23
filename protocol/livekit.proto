@@ -1,0 +1,45 @@
+// Wire-compatible subset of LiveKit's Apache-2.0 protocol.
+// Original field numbers are preserved; protobuf skips unknown fields.
+syntax = "proto3";
+package livekit;
+option optimize_for = LITE_RUNTIME;
+enum SignalTarget { PUBLISHER = 0; SUBSCRIBER = 1; }
+enum TrackType { AUDIO = 0; VIDEO = 1; DATA = 2; }
+enum TrackSource { UNKNOWN = 0; CAMERA = 1; MICROPHONE = 2; SCREEN_SHARE = 3; SCREEN_SHARE_AUDIO = 4; }
+message Room { string sid = 1; string name = 2; string metadata = 8; bool active_recording = 10; }
+message TrackInfo { string sid = 1; TrackType type = 2; string name = 3; bool muted = 4; uint32 width = 5; uint32 height = 6; TrackSource source = 9; string mime_type = 11; string mid = 12; }
+message ParticipantInfo { string sid = 1; string identity = 2; int32 state = 3; repeated TrackInfo tracks = 4; string metadata = 5; string name = 9; int32 kind = 14; map<string,string> attributes = 15; int32 disconnect_reason = 16; }
+message ICEServer { repeated string urls = 1; string username = 2; string credential = 3; }
+message JoinResponse { Room room = 1; ParticipantInfo participant = 2; repeated ParticipantInfo other_participants = 3; string server_version = 4; repeated ICEServer ice_servers = 5; bool subscriber_primary = 6; string alternative_url = 7; int32 ping_timeout = 10; int32 ping_interval = 11; }
+message SessionDescription { string type = 1; string sdp = 2; uint32 id = 3; }
+message TrickleRequest { string candidateInit = 1; SignalTarget target = 2; bool final = 3; }
+message VideoLayer { int32 quality = 1; uint32 width = 2; uint32 height = 3; uint32 bitrate = 4; }
+message AddTrackRequest { string cid = 1; string name = 2; TrackType type = 3; uint32 width = 4; uint32 height = 5; TrackSource source = 8; repeated VideoLayer layers = 9; bool disable_red = 13; string stream = 15; }
+message TrackPublishedResponse { string cid = 1; TrackInfo track = 2; }
+message TrackUnpublishedResponse { string track_sid = 1; }
+message ParticipantUpdate { repeated ParticipantInfo participants = 1; }
+message ParticipantTracks { string participant_sid = 1; repeated string track_sids = 2; }
+message UpdateSubscription { repeated string track_sids = 1; bool subscribe = 2; repeated ParticipantTracks participant_tracks = 3; }
+message LeaveRequest { bool can_reconnect = 1; int32 reason = 2; int32 action = 3; }
+message MuteTrackRequest { string sid = 1; bool muted = 2; }
+message Ping { int64 timestamp = 1; int64 rtt = 2; }
+message Pong { int64 last_ping_timestamp = 1; int64 timestamp = 2; }
+message SubscriptionResponse { string track_sid = 1; int32 err = 2; }
+message SignalRequest {
+  oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; }
+}
+message SignalResponse {
+  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; }
+}
+message UserPacket { string participant_sid = 1; bytes payload = 2; string topic = 4; string participant_identity = 5; repeated string destination_identities = 6; bytes nonce = 11; }
+message DataPacket { int32 kind = 1; UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; string participant_identity = 4; repeated string destination_identities = 5; }
+
+message UpdateTrackSettings { repeated string track_sids = 1; bool disabled = 3; int32 quality = 4; uint32 width = 5; uint32 height = 6; uint32 fps = 7; uint32 priority = 8; }
+message UpdateParticipantMetadata { string metadata = 1; string name = 2; map<string,string> attributes = 3; uint32 request_id = 4; }
+message SpeakerInfo { string sid = 1; float level = 2; bool active = 3; }
+message SpeakersChanged { repeated SpeakerInfo speakers = 1; }
+message RoomUpdate { Room room = 1; }
+message ConnectionQualityInfo { string participant_sid = 1; int32 quality = 2; float score = 3; }
+message ConnectionQualityUpdate { repeated ConnectionQualityInfo updates = 1; }
+
+message ActiveSpeakerUpdate { repeated SpeakerInfo speakers = 1; }

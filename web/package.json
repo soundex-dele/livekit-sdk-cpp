@@ -1,0 +1,6 @@
+{
+  "name": "livekit-cli-cpp-viewer",
+  "private": true,
+  "scripts": { "start": "node ../scripts/viewer-server.cjs" },
+  "dependencies": { "livekit-client": "2.23.0" }
+}

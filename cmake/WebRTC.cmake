@@ -1,0 +1,25 @@
+set(WEBRTC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../webrtc" CACHE PATH "Native WebRTC source with CMakeLists.txt")
+if(NOT EXISTS "${WEBRTC_SOURCE_DIR}/api/peer_connection_interface.h")
+  message(FATAL_ERROR "Set WEBRTC_SOURCE_DIR to the native WebRTC checkout")
+endif()
+set(WEBRTC_BUILD_DEMO OFF CACHE BOOL "" FORCE)
+# The external checkout's find_library may select debug/lib for Release under
+# vcpkg. Resolve both explicitly, so the static CRT is consistent.
+if(VCPKG_TARGET_TRIPLET AND VCPKG_INSTALLED_DIR)
+  set(_vcpkg_prefix "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+  if(EXISTS "${_vcpkg_prefix}/lib/dav1d.lib")
+    set(DAV1D_LIBRARY_RELEASE "${_vcpkg_prefix}/lib/dav1d.lib" CACHE FILEPATH "" FORCE)
+    set(DAV1D_LIBRARY_DEBUG "${_vcpkg_prefix}/debug/lib/dav1d.lib" CACHE FILEPATH "" FORCE)
+  endif()
+endif()
+add_subdirectory("${WEBRTC_SOURCE_DIR}" webrtc EXCLUDE_FROM_ALL)
+# M137 VAD calls these iSAC helpers even when the iSAC codec is disabled.
+# Add only helpers absent from the external checkout's source manifest.
+get_target_property(_webrtc_sources webrtc SOURCES)
+foreach(_helper filter_functions.c isac_vad.c pitch_estimator.c pitch_filter.c)
+  set(_source "${WEBRTC_SOURCE_DIR}/modules/audio_coding/codecs/isac/main/source/${_helper}")
+  cmake_path(ABSOLUTE_PATH _source NORMALIZE)
+  if(NOT _source IN_LIST _webrtc_sources)
+    target_sources(webrtc PRIVATE "${_source}")
+  endif()
+endforeach()

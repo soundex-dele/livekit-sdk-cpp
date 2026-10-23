@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LiveKit 本地观看</title>
+<style>
+  body { margin: 0; padding: 32px; background: #101722; color: #e6edf7; font: 16px/1.6 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: auto; } h1 { margin-bottom: 4px; }
+  .muted { color: #a8b9cd; } .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 20px 0; }
+  button { padding: 10px 20px; border: 0; border-radius: 8px; font: inherit; cursor: pointer; background: #79d9c3; color: #10251f; }
+  button:disabled { opacity: .45; cursor: default; } #status { font-weight: bold; }
+  #tracks { display: grid; grid-template-columns: repeat(auto-fit,minmax(300px,1fr)); gap: 16px; }
+  .track { padding: 12px; background: #1b2839; border-radius: 12px; overflow: hidden; }
+  video { width: 100%; max-height: 520px; background: #000; } audio { width: 100%; }
+  pre { padding: 16px; border-radius: 8px; background: #080e16; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; }
+</style>
+<main>
+  <h1>LiveKit 本地观看</h1>
+  <div class="muted">只接收 CLI 发布的音视频，不启用摄像头或麦克风。</div>
+  <p id="session">正在加载连接设置…</p>
+  <label>WebSocket 地址 <input id="server-url" type="url" value="ws://127.0.0.1:7880" style="width:300px;padding:8px" /></label>
+  <div class="bar">
+    <button id="connect" disabled>连接观看</button>
+    <button id="disconnect" disabled>断开</button>
+    <button id="audio" disabled>启用声音</button>
+    <span id="status" role="status">未连接</span>
+  </div>
+  <p id="empty" class="muted">连接后等待发布端。CLI 与观看页需要加入同一个房间。</p>
+  <section id="tracks" aria-label="接收的音视频"></section>
+  <h2>接收统计</h2><pre id="stats">暂无接收数据</pre>
+  <details open><summary>连接日志</summary><pre id="log"></pre></details>
+</main>
+<script src="/livekit-client.umd.js"></script>
+<script src="/viewer.js"></script>
+</html>

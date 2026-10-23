@@ -1,0 +1,32 @@
+livekit-sdk-cpp derives its native implementation and CLI from livekit-cli-cpp.
+
+livekit-cli-cpp
+
+This project implements a native C++ command-line client compatible with LiveKit.
+The command surface and protocol are based on LiveKit projects:
+  Copyright 2021-2026 LiveKit, Inc.
+  https://github.com/livekit/livekit-cli
+  https://github.com/livekit/protocol
+  Apache License 2.0 (see LICENSE).
+
+protocol/upstream_rtc.txt and protocol/upstream_models.txt retain their original
+copyright notices. protocol/livekit.proto is a wire-compatible subset.
+
+External dependencies keep their own licenses. Their source license files are
+available in the WebRTC checkout and CMake's out/.../_deps source directories:
+  WebRTC and bundled third-party libraries: BSD-style and respective licenses
+  IXWebSocket: BSD 3-Clause
+  CLI11: BSD 3-Clause
+  nlohmann/json: MIT
+  Protocol Buffers: BSD 3-Clause
+  OpenSSL: Apache License 2.0
+  SDL2: zlib license (SDL2 source LICENSE.txt)
+  Dear ImGui v1.91.9b: MIT (imgui source LICENSE.txt; demo only)
+
+FFmpeg is an external executable, not linked into this program. Its licensing
+depends on the user's installed build.
+
+Go-compatible API design and method-specific grants are adapted from:
+  LiveKit server-sdk-go/v2, Copyright 2021-2026 LiveKit, Inc.
+  https://github.com/livekit/server-sdk-go (Apache License 2.0)
+  Reference revision: 743ab2d6b12ff24c2b2f9a0cc208c7afe8602571

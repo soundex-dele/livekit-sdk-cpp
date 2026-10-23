@@ -1,0 +1,69 @@
+#define SDL_MAIN_HANDLED
+#include "ui.hpp"
+#include "imgui.h"
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_sdlrenderer2.h"
+#include <filesystem>
+#include <iostream>
+#include <cmath>
+
+static void check(bool ok, const char* text) { if (!ok) throw std::runtime_error(text); }
+static std::shared_ptr<demo::sdk::VideoFrame> pixels(const std::string& id, int w = 321, int h = 181) {
+  auto f = std::make_shared<demo::sdk::VideoFrame>(); f->track_id = id; f->width = w; f->height = h;
+  f->stride_y = w + 7; f->stride_u = (w + 1) / 2 + 9; f->stride_v = (w + 1) / 2 + 11;
+  f->y.assign(f->stride_y * h, 81); f->u.assign(f->stride_u * ((h + 1) / 2), 90); f->v.assign(f->stride_v * ((h + 1) / 2), 240); return f;
+}
+int main(int argc, char** argv) {
+  try {
+    SDL_SetMainReady(); check(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL init");
+    auto* window = SDL_CreateWindow("Render test", 0, 0, 1100, 720, SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE);
+    check(window, "window"); auto* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE); check(renderer, "renderer");
+    IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGui::GetIO().IniFilename = nullptr;
+    ImGui_ImplSDL2_InitForSDLRenderer(window, renderer); ImGui_ImplSDLRenderer2_Init(renderer); demo::apply_style(1);
+    {
+      demo::VideoTexture texture; auto frame = pixels("TR_one"); texture.upload(renderer, *frame);
+      SDL_RenderCopy(renderer, texture.get(), nullptr, nullptr);
+      std::vector<uint32_t> buffer(1100 * 720);
+      check(SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888, buffer.data(), 1100 * 4) == 0, "readback");
+      auto center = buffer[360 * 1100 + 550];
+      check(((center >> 16) & 255) > 220 && ((center >> 8) & 255) < 35 && (center & 255) < 35, "I420 red: planes/colors swapped");
+      texture.upload(renderer, *pixels("TR_one", 181, 321)); check(texture.width() == 181, "resolution recreation");
+      auto fit = demo::fit_video(0, 0, 500, 500, 640, 360);
+      check(std::abs(fit.w - 500) < .01f && std::abs(fit.h - 281.25f) < .01f && fit.y > 100, "aspect ratio");
+      auto invalid = *frame; invalid.v.clear(); bool rejected = false;
+      try { texture.upload(renderer, invalid); } catch (...) { rejected = true; } check(rejected, "invalid buffer validation");
+      demo::Snapshot state; state.state = demo::State::Connected; state.finished = false; state.room = "demo-room";
+      demo::sdk::ParticipantInfo local; local.sid = "PA_me"; local.identity = "viewer";
+      demo::sdk::ParticipantInfo alice; alice.sid = "PA_alice"; alice.identity = "alice"; alice.name = "Alice";
+      demo::sdk::TrackInfo t; t.sid = "TR_one"; t.kind = demo::sdk::TrackKind::video; t.subscribed = true; alice.tracks.push_back(t);
+      demo::sdk::ParticipantInfo bob = alice; bob.sid = "PA_bob"; bob.identity = "bob"; bob.name = "Bob"; bob.tracks[0].sid = "TR_two";
+      demo::sdk::ParticipantInfo guest; guest.sid = "PA_guest"; guest.identity = "guest";
+      state.frames[t.sid] = frame; // pixels may precede participant metadata
+      state.update(local, {alice, bob, guest});
+      check(demo::tiles(state).size() == 3, "roster tile count");
+      state.frames["TR_two"] = pixels("TR_two");
+      demo::View view;
+      auto render = [&](demo::Snapshot snapshot) {
+        ImGui_ImplSDLRenderer2_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
+        view.draw(renderer, snapshot); ImGui::Render(); SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer);
+        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+      };
+      render(state); render(state);
+      check(SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888, buffer.data(), 1100 * 4) == 0, "ImGui readback");
+      size_t red = 0; for (auto c : buffer) if (((c >> 16) & 255) > 220 && ((c >> 8) & 255) < 35 && (c & 255) < 35) ++red;
+      check(red > 30000, "ImGui did not render video textures");
+      if (argc > 1) {
+        auto* surface = SDL_CreateRGBSurfaceWithFormatFrom(buffer.data(), 1100, 720, 32, 1100 * 4, SDL_PIXELFORMAT_ARGB8888);
+        check(SDL_SaveBMP(surface, argv[1]) == 0, "save visual QA"); SDL_FreeSurface(surface);
+      }
+      alice.tracks[0].muted = true; state.update(local, {alice, bob, guest});
+      check(demo::tiles(state)[0].status == "Video muted", "mute placeholder"); render(state);
+      state.update(local, {bob, guest}); check(!state.frames.contains("TR_one"), "departed pixels retained"); render(state);
+      SDL_SetWindowSize(window, 640, 480); render(state);
+      render({}); // idle view and texture teardown
+    }
+    ImGui_ImplSDLRenderer2_Shutdown(); ImGui_ImplSDL2_Shutdown(); ImGui::DestroyContext();
+    SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit();
+    std::cout << "Demo model, I420 and ImGui renderer tests passed\n";
+  } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
+}

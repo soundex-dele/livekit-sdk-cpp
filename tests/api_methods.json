@@ -1,0 +1,63 @@
+{
+  "room": [
+    "CreateRoom",
+    "ListRooms",
+    "DeleteRoom",
+    "ListParticipants",
+    "GetParticipant",
+    "RemoveParticipant",
+    "ForwardParticipant",
+    "MoveParticipant",
+    "MutePublishedTrack",
+    "UpdateParticipant",
+    "UpdateSubscriptions",
+    "UpdateRoomMetadata",
+    "SendData"
+  ],
+  "egress": [
+    "StartEgress",
+    "StartRoomCompositeEgress",
+    "StartParticipantEgress",
+    "StartTrackCompositeEgress",
+    "StartTrackEgress",
+    "StartWebEgress",
+    "UpdateLayout",
+    "UpdateStream",
+    "ListEgress",
+    "StopEgress"
+  ],
+  "ingress": [
+    "CreateIngress",
+    "UpdateIngress",
+    "ListIngress",
+    "DeleteIngress"
+  ],
+  "sip": [
+    "CreateSIPInboundTrunk",
+    "CreateSIPOutboundTrunk",
+    "UpdateSIPInboundTrunk",
+    "UpdateSIPOutboundTrunk",
+    "ListSIPTrunk",
+    "ListSIPInboundTrunk",
+    "ListSIPOutboundTrunk",
+    "DeleteSIPTrunk",
+    "CreateSIPDispatchRule",
+    "UpdateSIPDispatchRule",
+    "ListSIPDispatchRule",
+    "DeleteSIPDispatchRule",
+    "CreateSIPParticipant",
+    "TransferSIPParticipant"
+  ],
+  "agent_dispatch": [
+    "CreateDispatch",
+    "DeleteDispatch",
+    "ListDispatch"
+  ],
+  "connector": [
+    "ConnectTwilioCall",
+    "DialWhatsAppCall",
+    "AcceptWhatsAppCall",
+    "ConnectWhatsAppCall",
+    "DisconnectWhatsAppCall"
+  ]
+}
