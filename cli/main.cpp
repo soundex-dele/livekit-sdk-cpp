@@ -89,6 +89,7 @@ int run(int argc, char** argv) {
     join->add_option("--codec", options.codec, "Video codec")->check(CLI::IsMember({"vp8", "vp9", "h264", "av1"}));
     join->add_option("--duration", options.duration, "Exit after N connected seconds (0: until Ctrl+C)")->check(CLI::NonNegativeNumber);
     join->add_option("--connect-timeout", options.connect_timeout)->check(CLI::PositiveNumber);
+    join->add_option("--stats-interval-ms", options.stats_interval_ms, "Native RTC media/transport stats (0 disables; otherwise 200..60000 ms)")->check(CLI::Range(0, 60000));
     join->add_option("--publish-data", options.publish_data, "Send a reliable UTF-8 data message"); join->add_option("--topic", options.topic);
     join->callback([&, command = std::string(command)] {
       resolve_credentials();

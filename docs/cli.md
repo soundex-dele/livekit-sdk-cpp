@@ -1,5 +1,18 @@
 # SDK-based LiveKit CLI
 
+`room join/publish/subscribe --stats-interval-ms 500` 可输出 `rtc-stats` 事件。
+默认关闭；启用时范围为 200–60000 ms。`target=0` 是发布连接，`target=1` 是
+订阅连接；`stats` 保留 libwebrtc 原生 W3C 字段，包括帧数、编码器质量限制
+原因、码率、RTT、丢包、NACK/PLI 和候选连接对统计。未定义字段不会伪造为零。
+不输出 candidate 地址或 certificate 记录；采集为异步，每条连接最多一个
+未完成请求。事件仍在 SDK 会话线程串行交付，应用可通过
+`RoomOptions.stats_interval_ms` 和 `Room::run` 的 EventHandler 使用同一能力。
+
+Windows 会话显式使用 libwebrtc 的 `CreateTaskQueueWinFactory`。构建直接编译
+原生 `task_queue_win.cc`，无需修改 WebRTC 源码；它避免本地清单默认 stdlib
+计时队列导致的探测时序问题。带宽估计、探测参数和 RTP/RTCP 算法仍由
+libwebrtc 决定。
+
 原生 C++20 LiveKit CLI，当前迁移范围是**房间管理、音视频流发布与订阅**。
 直接编译链接同级目录的 WebRTC（本机为 `D:\workspace\webrtc`），不调用 Go CLI，也不通过 Rust FFI 转接媒体。
 

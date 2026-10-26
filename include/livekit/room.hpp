@@ -42,6 +42,9 @@ struct RoomOptions {
   std::string publish_data, topic, codec = "vp8";
   int duration = 0, connect_timeout = 30;
   bool relay_only = false, disable_turn = false;
+  // Optional native W3C media/transport stats emitted as "rtc-stats" events.
+  // 0 disables collection; otherwise 200..60000 ms. Callbacks stay serialized.
+  int stats_interval_ms = 0;
   // Latest remote frame per track, serialized with events on the run thread.
   // Copy the frame to retain it. Exceptions terminate and clean up the session.
   VideoFrameHandler video_frame_handler;

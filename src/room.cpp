@@ -10,14 +10,17 @@
 #include "api/make_ref_counted.h"
 #include "api/task_queue/default_task_queue_factory.h"
 #include "api/rtp_transceiver_interface.h"
+#include "api/stats/rtc_stats_collector_callback.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/ssl_adapter.h"
 #include "media/sctp/dcsctp_transport.h"
 #ifdef _WIN32
 #include "rtc_base/win32_socket_init.h"
+#include "rtc_base/task_queue_win.h"
 #endif
 #include <chrono>
+#include <atomic>
 #include <future>
 #include <map>
 #include <set>
@@ -39,6 +42,32 @@ class CreateDescription : public webrtc::CreateSessionDescriptionObserver {
   std::promise<std::unique_ptr<webrtc::SessionDescriptionInterface>> result;
   void OnSuccess(webrtc::SessionDescriptionInterface* description) override { result.set_value(std::unique_ptr<webrtc::SessionDescriptionInterface>(description)); }
   void OnFailure(webrtc::RTCError error) override { result.set_exception(std::make_exception_ptr(std::runtime_error(error.message()))); }
+};
+class StatsObserver : public webrtc::RTCStatsCollectorCallback {
+ public:
+  StatsObserver(EventEmitter event,livekit::SignalTarget target,std::shared_ptr<std::atomic<bool>> pending)
+      : event_(std::move(event)),target_(target),pending_(std::move(pending)) {}
+  void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    try {
+      Json rows=Json::array();
+      // Keep native fields/types. Candidate addresses, certificate contents,
+      // and credentials are not part of this media diagnostics interface.
+      for (const auto& stat:*report) {
+        std::string_view type=stat.type();
+        if (type=="outbound-rtp" || type=="inbound-rtp" || type=="remote-inbound-rtp" ||
+            type=="media-source" || type=="candidate-pair" || type=="transport")
+          rows.push_back(Json::parse(stat.ToJson()));
+      }
+      event_("rtc-stats",{{"target",int(target_)},{"timestampUs",report->timestamp().us()},{"stats",std::move(rows)}});
+    } catch (...) {
+      // Diagnostics must not unwind through libwebrtc's callback or stop media.
+    }
+    pending_->store(false);
+  }
+ private:
+  EventEmitter event_;
+  livekit::SignalTarget target_;
+  std::shared_ptr<std::atomic<bool>> pending_;
 };
 // The local WebRTC manifest builds DcSctpTransport but does not enable the
 // default factory's WEBRTC_HAVE_DCSCTP branch. Supply the native factory
@@ -72,7 +101,11 @@ class Runtime {
       webrtc::PeerConnectionFactoryDependencies deps;
       deps.network_thread = network.get(); deps.worker_thread = worker.get(); deps.signaling_thread = signaling.get();
       deps.sctp_factory = std::make_unique<SctpFactory>(network.get());
+#ifdef _WIN32
+      deps.task_queue_factory = webrtc::CreateTaskQueueWinFactory();
+#else
       deps.task_queue_factory = webrtc::CreateDefaultTaskQueueFactory();
+#endif
       deps.adm = worker->BlockingCall([&]() -> webrtc::scoped_refptr<webrtc::AudioDeviceModule> {
         if (hardware) return webrtc::AudioDeviceModule::Create(webrtc::AudioDeviceModule::kPlatformDefaultAudio, deps.task_queue_factory.get());
         return webrtc::make_ref_counted<HeadlessAudioDevice>();
@@ -179,6 +212,11 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
     std::lock_guard lock(mutex_);
     for (auto& sink : sinks_) { auto error = sink->error(); if (!error.empty()) throw std::runtime_error(error); }
   }
+  void request_stats() {
+    if (!connected || stats_pending_->exchange(true)) return;
+    auto observer=webrtc::make_ref_counted<StatsObserver>(event,target,stats_pending_);
+    pc->GetStats(observer.get());
+  }
   void remote(const livekit::SessionDescription& description) {
     webrtc::SdpParseError error;
     auto type = webrtc::SdpTypeFromString(description.type());
@@ -223,6 +261,7 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
   std::vector<webrtc::scoped_refptr<webrtc::DataChannelInterface>> channels_;
   std::vector<std::string> pending_ice_;
   bool remote_set_ = false;
+  std::shared_ptr<std::atomic<bool>> stats_pending_=std::make_shared<std::atomic<bool>>(false);
 };
 void webrtc_smoke(EventEmitter event) {
   Runtime runtime(false); SignalSocket socket;
@@ -371,6 +410,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       published_tracks.erase(found); dirty = true; event("track-unpublished", {{"sid", sid}});
     };
     auto joined_at = Clock::now(), last_ping = joined_at, last_pong = joined_at, connected_at = joined_at;
+    auto next_stats=joined_at;
     auto ping_interval = std::chrono::seconds(join.ping_interval() > 0 ? join.ping_interval() : 5);
     auto ping_timeout = std::chrono::seconds(join.ping_timeout() > 0 ? join.ping_timeout() : 15);
     while (!stop.stop_requested()) {
@@ -379,6 +419,10 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       if (playout && !playout->poll()) break;
       if (publisher->failed || subscriber->failed) throw std::runtime_error("WebRTC transport or media failed");
       publisher->check_recordings(); subscriber->check_recordings();
+      if (options.stats_interval_ms && Clock::now()>=next_stats) {
+        publisher->request_stats(); subscriber->request_stats();
+        next_stats=Clock::now()+std::chrono::milliseconds(options.stats_interval_ms);
+      }
       if (video_frames) video_frames->dispatch();
       for (const auto& pump : pumps) { auto error = pump->error(); if (!error.empty()) throw std::runtime_error(error); }
       if (session) {

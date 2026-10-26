@@ -9,6 +9,8 @@ void validate(const RoomOptions& o) {
   endpoint(o.url, true);
   if (o.token.empty()) throw std::invalid_argument("Token is required");
   if (o.connect_timeout <= 0 || o.duration < 0) throw std::invalid_argument("Invalid room timeout/duration");
+  if (o.stats_interval_ms && (o.stats_interval_ms < 200 || o.stats_interval_ms > 60000))
+    throw std::invalid_argument("stats_interval_ms must be 0 or 200..60000");
   if (o.relay_only && o.disable_turn) throw std::invalid_argument("relay_only conflicts with disable_turn");
   if (!o.subscribe && (!o.record.empty() || o.video_playout || o.audio_playout || o.video_frame_handler || !o.subscribe_tracks.empty()))
     throw std::invalid_argument("Recording/playout/track selection requires subscriptions");

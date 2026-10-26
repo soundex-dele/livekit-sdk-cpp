@@ -34,6 +34,11 @@ int main(int argc, char** argv) {
     options.media.push_back({"", "ffmpeg", true, true, false, 641, 360, 30});
     rejects([&] { room.run(options); });
     options.media.clear();
+    options.stats_interval_ms=100;
+    rejects([&] { room.run(options); });
+    options.stats_interval_ms=60001;
+    rejects([&] { room.run(options); });
+    options.stats_interval_ms=500;
     std::stop_source stopped; stopped.request_stop();
     // An already-cancelled valid session must not attempt a network connection.
     room.run(options, {}, stopped.get_token());
