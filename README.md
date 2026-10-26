@@ -1,5 +1,13 @@
 # livekit-sdk-cpp
 
+[远程控制](../docs/remote-control/README.md)：新增 `RemoteControlSession`、可靠键鼠协议、租约/心跳 watchdog 和 Windows 输入后端；搭配相邻 ImGui 被控端、浏览器及 Go 授权服务使用。自动化只验证合成媒体和输入记录器，实际桌面需人工验收。
+
+[WebRTC 媒体图节点](docs/media-graph-webrtc.md)：采集、音视频编解码与渲染拆为独立节点，四类 Factory 默认接入 Room；支持摄像头/主屏输入、可选本地预览及节点统计。
+
+[仓库设计](docs/design.md)说明当前代码分工、线程契约及向统一媒体 SDK 演进的路径；[平台总体设计](../docs/platform-design.md)定义跨仓库边界。
+
+新增独立的 [本地文件播放器](docs/player.md)：`LiveKit::Player` 提供 FFmpeg 库级播放、暂停、Seek 与音视频帧输出，可关闭 RTC 单独构建；附 SDL 播放示例和 Windows 构建脚本。
+
 C++20 LiveKit SDK，底层直接链接原生 **libwebrtc**。从同级 `livekit-cli-cpp` 提取信令、媒体和管理能力，CLI 已迁入 `cli/`，仅使用 SDK 的公开头文件与 `LiveKit::SDK` CMake target。
 
 当前版本 **0.3.0** 按同级 `server-sdk-go/v2` 适配客户端和服务端核心 API：`Room / Participant / TrackPublication`、动态音视频发布/订阅、可靠/丢包数据、参与者状态及事件，以及 `LiveKitAPI` 的 Room、Egress、Ingress、SIP、AgentDispatch、Connector 六类服务（49 个 RPC）。没有 Go 子进程或 Rust FFI。

@@ -32,7 +32,9 @@ ParticipantInfo parse_participant(const Json& v) {
 void validate_media(const MediaSpec& m) {
   if (m.width < 2 || m.width > 3840 || m.height < 2 || m.height > 2160 || m.width % 2 || m.height % 2 || m.fps < 1 || m.fps > 60)
     throw std::invalid_argument("Invalid media dimensions or frame rate");
-  if (!m.demo && m.input.empty()) throw std::invalid_argument("Media input is required");
+  if (!m.demo && m.input.empty() && m.capture == CaptureKind::input) throw std::invalid_argument("Media input is required");
+  if (m.capture != CaptureKind::input && (!m.video || m.demo || m.loop || m.device_index < 0))
+    throw std::invalid_argument("Invalid device capture specification");
 }
 }
 namespace livekit::sdk {

@@ -4,6 +4,11 @@
 #include "lk/process.hpp"
 #include "api/peer_connection_interface.h"
 #include "media/base/adapted_video_track_source.h"
+#include "media_graph/rtc_graph.hpp"
+#include "media_nodes/video_render.hpp"
+#include "media_nodes/capture_source.hpp"
+#include "media_nodes/recording.hpp"
+#include "backends/webrtc/graph_video_encoder.hpp"
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -14,11 +19,14 @@ class VideoPlayout;
 class VideoFrames;
 class VideoSource : public webrtc::AdaptedVideoTrackSource {
  public:
+  explicit VideoSource(bool screen = false) : screen_(screen) {}
   SourceState state() const override { return kLive; }
   bool remote() const override { return false; }
-  bool is_screencast() const override { return false; }
+  bool is_screencast() const override { return screen_; }
   std::optional<bool> needs_denoising() const override { return false; }
   void push(const webrtc::VideoFrame& frame) { OnFrame(frame); }
+ private:
+  bool screen_;
 };
 class AudioSource : public webrtc::Notifier<webrtc::AudioSourceInterface> {
  public:
@@ -34,29 +42,28 @@ class AudioSource : public webrtc::Notifier<webrtc::AudioSourceInterface> {
 using livekit::sdk::MediaSpec;
 std::vector<MediaSpec> probe_media(const std::string& input, const std::string& ffmpeg,
                                   bool loop, int width, int height, int fps);
+// Track-level owner; GraphEngine owns and connects the actual processing nodes.
 class MediaPump {
+ private:
+  std::shared_ptr<CaptureNode> capture_;
+  std::unique_ptr<livekit::sdk::detail::GraphVideoSender> sender_;
+  std::unique_ptr<livekit::sdk::detail::RtcPipeline> pipeline_;
  public:
-  explicit MediaPump(MediaSpec spec);
+  explicit MediaPump(MediaSpec spec, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {},
+                    VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string id = {});
   ~MediaPump();
-  void start();
+  bool start();
   void stop();
-  bool finished() const { return finished_; }
-  std::string error() const;
-  const MediaSpec spec;
+  bool finished() const { return capture_->finished(); }
+  std::string error() const { return capture_->error(); }
+  const MediaSpec& spec;
+  std::atomic<uint64_t>& frames;
   webrtc::scoped_refptr<VideoSource> video;
   webrtc::scoped_refptr<AudioSource> audio;
-  std::atomic<uint64_t> frames{0};
- private:
-  void run();
-  std::thread thread_;
-  std::atomic<bool> stop_{false}, finished_{false};
-  mutable std::mutex mutex_;
-  std::shared_ptr<Process> process_;
-  std::string error_;
 };
 class TrackSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame>, public webrtc::AudioTrackSinkInterface {
  public:
-  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {});
+  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {}, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {});
   ~TrackSink();
   void attach();
   void detach();
@@ -67,18 +74,19 @@ class TrackSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame>, public 
   std::string track_id() const { return track_id_; }
   bool owns_track(const webrtc::MediaStreamTrackInterface* track) const { return track_.get() == track; }
  private:
-  void open_video(int width, int height);
-  void close_audio();
   webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track_;
   std::string track_id_;
   VideoPlayout* playout_ = nullptr;
   VideoFrames* frame_output_ = nullptr;
-  std::filesystem::path base_;
-  std::ofstream file_;
   mutable std::mutex mutex_;
   uint64_t frames_ = 0, bytes_ = 0;
-  int width_ = 0, height_ = 0, rate_ = 0, channels_ = 0, part_ = 0;
   bool attached_ = false;
   std::string error_;
+  std::shared_ptr<VideoRenderNode> renderer_;
+  std::shared_ptr<RecordingNode> recorder_;
+  std::shared_ptr<livekit::sdk::detail::MediaEventNode<livekit::sdk::detail::RawVideoFrame>> video_input_;
+  std::shared_ptr<livekit::sdk::detail::MediaEventNode<livekit::sdk::detail::PcmFrame>> audio_input_;
+  std::shared_ptr<livekit::sdk::detail::MediaNode> subscribe_node_;
+  std::unique_ptr<livekit::sdk::detail::RtcPipeline> pipeline_;
 };
 }

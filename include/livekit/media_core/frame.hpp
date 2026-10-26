@@ -1,0 +1,25 @@
+#pragma once
+#include <cstdint>
+#include <memory>
+#include <variant>
+#include <vector>
+
+namespace livekit::sdk::media {
+// CPU-owned immutable payloads. All times are microseconds on the file timeline,
+// normalized to the container start. Frames remain valid after seek/close.
+struct VideoFrame {
+  int width = 0, height = 0, stride = 0;
+  int64_t timestamp_us = 0, duration_us = 0;
+  uint64_t generation = 0;
+  // Packed RGBA8, top to bottom; conversion is explicit in the FFmpeg node.
+  std::shared_ptr<const std::vector<uint8_t>> rgba;
+};
+struct AudioFrame {
+  int sample_rate = 48000, channels = 2, samples = 0;
+  int64_t timestamp_us = 0, duration_us = 0;
+  uint64_t generation = 0;
+  // Interleaved float32 stereo, FL/FR.
+  std::shared_ptr<const std::vector<float>> pcm;
+};
+using Frame = std::variant<VideoFrame, AudioFrame>;
+}

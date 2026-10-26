@@ -3,6 +3,8 @@
 #include "lk/headless_audio.hpp"
 #include "lk/video_playout.hpp"
 #include "lk/video_frames.hpp"
+#include "backends/webrtc/codec_factories.hpp"
+#include "backends/webrtc/audio_device.hpp"
 #include "livekit.pb.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/enable_media_with_defaults.h"
@@ -89,6 +91,7 @@ class Runtime {
 #endif
   std::unique_ptr<webrtc::Thread> network, worker, signaling;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
+  std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = std::make_shared<livekit::sdk::detail::RtcGraph>();
   Runtime(bool hardware) {
 #ifdef _WIN32
     if (winsock.error()) throw std::runtime_error("Winsock initialization failed");
@@ -111,6 +114,8 @@ class Runtime {
         return webrtc::make_ref_counted<HeadlessAudioDevice>();
       });
       if (!deps.adm) throw std::runtime_error("Cannot create WebRTC audio device");
+      deps.adm = webrtc::make_ref_counted<livekit::sdk::detail::GraphAudioDevice>(deps.adm, graph);
+      livekit::sdk::detail::install_graph_codecs(deps, graph);
       webrtc::EnableMediaWithDefaults(deps);
       factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
       if (!factory) throw std::runtime_error("Cannot create WebRTC factory");
@@ -125,6 +130,7 @@ class Runtime {
  private:
   bool ssl_ = false;
   void cleanup() {
+    graph->close();
     if (factory) signaling->BlockingCall([&] { factory = nullptr; });
     if (signaling) signaling->Stop(); if (worker) worker->Stop(); if (network) network->Stop();
     if (ssl_) { webrtc::CleanupSSL(); ssl_ = false; }
@@ -136,7 +142,7 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
   std::atomic<bool> connected{false}, failed{false};
   const livekit::SignalTarget target;
   Peer(Runtime& runtime, SignalSocket& socket, livekit::SignalTarget which, const PC::RTCConfiguration& config, std::filesystem::path record, EventEmitter events, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr)
-      : target(which), event(std::move(events)), socket_(socket), record_(std::move(record)), playout_(playout), frames_(frames) {
+      : target(which), event(std::move(events)), socket_(socket), record_(std::move(record)), playout_(playout), frames_(frames), graph_(runtime.graph) {
     auto result = runtime.factory->CreatePeerConnectionOrError(config, webrtc::PeerConnectionDependencies(this));
     if (!result.ok()) throw std::runtime_error(result.error().message());
     pc = result.MoveValue();
@@ -177,7 +183,7 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
         if (separator != std::string::npos && id.starts_with("PA_") && id.substr(separator + 1).starts_with("TR_"))
           sid = id.substr(separator + 1);
       }
-      auto sink = std::make_unique<TrackSink>(track, record_, playout_, frames_, sid);
+      auto sink = std::make_unique<TrackSink>(track, record_, playout_, frames_, sid, graph_);
       sink->attach();
       std::lock_guard lock(mutex_); sinks_.push_back(std::move(sink));
       event("track-subscribed", {{"track", sid}, {"kind", track->kind()}, {"mid", transceiver->mid().value_or("")}, {"streams", streams}});
@@ -256,6 +262,7 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
   std::filesystem::path record_;
   VideoPlayout* playout_ = nullptr;
   VideoFrames* frames_ = nullptr;
+  std::shared_ptr<livekit::sdk::detail::RtcGraph> graph_;
   std::mutex mutex_;
   std::vector<std::unique_ptr<TrackSink>> sinks_;
   std::vector<webrtc::scoped_refptr<webrtc::DataChannelInterface>> channels_;
@@ -325,7 +332,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   }
   if (options.relay_only) config.type = PC::kRelay;
   std::unique_ptr<Peer> publisher, subscriber;
-  std::vector<std::unique_ptr<MediaPump>> pumps;
+  std::vector<std::shared_ptr<MediaPump>> pumps;
   std::vector<webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface>> tracks;
   webrtc::scoped_refptr<webrtc::DataChannelInterface> reliable, lossy_channel;
   using Command = livekit::sdk::detail::Command;
@@ -336,6 +343,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   std::set<MediaPump*> started_pumps;
   std::map<std::string, webrtc::scoped_refptr<webrtc::RtpSenderInterface>> senders;
   auto cleanup = [&] {
+    runtime.graph->close();
     auto closed = std::make_exception_ptr(std::runtime_error("Room disconnected before command completed"));
     for (auto& [id, command] : publishing) command->reject(closed);
     for (auto& command : deferred) command->reject(closed);
@@ -370,14 +378,16 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       livekit::SignalRequest request; auto* add = request.mutable_add_track();
       add->set_cid(track->id()); add->set_name(publication.name.empty() ? track->id() : publication.name); add->set_stream(init.stream_ids.front());
       add->set_type(track->kind() == "video" ? livekit::VIDEO : livekit::AUDIO);
-      add->set_source(publication.source == livekit::sdk::TrackSource::unknown ? (track->kind() == "video" ? livekit::CAMERA : livekit::MICROPHONE) : static_cast<livekit::TrackSource>(publication.source));
+      const auto default_source = spec && spec->capture == livekit::sdk::CaptureKind::screen ? livekit::SCREEN_SHARE :
+          track->kind() == "video" ? livekit::CAMERA : livekit::MICROPHONE;
+      add->set_source(publication.source == livekit::sdk::TrackSource::unknown ? default_source : static_cast<livekit::TrackSource>(publication.source));
       if (spec && spec->video) { add->set_width(spec->width); add->set_height(spec->height); auto layer = add->add_layers(); layer->set_quality(2); layer->set_width(spec->width); layer->set_height(spec->height); layer->set_bitrate(2000000); }
       send(request);
     };
     int counter = 0;
     for (const auto& spec : options.media) {
-      auto pump = std::make_unique<MediaPump>(spec);
       auto id = std::string(spec.video ? "video-" : "audio-") + std::to_string(++counter);
+      auto pump = std::make_shared<MediaPump>(spec, runtime.graph, playout.get(), video_frames.get(), id);
       if (spec.video) add_track(runtime.factory->CreateVideoTrack(pump->video, id), &spec);
       else add_track(runtime.factory->CreateAudioTrack(id, pump->audio.get()), &spec);
       track_pumps[id] = pump.get(); pumps.push_back(std::move(pump));
@@ -421,6 +431,14 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       publisher->check_recordings(); subscriber->check_recordings();
       if (options.stats_interval_ms && Clock::now()>=next_stats) {
         publisher->request_stats(); subscriber->request_stats();
+        Json nodes = Json::array();
+        for (const auto& node : runtime.graph->snapshot()) nodes.push_back({{"id", node.id}, {"name", node.name}, {"kind", node.kind},
+          {"format", node.format}, {"inputs", node.inputs}, {"outputs", node.outputs},
+          {"errors", node.errors}, {"dropped", node.dropped}, {"generation", node.generation}});
+        Json edges = Json::array();
+        for (const auto& edge : runtime.graph->connections())
+          edges.push_back({{"from", edge.from}, {"to", edge.to}, {"dataType", edge.data_type}});
+        event("media-graph-stats", {{"nodes", std::move(nodes)}, {"edges", std::move(edges)}});
         next_stats=Clock::now()+std::chrono::milliseconds(options.stats_interval_ms);
       }
       if (video_frames) video_frames->dispatch();
@@ -442,8 +460,8 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
             livekit::SignalRequest request;
             if (op == "publish") {
               need_publisher = true;
-              auto pump = std::make_unique<MediaPump>(command->media);
               const auto id = std::string(command->media.video ? "video-" : "audio-") + std::to_string(++counter);
+              auto pump = std::make_shared<MediaPump>(command->media, runtime.graph, playout.get(), video_frames.get(), id);
               if (command->media.video) add_track(runtime.factory->CreateVideoTrack(pump->video, id), &command->media, command->publication);
               else add_track(runtime.factory->CreateAudioTrack(id, pump->audio.get()), &command->media, command->publication);
               track_pumps[id] = pump.get(); pumps.push_back(std::move(pump));

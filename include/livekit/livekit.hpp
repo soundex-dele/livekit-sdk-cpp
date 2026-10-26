@@ -4,3 +4,4 @@
 #include "livekit/room.hpp"
 #include "livekit/room_service.hpp"
 #include "livekit/api.hpp"
+#include "livekit/remote_control.hpp"
