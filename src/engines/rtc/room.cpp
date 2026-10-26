@@ -183,7 +183,12 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
         if (separator != std::string::npos && id.starts_with("PA_") && id.substr(separator + 1).starts_with("TR_"))
           sid = id.substr(separator + 1);
       }
-      auto sink = std::make_unique<TrackSink>(track, record_, playout_, frames_, sid, graph_);
+      std::vector<uint32_t> ssrcs;
+      if (track->kind() == "video") {
+        for (const auto& encoding : transceiver->receiver()->GetParameters().encodings)
+          if (encoding.ssrc) ssrcs.push_back(*encoding.ssrc);
+      }
+      auto sink = std::make_unique<TrackSink>(track, record_, playout_, frames_, sid, graph_, std::move(ssrcs));
       sink->attach();
       std::lock_guard lock(mutex_); sinks_.push_back(std::move(sink));
       event("track-subscribed", {{"track", sid}, {"kind", track->kind()}, {"mid", transceiver->mid().value_or("")}, {"streams", streams}});

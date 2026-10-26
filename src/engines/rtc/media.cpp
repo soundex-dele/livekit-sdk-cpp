@@ -73,58 +73,53 @@ bool MediaPump::start() {
   return true;
 }
 void MediaPump::stop() { pipeline_->stop(); }
-TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout, VideoFrames* frames, std::string track_id, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph)
+TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout, VideoFrames* frames, std::string track_id, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph, std::vector<uint32_t> ssrcs)
     : track_(std::move(track)), track_id_(track_id.empty() ? track_->id() : std::move(track_id)), playout_(playout), frame_output_(frames) {
   if (!graph) graph = std::make_shared<livekit::sdk::detail::RtcGraph>();
   using namespace livekit::sdk::detail;
-  pipeline_ = std::make_unique<RtcPipeline>(graph);
+  registry_ = graph;
+  ssrcs_ = std::move(ssrcs);
   if (track_->kind() == "video") {
-    video_input_ = std::make_shared<MediaEventNode<RawVideoFrame>>("RtcSubscribeNode", NodeExecution::source);
-    subscribe_node_ = video_input_;
-    renderer_ = std::make_shared<VideoRenderNode>(track_id_, playout, frames);
-  } else {
-    audio_input_ = std::make_shared<MediaEventNode<PcmFrame>>("RtcSubscribeNode", NodeExecution::source);
-    subscribe_node_ = audio_input_;
+    receive_video_ = std::make_shared<VideoReceiveGraph>(graph, track_id_, directory, playout, frames);
+    return;
   }
+  pipeline_ = std::make_unique<RtcPipeline>(graph);
+  audio_input_ = std::make_shared<MediaEventNode<PcmFrame>>("RtcSubscribeNode", NodeExecution::source);
+  subscribe_node_ = audio_input_;
   std::vector<std::shared_ptr<MediaNode>> nodes{subscribe_node_};
   std::vector<RtcPipeline::Connection> edges;
-  if (renderer_) {
-    nodes.push_back(renderer_); edges.push_back(RtcPipeline::connect<RawVideoFrame>(subscribe_node_, renderer_));
-  }
   if (!directory.empty()) {
-    recorder_ = std::make_shared<RecordingNode>(directory, track_id_, track_->kind() == "video");
+    recorder_ = std::make_shared<RecordingNode>(directory, track_id_, false);
     nodes.push_back(recorder_);
-    edges.push_back(video_input_ ? RtcPipeline::connect<RawVideoFrame>(subscribe_node_, recorder_)
-                                 : RtcPipeline::connect<PcmFrame>(subscribe_node_, recorder_));
+    edges.push_back(RtcPipeline::connect<PcmFrame>(subscribe_node_, recorder_));
   }
   pipeline_->build(nodes, edges);
 }
 TrackSink::~TrackSink() { detach(); }
 void TrackSink::attach() {
   if (attached_) return;
-  if (!pipeline_->start()) throw std::runtime_error("media_graph: receive pipeline start failed");
-  if (track_->kind() == "video") {
-    static_cast<webrtc::VideoTrackInterface*>(track_.get())->AddOrUpdateSink(this, webrtc::VideoSinkWants{});
+  if (receive_video_) {
+    if (!receive_video_->start()) throw std::runtime_error("media_graph: receive video graph start failed");
+    try { registry_->bind_video(ssrcs_, receive_video_); }
+    catch (...) { receive_video_->stop(); throw; }
+    attached_ = true;
+    return;
   }
-  else static_cast<webrtc::AudioTrackInterface*>(track_.get())->AddSink(this);
+  if (!pipeline_->start()) throw std::runtime_error("media_graph: receive pipeline start failed");
+  static_cast<webrtc::AudioTrackInterface*>(track_.get())->AddSink(this);
   attached_ = true;
 }
 void TrackSink::detach() {
   if (!attached_) return;
-  if (track_->kind() == "video") {
-    static_cast<webrtc::VideoTrackInterface*>(track_.get())->RemoveSink(this);
+  if (receive_video_) {
+    registry_->unbind_video(receive_video_.get());
+    receive_video_->stop();
+    attached_ = false;
+    return;
   }
-  else static_cast<webrtc::AudioTrackInterface*>(track_.get())->RemoveSink(this);
+  static_cast<webrtc::AudioTrackInterface*>(track_.get())->RemoveSink(this);
   pipeline_->stop();
   attached_ = false;
-}
-void TrackSink::OnFrame(const webrtc::VideoFrame& frame) {
-  try {
-    { std::lock_guard lock(mutex_); ++frames_; }
-    video_input_->emit(livekit::sdk::detail::RawVideoFrame(frame));
-  } catch (const std::exception& error) {
-    ++subscribe_node_->errors; std::lock_guard lock(mutex_); error_ = error.what();
-  }
 }
 void TrackSink::OnData(const void* data, int bits, int rate, size_t channels, size_t frames) {
   try {
@@ -135,8 +130,9 @@ void TrackSink::OnData(const void* data, int bits, int rate, size_t channels, si
   }
 }
 std::string TrackSink::error() const {
+  if (receive_video_) return receive_video_->error();
   { std::lock_guard lock(mutex_); if (!error_.empty()) return error_; }
   return recorder_ ? recorder_->error() : std::string{};
 }
-Json TrackSink::stats() const { std::lock_guard lock(mutex_); return {{"track", track_id_}, {"kind", track_->kind()}, {"frames", frames_}}; }
+Json TrackSink::stats() const { std::lock_guard lock(mutex_); return {{"track", track_id_}, {"kind", track_->kind()}, {"frames", receive_video_ ? receive_video_->frames() : frames_}}; }
 }

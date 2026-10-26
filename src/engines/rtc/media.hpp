@@ -9,6 +9,7 @@
 #include "media_nodes/capture/capture_source.hpp"
 #include "media_nodes/recording/recording.hpp"
 #include "backends/webrtc/graph_video_encoder.hpp"
+#include "engines/rtc/video_receive_graph.hpp"
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -61,13 +62,12 @@ class MediaPump {
   webrtc::scoped_refptr<VideoSource> video;
   webrtc::scoped_refptr<AudioSource> audio;
 };
-class TrackSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame>, public webrtc::AudioTrackSinkInterface {
+class TrackSink : public webrtc::AudioTrackSinkInterface {
  public:
-  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {}, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {});
+  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {}, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {}, std::vector<uint32_t> ssrcs = {});
   ~TrackSink();
   void attach();
   void detach();
-  void OnFrame(const webrtc::VideoFrame& frame) override;
   void OnData(const void* data, int bits, int rate, size_t channels, size_t frames) override;
   std::string error() const;
   Json stats() const;
@@ -82,11 +82,12 @@ class TrackSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame>, public 
   uint64_t frames_ = 0, bytes_ = 0;
   bool attached_ = false;
   std::string error_;
-  std::shared_ptr<VideoRenderNode> renderer_;
   std::shared_ptr<RecordingNode> recorder_;
-  std::shared_ptr<livekit::sdk::detail::MediaEventNode<livekit::sdk::detail::RawVideoFrame>> video_input_;
   std::shared_ptr<livekit::sdk::detail::MediaEventNode<livekit::sdk::detail::PcmFrame>> audio_input_;
   std::shared_ptr<livekit::sdk::detail::MediaNode> subscribe_node_;
   std::unique_ptr<livekit::sdk::detail::RtcPipeline> pipeline_;
+  std::shared_ptr<livekit::sdk::detail::RtcGraph> registry_;
+  std::shared_ptr<livekit::sdk::detail::VideoReceiveGraph> receive_video_;
+  std::vector<uint32_t> ssrcs_;
 };
 }

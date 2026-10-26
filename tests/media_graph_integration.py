@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--lk", required=True)
     parser.add_argument("--server", required=True)
     parser.add_argument("--sdk-client")
+    parser.add_argument("--demo-client", help="Headless conference session integration (no application window)")
     parser.add_argument("--output", default="out/media-graph-integration")
     args = parser.parse_args()
     root = Path(args.output).resolve() / time.strftime("%Y%m%d-%H%M%S")
@@ -29,7 +30,7 @@ def main():
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     env = dict(os.environ, LIVEKIT_URL=f"http://127.0.0.1:{port}", LIVEKIT_API_KEY="graphtest",
-               LIVEKIT_API_SECRET="isolated-graph-test-secret-32-characters", LIVEKIT_TOKEN="")
+               LIVEKIT_API_SECRET="isolated-graph-test-secret-32-characters", LIVEKIT_TOKEN="", LIVEKIT_DEMO_TEST_AUDIO="0")
     config = root / "server.json"
     config.write_text(json.dumps({"bind": "127.0.0.1", "port": port,
         "keys": {"graphtest": env["LIVEKIT_API_SECRET"]},
@@ -102,10 +103,12 @@ def main():
         require_edge("publisher", "VideoSourceNode", "VideoEncodeInputNode", "RawVideoFrame")
         require_edge("publisher", "VideoEncodeInputNode", "VideoEncoderNode", "RawVideoFrame")
         require_edge("publisher", "VideoEncoderNode", "VideoTrackInputNode", "EncodedVideoFrame")
-        require_edge("subscriber", "RtcDecodeInputNode", "VideoDecoderNode", "VideoDecodeRequest")
-        require_edge("subscriber", "VideoDecoderNode", "RtcDecodeOutputNode", "DecodedVideoFrame")
-        require_edge("subscriber", "RtcSubscribeNode", "VideoRenderNode", "RawVideoFrame")
-        require_edge("subscriber", "RtcSubscribeNode", "RecordingNode", "RawVideoFrame")
+        require_edge("subscriber", "RtcEncodedSourceNode", "VideoDecoderNode", "VideoDecodeRequest")
+        require_edge("subscriber", "VideoDecoderNode", "VideoPresentNode", "RawVideoFrame")
+        require_edge("subscriber", "VideoPresentNode", "VideoRenderNode", "RawVideoFrame")
+        require_edge("subscriber", "VideoDecoderNode", "RecordingNode", "RawVideoFrame")
+        assert not any(node["kind"] == "RtcDecodeOutputNode" for event in events("subscriber")
+                       if event.get("event") == "media-graph-stats" for node in event["nodes"])
         assert any(event.get("event") == "data" for event in events("subscriber")), "Data channel regression"
         videos = list(recordings.glob("*.y4m"))
         assert videos and max(path.stat().st_size for path in videos) > 640 * 360 * 3 // 2 * 20, "Missing decoded video"
@@ -119,7 +122,12 @@ def main():
         if args.sdk_client:
             client = start("sdk-api", [str(Path(args.sdk_client).resolve()), str(root / "sdk-recordings")])
             assert client.wait(timeout=110) == 0, f"SDK dynamic publish/subscription regression; see {root}"
+        if args.demo_client:
+            client = start("conference", [str(Path(args.demo_client).resolve()), str(root / "conference-recordings")])
+            assert client.wait(timeout=180) == 0, f"Headless conference frame routing regression; see {root}"
         report = {"ok": True, "factories": 4, "graphDrivenVideoEncoding": True, "graphEngineTopology": True,
+                  "directGraphVideoReceive": True,
+                  "headlessConferenceRegression": bool(args.demo_client),
                   "actualMedia": True, "recordings": True,
                   "sdkApiRegression": bool(args.sdk_client), "server": str(Path(args.server).resolve())}
         report["serverSha256"] = hashlib.sha256(Path(args.server).read_bytes()).hexdigest()

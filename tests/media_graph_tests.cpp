@@ -1,5 +1,6 @@
 #include "backends/webrtc/codec_factories.hpp"
 #include "backends/webrtc/audio_device.hpp"
+#include "backends/webrtc/graph_video_decoder.hpp"
 #include "media_graph/encode_executor.hpp"
 #include "system_wrappers/include/clock.h"
 #include "media_graph/realtime_channel.hpp"
@@ -10,6 +11,7 @@
 #include "api/video_codecs/video_codec.h"
 #include "api/make_ref_counted.h"
 #include "modules/video_coding/include/video_codec_interface.h"
+#include "modules/video_coding/include/video_error_codes.h"
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -115,6 +117,14 @@ struct TriggerFrames {
 };
 static void graph_driven_video() {
   auto env = CreateEnvironment(); auto graph = std::make_shared<RtcGraph>();
+  int displayed = 0;
+  lk::VideoFrames output([&](const auto& frame) {
+    check(frame.track_id == "receive-vp8" && frame.width == 160 && frame.height == 120 && frame.y[0] > 80,
+          "direct decoded pixels reach the correct track");
+    ++displayed;
+  });
+  auto receiver = std::make_shared<VideoReceiveGraph>(graph, "receive-vp8", std::filesystem::path{}, nullptr, &output);
+  check(receiver->start(), "receive graph starts"); graph->bind_video({1234}, receiver);
   PeerConnectionFactoryDependencies deps; install_graph_codecs(deps, graph);
   auto encoder = deps.video_encoder_factory->Create(env, SdpVideoFormat("VP8"));
   auto encoder2 = deps.video_encoder_factory->Create(env, SdpVideoFormat("VP8"));
@@ -138,9 +148,10 @@ static void graph_driven_video() {
   check(has_edge(graph, "VideoEncodeInputNode", "VideoEncoderNode", "RawVideoFrame") &&
         has_edge(graph, "VideoEncoderNode", "VideoTrackInputNode", "EncodedVideoFrame"),
         "GraphEngine connects raw input, real encoder and native track output");
-  check(has_edge(graph, "RtcDecodeInputNode", "VideoDecoderNode", "VideoDecodeRequest") &&
-        has_edge(graph, "VideoDecoderNode", "RtcDecodeOutputNode", "DecodedVideoFrame"),
-        "DecoderFactory creates an executable GraphEngine decoder pipeline");
+  check(has_edge(graph, "RtcEncodedSourceNode", "VideoDecoderNode", "VideoDecodeRequest") &&
+        has_edge(graph, "VideoDecoderNode", "VideoPresentNode", "RawVideoFrame") &&
+        has_edge(graph, "VideoPresentNode", "VideoRenderNode", "RawVideoFrame"),
+        "one GraphEngine connects encoded ingress, decoder, presentation and renderer");
   auto push = [&](auto& source) {
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
     auto frame = video_frame(); frame.set_timestamp_us(env.clock().CurrentTime().us()); source->submit(frame);
@@ -164,7 +175,9 @@ static void graph_driven_video() {
   check(encoded2.count == 1, "second sender independently encoded");
   VideoDecoder::Settings ds; ds.set_codec_type(kVideoCodecVP8); ds.set_number_of_cores(1);
   DecodedFrames decoded; check(decoder->Configure(ds), "decoder configure"); decoder->RegisterDecodeCompleteCallback(&decoded);
-  check(decoder->Decode(*encoded.frame, 0) == 0 && decoded.count == 1, "graph passthrough produces real decodable video");
+  encoded.frame->SetPacketInfos(RtpPacketInfos({RtpPacketInfo(1234, {}, encoded.frame->RtpTimestamp(), env.clock().CurrentTime())}));
+  check(decoder->Decode(*encoded.frame, 0) == 0 && decoded.count == 0, "real VP8 decode never calls WebRTC's pixel callback");
+  eventually([&] { output.dispatch(); return displayed == 1; }, "graph presents decoded VP8 pixels");
   // Discard a trigger as WebRTC may do under load. No FIFO packet can leak into
   // the next trigger, and the reference chain must recover with a keyframe.
   push(sender); { auto dropped = triggers.take(); }
@@ -195,8 +208,10 @@ static void graph_driven_video() {
   sender->pause(); sender2->pause();
   sender.reset(); sender2.reset();
   encoder.reset(); encoder2.reset(); decoder->Release(); decoder.reset();
+  graph->unbind_video(receiver.get()); receiver->stop(); receiver.reset();
   check(graph->snapshot().empty(), "native envelope weak leases do not retain graph nodes");
 }
+#include "direct_receive_tests.inc"
 static void graph_encode_queues() {
   auto env = CreateEnvironment(); EncodeExecutor executor(env, "graph-queue-test", 1);
   std::promise<void> entered, unblock; auto release = unblock.get_future().share();
@@ -351,7 +366,7 @@ static void recording() {
   std::filesystem::remove_all(directory);
 }
 int main() {
-  try { engine_routing(); channels(); audio_codecs(); graph_driven_video(); graph_encode_queues(); audio_device(); source_and_render(); recording();
+  try { engine_routing(); channels(); audio_codecs(); graph_driven_video(); direct_receive_lifecycle(); receive_presentation_bounds(); receive_stop_barrier(); graph_encode_queues(); audio_device(); source_and_render(); recording();
     std::cout << "media graph codec/source/render/channel tests passed\n"; return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

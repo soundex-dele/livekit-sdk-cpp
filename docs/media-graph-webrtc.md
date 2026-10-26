@@ -1,6 +1,6 @@
 # WebRTC 媒体图节点
 
-实现日期：2026-10-26；采集、视频编码、解码、渲染和录制已拆成独立节点，使用 GraphEngine 创建实际事件图，发送侧仍由 media_graph 主动驱动真实编码。设计背景见 [接入方案](../../docs/architecture/webrtc-media-graph-design.md)。本实现保留 Room/Participant/TrackPublication 与 Player API，默认 RTC runtime 使用图节点工厂。
+实现日期：2026-10-26；采集、视频编码、解码、呈现、渲染和录制已拆成独立节点，使用 GraphEngine 创建实际事件图。发送侧由 media_graph 主动编码，接收侧通过 DecoderFactory 的 Decode 入口进入每轨完整接收图。设计背景见 [接入方案](../../docs/architecture/webrtc-media-graph-design.md)。本实现保留 Room/Participant/TrackPublication 与 Player API，默认 RTC runtime 使用图节点工厂。
 
 ## 构建边界
 
@@ -19,11 +19,11 @@ VideoSourceNode / CameraCaptureNode / ScreenCaptureNode
       → OnEncodedImage → WebRTC RTP / pacer
 
 视频接收：
-WebRTC RTP / 组帧 / 抖动缓冲 → DecoderAdapter
-  → RtcDecodeInputNode → VideoDecoderNode → RtcDecodeOutputNode
-  → 解码完成回调 → WebRTC 正常播放时序 → TrackSink / RtcSubscribeNode
-  ├─ VideoRenderNode → SDL / I420 应用帧回调
-  └─ RecordingNode → 有界队列 → Y4M 文件（可选）
+WebRTC RTP / 组帧 / 抖动缓冲 / 解码调度 → DecoderAdapter::Decode
+  → RtcEncodedSourceNode → VideoDecoderNode
+      ├─ VideoPresentNode → VideoRenderNode → SDL / I420 应用帧回调
+      └─ RecordingNode → 有界队列 → Y4M 文件（可选）
+  解码像素不回交 WebRTC，不再通过 VideoTrack Sink 输出。
 
 设备音频：
 原生 ADM → GraphAudioDevice → AudioCaptureNode → 原生 AudioTransport / APM
@@ -52,8 +52,9 @@ WebRTC NetEq → AudioDecoderAdapter → AudioDecoderNode → 返回 NetEq / 混
 `RtcPipeline` 持有 `graphflow::engine::GraphEngine`，通过 `loadFromNodes(nodes, connections)` 建图，再由引擎统一执行 init/start/stop/release。使用默认 EventBus 传输，不使用只描述拓扑的 External 边；媒体确实通过节点的 `publish<Event>()` / `subscribe<Event>()` 流动。
 
 - 每个发布轨道拥有一张图：CaptureNode → VideoEncodeInputNode → VideoEncoderNode → VideoTrackInputNode；CaptureNode 可分流到 VideoRenderNode。MediaPump 只负责组装与控制，采集线程、设备和文件输入实现在独立的 `media_nodes/capture_source.*`。
-- 每个 DecoderFactory 实例拥有一张图：RtcDecodeInputNode → VideoDecoderNode → RtcDecodeOutputNode。输出通过标准回调返回 WebRTC，保留其播放同步和缓冲。
-- 每个接收轨道拥有一张输出图：RtcSubscribeNode → VideoRenderNode / RecordingNode。TrackSink 只注入图入口，不再直接调用渲染或录制节点。
+- 每个接收视频轨道拥有一张完整的 `VideoReceiveGraph`：RtcEncodedSourceNode → VideoDecoderNode → VideoPresentNode → VideoRenderNode，解码节点另分流到 RecordingNode。统一由该轨道的 GraphEngine 管理；不是全会议所有轨道共用一个可变拓扑。
+- DecoderFactory 创建标准 DecoderAdapter 和真实 codec 租约。适配器在 Decode 中依据 EncodedImage.PacketInfos 的 SSRC 查找接收图，使用同步事件调用 VideoDecoderNode，返回真实解码返回码；真实 codec 回调只将像素送回这张图。
+- OnTrack 从 RtpReceiver.GetParameters().encodings 注册 SSRC 与轨道的关联；缺失、混合或冲突的 SSRC 明确拒绝，不按格式或创建顺序猜测。TrackSink 管理接收图租约，视频不再注册原生 VideoTrack sink。音频继续使用 RtcSubscribeNode → RecordingNode。
 - 文件/合成音频输入使用 AudioSourceNode → AudioTrackInputNode；麦克风、音频 codec 和 NetEq 保留原有设备/工厂适配。
 
 构图示意（节点实例均为 Created 状态）：
@@ -72,15 +73,15 @@ pipeline.start();
 
 图边同步派发，只负责传递数据；跨线程和背压由处理节点负责。VideoEncoderNode 使用独立 EncodeExecutor，最多保留 1 个待编码原始帧；RecordingNode 使用自己的有界磁盘队列；渲染使用已有 latest-frame 输出。没有为每帧向 GraphEngine 的通用线程池投递无限异步任务。RawVideoFrame/EncodedVideoFrame 保留引用计数 buffer；PCM 和解码请求/返回值的借用只在同步调用期间有效。
 
-节点在每个进程内有唯一名称，多轨不会因类型相同而连接到一起。拓扑加载后不在编解码回调中修改；协商变化只重建 VideoEncoderNode 内部 codec。停止按节点顺序先 join 采集，再关闭编码准入并等待 codec 回调屏障，最后停止输出；release 后关闭图边。接收侧先解除 TrackSink，再停止输出图。重启复用订阅，录制队列重新开启并写入新的文件分段。
+节点在每个进程内有唯一名称，多轨不会因类型相同而连接到一起。拓扑加载后不在编解码回调中修改；协商变化只重建 VideoEncoderNode 内部 codec。停止按节点顺序先 join 采集，再关闭编码准入并等待 codec 回调屏障，最后停止输出；release 后关闭图边。视频接收侧先解除 SSRC 路由，再关闭图准入，等待同步在途操作退出、取消呈现队列并排空录制；真实 codec 仍在 WebRTC 所属序列 Release。迟到的异步回调通过弱引用及图代次拒绝，不能访问已停止的输出目标。重启复用订阅，录制队列重新开启并写入新的文件分段。
 
 ## Factory 与生命周期
 
-`src/backends/webrtc/codec_factories.*` 实现四类 Graph factories。视频 EncoderFactory 的 `Create(env, format)` 创建透传适配器，协商参数与源绑定后由已建图的 VideoEncoderNode 创建真实 codec；DecoderFactory 创建独立的解码子图。`room.cpp` 在 `EnableMediaWithDefaults(deps)` **之前**注入 factories；内置 helper 只补空缺配置。
+`src/backends/webrtc/codec_factories.*` 实现四类 Graph factories。视频 EncoderFactory 的 `Create(env, format)` 创建透传适配器，协商参数与源绑定后由已建图的 VideoEncoderNode 创建真实 codec；DecoderFactory 创建接收图入口适配器，不再创建回交 WebRTC 的独立解码子图。`room.cpp` 在 `EnableMediaWithDefaults(deps)` **之前**注入 factories；内置 helper 只补空缺配置。
 
-视频真实 codec 分别由 VideoEncoderNode 和 VideoDecoderNode 持有，两者继承 MediaNode/GraphNode；音频保留 `CodecNode<Backend>`。GraphVideoSender 负责提供编码子图的节点与边，视频透传适配器持有每轨协商/反馈状态。默认 delegate 使用 WebRTC builtin factories；私有 `CodecBackends` 注入结构允许替换后端及测试工厂，不是对外稳定的插件 ABI。
+视频编码 codec 由 VideoEncoderNode 持有；解码 codec 由 DecoderAdapter 持有生命周期租约，实际 Decode 只通过接收图的 VideoDecoderNode 执行；音频保留 `CodecNode<Backend>`。GraphVideoSender 负责提供编码子图的节点与边，视频透传适配器持有每轨协商/反馈状态。默认 delegate 使用 WebRTC builtin factories；私有 `CodecBackends` 注入结构允许替换后端及测试工厂，不是对外稳定的插件 ABI。
 
-节点保持编码参数、单空间层的时间层码率、关键帧请求和 RTT/loss 反馈；音频保留 FEC 等原生控制。编码包、codec-specific 元数据及 native frame 直接按 WebRTC 引用契约传递，不经过有损的公共字节数组转换。视频 callback 回交 WebRTC，渲染不绕过接收输出时序。
+节点保持编码参数、单空间层的时间层码率、关键帧请求和 RTT/loss 反馈；音频保留 FEC 等原生控制。编码包、codec-specific 元数据及 native frame 直接按 WebRTC 引用契约传递，不经过有损的公共字节数组转换。发送侧编码 callback 回交 WebRTC；接收侧解码 callback 直接进入图的呈现与录制分支，不再回交 WebRTC。
 
 音频编码在 WebRTC 原有序列内同步执行；解码包装真实 `ParsePayload → EncodedAudioFrame::Decode` 路径，保留 duration、DTX、PLC、FEC 与网络自适应行为。解析出的音频帧持有 decoder 节点租约，帧销毁前 backend 不会提前释放。
 
@@ -89,6 +90,16 @@ pipeline.start();
 Factory 没有 track ID，实例 ID 不能当作 track ID/SSRC；不根据创建顺序绑定轨道。默认 builtin encoder 内部可以使用 simulcast adapter，节点同时保留其 delegate factory 的寿命，避免 factory 先销毁后的悬空引用。
 
 停止先关闭图准入、停止采集，再暂停图编码器并等待真实 codec 的 Release 回调屏障，随后关闭 PC。透传适配器的 callback 只在 WebRTC 的 Encode 调用内使用；它不持有源的裸指针。旧 native buffer 只保留源的弱引用和状态租约，关闭后不能重新启动编码。支持采集暂停/恢复和 codec 重建，图使用弱引用，不无限保留历史 codec。
+
+## 视频直接接收的时序与限制
+
+`DecoderAdapter::Decode` 保留 WebRTC 的调用线程和真实返回码，不把“已入队”伪装成解码成功。原生 backend 可以异步产出画面，适配器以 RTP timestamp 关联目标呈现时间、rotation、NTP、packet infos 和图代次。待完成元数据最多 64 项，溢出清理并返回错误以触发原有关键帧恢复；不静默丢弃压缩参考帧后继续宣告成功。
+
+`VideoPresentNode` 使用当前原生 runtime 的本地单调时钟，按 Decode 提供的 render_time_ms 呈现；0/负值视为立即呈现。已解码队列最多 8 帧、按宽高四字节估计最多 64 MiB，超限淘汰最旧画面；迟到超过 250 ms 或目标时间超前超过 10 s 的帧丢弃。录制分流位于呈现队列之前，不受呈现丢帧影响。以上是 CPU/I420 首期策略，不代表 GPU buffer 精确内存核算。
+
+不调用 WebRTC 的 DecodedImageCallback 是明确的行为边界：其 framesDecoded、解码耗时估计、解码后丢帧统计和解码后同步反馈不再能代表实际图输出；WebRTC 内部时间戳表仍有界，但可能把未回交的帧统计为丢帧。实际解码/呈现以 media-graph-stats 为准。音频仍在 NetEq/ADM 路径，当前呈现节点没有接入实际音频播放时钟，不能宣称保留了原生完整 A-V 同步或自适应解码耗时反馈；弱网、长时音画同步和硬件异步 decoder 需后续验收。
+
+当前按一个 Room runtime 的明确 SSRC 注册路由；SSRC 未在协商参数中出现的无信令流和仅靠 MID/RID 发现的动态流尚不支持。轨道移除后注销路由，重新订阅重新建立图和代次。
 
 ## 采集与预览
 
@@ -146,7 +157,16 @@ python tests/media_graph_integration.py `
 
 集成脚本启动独立本地 C++ SFU，验证真实音视频、数据通道、四类 codec 节点和录制输出；可同时运行既有动态发布订阅/Room 复用回归。所有进程由脚本创建并清理，输出保存在 `out/media-graph-integration/`。
 
-本次 GraphEngine 版本验证（2026-10-26，Windows x64 Release）：
+直接接收版本验证（2026-10-26，Windows x64 Release）：
+
+- SDK、CLI、会议 Demo 和测试构建通过：`out/direct-receive-build-final.log`。
+- 当前 RTC CTest **9/9 通过**：`out/direct-receive-ctest.log`，包含无窗口 SDL/ImGui 渲染；未操作用户桌面。
+- `media_graph` 测试覆盖真实 VP8 解码、禁止回调 WebRTC、SSRC 匹配/冲突/缺失、两条同格式轨道、异步完成、目标时间/旋转恢复、旧代次拒绝、原生错误码与 NO_OUTPUT、元数据上限、呈现队列上限、停止屏障和资源释放。
+- 本地 C++ SFU 端到端通过：VP8/Opus、数据、真实 WAV/Y4M、图边检查、SDK 动态发布订阅与 Room 复用。额外运行无窗口会议会话集成，验证双发布者、单用户三路视频、增删轨道后其他画面持续输出、重复入会与应用帧回调异常。
+- 证据：[result.json](../out/direct-receive-integration/20261026-182723/result.json)，会议摘要见同目录 `conference.stdout.log`；完整执行日志 `out/direct-receive-integration-final.log`。
+- WebRTC 源码未修改；SFU 使用已有二进制。物理设备、硬件异步 codec、弱网与长期音画同步未人工验收；上述自动化通过不代表这些验收已完成。
+
+此前回交 WebRTC 的 GraphEngine 版本验证（2026-10-26，Windows x64 Release；不是直接接收改造的验证）：
 
 - SDK/CLI/Demo 构建通过：`out/graph-engine-build-final.log`。
 - RTC CTest **10/10 通过**：`out/graph-engine-ctest.log`。

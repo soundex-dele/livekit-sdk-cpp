@@ -17,7 +17,29 @@ std::vector<NodeMetrics> RtcGraph::snapshot() {
   }
   return result;
 }
-void RtcGraph::close() { std::lock_guard lock(mutex_); closing_ = true; }
+void RtcGraph::close() { std::lock_guard lock(mutex_); closing_ = true; video_routes_.clear(); }
+void RtcGraph::bind_video(const std::vector<uint32_t>& ssrcs, const std::shared_ptr<VideoDecodeTarget>& route) {
+  std::lock_guard lock(mutex_);
+  if (closing_ || ssrcs.empty()) throw std::runtime_error("media_graph: missing receive SSRC or closed graph");
+  for (auto ssrc : ssrcs) {
+    auto it = video_routes_.find(ssrc);
+    auto previous = it == video_routes_.end() ? nullptr : it->second.lock();
+    if (!ssrc || (previous && previous != route)) throw std::runtime_error("media_graph: ambiguous receive SSRC");
+  }
+  for (auto ssrc : ssrcs) video_routes_[ssrc] = route;
+}
+void RtcGraph::unbind_video(const VideoDecodeTarget* route) {
+  std::lock_guard lock(mutex_);
+  for (auto it = video_routes_.begin(); it != video_routes_.end();) {
+    auto current = it->second.lock();
+    if (!current || current.get() == route) it = video_routes_.erase(it); else ++it;
+  }
+}
+std::shared_ptr<VideoDecodeTarget> RtcGraph::video_route(uint32_t ssrc) {
+  std::lock_guard lock(mutex_);
+  auto it = video_routes_.find(ssrc);
+  return closing_ || it == video_routes_.end() ? nullptr : it->second.lock();
+}
 void RtcGraph::observe(const std::vector<std::shared_ptr<MediaNode>>& nodes) {
   std::lock_guard lock(mutex_);
   if (closing_) throw std::runtime_error("media_graph: session is closing");

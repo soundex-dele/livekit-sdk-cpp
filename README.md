@@ -2,7 +2,7 @@
 
 [远程控制](../docs/integration/remote-control/README.md)：新增 `RemoteControlSession`、可靠键鼠协议、租约/心跳 watchdog 和 Windows 输入后端；搭配相邻 ImGui 被控端、浏览器及 Go 授权服务使用。自动化只验证合成媒体和输入记录器，实际桌面需人工验收。
 
-[WebRTC 媒体图节点](docs/media-graph-webrtc.md)：采集、音视频编解码与渲染拆为独立节点，四类 Factory 默认接入 Room；支持摄像头/主屏输入、可选本地预览及节点统计。
+[WebRTC 媒体图节点](docs/media-graph-webrtc.md)：采集、音视频编解码与渲染拆为独立节点，四类 Factory 默认接入 Room；支持摄像头/主屏输入、可选本地预览及节点统计。视频接收通过自定义 DecoderFactory 将待解码帧送入每轨完整接收图，解码像素直接进入图内呈现、渲染与录制，不回交 WebRTC；音画同步及统计边界见该文档。
 
 [仓库设计](docs/design.md)说明当前代码分工、线程契约及向统一媒体 SDK 演进的路径；[平台总体设计](../docs/architecture/platform-design.md)定义跨仓库边界。
 

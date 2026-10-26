@@ -79,3 +79,15 @@ SDK 测试只调用公开 API，在单个 C++ 进程内运行多个 Room，不�
 构建过程中一次增量 AOM 链接遇到缺失中间对象，重新串行构建成功。并行完整依赖编译期间，原 core 短时音频检查和 SDK 录制帧数检查出现过失败；负载下降后串行回归全部通过，未降低检查标准。
 
 实际 Windows 窗口已启动，但桌面处于锁屏状态，computer-use 按其锁屏规则停止操作。因此实际鼠标/键盘入会、窗口拖拽和多屏 DPI 切换验收仍待解锁后进行；离屏渲染和会话集成测试已完成。Linux、Debug、远程 Cloud/TURN 网络本轮未验证。
+
+
+## 视频直接进入媒体图（2026-10-26）
+
+自定义 DecoderFactory 接收 WebRTC 调度后的编码帧，实际解码在图节点执行，像素不再回交 WebRTC。每个接收轨道由同一 GraphEngine 管理解码、呈现、渲染和可选录制；WebRTC 源码没有改动。
+
+- Windows x64 Release 构建通过：`out/direct-receive-build-final.log`。
+- 当前配置 CTest 9/9 通过：`out/direct-receive-ctest.log`。覆盖真实 VP8、禁止像素回交、SSRC 绑定、异步回调/旧代次、队列上限、停止屏障及无窗口渲染。
+- 本地 SFU 集成通过：[result.json](out/direct-receive-integration/20261026-182723/result.json)。包含 VP8/Opus 实际录制、数据、动态发布订阅；无窗口会议会话验证双发布者、单用户三路视频、增删轨道、Room 复用、应用帧回调异常。执行日志：`out/direct-receive-integration-final.log`。
+- 全程未使用桌面自动化，会议会话测试显式关闭物理音频输出。物理设备、硬件 codec、弱网、长期音画同步及实际设备人工验收未执行。
+
+此模式不再更新 WebRTC 的解码完成反馈，其 framesDecoded/解码耗时及部分丢帧统计不能代表图输出。呈现按本地单调时钟与 render_time_ms 执行，实际音频播放主时钟尚未接入；不能宣称保留了原生完整 A-V 同步。具体边界见 [实现说明](docs/media-graph-webrtc.md)。

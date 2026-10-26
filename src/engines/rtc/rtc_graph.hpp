@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace livekit::sdk::detail {
+class VideoDecodeTarget;
 enum class NodeExecution { source, backend, sink };
 struct NodeMetrics {
   uint64_t id = 0;
@@ -43,6 +44,9 @@ class MediaNode : public graphflow::core::GraphNode {
 // receive-side codecs preserve WebRTC's original scheduling.
 class RtcGraph {
  public:
+  void bind_video(const std::vector<uint32_t>& ssrcs, const std::shared_ptr<VideoDecodeTarget>& route);
+  void unbind_video(const VideoDecodeTarget* route);
+  std::shared_ptr<VideoDecodeTarget> video_route(uint32_t ssrc);
   // Engine-owned nodes are registered only after their topology is immutable.
   void observe(const std::vector<std::shared_ptr<MediaNode>>& nodes);
   struct Connection { std::string from, to, data_type; };
@@ -65,6 +69,7 @@ class RtcGraph {
   bool closing_ = false;
   uint64_t next_id_ = 1;
   std::map<uint64_t, std::weak_ptr<MediaNode>> nodes_;
+  std::map<uint32_t, std::weak_ptr<VideoDecodeTarget>> video_routes_;
 };
 
 // One immutable topology per track/codec instance. All lifecycle operations run
