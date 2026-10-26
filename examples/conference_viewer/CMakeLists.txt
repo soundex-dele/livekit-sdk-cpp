@@ -15,6 +15,20 @@ target_include_directories(livekit_demo_session PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(livekit_demo_session PUBLIC LiveKit::SDK)
 add_executable(livekit_conference_demo main.cpp ui.cpp video_texture.cpp)
 target_link_libraries(livekit_conference_demo PRIVATE livekit_demo_session livekit_demo_imgui)
+if(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set_target_properties(livekit_conference_demo PROPERTIES
+    MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/macos/Info.plist.in"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "org.livekit.conference-demo"
+    MACOSX_BUNDLE_BUNDLE_NAME "LiveKit Conference"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
+  install(TARGETS livekit_conference_demo BUNDLE DESTINATION . COMPONENT Conference)
+  # Copy non-system dylibs (OpenSSL, libvpx, dav1d) and rewrite their install
+  # names so the installed app does not depend on the developer's Homebrew.
+  configure_file(macos/InstallBundle.cmake.in InstallBundle.cmake @ONLY)
+  install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/InstallBundle.cmake" COMPONENT Conference)
+endif()
 if(LIVEKIT_BUILD_TESTS)
   add_executable(livekit_demo_integration ../../tests/demo_integration.cpp)
   target_link_libraries(livekit_demo_integration PRIVATE livekit_demo_session)

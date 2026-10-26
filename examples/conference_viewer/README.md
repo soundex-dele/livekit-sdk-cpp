@@ -1,6 +1,6 @@
 # ImGui 多人会议观看客户端
 
-基于 Dear ImGui v1.91.9b 和 SDL2 的桌面客户端，优先支持 Windows，界面使用英文。客户端在可滚动的视频网格中展示多位参与者，并播放远端音频。同一参与者可同时发布多路生成的测试视频，以及独立的 440 Hz 测试音调，方便打开多个实例演示会议，无需摄像头、麦克风或 FFmpeg。当前未实现自动重连、屏幕共享和聊天。
+基于 Dear ImGui v1.91.9b 和 SDL2 的桌面客户端，支持 Windows 和 macOS 构建，界面使用英文。客户端在可滚动的视频网格中展示多位参与者，并播放远端音频。同一参与者可同时发布多路生成的测试视频，以及独立的 440 Hz 测试音调，方便打开多个实例演示会议，无需摄像头、麦克风或 FFmpeg。当前未实现自动重连、屏幕共享和聊天。
 
 ## 构建与运行
 
@@ -14,6 +14,44 @@ cmake --build --preset windows-release --target livekit_conference_demo
 ```
 
 作为顶层工程构建时，`LIVEKIT_BUILD_DEMO` 默认开启；通过 `add_subdirectory` 引用时默认关闭。同时关闭此选项和 `LIVEKIT_ENABLE_VIDEO_PLAYOUT`，即可构建不依赖 SDL 的 SDK。只有启用 demo 时才会下载 ImGui，其版本和 SHA-256 校验值均已固定；依赖库沿用工程的静态 MSVC 运行库配置。保留了 Linux 代码路径，但尚未验证。
+
+## macOS 构建与打包
+
+需要 Xcode / Command Line Tools、CMake 3.25+、NASM、Homebrew LLVM（含匹配的 libc++），以及与目标架构一致的 OpenSSL、libvpx、dav1d。使用同级仓库中包含 Apple CMake 支持的 WebRTC。以下命令在 SDK 根目录运行：
+
+```sh
+brew install cmake nasm llvm openssl@3 libvpx dav1d
+# Intel 使用 macos-x86_64；Apple Silicon 使用 macos-arm64。
+preset=macos-x86_64
+cmake --preset "$preset" \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix libvpx);$(brew --prefix dav1d)"
+cmake --build --preset "$preset"
+ctest --preset "$preset"
+cmake --install "out/$preset" --prefix "$PWD/out/$preset/package" --component Conference
+open "out/$preset/package/livekit_conference_demo.app"
+```
+
+构建目录中的 `Release/livekit_conference_demo.app` 依赖本机库路径；安装步骤会把非系统动态库复制到应用中、改写加载路径并进行本地 ad-hoc 签名。`package/livekit_conference_demo.app` 是可复制的本地运行产物；公开分发仍需发行者的 Developer ID 签名及公证。预设最低系统版本为 macOS 14，但所用第三方库可能要求更高版本，应以依赖库和最终产物为准。每个构建目录只包含一种架构，不可混用 Intel 与 ARM 依赖。
+
+SDK 公共 API 使用 C++20 `std::jthread` / `std::stop_token`；Xcode 16 自带 libc++ 尚未开放这些类型。macOS 预设因此统一使用 Homebrew LLVM 的编译器与 libc++（安装打包时一并收集）。可用 `-DLIVEKIT_LLVM_ROOT=/path/to/llvm` 指定其他安装前缀；更换编译器需使用新的构建目录或清理 CMake 缓存。
+
+如果同级 WebRTC 已有匹配源码、架构及 libc++ ABI 的 CMake Release 产物，可在配置命令中追加 `-DWEBRTC_PREBUILT_DIR="$PWD/../webrtc/out/$preset"`，复用原生库以减少重复编译。此路径还需匹配的 libjpeg（Homebrew 可用 `brew install jpeg-turbo`）；配置会检查每个静态库是否含目标架构。切回源码构建时显式传入 `-DWEBRTC_PREBUILT_DIR=`。不要混用其他 WebRTC 版本或架构的库。
+
+macOS 窗口使用逻辑点，字体按实际 backing scale 生成，以适配 Retina 和跨屏缩放。音频播放使用 WebRTC CoreAudio 后端。当前界面仅发布合成视频和测试音调，不采集摄像头、麦克风或屏幕，因此不请求这些权限；本地网络连接用途在应用 Info.plist 中声明。HTTPS/WSS 使用 Apple 原生 TLS 和系统信任库，避免依赖 Homebrew 的 CA 文件路径；WebRTC 媒体加密仍使用 OpenSSL。
+
+无窗口验证和程序内截图（不会打开或操作桌面）：
+
+```sh
+SDL_VIDEODRIVER=dummy SDL_RENDER_DRIVER=software \
+  "out/$preset/Release/livekit_demo_tests" "out/$preset/conference.bmp"
+# 同时生成 conference.retina.bmp，验证 2x backing buffer 的布局和纹理。
+python3 tests/sdk_integration.py \
+  --client "out/$preset/Release/livekit_demo_integration" \
+  --server /absolute/path/to/livekit-server
+```
+
+集成测试默认使用无硬件音频设备，检查实际解码与录制。扬声器可听、Retina 实屏跨屏切换、系统本地网络授权及 Finder 启动需另行人工验收，不能由无窗口测试代替。
 
 ## 加入会议
 

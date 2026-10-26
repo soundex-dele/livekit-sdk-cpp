@@ -24,5 +24,6 @@ class View {
   };
   std::map<std::string, Cached> textures_;
 };
-void apply_style(float scale);
+void apply_style(float scale, float pixel_density = 1.0f);
+void render_draw_data(SDL_Renderer* renderer);
 }

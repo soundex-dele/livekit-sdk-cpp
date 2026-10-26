@@ -1,7 +1,16 @@
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
 set(USE_TLS ON CACHE BOOL "" FORCE)
-set(USE_OPEN_SSL ON CACHE BOOL "" FORCE)
+if(APPLE)
+  # HTTPS/WSS must use the system trust store, not Homebrew's absolute CA
+  # bundle path, which is absent when the .app is copied to another Mac.
+  set(USE_OPEN_SSL OFF CACHE BOOL "" FORCE)
+  set(USE_MBED_TLS OFF CACHE BOOL "" FORCE)
+  set(USE_SECURE_TRANSPORT ON CACHE BOOL "" FORCE)
+else()
+  set(USE_OPEN_SSL ON CACHE BOOL "" FORCE)
+  set(USE_SECURE_TRANSPORT OFF CACHE BOOL "" FORCE)
+endif()
 set(USE_ZLIB OFF CACHE BOOL "" FORCE)
 set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(ixwebsocket URL https://github.com/machinezone/IXWebSocket/archive/refs/tags/v11.4.6.tar.gz DOWNLOAD_EXTRACT_TIMESTAMP TRUE)

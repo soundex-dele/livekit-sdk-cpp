@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
       auto render = [&](demo::Snapshot snapshot) {
         ImGui_ImplSDLRenderer2_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
         view.draw(renderer, snapshot); ImGui::Render(); SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer);
-        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+        demo::render_draw_data(renderer);
       };
       render(state); render(state);
       check(SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888, buffer.data(), 1100 * 4) == 0, "ImGui readback");
@@ -67,6 +67,34 @@ int main(int argc, char** argv) {
         auto* surface = SDL_CreateRGBSurfaceWithFormatFrom(buffer.data(), 1100, 720, 32, 1100 * 4, SDL_PIXELFORMAT_ARGB8888);
         check(SDL_SaveBMP(surface, argv[1]) == 0, "save visual QA"); SDL_FreeSurface(surface);
       }
+      // Emulate a Retina backing buffer without opening a physical window.
+      auto* retina = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+        SDL_TEXTUREACCESS_TARGET, 2200, 1440);
+      check(retina, "Retina target");
+      check(SDL_SetRenderTarget(renderer, retina) == 0, "Retina render target");
+      ImGui_ImplSDLRenderer2_DestroyFontsTexture(); demo::apply_style(1, 2);
+      render(state); render(state);
+      check(std::abs(ImGui::GetIO().DisplayFramebufferScale.x - 2) < .01f, "Retina framebuffer scale");
+      check(std::abs(ImGui::GetIO().FontDefault->FontSize * ImGui::GetIO().FontGlobalScale - 13) < .01f,
+        "Retina must preserve logical font size");
+      std::vector<uint32_t> retina_buffer(2200 * 1440);
+      check(SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
+        retina_buffer.data(), 2200 * 4) == 0, "Retina readback");
+      size_t retina_red = 0;
+      for (auto c : retina_buffer)
+        if (((c >> 16) & 255) > 220 && ((c >> 8) & 255) < 35 && (c & 255) < 35) ++retina_red;
+      if (argc > 1) {
+        auto* surface = SDL_CreateRGBSurfaceWithFormatFrom(retina_buffer.data(), 2200, 1440,
+          32, 2200 * 4, SDL_PIXELFORMAT_ARGB8888);
+        auto path = std::filesystem::path(argv[1]); path.replace_extension("retina.bmp");
+        check(SDL_SaveBMP(surface, path.string().c_str()) == 0, "save Retina visual QA"); SDL_FreeSurface(surface);
+      }
+      if (!(retina_red > red * 3.8 && retina_red < red * 4.2))
+        std::cerr << "Red pixels: 1x=" << red << " 2x=" << retina_red << '\n';
+      check(retina_red > red * 3.8 && retina_red < red * 4.2, "Retina video layout/scale");
+      check(SDL_SetRenderTarget(renderer, nullptr) == 0, "restore render target");
+      SDL_DestroyTexture(retina);
+      ImGui_ImplSDLRenderer2_DestroyFontsTexture(); demo::apply_style(1);
       alice.tracks[0].muted = true; state.update(local, {alice, bob, guest});
       check(demo::tiles(state)[0].status == "Video muted", "mute placeholder"); render(state);
       alice.tracks.erase(alice.tracks.begin()); state.update(local, {alice, bob, guest});

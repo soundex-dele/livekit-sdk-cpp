@@ -1,8 +1,10 @@
 #include "ui.hpp"
 #include "imgui.h"
+#include "imgui_impl_sdlrenderer2.h"
 #include <algorithm>
 #include <cstdio>
 #include <set>
+#include <stdexcept>
 
 namespace demo {
 View::View() { std::snprintf(url.data(), url.size(), "ws://127.0.0.1:7880"); std::snprintf(room.data(), room.size(), "demo"); }
@@ -12,7 +14,7 @@ sdk::RoomOptions View::options() const {
   if (tone) { sdk::MediaSpec m; m.demo = true; m.video = false; o.media.push_back(m); }
   return o;
 }
-void apply_style(float scale) {
+void apply_style(float scale, float pixel_density) {
   ImGui::GetStyle() = ImGuiStyle{};
   ImGui::StyleColorsDark();
   auto& s = ImGui::GetStyle(); s.WindowPadding = {20, 20}; s.FramePadding = {10, 8};
@@ -22,10 +24,27 @@ void apply_style(float scale) {
   s.Colors[ImGuiCol_Button] = {0.14f, 0.32f, 0.50f, 1};
   s.Colors[ImGuiCol_ButtonHovered] = {0.20f, 0.44f, 0.64f, 1};
   s.Colors[ImGuiCol_FrameBg] = {0.12f, 0.15f, 0.20f, 1};
-  s.ScaleAllSizes(scale); ImGui::GetIO().FontGlobalScale = scale;
+  s.ScaleAllSizes(scale);
+  auto& io = ImGui::GetIO();
+  // Rasterize at backing-pixel resolution while retaining logical UI sizes.
+  // The caller destroys the renderer's font texture before rebuilding fonts.
+  pixel_density = std::clamp(pixel_density, 1.0f, 3.0f);
+  io.Fonts->Clear();
+  ImFontConfig font;
+  font.SizePixels = 13.0f * scale * pixel_density;
+  io.FontDefault = io.Fonts->AddFontDefault(&font);
+  io.FontGlobalScale = 1.0f / pixel_density;
+}
+void render_draw_data(SDL_Renderer* renderer) {
+  // SDL's ImGui backend scales clipping, but expects the application to scale
+  // vertex coordinates via the renderer (as in the upstream SDL example).
+  const auto& io = ImGui::GetIO();
+  if (SDL_RenderSetScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y) != 0)
+    throw std::runtime_error(SDL_GetError());
+  ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
 }
 Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
-  const float scale = ImGui::GetIO().FontGlobalScale;
+  const float scale = ImGui::GetFontSize() / 13.0f;
   auto* viewport = ImGui::GetMainViewport();
   ImGui::SetNextWindowPos(viewport->WorkPos); ImGui::SetNextWindowSize(viewport->WorkSize);
   ImGui::Begin("Conference", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);

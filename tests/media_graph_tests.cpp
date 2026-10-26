@@ -241,6 +241,10 @@ static void channels() {
 class TestAudioDevice : public lk::HeadlessAudioDevice {
  public:
   AudioTransport* callback = nullptr;
+  int microphone_initializations = 0, recording_initializations = 0, recording_starts = 0;
+  int32_t InitMicrophone() override { ++microphone_initializations; return HeadlessAudioDevice::InitMicrophone(); }
+  int32_t InitRecording() override { ++recording_initializations; return HeadlessAudioDevice::InitRecording(); }
+  int32_t StartRecording() override { ++recording_starts; return HeadlessAudioDevice::StartRecording(); }
   int32_t RegisterAudioCallback(AudioTransport* transport) override {
     auto result = HeadlessAudioDevice::RegisterAudioCallback(transport); callback = transport; return result;
   }
@@ -270,7 +274,7 @@ class TestAudioTransport final : public AudioTransport {
 };
 static void audio_device() {
   auto graph = std::make_shared<RtcGraph>(); auto device = make_ref_counted<TestAudioDevice>();
-  auto bridge = make_ref_counted<GraphAudioDevice>(device, graph);
+  auto bridge = make_ref_counted<GraphAudioDevice>(device, graph, true);
   TestAudioTransport transport;
   bridge->Init(); bridge->RegisterAudioCallback(&transport);
   std::array<int16_t, 480> pcm{}; uint32_t level = 0;
@@ -285,6 +289,31 @@ static void audio_device() {
   check(nodes.size() == 2 && nodes[0].inputs == 1 && nodes[1].outputs >= 3, "separate device input/output nodes");
   bridge->Terminate(); check(device->callback == nullptr, "device callback detached before release");
   bridge = nullptr; check(graph->snapshot().empty(), "device node leases released");
+}
+static void playback_only_audio_device() {
+  auto graph = std::make_shared<RtcGraph>(); auto device = make_ref_counted<TestAudioDevice>();
+  auto bridge = make_ref_counted<GraphAudioDevice>(device, graph, false);
+  TestAudioTransport transport;
+  bridge->Init(); bridge->RegisterAudioCallback(&transport);
+  bridge->InitMicrophone(); bridge->InitRecording(); bridge->StartRecording();
+  check(bridge->Recording() && bridge->RecordingIsInitialized(), "external PCM has logical recording state");
+  check(device->microphone_initializations == 0 && device->recording_initializations == 0 && device->recording_starts == 0,
+        "playback/test tone must not initialize or start a physical microphone");
+  std::array<int16_t, 480> pcm{}; uint32_t level = 0;
+  device->callback->RecordedDataIsAvailable(pcm.data(), 480, 2, 1, 48000, 0, 0, 10, false, level);
+  check(transport.captured == 0, "capture remains disabled in playback-only sessions");
+  bridge->InitPlayout(); bridge->StartPlayout();
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (transport.rendered < 3 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  bridge->StopPlayout(); bridge->StopRecording();
+  check(transport.rendered >= 3 && !bridge->Recording(), "playback works independently of microphone capture");
+  bridge->Terminate(); bridge = nullptr;
+  bridge = make_ref_counted<GraphAudioDevice>(device, graph, true);
+  bridge->Init(); bridge->InitMicrophone(); bridge->InitRecording(); bridge->StartRecording();
+  check(device->microphone_initializations == 1 && device->recording_initializations == 1 && device->recording_starts == 1,
+        "explicit microphone enable still reaches the physical device");
+  bridge->Terminate();
 }
 static void source_and_render() {
   auto graph = std::make_shared<RtcGraph>();
@@ -366,7 +395,7 @@ static void recording() {
   std::filesystem::remove_all(directory);
 }
 int main() {
-  try { engine_routing(); channels(); audio_codecs(); graph_driven_video(); direct_receive_lifecycle(); receive_presentation_bounds(); receive_stop_barrier(); graph_encode_queues(); audio_device(); source_and_render(); recording();
+  try { engine_routing(); channels(); audio_codecs(); graph_driven_video(); direct_receive_lifecycle(); receive_presentation_bounds(); receive_stop_barrier(); graph_encode_queues(); audio_device(); playback_only_audio_device(); source_and_render(); recording();
     std::cout << "media graph codec/source/render/channel tests passed\n"; return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

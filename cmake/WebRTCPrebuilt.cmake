@@ -1,6 +1,10 @@
 # Consume a matching native build without rebuilding WebRTC for each product.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  include("${CMAKE_CURRENT_LIST_DIR}/WebRTCPrebuiltMacOS.cmake")
+  return()
+endif()
 if(NOT WIN32)
-  message(FATAL_ERROR "WEBRTC_PREBUILT_DIR currently supports Windows Release only")
+  message(FATAL_ERROR "WEBRTC_PREBUILT_DIR supports Windows and macOS Release builds")
 endif()
 set(CMAKE_CONFIGURATION_TYPES Release CACHE STRING "Matching prebuilt configuration" FORCE)
 file(GLOB _webrtc_absl "${WEBRTC_PREBUILT_DIR}/lib/Release/absl_*.lib")

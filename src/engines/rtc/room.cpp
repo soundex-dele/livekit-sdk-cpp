@@ -92,7 +92,7 @@ class Runtime {
   std::unique_ptr<webrtc::Thread> network, worker, signaling;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
   std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = std::make_shared<livekit::sdk::detail::RtcGraph>();
-  Runtime(bool hardware) {
+  Runtime(bool hardware, bool microphone = false) {
 #ifdef _WIN32
     if (winsock.error()) throw std::runtime_error("Winsock initialization failed");
 #endif
@@ -114,7 +114,7 @@ class Runtime {
         return webrtc::make_ref_counted<HeadlessAudioDevice>();
       });
       if (!deps.adm) throw std::runtime_error("Cannot create WebRTC audio device");
-      deps.adm = webrtc::make_ref_counted<livekit::sdk::detail::GraphAudioDevice>(deps.adm, graph);
+      deps.adm = webrtc::make_ref_counted<livekit::sdk::detail::GraphAudioDevice>(deps.adm, graph, microphone);
       livekit::sdk::detail::install_graph_codecs(deps, graph);
       webrtc::EnableMediaWithDefaults(deps);
       factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
@@ -326,7 +326,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
     {"localParticipant", participant_json(join.participant())}, {"participants", roster}});
   for (const auto& p : join.other_participants())
     event("participant", {{"identity", p.identity()}, {"sid", p.sid()}, {"state", p.state()}, {"participant", participant_json(p)}, {"initial", true}});
-  Runtime runtime(options.audio_playout || options.microphone);
+  Runtime runtime(options.audio_playout || options.microphone, options.microphone);
   std::unique_ptr<VideoFrames> video_frames;
   if (options.video_frame_handler) video_frames = std::make_unique<VideoFrames>(options.video_frame_handler);
   std::unique_ptr<VideoPlayout> playout;

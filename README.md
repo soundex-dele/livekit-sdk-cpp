@@ -56,7 +56,7 @@ add_executable(my_app main.cpp)
 target_link_libraries(my_app PRIVATE LiveKit::SDK)
 ```
 
-Windows 配置时也要传入 vcpkg toolchain 与 `x64-windows-static` triplet。`tests/consumer/` 提供完整独立工程样例。关闭 CLI 后不引入 CLI11，同时关闭 `LIVEKIT_BUILD_DEMO` 和视频窗口后不引入 SDL2。Linux 提供 preset，但本次未验证；当前外部 WebRTC 工程不支持任意平台直接构建。
+Windows 配置时也要传入 vcpkg toolchain 与 `x64-windows-static` triplet。`tests/consumer/` 提供完整独立工程样例。关闭 CLI 后不引入 CLI11，同时关闭 `LIVEKIT_BUILD_DEMO` 和视频窗口后不引入 SDL2。macOS 提供 `macos-x86_64` / `macos-arm64` 预设及会议 `.app` 打包入口，依赖和命令见 [会议客户端 macOS 说明](examples/conference_viewer/README.md#macos-构建与打包)。Linux 提供 preset，但本次未验证。
 
 ```cpp
 #include <livekit/livekit.hpp>
