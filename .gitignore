@@ -1,7 +1,6 @@
 /out/
 /recordings/
-/tools/
 /CMakeUserPresets.json
 *.log
 __pycache__/
-/web/node_modules/
+/examples/web_viewer/node_modules/

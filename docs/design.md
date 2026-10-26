@@ -2,7 +2,7 @@
 
 版本：v0.1；日期：2026-10-26；状态：现有实现说明 + 演进设计；读取基线：`2cfd118`。
 
-平台定位见 [总体设计](../../docs/platform-design.md)，统一媒体层的详细契约见 [SDK 架构设计](../../docs/sdk-architecture.md)。本文说明现有代码如何向该架构演进，不将目标类型视为已发布 API。
+平台定位见 [总体设计](../../docs/architecture/platform-design.md)，统一媒体层的详细契约见 [SDK 架构设计](../../docs/architecture/sdk-architecture.md)。本文说明现有代码如何向该架构演进，不将目标类型视为已发布 API。
 
 ## 1. 职责与现状
 
@@ -10,7 +10,7 @@
 
 当前源码级集成已在 Windows x64 验证；Linux preset 不等于 SDK Linux 已验收。文件/FFmpeg 网络输入解码后由 WebRTC 编码发送；每轨 WAV/Y4M 录制不等于同步 MP4 或云录制。六类管理客户端、49 个 RPC 存在，不等于本项目媒体服务实现所有对应后端。
 
-尚缺完整设备枚举/切换/热插拔、相机/屏幕采集、自定义 PCM/I420/NV12 输入、统一媒体图、播放器、时间线编辑、远控、自动重连及跨平台分发。现有 RTC 和会议观看 Demo 是演进基础。
+当前已接入首版媒体图、播放器、采集和远控。尚缺完整设备管理、通用自定义媒体输入、时间线编辑、自动重连及跨平台分发；具体范围见播放器、媒体图和远控实现说明。
 
 ## 2. 当前代码分工
 
@@ -18,12 +18,12 @@
 | --- | --- |
 | `include/livekit/room.hpp`、`participant.hpp` | 会话与参与者/轨道公共 API |
 | `include/livekit/media.hpp` | 当前媒体输入描述与帧相关接口 |
-| `src/room.cpp`、`sdk.cpp`、`participant.cpp`、`room_events.cpp` | 会话、命令、对象状态与事件 |
-| `src/media.cpp`、`video_frames.cpp`、`video_playout*.cpp` | 媒体输入、帧回调与可选窗口输出 |
-| `src/auth.cpp`、`api.cpp`、`services.cpp`、`room_service.cpp` | Token 和服务端管理客户端 |
-| `src/internal/lk/` | 原生实现私有头文件 |
+| `src/engines/rtc/room.cpp`、`sdk.cpp`、`participant.cpp`、`room_events.cpp` | 会话、命令、对象状态与事件 |
+| `src/engines/rtc/media.cpp`、`video_frames.cpp`、`video_playout*.cpp` | 媒体输入、帧回调与可选窗口输出 |
+| `src/server_sdk/auth.cpp`、`api.cpp`、`services.cpp`、`room_service.cpp` | Token 和服务端管理客户端 |
+| 各 `src/` 模块内的 `.hpp` | 私有头与实现共置 |
 | `protocol/`、`cmake/` | 信令兼容子集、原生依赖和构建 |
-| `cli/`、`demo/`、`examples/`、`tests/consumer/` | 公共 API 消费者与集成验证 |
+| `tools/cli/`、`examples/`、`tests/consumer/` | 公共 API 消费者与集成验证 |
 
 公共头文件不泄露 WebRTC、Protobuf、SDL、GraphFlow 类型。客户端应用只消费公开接口；CLI 的信号处理、stdout JSON 和命令参数不进入 SDK 内核。
 
@@ -48,7 +48,7 @@ flowchart TB
     Core --> Backend
 ```
 
-拟定 `media_core`、`media_graph`、`media_nodes_*`、`rtc/player/editor`、场景模块与 bindings 的逻辑目标，首期在本仓库内组织。它们尚非现成 CMake target。server_sdk 逻辑独立，后续从客户端构建依赖中分离；现有 `LiveKit::SDK` 保留兼容入口，通过弃用周期演进，避免直接破坏 CLI 和消费工程。
+`LiveKit::MediaCore`、`LiveKit::MediaGraph`、`LiveKit::MediaNodesWebRTC`、`LiveKit::Player`、`LiveKit::ServerSDK` 已有构建目标。RTC 图由独立私有目标 `livekit_rtc_graph` 管理；Player-only 不链接 RTC，ServerSDK-only 不引入媒体依赖。CLI、示例和产品 APP 分别由自己的入口构建。
 
 播放器不因公共依赖引入完整 RTC，会议也不因统一 SDK 引入剪辑器。FFmpeg 按播放、编码、封装需求分别接入；当前外部进程输入方式与未来库级后端明确区分。具体静态/动态链接及许可证要求在打包时确认。
 
@@ -113,4 +113,4 @@ SDK 以源码集成为当前交付形式；稳定跨语言分发采用版本化 
 4. 分离 server_sdk 构建边界，增加场景与可选节点目标。
 5. 实现播放器、剪辑、远控及版本化绑定，按平台验收后发布。
 
-验证入口沿用 [README](../README.md)与 [VALIDATION](../VALIDATION.md)：单测、独立消费者、SDK/CLI 实际媒体集成。新增架构需覆盖队列过载、停止排空、取消、旧代次丢弃、共享设备、快速 Seek 和回调异常。当前 [RTC 交接快照](../../docs/rtc/STATUS_AND_HANDOFF.md)记录的失败优先于历史通过；本次只编写设计，没有重跑媒体验收。
+验证入口沿用 [README](../README.md)与 [VALIDATION](../VALIDATION.md)：单测、独立消费者、SDK/CLI 实际媒体集成。新增架构需覆盖队列过载、停止排空、取消、旧代次丢弃、共享设备、快速 Seek 和回调异常。当前 [RTC 交接快照](../../docs/integration/rtc/STATUS_AND_HANDOFF.md)记录的失败优先于历史通过；本次只编写设计，没有重跑媒体验收。

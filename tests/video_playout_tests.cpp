@@ -1,4 +1,4 @@
-#include "lk/video_playout.hpp"
+#include "media_nodes/render/video_playout.hpp"
 #include "api/video/i420_buffer.h"
 #define SDL_MAIN_HANDLED
 #include <SDL.h>

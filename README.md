@@ -1,10 +1,10 @@
 # livekit-sdk-cpp
 
-[远程控制](../docs/remote-control/README.md)：新增 `RemoteControlSession`、可靠键鼠协议、租约/心跳 watchdog 和 Windows 输入后端；搭配相邻 ImGui 被控端、浏览器及 Go 授权服务使用。自动化只验证合成媒体和输入记录器，实际桌面需人工验收。
+[远程控制](../docs/integration/remote-control/README.md)：新增 `RemoteControlSession`、可靠键鼠协议、租约/心跳 watchdog 和 Windows 输入后端；搭配相邻 ImGui 被控端、浏览器及 Go 授权服务使用。自动化只验证合成媒体和输入记录器，实际桌面需人工验收。
 
 [WebRTC 媒体图节点](docs/media-graph-webrtc.md)：采集、音视频编解码与渲染拆为独立节点，四类 Factory 默认接入 Room；支持摄像头/主屏输入、可选本地预览及节点统计。
 
-[仓库设计](docs/design.md)说明当前代码分工、线程契约及向统一媒体 SDK 演进的路径；[平台总体设计](../docs/platform-design.md)定义跨仓库边界。
+[仓库设计](docs/design.md)说明当前代码分工、线程契约及向统一媒体 SDK 演进的路径；[平台总体设计](../docs/architecture/platform-design.md)定义跨仓库边界。
 
 新增独立的 [本地文件播放器](docs/player.md)：`LiveKit::Player` 提供 FFmpeg 库级播放、暂停、Seek 与音视频帧输出，可关闭 RTC 单独构建；附 SDL 播放示例和 Windows 构建脚本。
 
@@ -29,7 +29,7 @@ $env:VCPKG_ROOT = 'D:\vcpkg'
 首次构建下载固定版本依赖并完整编译 libwebrtc。产物：
 
 - `out/windows-x64/Release/livekit_sdk.lib`：SDK 静态库，通过 CMake target 自动连接完整依赖。
-- `out/windows-x64/Release/livekit_conference_demo.exe`：英文 ImGui 多人会议观看客户端，见 [demo 文档](demo/README.md)。
+- `out/windows-x64/Release/livekit_conference_demo.exe`：英文 ImGui 多人会议观看客户端，见 [demo 文档](examples/conference_viewer/README.md)。
 - `out/windows-x64/Release/lk.exe`：移植后的 CLI。
 - `out/windows-x64/Release/livekit_sdk_example.exe`：只调用公开 API 的示例。
 
@@ -133,9 +133,9 @@ python tests/api_contract.py --client out/windows-x64/Release/livekit_sdk_tests.
 | 目录 | 内容 |
 | --- | --- |
 | `include/livekit/` | SDK 公开 API；命名空间 `livekit::sdk` |
-| `src/`、`src/internal/lk/` | 原生实现与私有头文件 |
-| `cli/` | 仅依赖公开 SDK 的命令行程序 |
-| `demo/` | ImGui + SDL2 会议观看客户端；使用最新类型化 Room/Participant API |
+| `src/engines/`、`src/media_nodes/`、`src/backends/` | 原生实现与私有头文件 |
+| `tools/cli/` | 仅依赖公开 SDK 的命令行程序 |
+| `examples/conference_viewer/` | ImGui + SDL2 会议观看客户端；使用最新类型化 Room/Participant API |
 | `examples/` | SDK 直接调用示例 |
 | `protocol/` | LiveKit protobuf 字段兼容子集及参考快照 |
 | `cmake/` | libwebrtc 和固定版本依赖配置 |
@@ -146,3 +146,5 @@ python tests/api_contract.py --client out/windows-x64/Release/livekit_sdk_tests.
 服务端六类客户端通过协议测试；实际部署验证目前覆盖 Room 服务，未部署 Egress/Ingress/SIP/Agent/Connector 后端。文件输入经 FFmpeg 解码后由 WebRTC 重编码；录制为每轨道 WAV/Y4M，Y4M 使用名义 30 fps。
 
 许可证和来源声明见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
+
+目录重构与独立构建边界见 [仓库结构](../docs/architecture/repository-layout.md)。`LiveKit::ServerSDK` 可在关闭 RTC、Player 后独立构建。SDK 不再提供构建产品客户端的选项；远控产品从 `livekit-app/apps/remote-control/desktop` 构建。

@@ -1,4 +1,4 @@
-#include "lk/video_frames.hpp"
+#include "media_nodes/render/video_frames.hpp"
 #include "api/video/i420_buffer.h"
 #include <cstring>
 #include <iostream>

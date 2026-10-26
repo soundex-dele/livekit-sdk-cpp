@@ -9,7 +9,7 @@
 ```powershell
 cd D:\workspace\av-platform\livekit-sdk-cpp
 .\scripts\build-player-windows.ps1 -FFmpegRoot 'D:\Downloads\ffmpeg-n7.1-241205-gpl-amd64-shared\bin'
-.\out\player-windows-ffmpeg71\player\Release\livekit_local_player.exe 'D:\media\example.mp4'
+.\out\player-windows-ffmpeg71\Release\livekit_local_player.exe 'D:\media\example.mp4'
 ```
 
 脚本接受包根目录或 `bin` 目录，完成配置、构建和 CTest。此 7.1 包的版本标识为 `b08d796`，导入库位于 `bin`，缺少 FFmpeg 和 SDL 公共头文件。脚本从 FFmpeg 官方仓库下载对应完整提交的源码头文件，并下载 SDL 2.30.9 官方开发包，校验 SHA-256，缓存到 `out/player-deps`；针对 Windows x64 生成公共 `avconfig.h`。不修改下载目录中的原始包。不同版本缺少头文件时需要自行提供匹配开发包，不会复用 6.x 的 FFmpeg 头文件。
@@ -42,10 +42,10 @@ ctest --test-dir out/player -C Release --output-on-failure
 | `src/media_nodes` / `livekit_media_nodes_ffmpeg` | 独立的文件源、解封装、音视频解码、视频转换、音频重采样节点 |
 | `src/media_graph/playback_graph.*` / `LiveKit::Player` | GraphEngine::loadFromNodes 装配、引擎生命周期和播放控制 |
 | `src/media_graph/media_flow.hpp` | 通用图执行器、类型化发布/订阅、接收确认、背压、epoch 和错误回传 |
-| `src/media_nodes/playback_output.hpp` / `LiveKit::Player` | 图内音视频输出节点，各自拥有有界 MediaChannel，支持跨线程拉取 |
+| `src/media_nodes/render/playback_output.hpp` / `LiveKit::Player` | 图内音视频输出节点，各自拥有有界 MediaChannel，支持跨线程拉取 |
 | `src/player` / `LiveKit::Player` | 场景状态机、命令队列、播放时钟和按时取帧 |
-| `examples/local_player.cpp` | ImGui/SDL 窗口入口、事件循环、快捷键和拖放 |
-| `player/demo/session.*`、`player/demo/ui.*` | SDK 公共 API 消费者；异步会话控制、音视频输出、中文播放器界面 |
+| `examples/local_player/main.cpp` | ImGui/SDL 窗口入口、事件循环、快捷键和拖放 |
+| `examples/local_player/session.*`、`examples/local_player/ui.*` | SDK 公共 API 消费者；异步会话控制、音视频输出、中文播放器界面 |
 
 Player 独占内部图。`PlaybackGraph` 包含 **8 个实际 GraphNode 和 7 条带类型的媒体连接**：
 
@@ -61,12 +61,12 @@ FileSourceNode → DemuxerNode
 
 | 节点 ID | 实现文件 | 所有权与职责 |
 | --- | --- | --- |
-| `file.source` | `src/media_nodes/file_source.cpp` | 文件句柄；按 IO 请求读取并发布 SeekableBytes，处理 Seek、取消/超时 |
-| `file.demuxer` | `src/media_nodes/ffmpeg_demuxer.cpp` | 自定义 AVIO、容器上下文；订阅字节，发布流参数、VideoPacket / AudioPacket 和 EOS |
-| `video.decoder` / `audio.decoder` | `src/media_nodes/ffmpeg_decoder.cpp` | 订阅流参数/编码包，持有各自解码器，发布 DecodedVideo / DecodedAudio 和 EOS |
-| `video.rgba` | `src/media_nodes/ffmpeg_video_converter.cpp` | swscale 上下文；RGBA 转换、过滤 Seek 目标之前的帧 |
-| `audio.resampler` | `src/media_nodes/ffmpeg_audio_resampler.cpp` | swresample 上下文；48 kHz 双声道 PCM、Seek 裁剪、重采样尾部排空 |
-| `video.output` / `audio.output` | `src/media_nodes/playback_output.hpp` | 有界帧队列、generation、按时间拉取、线程间同步 |
+| `file.source` | `src/media_nodes/capture/file_source.cpp` | 文件句柄；按 IO 请求读取并发布 SeekableBytes，处理 Seek、取消/超时 |
+| `file.demuxer` | `src/media_nodes/demux/ffmpeg_demuxer.cpp` | 自定义 AVIO、容器上下文；订阅字节，发布流参数、VideoPacket / AudioPacket 和 EOS |
+| `video.decoder` / `audio.decoder` | `src/media_nodes/codecs/ffmpeg_decoder.cpp` | 订阅流参数/编码包，持有各自解码器，发布 DecodedVideo / DecodedAudio 和 EOS |
+| `video.rgba` | `src/media_nodes/process/ffmpeg_video_converter.cpp` | swscale 上下文；RGBA 转换、过滤 Seek 目标之前的帧 |
+| `audio.resampler` | `src/media_nodes/process/ffmpeg_audio_resampler.cpp` | swresample 上下文；48 kHz 双声道 PCM、Seek 裁剪、重采样尾部排空 |
+| `video.output` / `audio.output` | `src/media_nodes/render/playback_output.hpp` | 有界帧队列、generation、按时间拉取、线程间同步 |
 
 `MediaExecutor` 根据实际连接计算拓扑顺序，每次从下游向上游执行一轮节点 `pump()`。执行器不识别 FFmpeg 节点类型，`PlaybackGraph::step()` 不再调用 read/send/receive/convert。节点通过 `subscribe_media<T>()` 接收事件，在自己的有界输入槽中保存数据，处理后通过 `publish_media<T>()` 沿图边发布。
 

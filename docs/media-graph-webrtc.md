@@ -1,10 +1,10 @@
 # WebRTC 媒体图节点
 
-实现日期：2026-10-26；采集、视频编码、解码、渲染和录制已拆成独立节点，使用 GraphEngine 创建实际事件图，发送侧仍由 media_graph 主动驱动真实编码。设计背景见 [接入方案](../../docs/webrtc-media-graph-design.md)。本实现保留 Room/Participant/TrackPublication 与 Player API，默认 RTC runtime 使用图节点工厂。
+实现日期：2026-10-26；采集、视频编码、解码、渲染和录制已拆成独立节点，使用 GraphEngine 创建实际事件图，发送侧仍由 media_graph 主动驱动真实编码。设计背景见 [接入方案](../../docs/architecture/webrtc-media-graph-design.md)。本实现保留 Room/Participant/TrackPublication 与 Player API，默认 RTC runtime 使用图节点工厂。
 
 ## 构建边界
 
-`cmake/MediaGraph.cmake` 创建公共 `LiveKit::MediaCore`、`LiveKit::MediaGraph`。GraphFlow 是私有实现依赖；公共图目标不链接 FFmpeg 或 WebRTC。Player 的 FFmpeg 构图归 `LiveKit::Player`，RTC 编解码适配位于 `LiveKit::MediaNodesWebRTC`。原 `LiveKit::SDK` 链接 RTC 节点库，Player-only 构建继续不需要 RTC。
+`cmake/MediaGraph.cmake` 创建公共 `LiveKit::MediaCore`、`LiveKit::MediaGraph`。GraphFlow 是私有实现依赖；公共图目标不链接 FFmpeg 或 WebRTC；RTC 图登记与管线实现已移入 `src/engines/rtc` 的 `livekit_rtc_graph` 私有目标。Player 的 FFmpeg 构图归 `LiveKit::Player`，RTC 编解码适配位于 `LiveKit::MediaNodesWebRTC`。原 `LiveKit::SDK` 链接 RTC 节点库，Player-only 构建继续不需要 RTC。
 
 ## 实际链路
 

@@ -1,5 +1,5 @@
 #pragma once
-#include "media_graph/rtc_graph.hpp"
+#include "engines/rtc/rtc_graph.hpp"
 #include "api/peer_connection_interface.h"
 #include "api/video_codecs/video_encoder_factory.h"
 #include "api/video_codecs/video_decoder_factory.h"

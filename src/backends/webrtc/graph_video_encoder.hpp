@@ -1,5 +1,5 @@
 #pragma once
-#include "media_graph/rtc_graph.hpp"
+#include "engines/rtc/rtc_graph.hpp"
 #include "media_graph/video_events.hpp"
 #include "api/environment/environment.h"
 #include "api/video/video_frame.h"

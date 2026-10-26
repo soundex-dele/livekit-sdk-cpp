@@ -1,5 +1,5 @@
 #include <livekit/remote_control.hpp>
-#include "control_input_win.hpp"
+#include "backends/platform/windows/control_input_win.hpp"
 #include <fstream>
 #include <iostream>
 #include <stdexcept>

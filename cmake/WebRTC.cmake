@@ -2,6 +2,11 @@ set(WEBRTC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../webrtc" CACHE PATH "Native
 if(NOT EXISTS "${WEBRTC_SOURCE_DIR}/api/peer_connection_interface.h")
   message(FATAL_ERROR "Set WEBRTC_SOURCE_DIR to the native WebRTC checkout")
 endif()
+set(WEBRTC_PREBUILT_DIR "" CACHE PATH "Matching Windows Release WebRTC CMake build")
+if(WEBRTC_PREBUILT_DIR)
+  include("${CMAKE_CURRENT_LIST_DIR}/WebRTCPrebuilt.cmake")
+  return()
+endif()
 set(WEBRTC_BUILD_DEMO OFF CACHE BOOL "" FORCE)
 # The external checkout's find_library may select debug/lib for Release under
 # vcpkg. Resolve both explicitly, so the static CRT is consistent.

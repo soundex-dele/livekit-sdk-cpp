@@ -1,5 +1,5 @@
 #pragma once
-#include "media_graph/rtc_graph.hpp"
+#include "engines/rtc/rtc_graph.hpp"
 #include "api/video_codecs/video_decoder.h"
 
 namespace livekit::sdk::detail {

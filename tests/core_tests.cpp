@@ -1,6 +1,6 @@
-#include "lk/auth.hpp"
-#include "lk/process.hpp"
-#include "lk/media.hpp"
+#include "server_sdk/auth.hpp"
+#include "support/process.hpp"
+#include "engines/rtc/media.hpp"
 #include "livekit.pb.h"
 #include <iostream>
 #include <stdexcept>

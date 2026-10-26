@@ -1,5 +1,5 @@
 #pragma once
-#include "media_graph/rtc_graph.hpp"
+#include "engines/rtc/rtc_graph.hpp"
 #include "api/audio/audio_device.h"
 #include <cstring>
 

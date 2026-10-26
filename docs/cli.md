@@ -248,13 +248,13 @@ python tests/stream_integration.py --lk out/windows-x64/Release/lk.exe --server 
 
 | 路径 | 职责 |
 | --- | --- |
-| `cli/main.cpp` | 命令解析和房间 API 操作 |
-| `src/auth.cpp` | HS256 JWT、URL、JSON 事件 |
-| `src/net.cpp` | HTTP/Twirp 和 WSS 信令 |
-| `src/room.cpp` | LiveKit 双 PeerConnection、协商与轨道生命周期 |
-| `src/media.cpp` | FFmpeg 输入、音视频源、订阅录制 |
-| `src/internal/lk/headless_audio.hpp` | 无声音频播放时钟，驱动订阅解码 |
-| `src/process.cpp` | Windows/POSIX 子进程与管道；不经过 shell |
+| `tools/cli/main.cpp` | 命令解析和房间 API 操作 |
+| `src/server_sdk/auth.cpp` | HS256 JWT、URL、JSON 事件 |
+| `src/support/net.cpp` | HTTP/Twirp 和 WSS 信令 |
+| `src/engines/rtc/room.cpp` | LiveKit 双 PeerConnection、协商与轨道生命周期 |
+| `src/engines/rtc/media.cpp` | FFmpeg 输入、音视频源、订阅录制 |
+| `src/backends/webrtc/headless_audio.hpp` | 无声音频播放时钟，驱动订阅解码 |
+| `src/support/process.cpp` | Windows/POSIX 子进程与管道；不经过 shell |
 | `protocol/livekit.proto` | 保留官方字段编号的 Protobuf 子集 |
 
 协议参考快照保留在 `protocol/upstream_*.txt`；未实现的 protobuf 字段由运行库忽略。

@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const root = path.resolve(__dirname, '..');
-const web = path.join(root, 'web');
+const web = path.join(root, 'examples/web_viewer');
 const { values } = require('node:util').parseArgs({ options: {
   port: { type: 'string' }, room: { type: 'string' }, url: { type: 'string' },
 } });
@@ -13,7 +13,7 @@ const room = values.room || process.env.VIEWER_ROOM || 'test';
 const url = values.url || process.env.LIVEKIT_URL || 'http://127.0.0.1:7880';
 const cli = process.env.LIVEKIT_CLI || path.join(root, 'out/windows-x64/Release/lk.exe');
 const sdk = path.join(web, 'node_modules/livekit-client/dist/livekit-client.umd.js');
-if (!fs.existsSync(sdk)) throw new Error('Run npm ci --prefix web first.');
+if (!fs.existsSync(sdk)) throw new Error('Run npm ci --prefix examples/web_viewer first.');
 const env = { ...process.env,
   LIVEKIT_API_KEY: process.env.LIVEKIT_API_KEY || 'devkey',
   LIVEKIT_API_SECRET: process.env.LIVEKIT_API_SECRET || 'local-dev-secret-change-me-32-chars',
