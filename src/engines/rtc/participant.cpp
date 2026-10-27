@@ -9,7 +9,7 @@ namespace livekit::sdk::detail {
 void RoomState::enqueue(uint64_t expected, const std::shared_ptr<Command>& command) {
   if (command->options.timeout < std::chrono::milliseconds::zero() || command->options.timeout > std::chrono::minutes(5))
     throw std::invalid_argument("Invalid operation timeout");
-  if (command->options.wait_for_ack && command->operation != "metadata" && command->operation != "publish")
+  if (command->options.wait_for_ack && command->operation != "metadata" && command->operation != "publish" && command->operation != "publish-microphone")
     throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported, "This operation has no server acknowledgement contract");
   std::lock_guard lock(mutex);
   if (command->done()) return;
@@ -141,6 +141,10 @@ std::future<TrackPublication> LocalParticipant::publish_track(const MediaSpec& m
       [weak = state_, generation = generation_, owner = identity()](const Json& result) {
         return TrackPublication(weak, generation, owner, detail::parse_track(result), true);
       }, media, options, operation);
+}
+std::future<TrackPublication> LocalParticipant::publish_microphone(const OperationOptions& operation) const {
+ MediaSpec spec; spec.video=false; TrackPublishOptions options; options.source=TrackSource::microphone; options.name="麦克风";
+ return submit<TrackPublication>(state_,generation_,"publish-microphone",{},[weak=state_,generation=generation_,owner=identity()](const Json& result){return TrackPublication(weak,generation,owner,detail::parse_track(result),true);},spec,options,operation);
 }
 std::future<void> LocalParticipant::unpublish_track(const std::string& sid, const OperationOptions& operation) const { return submit_void(state_, generation_, "unpublish", {{"sid", sid}}, operation); }
 std::future<void> LocalParticipant::publish_data(const std::vector<uint8_t>& payload, const DataPublishOptions& options, const OperationOptions& operation) const {
