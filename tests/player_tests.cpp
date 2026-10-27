@@ -74,7 +74,20 @@ int main(int argc, char** argv) {
     require(player.snapshot().state == PlayerState::paused, "invalid seek changed state");
     auto first = player.seek(1500ms); auto second = player.seek(400ms); auto third = player.seek(1800ms);
     get(std::move(first)); get(std::move(second)); get(std::move(third));
-    require(player.snapshot().generation > buffered.generation && player.snapshot().queued_video == 0, "seek did not flush");
+    require(player.snapshot().generation > buffered.generation, "seek did not advance generation");
+    std::optional<media::VideoFrame> preview;
+    const auto preview_limit = std::chrono::steady_clock::now() + 3s;
+    while (!(preview = player.poll_video()) && std::chrono::steady_clock::now() < preview_limit) {
+      require(!player.poll_audio(), "preview emitted audio");
+      require(player.snapshot().state == PlayerState::paused, "preview changed playback state");
+      std::this_thread::sleep_for(2ms);
+    }
+    require(preview && preview->timestamp_us >= 1800000 && preview->timestamp_us < 1840000,
+      "paused seek did not deliver target frame");
+    require(preview->generation == player.snapshot().generation, "stale preview generation");
+    std::this_thread::sleep_for(40ms);
+    require(player.snapshot().position_us == 1800000 && !player.poll_audio() && !player.poll_video(),
+      "preview advanced clock or delivered more than one frame");
     get(player.play());
     auto tail = drain(player, 1800000);
     require(tail.video == 15 && tail.audio > 0, "seek did not drain final B frames/audio");
@@ -90,14 +103,18 @@ int main(int argc, char** argv) {
     const auto playing_tail = drain(player, 2000000);
     if (playing_tail.video != 10) throw std::runtime_error("playing seek tail mismatch: " + std::to_string(playing_tail.video) + " first=" + std::to_string(playing_tail.first_video));
     get(player.seek(std::chrono::microseconds(info.duration_us)));
+    std::this_thread::sleep_for(40ms);
+    require(!player.poll_video() && !player.poll_audio() && player.snapshot().state == PlayerState::paused,
+      "end preview returned stale output or changed state");
     get(player.play());
     require(drain(player, info.duration_us).video == 0, "seek to duration returned old frames");
     get(player.close()); get(player.close());
     require(player.snapshot().state == PlayerState::closed, "idempotent close failed");
     for (const char* name : {"audio.wav", "video.mp4", "offset.ts"}) {
       auto stream = get(player.open(file(name)));
+      get(player.seek(0us));
       get(player.play()); auto count = drain(player);
-      require((count.video > 0) == stream.has_video && (count.audio > 0) == stream.has_audio, "single-stream playback failed");
+      if ((count.video > 0) != stream.has_video || (count.audio > 0) != stream.has_audio) throw std::runtime_error(std::string("single-stream playback failed: ") + name + " video=" + std::to_string(count.video) + " audio=" + std::to_string(count.audio));
       if (stream.has_video) require(count.video == 10 && count.first_video == 0, "start timestamp normalization/B-frame drain failed");
       if (stream.has_audio) require(std::abs(count.samples - 16800) <= 1, "resampler tail lost");
     }

@@ -46,6 +46,8 @@ class Player {
   std::future<PlayerMediaInfo> open(std::string utf8_local_path);
   std::future<void> play();
   std::future<void> pause();
+  // Paused seek asynchronously prepares one target video frame for poll_video;
+  // the clock remains frozen and poll_audio stays empty until play().
   std::future<void> seek(std::chrono::microseconds position);
   std::future<void> stop(); // rewind to zero, retain the source, transition to ready
   std::future<void> close(); // idempotent; may open again after completion

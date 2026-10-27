@@ -128,8 +128,11 @@ const AVPacket* DemuxerNode::read() {
 }
 void DemuxerNode::seek(int64_t position, int64_t preroll) {
   begin_io();
-  const int64_t target = std::max<int64_t>(0, position - preroll) + origin_;
-  const int result = avformat_seek_file(format_, -1, std::numeric_limits<int64_t>::min(), target, target, 0);
+  // The first keyframe DTS can precede the container's first presentation PTS
+  // (notably MPEG-TS with B frames). Allow preroll before normalized zero.
+  const int64_t latest = position + origin_;
+  const int64_t target = latest - preroll;
+  const int result = avformat_seek_file(format_, -1, std::numeric_limits<int64_t>::min(), target, latest, 0);
   if (io_error_) std::rethrow_exception(io_error_);
   ffmpeg_check(result, "file.demuxer/seek");
   av_packet_unref(packet_);

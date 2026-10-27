@@ -22,11 +22,13 @@ struct ControlInput {
   bool down = false;
   bool positioned = false;
   int x = 0, y = 0, button = 0, delta = 0;
+  std::string text; // UTF-8 for type=text; text_release retries interrupted Unicode keyup
 };
 class ControlInputSink {
  public:
   virtual ~ControlInputSink() = default;
   virtual bool apply(const ControlInput&) noexcept = 0;
+  virtual bool supports_text() const noexcept { return false; }
 };
 // Windows ordinary interactive desktop only. These functions never elevate.
 std::shared_ptr<ControlInputSink> make_windows_control_input();

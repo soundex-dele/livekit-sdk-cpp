@@ -1,5 +1,7 @@
 #include <livekit/remote_control.hpp>
 #include "backends/platform/windows/control_input_win.hpp"
+#include "scenarios/remote_control/text.hpp"
+#include <array>
 #include <stdexcept>
 #include <algorithm>
 #ifdef _WIN32
@@ -28,12 +30,36 @@ class SystemInputApi final:public detail::WindowsInputApi {
 };
 class WindowsInput final:public ControlInputSink {
   std::shared_ptr<detail::WindowsInputApi> api_;
+  std::optional<WORD> pending_unicode_up_;
  public:
   explicit WindowsInput(std::shared_ptr<detail::WindowsInputApi> api):api_(std::move(api)){}
+  bool supports_text()const noexcept override{return true;}
   bool apply(const ControlInput& event)noexcept override {
+    if(event.type=="text_release"&&!pending_unicode_up_)return true;
     INPUT inputs[2]{};UINT count=0;
     // Refuse injection into a different / secure input desktop.
     if(!api_->desktop_available())return false;
+    if(event.type=="text_release"){
+      INPUT up{};up.type=INPUT_KEYBOARD;up.ki.wScan=*pending_unicode_up_;up.ki.dwFlags=KEYEVENTF_UNICODE|KEYEVENTF_KEYUP;
+      if(api_->send(std::span<const INPUT>(&up,1))!=1)return false;
+      pending_unicode_up_.reset();return true;
+    }
+    if(event.type=="text"){
+      if(pending_unicode_up_)return false;
+      try{
+        const auto units=detail::control_text_utf16(event.text);if(!units)return false;
+        std::array<INPUT,1024> text_inputs{};size_t used=0;char16_t previous=0;
+        for(const auto unit:*units){
+          if(unit=='\n'&&previous=='\r'){previous=unit;continue;}
+          const auto value=unit=='\n'?'\r':unit;previous=unit;
+          auto&down=text_inputs[used++];down.type=INPUT_KEYBOARD;down.ki.wScan=static_cast<WORD>(value);down.ki.dwFlags=KEYEVENTF_UNICODE;
+          auto&up=text_inputs[used++];up=down;up.ki.dwFlags|=KEYEVENTF_KEYUP;
+        }
+        const auto sent=api_->send(std::span<const INPUT>(text_inputs.data(),used));
+        if(sent<used&&(sent%2))pending_unicode_up_=text_inputs[sent-1].ki.wScan;
+        return sent==used;
+      }catch(...){return false;}
+    }
     if(event.type=="key"){
       auto scan=control_key_scan_code(event.code);if(!scan)return false;
       auto&input=inputs[count++];input.type=INPUT_KEYBOARD;input.ki.wScan=static_cast<WORD>(scan&255);input.ki.dwFlags=KEYEVENTF_SCANCODE|(scan&256?KEYEVENTF_EXTENDEDKEY:0)|(event.down?0:KEYEVENTF_KEYUP);

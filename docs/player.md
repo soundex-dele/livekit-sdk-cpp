@@ -86,7 +86,8 @@ player.close().get();
 `open/play/pause/seek/stop/close` 返回 future，表示操作实际完成，而非仅入队。无回调线程，公共方法线程安全，错误可通过 future 异常或 `snapshot().error` 获取；媒体工作线程失败会进入 `failed`。参数或状态错误抛出标准逻辑异常，保留现有会话；后端失败需要重新 open。
 
 - `open` 仅接受本地常规文件路径；FFmpeg 协议白名单为 `file`，不开放网络 URL。
-- `open` 后为 `ready`，尚未自动播放；`play` 后为 `playing`，`pause` 冻结时钟并停止交付帧。
+- `open` 后为 `ready`，尚未自动播放；`play` 后为 `playing`，`pause` 冻结时钟并停止常规帧交付。
+- 暂停状态的 `seek` 在完成清理后异步准备一个目标视频帧，由 `poll_video()` 取出一次；`poll_audio()` 保持为空，时钟不推进。预览阶段静默消费音频避免队列背压，恢复播放前从目标位置重新解码，避免丢失音频。纯音频或文件末尾没有预览帧；新 seek/stop/close 会清除待交付预览。
 - `seek` 保留正在播放状态，否则进入 `paused`；定位范围为 `[0, duration]`，未知总时长时只检查非负。多个 Seek 串行完成。
 - `stop` 定位到零并回到 `ready`；`ended` 上调用 `play` 自动从头播放。
 - 解封装 EOF 后排空两个解码器和重采样器；输出队列取空且最后一帧时间结束后才进入 `ended`。

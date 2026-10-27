@@ -7,6 +7,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <limits>
 #include <thread>
 
 namespace livekit::sdk {
@@ -50,11 +51,13 @@ class Player::Impl {
     std::lock_guard lock(mutex_);
     snapshot_.state = PlayerState::failed;
     snapshot_.error = error;
+    preview_pending_ = false; preview_.reset();
     clock_.pause();
     if (outputs_) outputs_->clear();
   }
   void clear_locked(int64_t position, PlayerState state) {
     eof_ = false; end_us_ = position;
+    preview_pending_ = false; preview_dirty_ = false; preview_.reset();
     ++snapshot_.generation;
     if (outputs_) outputs_->flush(snapshot_.generation);
     snapshot_.state = state; snapshot_.error.clear();
@@ -95,17 +98,32 @@ class Player::Impl {
     }
     graph_->pause();
     graph_->seek(position);
-    if (next == PlayerState::playing) graph_->start();
-    std::lock_guard lock(mutex_);
-    clear_locked(position, next);
+    bool preview;
+    {
+      std::lock_guard lock(mutex_);
+      clear_locked(position, next);
+      preview = next == PlayerState::paused && snapshot_.media.has_video;
+      preview_pending_ = preview_dirty_ = preview;
+      preview_deadline_ = std::chrono::steady_clock::now() + options_.io_timeout;
+    }
+    if (next == PlayerState::playing || preview) graph_->start();
   }
   void play_worker() {
     require_open();
-    bool ended;
-    { std::lock_guard lock(mutex_); ended = snapshot_.state == PlayerState::ended; }
+    bool ended, rewind_preview;
+    int64_t position;
+    { std::lock_guard lock(mutex_); ended = snapshot_.state == PlayerState::ended;
+      rewind_preview = preview_dirty_; position = clock_.position_us(); }
     if (ended) seek_worker(0);
+    if (rewind_preview) {
+      // Preview drains audio silently to reach a video frame even with tiny
+      // queues. Re-seek before playback so no audio or video is lost.
+      graph_->pause(); graph_->seek(position);
+      std::lock_guard lock(mutex_); clear_locked(position, PlayerState::paused);
+    }
     graph_->start();
     std::lock_guard lock(mutex_);
+    preview_pending_ = false; preview_dirty_ = false; preview_.reset();
     if (snapshot_.state != PlayerState::playing) clock_.resume();
     snapshot_.state = PlayerState::playing;
   }
@@ -113,6 +131,7 @@ class Player::Impl {
     require_open();
     graph_->pause();
     std::lock_guard lock(mutex_);
+    preview_pending_ = false;
     if (snapshot_.state == PlayerState::playing) {
       clock_.pause(); snapshot_.state = PlayerState::paused;
     }
@@ -128,6 +147,11 @@ class Player::Impl {
   }
   template<class T> std::optional<T> poll(int64_t ahead) {
     std::lock_guard lock(mutex_);
+    if constexpr (std::is_same_v<T, media::VideoFrame>) {
+      if (snapshot_.state == PlayerState::paused && preview_) {
+        auto result = std::move(preview_); preview_.reset(); return result;
+      }
+    }
     if (snapshot_.state != PlayerState::playing || !outputs_) return {};
     const auto time = clock_.position_us() + ahead;
     std::optional<T> frame;
@@ -145,7 +169,7 @@ class Player::Impl {
         if (!commands_.empty()) {
           command = std::move(commands_.front()); commands_.pop_front();
           cancelled_ = false;
-        } else if (snapshot_.state == PlayerState::playing) {
+        } else if (snapshot_.state == PlayerState::playing || preview_pending_) {
           if (eof_) {
             if (outputs_->empty() && clock_.position_us() >= end_us_) {
               clock_.reset(end_us_); snapshot_.state = PlayerState::ended;
@@ -154,7 +178,7 @@ class Player::Impl {
             changed_.wait_for(lock, std::chrono::milliseconds(5)); continue;
           }
         } else {
-          changed_.wait(lock, [&] { return quitting_ || !commands_.empty() || snapshot_.state == PlayerState::playing; });
+          changed_.wait(lock, [&] { return quitting_ || !commands_.empty() || snapshot_.state == PlayerState::playing || preview_pending_; });
           continue;
         }
       }
@@ -163,6 +187,17 @@ class Player::Impl {
         const auto step = graph_->step();
         std::unique_lock lock(mutex_);
         end_us_ = graph_->end_us();
+        if (preview_pending_) {
+          constexpr auto all = std::numeric_limits<int64_t>::max();
+          preview_ = outputs_->video->poll(all, snapshot_.generation);
+          while (outputs_->audio->poll(all, snapshot_.generation)) {}
+          if (preview_ || step == detail::PlaybackGraph::Step::end) {
+            preview_pending_ = false; outputs_->clear();
+            lock.unlock(); graph_->pause(); continue;
+          }
+          if (std::chrono::steady_clock::now() >= preview_deadline_)
+            throw PlayerError("player/preview: timed out decoding the target frame");
+        }
         if (step == detail::PlaybackGraph::Step::end) eof_ = true;
         if (step == detail::PlaybackGraph::Step::backpressured && commands_.empty() && !quitting_)
           changed_.wait_for(lock, std::chrono::milliseconds(5));
@@ -182,6 +217,9 @@ class Player::Impl {
   std::deque<std::function<void()>> commands_;
   std::atomic<bool> cancelled_{false};
   bool quitting_ = false, eof_ = false;
+  bool preview_pending_ = false, preview_dirty_ = false;
+  std::optional<media::VideoFrame> preview_;
+  std::chrono::steady_clock::time_point preview_deadline_;
   int64_t end_us_ = 0;
   PlayerSnapshot snapshot_;
   media::MediaClock clock_;

@@ -1,4 +1,5 @@
 #include <livekit/remote_control.hpp>
+#include "scenarios/remote_control/text.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -24,9 +25,13 @@ struct RemoteControlSession::Impl {
   mutable std::mutex mutex;
   ControlGrant grant;
   ControlLayout layout;
-  bool enabled=false, acknowledged=false;
+  bool enabled=false, acknowledged=false, heartbeat_received=false;
   uint64_t sequence=0;
+  uint64_t text_id=0;
+  bool text_accepted=false, text_pending_release=false;
+  std::string text_reason;
   ControlClock::time_point heartbeat;
+  ControlClock::time_point initial_deadline;
   std::string stopped="idle";
   std::set<std::string> keys;
   std::set<int> buttons;
@@ -35,10 +40,11 @@ struct RemoteControlSession::Impl {
     bool ok=true;
     for(auto it=keys.begin();it!=keys.end();) {ControlInput e; e.type="key";e.code=*it;if(sink->apply(e))it=keys.erase(it);else{ok=false;++it;}}
     for(auto it=buttons.begin();it!=buttons.end();) {ControlInput e;e.type="button";e.button=*it;if(sink->apply(e))it=buttons.erase(it);else{ok=false;++it;}}
+    if(text_pending_release){ControlInput e;e.type="text_release";if(sink->apply(e))text_pending_release=false;else ok=false;}
     return ok;
   }
   void stop(const std::string& why) noexcept {enabled=false;acknowledged=false;stopped=why;if(!release())stopped="input_release_failed";}
-  void tick(ControlClock::time_point now) {if(enabled) {if(now>=grant.deadline)stop("lease_expired");else if(now-heartbeat>=std::chrono::seconds(3))stop("heartbeat_timeout");}else if(!keys.empty()||!buttons.empty())release();}
+  void tick(ControlClock::time_point now) {if(enabled) {if(now>=grant.deadline)stop("lease_expired");else if(!heartbeat_received ? now>=initial_deadline : now-heartbeat>=std::chrono::seconds(3))stop(heartbeat_received?"heartbeat_timeout":"control_connect_timeout");}else if(!keys.empty()||!buttons.empty()||text_pending_release)release();}
 };
 RemoteControlSession::RemoteControlSession(std::shared_ptr<ControlInputSink> sink,bool watchdog):impl_(std::make_unique<Impl>()){
   if(!sink)throw std::invalid_argument("input sink required");impl_->sink=std::move(sink);
@@ -47,9 +53,11 @@ RemoteControlSession::RemoteControlSession(std::shared_ptr<ControlInputSink> sin
 RemoteControlSession::~RemoteControlSession(){impl_->watchdog.request_stop();if(impl_->watchdog.joinable())impl_->watchdog.join();stop();}
 void RemoteControlSession::authorize(ControlGrant grant,ControlLayout layout,ControlClock::time_point now){
   std::lock_guard lock(impl_->mutex);impl_->stop("replaced");
-  if(!impl_->keys.empty()||!impl_->buttons.empty())throw std::runtime_error("Previous input could not be released");
+  if(!impl_->keys.empty()||!impl_->buttons.empty()||impl_->text_pending_release)throw std::runtime_error("Previous input could not be released");
   if(grant.id.empty()||grant.controller_identity.empty()||!grant.epoch||grant.deadline<=now||layout.width<=0||layout.height<=0||!layout.version)throw std::invalid_argument("invalid grant or layout");
   impl_->grant=std::move(grant);impl_->layout=layout;impl_->enabled=true;impl_->sequence=0;impl_->heartbeat=now;impl_->stopped.clear();
+  impl_->heartbeat_received=false;impl_->initial_deadline=now+std::chrono::seconds(10);
+  impl_->text_id=0;impl_->text_accepted=false;impl_->text_reason.clear();
 }
 bool RemoteControlSession::renew(const ControlGrant& grant,ControlClock::time_point now){
   std::lock_guard lock(impl_->mutex);impl_->tick(now);
@@ -68,12 +76,30 @@ bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,const DataR
     auto v=Json::parse(bytes);if(v.at("v")!=1||v.at("grant_id")!=s.grant.id||v.at("epoch")!=s.grant.epoch)return false;
     if(!v.at("seq").is_number_unsigned())return false;auto seq=v.at("seq").get<uint64_t>();if(seq<=s.sequence||seq>9007199254740991ULL)return false;
     const auto type=v.at("type").get<std::string>();
-    if(type=="heartbeat"){s.sequence=seq;s.heartbeat=now;return true;}
+    if(type=="heartbeat"){s.sequence=seq;s.heartbeat=now;s.heartbeat_received=true;return true;}
     if(type=="release"||type=="stop"){s.sequence=seq;if(type=="stop")s.stop("peer_stopped");else if(!s.release())s.stop("input_release_failed");return true;}
+    // Transport setup has a bounded grace period, but no input or layout ack
+    // may activate control before the authenticated peer's first heartbeat.
+    if(!s.heartbeat_received)return false;
     if(v.at("layout_version")!=s.layout.version)return false;
     if(type=="layout_ack"){s.sequence=seq;s.acknowledged=true;return true;}
     if(!s.acknowledged)return false;
     ControlInput event;event.type=type;
+    if(type=="text") {
+      const auto& id=v.at("text_id");
+      if(!id.is_number_unsigned()||id==0||id>9007199254740991ULL||id.get<uint64_t>()<=s.text_id)return false;
+      s.sequence=seq;s.text_id=id.get<uint64_t>();s.text_accepted=false;
+      s.text_reason="invalid_text";
+      if(!v.contains("text")||!v.at("text").is_string())return false;
+      event.text=v.at("text").get<std::string>();
+      if(!detail::control_text_utf16(event.text))return false;
+      if(!s.sink->supports_text()){s.text_reason="unsupported";return false;}
+      // Text must not inherit held Ctrl/Alt/Shift or mouse buttons.
+      if(!s.release()){s.text_reason="input_failed";s.stop("input_release_failed");return false;}
+      s.text_pending_release=true;
+      if(!s.sink->apply(event)){s.text_reason="input_failed";s.stop("input_failed");return false;}
+      s.text_pending_release=false;s.text_accepted=true;s.text_reason.clear();return true;
+    }
     if(type=="move"||type=="button"||type=="wheel"){
       double x=v.at("x").get<double>(),y=v.at("y").get<double>();if(!std::isfinite(x)||!std::isfinite(y)||x<0||x>1||y<0||y>1)return false;
       event.x=s.layout.x+static_cast<int>(std::lround(x*(s.layout.width-1)));event.y=s.layout.y+static_cast<int>(std::lround(y*(s.layout.height-1)));
@@ -97,5 +123,5 @@ void RemoteControlSession::tick(ControlClock::time_point now){std::lock_guard lo
 void RemoteControlSession::stop(const std::string& reason)noexcept{std::lock_guard lock(impl_->mutex);impl_->stop(reason);}
 bool RemoteControlSession::active()const{std::lock_guard lock(impl_->mutex);return impl_->enabled;}
 std::string RemoteControlSession::reason()const{std::lock_guard lock(impl_->mutex);return impl_->stopped;}
-Json RemoteControlSession::status()const{std::lock_guard lock(impl_->mutex);auto&s=*impl_;return Json{{"v",1},{"type","layout"},{"grant_id",s.grant.id},{"epoch",s.grant.epoch},{"layout_version",s.layout.version},{"width",s.layout.width},{"height",s.layout.height},{"active",s.enabled}};}
+Json RemoteControlSession::status()const{std::lock_guard lock(impl_->mutex);auto&s=*impl_;return Json{{"v",1},{"type","layout"},{"grant_id",s.grant.id},{"epoch",s.grant.epoch},{"layout_version",s.layout.version},{"width",s.layout.width},{"height",s.layout.height},{"active",s.enabled},{"text_input",s.sink->supports_text()},{"text_result",{{"id",s.text_id},{"accepted",s.text_accepted},{"reason",s.text_reason}}}};}
 }
