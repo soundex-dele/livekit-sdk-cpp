@@ -5,6 +5,9 @@
 #include "rtc_base/time_utils.h"
 #include "libyuv/convert.h"
 #include <chrono>
+#ifdef __APPLE__
+#include "media_nodes/capture/screen_macos.hpp"
+#endif
 #include <thread>
 #include <stdexcept>
 #ifdef _WIN32
@@ -35,6 +38,9 @@ CaptureSize screen_capture_size(int width,int height) {
 }
 std::vector<ScreenCaptureDevice> screen_capture_devices() {
   std::vector<ScreenCaptureDevice> result;
+#ifdef __APPLE__
+  return lk::mac_screen_devices();
+#endif
 #ifdef _WIN32
   DpiScope dpi;
   // Enumerate physical modes rather than DPI-virtualized window coordinates.
@@ -163,8 +169,10 @@ void capture_device(const livekit::sdk::MediaSpec& spec, std::atomic<bool>& stop
     next += period; if (next < std::chrono::steady_clock::now() - period) next = std::chrono::steady_clock::now();
     std::this_thread::sleep_until(next);
   }
+#elif defined(__APPLE__)
+  capture_screen_macos(spec,stop,output);
 #else
-  throw std::runtime_error("Screen capture backend is currently Windows-only");
+  throw std::runtime_error("Screen capture backend unavailable");
 #endif
 }
 }

@@ -40,7 +40,9 @@ struct MediaSpec {
 };
 struct ScreenCaptureDevice {
   std::string id, name;
-  int x = 0, y = 0, width = 0, height = 0; // physical desktop pixels, possibly negative origin
+  // Physical pixel width/height. Origins use platform desktop coordinates
+  // (logical points on macOS, physical pixels on Windows), possibly negative.
+  int x = 0, y = 0, width = 0, height = 0;
   bool primary = false;
   int rotation = 0, refresh_rate = 0;
   bool operator==(const ScreenCaptureDevice&) const = default;
