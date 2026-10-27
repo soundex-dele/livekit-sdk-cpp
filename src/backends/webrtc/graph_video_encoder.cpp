@@ -239,7 +239,7 @@ class VideoEncoderNode final : public MediaNode, public std::enable_shared_from_
   void reset_encoder() {
     if (encoder_) { encoder_->Release(); encoder_.reset(); }
     std::lock_guard lock(metadata_mutex_); metadata_.clear();
-    revision_ = 0; controls_ = 0; last_frame_us_.reset();
+    revision_ = 0; controls_ = 0; last_frame_us_.reset(); next_frame_us_.reset();
   }
   PacketBuffer::Bind binding() {
     return [weak = weak_from_this()](std::shared_ptr<EncoderSession> session) {
@@ -298,11 +298,16 @@ class VideoEncoderNode final : public MediaNode, public std::enable_shared_from_
       controls_ = config.controls;
     }
     if (config.rates && config.rates->bitrate.get_sum_bps() == 0) { ++dropped; return; }
-    const double fps = config.rates && config.rates->framerate_fps > 0
-        ? config.rates->framerate_fps : config.codec.maxFramerate;
-    if (fps <= 0 || (last_frame_us_ && time_us - *last_frame_us_ < 1000000 / fps - 1000)) {
+    // RateControlParameters::framerate_fps is an observed input rate, not a
+    // requested cap. Gating on it feeds our drops back into WebRTC's estimator
+    // and progressively collapses a healthy 30 fps source to 1 fps.
+    const double fps = config.codec.maxFramerate;
+    if (fps <= 0 || (next_frame_us_ && time_us + 1000 < *next_frame_us_)) {
       ++dropped; return;
     }
+    const int64_t period = static_cast<int64_t>(1000000 / fps);
+    next_frame_us_ = next_frame_us_ && time_us - *next_frame_us_ < period
+        ? *next_frame_us_ + period : time_us + period;
     last_frame_us_ = time_us;
     const auto recovery = session_->recovery.load();
     Metadata metadata{frame.rtp_timestamp(), frame.width(), frame.height(), time_us,
@@ -352,7 +357,7 @@ class VideoEncoderNode final : public MediaNode, public std::enable_shared_from_
   std::shared_ptr<EncoderSession> session_;
   std::unique_ptr<webrtc::VideoEncoder> encoder_;
   uint64_t revision_ = 0, controls_ = 0, applied_loss_revision_ = 0;
-  std::optional<int64_t> last_frame_us_;
+  std::optional<int64_t> last_frame_us_, next_frame_us_;
   std::mutex metadata_mutex_;
   std::deque<Metadata> metadata_;
   EncodeExecutor executor_;

@@ -48,6 +48,8 @@ struct RoomCallback {
   // ID in the application. params.sender_identity is distinct from the subject.
   std::function<void(const Transcription&, const DataReceiveParams&)> on_transcription_received;
   std::function<void(const std::string& participant_sid, const std::string& track_sid, bool allowed)> on_subscription_permission_changed;
+  // Serialized W3C media statistics; enabled by RoomOptions::stats_interval_ms.
+  std::function<void(const Json&)> on_stats;
 };
 struct RoomOptions {
   std::string url, token, room, identity;

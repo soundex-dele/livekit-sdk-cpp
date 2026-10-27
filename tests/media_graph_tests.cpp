@@ -207,6 +207,12 @@ static void graph_driven_video() {
   encoder->RegisterEncodeCompleteCallback(&encoded);
   push(sender); encoder->Encode(triggers.take(), &delta);
   check(encoded.frame->_frameType == VideoFrameType::kVideoFrameKey, "reinitialize after factory destruction");
+  const int before_rate_recovery = encoded.count;
+  encoder->SetRates(VideoEncoder::RateControlParameters(allocation, 1));
+  for (int i=0;i<6;++i) { push(sender); encoder->Encode(triggers.take(), &delta); }
+  check(encoded.count == before_rate_recovery + 6,
+        "observed low framerate must not throttle a recovering live source");
+  encoder->SetRates(VideoEncoder::RateControlParameters(allocation, 30));
   sender->pause(); sender->resume();
   push(sender); encoder->Encode(triggers.take(), &delta); // new source binding probe
   push(sender); encoder->Encode(triggers.take(), &delta);

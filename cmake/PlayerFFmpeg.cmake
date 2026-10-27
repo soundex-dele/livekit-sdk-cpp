@@ -29,7 +29,7 @@ foreach(component avformat avcodec avutil swscale swresample)
   if(NOT LIVEKIT_FFMPEG_${component}_LIBRARY)
     message(FATAL_ERROR "Missing FFmpeg ${component} development library; set LIVEKIT_FFMPEG_ROOT")
   endif()
-  add_library(livekit_ffmpeg_${component} UNKNOWN IMPORTED)
+  add_library(livekit_ffmpeg_${component} UNKNOWN IMPORTED GLOBAL)
   set_target_properties(livekit_ffmpeg_${component} PROPERTIES
     IMPORTED_LOCATION "${LIVEKIT_FFMPEG_${component}_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "${LIVEKIT_FFMPEG_INCLUDE}")

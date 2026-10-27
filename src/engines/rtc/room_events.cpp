@@ -33,6 +33,8 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
     };
     if (type == "session-capabilities") {
       update_capabilities(s->capabilities,e);
+    } else if (type == "rtc-stats") {
+      if(cb.on_stats) callbacks.push_back([e,fn=cb.on_stats]{fn(e);});
     } else if (type == "joined") {
       const auto& room = e.at("roomInfo");
       s->room = {room.value("sid", ""), room.value("name", ""), room.value("metadata", ""), room.value("recording", false)};
