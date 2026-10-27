@@ -1,4 +1,6 @@
 #include "engines/rtc/session.hpp"
+#include "engines/rtc/data_messages.hpp"
+#include "engines/rtc/capabilities.hpp"
 #include <algorithm>
 
 namespace livekit::sdk::detail {
@@ -29,7 +31,9 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
         if (!local && cb.on_track_unpublished) callbacks.push_back([=, fn = cb.on_track_unpublished] { fn(pub, RemoteParticipant(s, g, old, false)); });
       }
     };
-    if (type == "joined") {
+    if (type == "session-capabilities") {
+      update_capabilities(s->capabilities,e);
+    } else if (type == "joined") {
       const auto& room = e.at("roomInfo");
       s->room = {room.value("sid", ""), room.value("name", ""), room.value("metadata", ""), room.value("recording", false)};
       s->local = parse_participant(e.at("localParticipant"));
@@ -68,6 +72,8 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
         remote.emplace(info.identity, std::move(info));
       }
       // Validate the complete snapshot before mutating any public state.
+      if(s->rpc){auto rpc=s->rpc;const bool retained=e.value("transportRetained",true);
+        callbacks.push_back([rpc,retained]{rpc->disconnect();if(retained)rpc->connect();});}
       for (const auto& [identity, old] : s->remote) {
         auto removed = old; removed.state = 3; removed.disconnect_reason = 8; removed.tracks.clear();
         tracks_changed(old, removed, false);
@@ -78,6 +84,9 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       interrupted.swap(s->commands); // Reject old queued work, not work enqueued by new callbacks.
       g = ++s->generation;
       s->room = moved.current; s->local = std::move(local); s->remote = std::move(remote);
+      // Migration carries no ServerInfo. Do not attribute the previous node's
+      // advertised policy to the destination; rejoin will supply new evidence.
+      s->capabilities.server={};
       s->subscriptions = std::move(destination_subscriptions);
       s->recovery.local_snapshot = s->local;
       if (!e.value("transportRetained", true)) s->connection = ConnectionState::reconnecting;
@@ -101,11 +110,13 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       s->recovery.budget.reset();
       s->recovery.regions.attempted.clear();
       s->connection = ConnectionState::connected;
+      if(s->rpc)s->rpc->connect();
       s->cv.notify_all();
       if (cb.on_connected) callbacks.push_back(cb.on_connected);
     } else if (type == "reconnecting" || type == "reconnected") {
       const bool restored = type == "reconnected";
       s->connection = restored ? ConnectionState::connected : ConnectionState::reconnecting;
+      if(s->rpc){auto rpc=s->rpc;callbacks.push_back([rpc,restored]{if(restored)rpc->connect();else rpc->disconnect();});}
       ReconnectInfo info{e.value("mode", "resume") == "resume" ? ReconnectMode::resume : ReconnectMode::rejoin,
                          e.value("attempt", size_t{0})};
       auto fn = restored ? cb.on_reconnected : cb.on_reconnecting;
@@ -126,6 +137,7 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       for (auto& track : now.tracks) track.subscribed = s->subscriptions[track.sid];
       if (now.state == 3) {
         if (!local && existed) {
+          if(s->rpc){auto rpc=s->rpc;callbacks.push_back([rpc,identity=now.identity]{rpc->participant_left(identity);});}
           auto empty = now; empty.tracks.clear(); tracks_changed(old, empty, false);
           s->remote.erase(now.identity);
           if (cb.on_participant_disconnected) callbacks.push_back([=, fn = cb.on_participant_disconnected] { fn(RemoteParticipant(s, g, now, false)); });
@@ -165,6 +177,22 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       std::vector<uint8_t> payload(bytes.begin(), bytes.end());
       DataReceiveParams params{e.value("identity", ""), e.value("topic", ""), e.value("reliable", true)};
       if (cb.on_data_received) callbacks.push_back([=, fn = cb.on_data_received] { fn(payload, params); });
+    } else if (type == "rpc") {
+      livekit::DataPacket packet;
+      if(packet.ParseFromString(base64_decode(e.at("payload").get<std::string>()))&&s->remote.contains(packet.participant_identity()))
+        s->rpc_session()->receive(packet);
+    } else if (type == "subscription-permission") {
+      const auto participant=e.at("participantSid").get<std::string>(),track=e.at("trackSid").get<std::string>();
+      const bool allowed=e.at("allowed");
+      if(cb.on_subscription_permission_changed)callbacks.push_back([=,fn=cb.on_subscription_permission_changed]{fn(participant,track,allowed);});
+    } else if (type == "dtmf") {
+      DtmfDigit digit{e.at("code"),e.at("digit")};
+      DataReceiveParams params{e.value("identity",""),{},e.value("reliable",true)};
+      if (cb.on_dtmf_received) callbacks.push_back([=,fn=cb.on_dtmf_received]{fn(digit,params);});
+    } else if (type == "transcription") {
+      auto transcription=parse_transcription(e.at("value"));
+      DataReceiveParams params{e.value("identity",""),{},e.value("reliable",true)};
+      if (cb.on_transcription_received) callbacks.push_back([=,fn=cb.on_transcription_received]{fn(transcription,params);});
     } else if (type == "room-update") {
       auto metadata = e.value("metadata", ""); auto recording = e.value("recording", false);
       if (metadata != s->room.metadata && cb.on_room_metadata_changed) callbacks.push_back([=, fn = cb.on_room_metadata_changed] { fn(metadata); });

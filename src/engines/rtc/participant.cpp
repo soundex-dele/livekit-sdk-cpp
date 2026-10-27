@@ -1,6 +1,8 @@
 #include "livekit/participant.hpp"
 #include "livekit/video_source.hpp"
 #include "engines/rtc/session.hpp"
+#include "engines/rtc/data_messages.hpp"
+#include "engines/rtc/subscription_permissions.hpp"
 #include <algorithm>
 
 namespace livekit::sdk::detail {
@@ -114,6 +116,11 @@ std::future<void> TrackPublication::set_video_dimensions(int width, int height, 
   if (local_ || width <= 0 || height <= 0) throw std::invalid_argument("Positive remote video dimensions required");
   return submit_void(state_, generation_, "settings", {{"sid", sid()}, {"width", width}, {"height", height}}, operation);
 }
+std::future<void> TrackPublication::set_video_quality(VideoQuality quality, const OperationOptions& operation) const {
+  const auto value=static_cast<int>(quality);
+  if(local_ || snapshot_.kind!=TrackKind::video || value<0 || value>2)throw std::invalid_argument("Valid remote video quality required");
+  return submit_void(state_,generation_,"settings",{{"sid",sid()},{"quality",value},{"width",0},{"height",0}},operation);
+}
 Participant::Participant(std::weak_ptr<detail::RoomState> s, uint64_t g, ParticipantInfo snapshot, bool local)
     : state_(std::move(s)), generation_(g), snapshot_(std::move(snapshot)), local_(local) {}
 ParticipantInfo Participant::info() const {
@@ -143,6 +150,26 @@ std::future<void> LocalParticipant::publish_data(const std::vector<uint8_t>& pay
   return submit_void(state_, generation_, "data", {{"payload", base64url(bytes)}, {"reliable", options.reliable}, {"topic", options.topic}, {"destinations", options.destination_identities}}, operation);
 }
 std::future<void> LocalParticipant::set_name(const std::string& value, const OperationOptions& operation) const { return submit_void(state_, generation_, "metadata", {{"name", value}}, operation); }
+std::future<void> LocalParticipant::publish_dtmf(const DtmfDigit& digit, const OperationOptions& operation) const {
+  return submit_void(state_, generation_, "packet", {{"payload",base64url(detail::encode_dtmf(digit).SerializeAsString())},{"reliable",true}}, operation);
+}
+std::future<void> LocalParticipant::set_subscription_permissions(const SubscriptionPermissions& permissions,const OperationOptions& operation) const {
+  return submit_void(state_,generation_,"permissions",detail::permissions_json(permissions),operation);
+}
+std::future<std::string> LocalParticipant::perform_rpc(const RpcCallOptions& options) const {
+  auto state=state_.lock();if(!state)throw std::logic_error("Room has been destroyed");
+  std::lock_guard lock(state->mutex);
+  if(!state->running||state->stop.stop_requested()||state->generation!=generation_||state->connection!=ConnectionState::connected)
+    throw std::logic_error("Participant handle is stale or room is not connected");
+  if(!state->remote.contains(options.destination_identity)){
+    std::promise<std::string> promise;auto result=promise.get_future();
+    promise.set_exception(std::make_exception_ptr(RpcError(RpcErrorCode::recipient_not_found,"RPC recipient not found")));return result;
+  }
+  return state->rpc_session()->call(options);
+}
+std::future<void> LocalParticipant::publish_transcription(const Transcription& transcription, const OperationOptions& operation) const {
+  return submit_void(state_, generation_, "packet", {{"payload",base64url(detail::encode_transcription(transcription).SerializeAsString())},{"reliable",true}}, operation);
+}
 std::future<void> LocalParticipant::set_metadata(const std::string& value, const OperationOptions& operation) const { return submit_void(state_, generation_, "metadata", {{"metadata", value}}, operation); }
 std::future<void> LocalParticipant::set_attributes(const std::map<std::string, std::string>& value, const OperationOptions& operation) const { return submit_void(state_, generation_, "metadata", {{"attributes", value}}, operation); }
 }

@@ -12,7 +12,9 @@ message ParticipantInfo { string sid = 1; string identity = 2; int32 state = 3; 
 message ICEServer { repeated string urls = 1; string username = 2; string credential = 3; }
 enum ClientConfigSetting { UNSET = 0; DISABLED = 1; ENABLED = 2; }
 message ClientConfiguration { ClientConfigSetting resume_connection = 3; ClientConfigSetting force_relay = 5; }
-message JoinResponse { Room room = 1; ParticipantInfo participant = 2; repeated ParticipantInfo other_participants = 3; string server_version = 4; repeated ICEServer ice_servers = 5; bool subscriber_primary = 6; string alternative_url = 7; ClientConfiguration client_configuration = 8; int32 ping_timeout = 10; int32 ping_interval = 11; }
+message ServerInfo { string version = 2; int32 protocol = 3; string region = 4; }
+message Codec { string mime = 1; string fmtp_line = 2; }
+message JoinResponse { Room room = 1; ParticipantInfo participant = 2; repeated ParticipantInfo other_participants = 3; string server_version = 4; repeated ICEServer ice_servers = 5; bool subscriber_primary = 6; string alternative_url = 7; ClientConfiguration client_configuration = 8; int32 ping_timeout = 10; int32 ping_interval = 11; ServerInfo server_info = 12; repeated Codec enabled_publish_codecs = 14; }
 message SessionDescription { string type = 1; string sdp = 2; uint32 id = 3; }
 message TrickleRequest { string candidateInit = 1; SignalTarget target = 2; bool final = 3; }
 message VideoLayer { int32 quality = 1; uint32 width = 2; uint32 height = 3; uint32 bitrate = 4; }
@@ -22,6 +24,9 @@ message TrackUnpublishedResponse { string track_sid = 1; }
 message ParticipantUpdate { repeated ParticipantInfo participants = 1; }
 message ParticipantTracks { string participant_sid = 1; repeated string track_sids = 2; }
 message UpdateSubscription { repeated string track_sids = 1; bool subscribe = 2; repeated ParticipantTracks participant_tracks = 3; }
+message TrackPermission { string participant_sid = 1; bool all_tracks = 2; repeated string track_sids = 3; string participant_identity = 4; }
+message SubscriptionPermission { bool all_participants = 1; repeated TrackPermission track_permissions = 2; }
+message SubscriptionPermissionUpdate { string participant_sid = 1; string track_sid = 2; bool allowed = 3; }
 message LeaveRequest { bool can_reconnect = 1; int32 reason = 2; int32 action = 3; RegionSettings regions = 4; }
 message RegionSettings { repeated RegionInfo regions = 1; }
 message RegionInfo { string region = 1; string url = 2; int64 distance = 3; }
@@ -38,13 +43,20 @@ message RequestResponse {
   oneof request { TrickleRequest trickle = 4; AddTrackRequest add_track = 5; MuteTrackRequest mute = 6; UpdateParticipantMetadata update_metadata = 7; }
 }
 message SignalRequest {
-  oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; SyncState sync_state = 12; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; }
+  oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; SubscriptionPermission subscription_permission = 11; SyncState sync_state = 12; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; }
 }
 message SignalResponse {
-  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; ReconnectResponse reconnect = 19; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; RequestResponse request_response = 22; RoomMovedResponse room_moved = 24; }
+  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; SubscriptionPermissionUpdate subscription_permission_update = 15; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; ReconnectResponse reconnect = 19; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; RequestResponse request_response = 22; RoomMovedResponse room_moved = 24; }
 }
 message UserPacket { string participant_sid = 1; bytes payload = 2; optional string topic = 4; string participant_identity = 5; repeated string destination_identities = 6; bytes nonce = 11; }
-message DataPacket { int32 kind = 1; oneof value { UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; } string participant_identity = 4; repeated string destination_identities = 5; }
+message DataPacket { int32 kind = 1; oneof value { UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; SipDTMF sip_dtmf = 6; Transcription transcription = 7; RpcRequest rpc_request = 10; RpcAck rpc_ack = 11; RpcResponse rpc_response = 12; } string participant_identity = 4; repeated string destination_identities = 5; }
+message RpcRequest { string id = 1; string method = 2; string payload = 3; uint32 response_timeout_ms = 4; uint32 version = 5; bytes compressed_payload = 6; }
+message RpcAck { string request_id = 1; }
+message RpcResponse { string request_id = 1; oneof value { string payload = 2; RpcError error = 3; bytes compressed_payload = 4; } }
+message RpcError { uint32 code = 1; string message = 2; string data = 3; }
+message SipDTMF { uint32 code = 3; string digit = 4; }
+message Transcription { string transcribed_participant_identity = 2; string track_id = 3; repeated TranscriptionSegment segments = 4; }
+message TranscriptionSegment { string id = 1; string text = 2; uint64 start_time = 3; uint64 end_time = 4; bool final = 5; string language = 6; }
 
 message UpdateTrackSettings { repeated string track_sids = 1; bool disabled = 3; int32 quality = 4; uint32 width = 5; uint32 height = 6; uint32 fps = 7; uint32 priority = 8; }
 message UpdateParticipantMetadata { string metadata = 1; string name = 2; map<string,string> attributes = 3; uint32 request_id = 4; }
@@ -56,7 +68,7 @@ message ConnectionQualityUpdate { repeated ConnectionQualityInfo updates = 1; }
 
 message ActiveSpeakerUpdate { repeated SpeakerInfo speakers = 1; }
 
-message ReconnectResponse { repeated ICEServer ice_servers = 1; ClientConfiguration client_configuration = 2; }
+message ReconnectResponse { repeated ICEServer ice_servers = 1; ClientConfiguration client_configuration = 2; ServerInfo server_info = 3; }
 message DataChannelInfo { string label = 1; uint32 id = 2; SignalTarget target = 3; }
 message SyncState {
   SessionDescription answer = 1;

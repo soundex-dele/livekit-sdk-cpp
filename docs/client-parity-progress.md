@@ -4,20 +4,20 @@
 
 ## 当前交付与后续待办（2026-10-27）
 
-本次提交固化已完成的连接恢复、操作取消/确认、逐轨 PCM 与 I420 输入输出及其文档、示例和自动化测试。按用户安排，剩余功能后续继续实现。下文各增量的限制描述保留当时状态；当前剩余范围以本节及最后一节为准。
+已交付连接恢复、操作取消/确认、逐轨 PCM/I420 输入输出，后续增量加入 RGBA/旋转/采集时间、订阅权限/接收质量、DTMF/转写和首次信令 failover。C++↔Go 单声道 PCM/官方数据消息互通已验证；RPC 实现和验证见最后一节。下文历史增量的限制描述保留当时状态；当前剩余范围以本节及最后一节为准。
 
 | 阶段 | 后续实现 |
 |---|---|
-| P0 | 公共能力查询、可选控制回调执行器、统一请求处理和内部模块拆分收尾、完整可观测性接口 |
-| P1 | 首次连接 Cloud failover、剩余 ClientConfiguration 编码及硬件策略 |
-| P2 | 编码帧输入输出、RTP/RTCP 观察与注入、视频外部采集时间及 RGBA/旋转/动态尺寸、任意 PCM 块和设备时钟漂移补偿 |
-| P3 | VP8 Simulcast、分层启停和质量控制、订阅权限及事件、实际音频播放时钟驱动的同步、准确解码和呈现统计 |
-| P4 | 官方 RPC、文本/字节流、文件传输、结构化转写、DTMF、有界公平数据调度 |
+| P0 | 可选控制回调执行器、统一请求处理和内部模块拆分收尾、完整可观测性接口；初版能力查询已加入，实际逐轨 codec 与硬件能力仍待扩展 |
+| P1 | 首次 JoinResponse 后的 ICE/媒体失败切换、剩余 ClientConfiguration 编码及硬件策略、真实 Cloud 验收 |
+| P2 | 编码帧输入输出、RTP/RTCP 观察与注入、视频动态尺寸、任意 PCM 块和设备时钟漂移补偿 |
+| P3 | VP8 Simulcast、分层启停、实际音频播放时钟驱动的同步、准确解码和呈现统计 |
+| P4 | 文本/字节流、文件传输、有界公平数据调度；RPC 本轮验证记录见文末 |
 | P5 | DataTrack 发布订阅、分片重组、过期处理、背压及恢复 |
 | P6 | 媒体/数据 E2EE、密钥提供器和轮换、跨 SDK 格式兼容；DataTrack 加密依赖 P5 |
 | P7 | 单 PeerConnection 模式、剩余传输/编码/日志/统计接口、跨平台发布收尾 |
 
-建议续做入口：先编写并运行 C++ ↔ Go 双向媒体互通夹具；独立 Go 工具链已准备，测试尚未执行。既有可靠/非可靠/定向普通数据已支持，不因 P4/P5 待实现而视为缺失。SVC、GPU 零拷贝及硬件编码器全覆盖属于额外增强，不作为 Go 基线对齐的推定要求。
+C++ ↔ Go 双向单声道 PCM、DTMF、转写夹具已经运行通过，编码帧/视频互通仍需补齐。既有可靠/非可靠/定向普通数据已支持，不因 P4/P5 待实现而视为缺失。SVC、GPU 零拷贝及硬件编码器全覆盖属于额外增强，不作为 Go 基线对齐的推定要求。
 
 验收仍缺真实 Cloud 跨区、真实服务端无缝 RoomMoved、新增能力的 Linux/macOS 验证、长期资源稳定性、完整弱网矩阵和实际设备人工验收。RoomMoved 当前证据包含协议注入及真实目的房间重连/媒体；本地官方服务端 MoveParticipant 返回 HTTP 500 `not implemented`。最终独立 CTest 10/10 及 Windows 合成媒体集成通过，不能替代上述验收；并发负载下曾出现的等待契约失败及未确认根因保留在最后一节。
 
@@ -189,3 +189,41 @@ python tests/reconnect_integration.py --client out/windows-x64/Release/livekit_r
 - 并行运行 CTest 与两个媒体集成时，一次 sdk 测试报 `Native wait contract failed`；原日志没有具体断言信息，尚未证明根因。未改生产等待逻辑或放宽 500 ms 阈值，独立复验通过；增加断言行号及超时/取消实际耗时诊断，构建记录 `out/client-audio-source-wait-diagnostics-build.log`。最终独立 CTest 10/10 通过。并发高负载时延与长期资源稳定性仍保留待验收，不能用最终通过抹去该次失败。
 - Go 互操作准备：已在 `out/toolchains/go1.26.10/` 安装独立 Go 1.26.10，官方 archive.json SHA-256 为 `7ecd2d7260e82c59bcbd7f1077a07cee2dea607295b858df67195a1e4e09629b`，未修改全局 PATH。当前 Go SDK go.mod 要求 Go 1.26.8。默认 proxy.golang.org 访问超时，命令局部使用 https://goproxy.cn 成功获取 media-sdk v0.1.1，模块及 go.mod 校验值均与本地 Go SDK go.sum 一致，未关闭校验。已确认 `D:/msys64/mingw64/bin/gcc.exe` 15.2.0、pkg-config 及 Opus 1.5.2 可用；Go PCM 依赖 CGO，互操作程序仍待编写/构建/运行。Go PCMRemoteTrack 源码明确标注立体声不支持，不能将本次 C++ 立体声结果推定为 Go 互通。
 - 使用说明：[应用 PCM 输入](audio-source.md)；可编译示例 `examples/audio_source/main.cpp`。上述为 Windows 本机合成媒体自动化，未执行物理设备、跨平台或 Go 实际互通。整个方案仍在实施：P2 编码帧/RTP/原始视频扩展、P0/P1 余项和 P3—P7 均继续有效。
+
+## 2026-10-27 后续：Go 互通、官方数据消息及权限/视频扩展
+
+- 新增可重复构建的 Go 互通夹具，单独在 out/ 构建，不修改对照 Go SDK，不作为 C++ SDK 运行时依赖。增加 `disable_red` 发布选项，并在完整 rejoin 中保留；Go PCMRemoteTrack 仅支持 Opus，测试关闭 RED。Go 尚不支持立体声 PCM reader，因此只声明本轮单声道互通。
+- 官方 DTMF/转写：公开 typed API 和回调，真实 DataPacket oneof，UTF-8/段数/文本及包大小限制，区分发送者与被转写参与者。future 是本地提交完成，不保证服务器转发；不在重连时重放。
+- 初次转写互通失败确认是官方服务端仅转发 Agent 发出的转写；测试改用既有 Token kind API 设置 Agent，未增加管理 API。最终通过：`out/go-interop-integration/20261027-164619/result.json`，C++→Go 437.5 Hz（目标 440）、Go→C++ 880 Hz，双向 DTMF 及多语言 partial/final 转写通过。
+- `I420VideoSource` 增加显式 steady_clock 采集时间、RGBA CPU 输入、0/90/180/270 度旋转和竖屏输入转横屏输出。输出尺寸固定，BT.601 limited range，忽略 alpha；严格单调时间与实时窗口校验，重绑定清空时间线。没有动态尺寸、GPU 零拷贝或设备时钟漂移补偿声明。
+- RGBA 红色测试曾错误期待 V=240；固定 libyuv 的实际值为 YUV 82/90/239。保留 `out/video-source-integration/20261027-164954/` 失败记录，修正精确期望，没有放宽编码前精确像素校验或远端 VP8 容差。
+- 增加订阅权限和权限变更事件，逐轨授权使用稳定 client_id；发布前及 rejoin 期间先拒绝缺失映射，收到 TrackPublished 的新 SID 后再授权。支持运行时撤销/恢复；接收端增加 quality，和 dimensions 按最后一次设置覆盖。没有声明 Simulcast 发送。
+- 官方服务端 RGBA/权限集成通过：`out/video-source-integration/20261027-165647/result.json`，50 个远端帧、87 次接受及 404 次背压；验证像素、旋转、拒绝第三参与者、rejoin 权限映射、撤销/恢复、稳定源 ID、再发布/EOS。
+- 使用说明：[官方数据消息](data-messages.md)、[订阅权限](subscription-permissions.md)、[视频输入](video-source.md)。以上均为 Windows 本机无窗口合成媒体自动化，未做物理设备验收。
+
+## 2026-10-27 后续：首次信令连接切换
+
+- `RegionOptions.initial_failover/endpoint_timeout/fallback_endpoints` 支持首次 Cloud 发现及显式备用端点，信任列表与候选列表分开。只在接受 JoinResponse 前重试；总 connect_timeout 共享，有其它候选时使用单端点预算，最后一个候选使用剩余总预算。
+- 不重试 401/403、取消、协议畸形及其它不可重试错误；provider 授权失败不会被发现阶段吞掉。原地址优先、禁止重复候选、切换前关闭旧连接，不发送 on_reconnecting。
+- 测试最初假定 join 返回前 on_connected 一定已执行；该假定不成立，现等待异步回调，不修改生产时序。官方服务端及故障代理通过：`out/region-integration/20261027-171149/result.json`，503/静默超时切换、授权/畸形终止、禁用策略、共享截止时间、取消及可信目的检查通过，forbiddenRequests=0。
+- 首次 JoinResponse 后 ICE/媒体失败切换、真实 Cloud 跨区、剩余 codec/hardware ClientConfiguration 仍待实现/验收。
+
+## 2026-10-27 后续：官方 RPC
+
+- 新增 `Room::register_rpc_method/unregister_rpc_method`、`LocalParticipant::perform_rpc`、RpcError/Invocation/Result/Completion，采用官方 request/ack/response v1。处理器由独立有界线程启动，完成函数可跨线程调用；ACK、响应截止时间及取消独立于信令线程。
+- 对方身份校验、响应早于 ACK、重复请求/完成抑制、UTF-8/大小限制、容量限制、错误脱敏、发送失败及未发送/已发送取消语义已实现。缓存 incarnation 隔离旧完成函数，即便同一个 key 在相同传输代次被移除后重用也不会误完成。
+- reconnect/rejoin、RoomMoved、对方退出和会话结束清理待处理 RPC；接收侧 stop 回调在内部锁外执行。不重放；取消后远端可能已经执行。完整语义及上限见 [RPC](rpc.md)。尚不支持压缩 RPC，也未实现跨数据类型公平调度。
+- 首次完整构建的编译阶段通过，但后处理依赖复制进程异常退出，保留 `out/client-rpc-build.log`；受影响消费者重试成功：`out/client-rpc-consumers-retry.log`。不将首次构建记录表述为完整成功。
+- CTest 10/10 通过：`out/client-rpc-ctest.log`，含新增 RPC 生命周期、伪造身份、容量、重复、取消和七秒 ACK 超时测试。
+- 官方 LiveKit Server 1.13.10 与固定 Go 2.19.0 双向互通通过：`out/go-interop-integration/20261027-174515/result.json`。双向 UTF-8 echo、自定义错误码/数据、未知方法 1400，并回归 PCM、DTMF、partial/final 转写；C++→Go 438.5 Hz、Go→C++ 879.5 Hz。C++ SHA-256 `832733e835d48551869759cbba4f475261deacbfa82929587c7ffb1b94dfe192`，Go `704669a32f839dfa2f1265381153bd4739967b25f9805296f7c032ede7fedebd`。后续能力查询及额外边界修正需使用重建后的二进制再次验证。
+
+## 2026-10-27 后续：公共能力查询与 RPC 收尾验证
+
+- 新增 `sdk_capabilities()` / `Room::capabilities()`，区分公开 API 实现、本次入会信令版本/双 PC/primary/relay 配置、服务端 ServerInfo 与发布 codec 策略。未知保留 unknown/nullopt，不根据服务端协议号升级本地声明，不将服务端 codec 列表当成实际编码/协商结果；不初始化设备、不输出凭据。新增 schema 字段仍受固定上游 descriptor 合约检查。
+- 当前查询未提供每轨实际 codec、硬件设备能力或服务端通用功能探测；这些能力不能从 supported 本地实现标记推定。rejoin 清空旧代信息，resume 替换新 ServerInfo，RoomMoved 清除旧节点声明，断开查询不返回旧会话有效配置。说明见 [能力查询](capabilities.md)。
+- RPC 增加压缩响应明确拒绝、入站容量耗尽后的错误回复、缓存淘汰后同 key 的迟到完成隔离、停止回调重入以及房间迁移清理回归。独立 CTest 10/10 通过，13.73 秒：`out/client-capabilities-ctest.log`。
+- Windows Release 协议/SDK 及完整消费者构建成功：`out/client-capabilities-protocol-build.log`、`out/client-capabilities-sdk-build.log`、`out/client-capabilities-full-build.log`。新纯数据夹具初次执行 `out/go-rpc-interop/20261027-175437/` 仍使用不含新模式的旧对象，报 `invalid stoi argument`；重编译夹具成功：`out/client-rpc-only-fixture-build.log`。后续证据均记录新二进制 SHA，未把该次失败当成网络错误或修改生产协议来绕过。
+- 双方无音视频发布的 C++↔Go RPC 通过：`out/go-rpc-interop/20261027-175636/result.json`，确认 RPC 可主动建立发布端数据通道，双向 echo/自定义错误/未知方法通过。
+- 新二进制完整 Go 互通通过：`out/go-interop-integration/20261027-175641/result.json`，C++→Go 438.5 Hz、Go→C++ 880 Hz；RPC、DTMF、partial/final 转写及 ServerInfo/入会/断开能力快照检查通过。C++ SHA-256 `2a627ca2466a9c41d56e21956eaebb7e4df9936b8a13c5b0b5835b9e39d953d0`，Go `ea17a74e331fec661ac9e92e2f135860eca285b96a6439e3f5ccebde61deaf74`；Go 对照 checkout 仍干净、revision 不变。
+- 原有 SDK 集成回归通过：`out/sdk-integration/20261027-175713/result.json`，动态发布/订阅/取消、定向数据、会话重用及 WAV/Y4M 内容校验通过。`git diff --check` 无空白错误。
+- 服务端管理 API 未扩展。剩余重点仍为文本/字节流/文件及公平调度、DataTrack、E2EE、Simulcast、编码帧/RTP、音频播放时钟同步和初始媒体失败切换；其它 P0/P1/P7 收尾见顶部表格。以上验证限 Windows 本机无窗口自动化，跨平台、物理设备和真实 Cloud/迁移验收尚未完成，整个方案仍在实施。

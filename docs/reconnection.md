@@ -1,6 +1,6 @@
 # 连接恢复
 
-当前实现使用同一 `ReconnectOptions` 预算管理信令恢复和完整重新入会，默认启用。已经建立过连接的会话才自动恢复；首次入会失败仍向调用方报告原始错误。
+当前实现使用同一 `ReconnectOptions` 预算管理信令恢复和完整重新入会，默认启用。首次信令连接另支持可信候选端点切换，使用 `connect_timeout` 总期限；不将首次切换报告为已建立会话的重连。
 
 ```cpp
 livekit::sdk::RoomOptions options;
@@ -83,7 +83,9 @@ provider 启动函数运行在会话线程，必须及时返回，不能在其�
 
 ## 区域发现和重定向
 
-`RoomOptions.regions` 控制候选端点选择。Cloud 的 HTTPS 区域发现用于完整 rejoin，默认开启；`discovery = false` 可关闭主动发现，自建部署不会请求 Cloud。发现失败保留已有可信候选或当前端点。初次连接失败仍返回错误，不隐式创建多次初始会话。
+`RoomOptions.regions` 控制候选端点选择。Cloud 的 HTTPS 区域发现用于首次连接及完整 rejoin，默认开启；`discovery = false` 可关闭主动发现，自建部署不会请求 Cloud。发现失败保留已有可信候选或当前端点。首次连接在接收有效 JoinResponse 前，允许对可重试的信令失败依次切换到可信候选。原端点先尝试，每个候选最多一次；切换时先关闭旧 WebSocket。收到并接受 JoinResponse 后即停止此路径，后续首次 ICE 建连失败仍向调用方报告错误。
+
+`initial_failover=false` 禁用首次切换。`fallback_endpoints` 是应用提供的有序备用列表，最多 32 项，须同时通过信任策略；`trusted_endpoints` 仅表示允许，不会单独触发访问。有剩余候选时，每个端点的 WebSocket+JoinResponse 阶段受 `endpoint_timeout`（默认 5 秒）限制；最后一个端点可使用剩余总期限。所有候选、发现和 Token 获取共享 `connect_timeout`。401/403、取消、畸形协议及不可重试错误不切换。可通过底层事件 `initial-region-failover` 观察尝试，Room 保持 connecting，只在最终连接成功后触发一次 on_connected。
 
 默认允许原始端点和从 Cloud 原始端点指向 `*.livekit.cloud` 的 TLS 根端点；可用 `allow_cloud_regions = false` 禁用后者。自建多区域需要在 `trusted_endpoints` 中列出精确 URL，含路径和端口；http/ws、https/wss 等价。TLS 降级始终拒绝。服务端下发的候选列表不能扩展应用信任策略。
 

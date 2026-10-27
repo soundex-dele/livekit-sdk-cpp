@@ -6,6 +6,7 @@
 #include "livekit/token_provider.hpp"
 #include "livekit/video_stream.hpp"
 #include "livekit/audio_stream.hpp"
+#include "livekit/capabilities.hpp"
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -42,6 +43,11 @@ struct RoomCallback {
   // handles; a room boundary invalidates old handles even if media continues.
   // The new server token is retained internally, never included in events.
   std::function<void(const RoomMovedInfo&)> on_room_moved;
+  std::function<void(const DtmfDigit&, const DataReceiveParams&)> on_dtmf_received;
+  // Each event is an update, not accumulated text. Merge by sender/track/segment
+  // ID in the application. params.sender_identity is distinct from the subject.
+  std::function<void(const Transcription&, const DataReceiveParams&)> on_transcription_received;
+  std::function<void(const std::string& participant_sid, const std::string& track_sid, bool allowed)> on_subscription_permission_changed;
 };
 struct RoomOptions {
   std::string url, token, room, identity;
@@ -76,6 +82,8 @@ struct RoomOptions {
   // Decoded per-track PCM before device mixing/playout. Audio/video streams
   // may be used together; each is bound to this logical session once.
   std::shared_ptr<AudioFrameStream> audio_frame_stream;
+  // Applied before publishing any initial/recovered track. Empty uses server default.
+  std::optional<SubscriptionPermissions> subscription_permissions;
 };
 
 class Room {
@@ -97,7 +105,14 @@ class Room {
   void join(const std::string& url, const ConnectInfo& info, RoomOptions options = {});
   void disconnect();
   void wait(); // joins owned worker and rethrows asynchronous failures
+  // Registrations survive reconnect and explicit Room reuse. Duplicate methods
+  // are rejected; unregister affects new calls, not already dispatched work.
+  void register_rpc_method(const std::string& method, RpcHandler handler);
+  void unregister_rpc_method(const std::string& method);
   ConnectionState connection_state() const;
+  // Current-generation snapshot. Server codec lists are advertised policy,
+  // not proof that a track negotiated or decoded a codec.
+  SessionCapabilities capabilities() const;
   RoomInfo info() const;
   int disconnect_reason() const;
   std::string last_error() const;

@@ -14,6 +14,9 @@
 | `LocalParticipant.PublishTrack` | `local_participant().publish_track` | 动态增加原生 transceiver，等待 TrackPublished 确认后返回 publication |
 | `UnpublishTrack` | `unpublish_track` | 移除 sender、停止对应源、重新协商；可继续发布新轨道 |
 | `PublishData` / `WithDataPublishReliable` / `WithDataPublishDestination` | `publish_data` + `DataPublishOptions` | 默认 lossy；可靠通道、topic、定向 identity、二进制 payload |
+| `PublishDTMF` / `OnTranscriptionReceived` | `publish_dtmf` / `publish_transcription` 及对应回调 | 官方 protobuf 消息；转写发布受服务端 Agent 身份策略限制 |
+| `RegisterRpcMethod` / `PerformRpc` | `register_rpc_method` / `perform_rpc` | 官方 v1 RPC；双向 UTF-8、业务错误及未知方法互通，异步处理器、有界等待和取消 |
+| `SetSubscriptionPermission` / `SetVideoQuality` | `set_subscription_permissions` / `set_video_quality` | 订阅授权及质量请求；权限使用稳定本地 client_id 恢复，不代表多层发布已实现 |
 | `SetName` / `SetMetadata` / `SetAttributes` | `set_name` / `set_metadata` / `set_attributes` | 需 Token `canUpdateOwnMetadata`；属性空值表示删除 |
 | `RemoteTrackPublication.SetSubscribed` | `set_subscribed` | 发送订阅变更，异步订阅状态由服务器协商确定 |
 | `SetEnabled` / `SetVideoDimensions` | `set_enabled` / `set_video_dimensions` | 修改远端流设置并保留已有设置 |
@@ -27,9 +30,9 @@ C++ 不暴露 Pion 或 libwebrtc 类型。`ParticipantInfo` 和 `TrackInfo` 是�
 
 客户端补齐增量已增加 `RoomOptions.video_frame_stream` 和 `audio_frame_stream`：应用从有界队列读取不可变 I420 帧或逐轨 PCM16/float32 块，慢消费者不阻塞信令；支持关闭、取消、容量统计及重连代次。具体接口与边界见 [有界视频帧读取](video-stream.md)、[逐轨 PCM 读取](audio-stream.md)。这些不等价于 RTP 读取。
 
-`MediaSpec.video_source` 可绑定 `I420VideoSource`，提交具有独立像素所有权的 CPU I420 视频，支持有界背压、过期帧清理和已确认源的完整 rejoin。首版使用提交时的本地单调时钟，固定尺寸且要求已转正；视频外部采集时钟、RGBA 转换、编码帧和 RTP 接入仍待提供。具体边界见 [应用 I420 输入](video-source.md)，验证结果见 [实施记录](client-parity-progress.md)。
+`MediaSpec.video_source` 可绑定 `I420VideoSource`，提交 CPU I420 或 RGBA 视频，支持有界背压、过期帧清理和已确认源的完整 rejoin。支持外部 steady_clock 采集时间、RGBA 转 I420 和 0/90/180/270 度旋转；固定输出尺寸，动态尺寸、编码帧和 RTP 接入仍待提供。具体边界见 [应用视频输入](video-source.md)，验证结果见 [实施记录](client-parity-progress.md)。
 
-`MediaSpec.audio_source` 可绑定独立 `PcmAudioSource`，支持 PCM16/float32、8/16/24/32/44.1/48/96 kHz、单/双声道，以 10 ms 整数倍输入并逐轨重采样至 48 kHz/Opus。可提供 steady_clock 采集时间，缺口/欠载补静音、过载返回背压，完整 rejoin 清空旧时间线；详见 [应用 PCM 输入](audio-source.md)。Go PCM 接收工具在其源码中仍声明不支持立体声，不能将 C++ 立体声测试当作 Go 立体声互通结果。原始 PCM/编码样本互操作验收继续待完成。
+`MediaSpec.audio_source` 可绑定独立 `PcmAudioSource`，支持 PCM16/float32、8/16/24/32/44.1/48/96 kHz、单/双声道，以 10 ms 整数倍输入并逐轨重采样至 48 kHz/Opus。可提供 steady_clock 采集时间，缺口/欠载补静音、过载返回背压，完整 rejoin 清空旧时间线；详见 [应用 PCM 输入](audio-source.md)。Go PCM 接收工具在其源码中仍声明不支持立体声，不能将 C++ 立体声测试当作 Go 立体声互通结果。C++ ↔ Go 单声道 PCM、DTMF 和转写双向互通已通过；编码样本互操作仍待完成。测试方法见 [数据消息与互通夹具](data-messages.md)。
 
 `set_name` / `set_metadata` 遵守 Go 的 proto3 字符串字段语义，空字符串表示不变，不能用来清空对应字段；`set_attributes` 可以通过空值删除键。默认 future 完成表示更新信令已经发送；显式选择 `RoomOptions.signal_protocol = 15` 和 `OperationOptions.wait_for_ack = true` 后可等待服务器 RequestResponse，权限拒绝返回类型化错误。默认 protocol 12 不支持成功确认，该选项会在发送前被拒绝。操作级取消/超时及结果未知的处理见 [操作契约](reconnection.md#操作取消超时与确认)。
 
@@ -65,7 +68,7 @@ C++ 不暴露 Pion 或 libwebrtc 类型。`ParticipantInfo` 和 `TrackInfo` 是�
 
 保留原有 CLI 和阻塞 run 入口；CLI 自己处理 SIGINT/JSON 输出，业务仅调用公开 SDK。SDK 中服务器 Leave 结束会话并保存原因；CLI 对非用户请求的服务器断开返回错误状态，以保持迁移前的命令行行为。
 
-2026-10-27 增量已支持信令 resume、publisher ICE restart，以及无法恢复时的完整 rejoin。`RoomOptions.reconnect` 控制共用的退避、重试次数和时间预算；`on_reconnecting/on_reconnected` 报告恢复模式。resume 保留原 PeerConnection 和句柄；完整 rejoin 重新发布已确认的源，旧句柄失效，通过稳定 `TrackInfo.client_id` 关联新 publication。未确认命令不盲目重放；有限文件源需显式允许重启。已接入异步 TokenProvider、可信区域重定向、RoomMoved 和部分 ClientConfiguration；真实 Cloud 跨区与服务端无缝迁移仍未验收。RPC、文本/字节流、转写、DataTrack、simulcast/SVC、E2EE 仍待实现。具体语义见 [连接恢复](reconnection.md)，证据见 [客户端补齐进度](client-parity-progress.md)。无窗口多 Room 可并发；SDL 窗口仍要求主线程。
+2026-10-27 增量已支持信令 resume、publisher ICE restart，以及无法恢复时的完整 rejoin。`RoomOptions.reconnect` 控制共用的退避、重试次数和时间预算；`on_reconnecting/on_reconnected` 报告恢复模式。resume 保留原 PeerConnection 和句柄；完整 rejoin 重新发布已确认的源，旧句柄失效，通过稳定 `TrackInfo.client_id` 关联新 publication。未确认命令不盲目重放；有限文件源需显式允许重启。已接入 TokenProvider、可信区域重定向、首次信令 failover、RoomMoved 和部分 ClientConfiguration；真实 Cloud 跨区与服务端无缝迁移仍未验收。RPC、转写和 DTMF 已增加，详见 [RPC](rpc.md) 与 [数据消息](data-messages.md)；文本/字节流、DataTrack、simulcast/SVC、E2EE 仍待实现。`sdk_capabilities()` 与 `Room::capabilities()` 区分本地实现、当前连接配置和未知服务端能力，见 [能力查询](capabilities.md)。具体恢复语义见 [连接恢复](reconnection.md)，证据见 [客户端补齐进度](client-parity-progress.md)。无窗口多 Room 可并发；SDL 窗口仍要求主线程。
 
 ## 验证层次
 

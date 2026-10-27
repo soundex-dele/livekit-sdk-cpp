@@ -22,6 +22,50 @@ int main(int argc, char** argv) {
     auto publication = redirected.local_participant().publish_track(video).get();
     check(!publication.sid().empty(), "Publication after redirect failed");
     redirected.disconnect(); redirected.wait();
+    // First-connect failures must not emit reconnect callbacks or retry the
+    // same endpoint. Trust is separate from the ordered candidate list.
+    for(const auto& path:{"/unavailable","/silent"}) {
+      std::atomic<int> connected{0},reconnecting{0};sdk::RoomCallback callbacks;
+      callbacks.on_connected=[&]{++connected;};callbacks.on_reconnecting=[&](const auto&){++reconnecting;};
+      sdk::Room first(callbacks);sdk::RoomOptions initial=options;
+      initial.connect_timeout=10;initial.regions.endpoint_timeout=250ms;initial.regions.fallback_endpoints={server,server};
+      first.join_with_token(fixture+path,token,initial);
+      const auto callback_deadline=Clock::now()+2s;
+      while(connected==0 && Clock::now()<callback_deadline)std::this_thread::sleep_for(10ms);
+      std::cerr<<"Initial endpoint "<<path<<" connected="<<connected.load()<<" reconnecting="<<reconnecting.load()<<" room="<<first.info().name<<'\n';
+      check(connected==1 && reconnecting==0 && first.info().name=="regions","Initial endpoint failover failed");
+      first.local_participant().publish_track(video).get();first.disconnect();first.wait();
+    }
+    for(const auto& path:{"/denied","/unauthorized","/malformed"}) {
+      sdk::Room first;sdk::RoomOptions initial=options;initial.regions.fallback_endpoints={server};
+      bool rejected=false;
+      try{first.join_with_token(fixture+path,token,initial);}catch(const std::exception&){rejected=true;}
+      check(rejected,"Initial failover bypassed a terminal error");
+    }
+    {
+      sdk::Room first;sdk::RoomOptions initial=options;
+      initial.regions.fallback_endpoints={server};initial.regions.initial_failover=false;
+      bool rejected=false;try{first.join_with_token(fixture+"/unavailable",token,initial);}catch(const sdk::SDKError&){rejected=true;}
+      check(rejected,"Disabled initial failover still switched endpoints");
+      initial.regions.initial_failover=true;initial.regions.fallback_endpoints={fixture+"/forbidden"};
+      rejected=false;try{first.join_with_token(fixture+"/unavailable",token,initial);}catch(const sdk::SDKError&){rejected=true;}
+      check(rejected,"Untrusted fallback was accepted");
+    }
+    {
+      sdk::Room first;sdk::RoomOptions initial=options;initial.connect_timeout=1;initial.regions.endpoint_timeout=300ms;
+      initial.regions.trusted_endpoints.push_back(fixture+"/silent-2");initial.regions.fallback_endpoints={fixture+"/silent-2"};
+      bool timed_out=false;const auto start=Clock::now();
+      try{first.join_with_token(fixture+"/silent",token,initial);}catch(const sdk::SDKError& e){timed_out=e.code()==sdk::ErrorCode::timeout;}
+      check(timed_out && Clock::now()-start<2500ms,"Initial failover total deadline exceeded");
+    }
+    {
+      sdk::Room first;sdk::RoomOptions initial=options;initial.regions.fallback_endpoints={server};
+      std::stop_source cancel;std::jthread stopper([&]{std::this_thread::sleep_for(100ms);cancel.request_stop();});
+      const auto start=Clock::now();
+      try{first.join_with_token(fixture+"/silent",token,initial,cancel.get_token());}catch(const std::exception&){}
+      first.disconnect();first.wait();
+      check(Clock::now()-start<2500ms && first.connection_state()==sdk::ConnectionState::disconnected,"Initial fallback cancellation failed");
+    }
     auto rejected = [&](const std::string& path, sdk::ErrorCode expected, int status = 0) {
       sdk::Room room;
       try { room.join_with_token(fixture + path, token); }
@@ -60,6 +104,7 @@ int main(int argc, char** argv) {
     catch (const sdk::SDKError& e) { cancelled = e.code() == sdk::ErrorCode::cancelled; }
     check(cancelled && Clock::now() - cancel_start < 1500ms, "Region discovery cancellation not bounded");
     std::cout << sdk::Json{{"ok", true}, {"trustedRedirect", true}, {"httpRedirectRejected", true},
-        {"discovery", true}, {"deadline", true}, {"cancelled", true}, {"relayConflictRejected", true}}.dump() << '\n';
+        {"discovery", true}, {"deadline", true}, {"cancelled", true}, {"relayConflictRejected", true},
+        {"initialFailover",true},{"initialFailoverTerminalErrors",true},{"initialFailoverDeadline",true},{"initialFailoverCancellation",true}}.dump() << '\n';
   } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

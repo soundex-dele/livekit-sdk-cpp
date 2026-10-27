@@ -2,11 +2,13 @@
 #include "media_nodes/capture/video_source.hpp"
 #include <future>
 #include <thread>
+#include <source_location>
+#include <iostream>
 
 inline void video_source_contract() {
   using namespace livekit::sdk;
   using namespace std::chrono_literals;
-  auto require = [](bool ok) { if (!ok) throw std::runtime_error("I420 source contract failed"); };
+  auto require = [](bool ok,const std::source_location location=std::source_location::current()) { if (!ok) throw std::runtime_error("I420 source contract failed at line "+std::to_string(location.line())); };
   auto source = std::make_shared<I420VideoSource>(I420SourceOptions{4, 4, 2, 48, 20ms});
   VideoFrame padded; padded.width = padded.height = 4;
   padded.stride_y = 6; padded.stride_u = padded.stride_v = 3;
@@ -57,4 +59,38 @@ inline void video_source_contract() {
   auto bytes = std::make_shared<I420VideoSource>(I420SourceOptions{4,4,100,24,1s});
   detail::I420SourceReader byte_reader(bytes); byte_reader.start();
   require(bytes->write(padded) == VideoWriteStatus::accepted && bytes->write(padded) == VideoWriteStatus::backpressure);
+  auto timed=std::make_shared<I420VideoSource>(I420SourceOptions{4,4,3,72,1s});
+  detail::I420SourceReader timed_reader(timed);timed_reader.start();
+  const auto captured=std::chrono::steady_clock::now()-100ms;
+  require(timed->write(padded,captured)==VideoWriteStatus::accepted);
+  require(timed_reader.read({})->captured==captured);
+  auto rejected=[&](auto fn){bool bad=false;try{fn();}catch(const std::invalid_argument&){bad=true;}require(bad);};
+  rejected([&]{timed->write(padded,captured);});
+  rejected([&]{timed->write(padded,std::chrono::steady_clock::now()+1s);});
+  timed_reader.stop();timed_reader.start();
+  require(timed->write(padded,std::chrono::steady_clock::now()-2s)==VideoWriteStatus::backpressure);
+  require(timed->write(padded,captured)==VideoWriteStatus::accepted);
+  timed_reader.read({});
+  RgbaInputFrame rgba;rgba.width=rgba.height=4;rgba.stride=20;rgba.pixels.resize(76,99);
+  for(int y=0;y<4;++y)for(int x=0;x<4;++x){const auto p=y*20+x*4;rgba.pixels[p]=255;rgba.pixels[p+1]=rgba.pixels[p+2]=0;rgba.pixels[p+3]=255;}
+  require(timed->write_rgba(rgba)==VideoWriteStatus::accepted);
+  auto red=timed_reader.read({});
+  std::cerr<<"RGBA red YUV="<<int(red->frame.y[0])<<'/'<<int(red->frame.u[0])<<'/'<<int(red->frame.v[0])<<'\n';
+  // Pinned libyuv's integer BT.601 conversion gives 82/90/239 for RGBA red.
+  require(red->frame.y[0]==82 && red->frame.u[0]==90 && red->frame.v[0]==239);
+  // Distinct 2x2 quadrants make rotation/chroma direction observable.
+  for(int y=0;y<4;++y)for(int x=0;x<4;++x){const auto p=y*20+x*4;const auto white=x<2 && y<2;rgba.pixels[p]=rgba.pixels[p+1]=rgba.pixels[p+2]=white?255:0;}
+  for(auto rotation:{VideoRotation::none,VideoRotation::clockwise90,VideoRotation::clockwise180,VideoRotation::clockwise270}) {
+    rgba.rotation=rotation;require(timed->write_rgba(rgba)==VideoWriteStatus::accepted);auto rotated=timed_reader.read({});
+    const auto corner=rotation==VideoRotation::none?0:rotation==VideoRotation::clockwise90?3:rotation==VideoRotation::clockwise180?15:12;
+    require(rotated->frame.y[corner]==235);
+    require(std::count(rotated->frame.y.begin(),rotated->frame.y.end(),235)==4);
+  }
+  rgba.rotation=static_cast<VideoRotation>(45);rejected([&]{timed->write_rgba(rgba);});
+  rgba.rotation=VideoRotation::none;rgba.pixels.pop_back();rejected([&]{timed->write_rgba(rgba);});
+  auto rectangular=std::make_shared<I420VideoSource>(I420SourceOptions{4,2,1,12,1s});
+  detail::I420SourceReader rectangular_reader(rectangular);rectangular_reader.start();
+  RgbaInputFrame portrait{2,4,8,std::vector<uint8_t>(32,255),VideoRotation::clockwise90};
+  require(rectangular->write_rgba(portrait)==VideoWriteStatus::accepted);
+  auto landscape=rectangular_reader.read({});require(landscape->frame.width==4 && landscape->frame.height==2);
 }

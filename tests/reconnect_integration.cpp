@@ -10,6 +10,7 @@
 #include "audio_stream_integration.hpp"
 #include "video_source_integration.hpp"
 #include "audio_source_integration.hpp"
+#include "go_interop_integration.hpp"
 
 namespace sdk = livekit::sdk;
 using namespace std::chrono_literals;
@@ -23,11 +24,14 @@ template<class Predicate> void until(Predicate predicate, const char* message) {
 }
 int main(int argc, char** argv) {
   try {
-    check(argc == 4 || argc == 5, "Usage: reconnect_integration server-url proxy-url marker-directory [rounds]");
+    check(argc == 4 || argc == 5, "Usage: reconnect_integration server-url proxy-url marker-directory [rounds|--go-interop|--go-rpc-only|--operations|media-mode]");
+    if (argc == 5 && std::string(argv[4]) == "--go-interop") return go_interop_test::run(argv[1], argv[3]);
+    if (argc == 5 && std::string(argv[4]) == "--go-rpc-only") return go_interop_test::run_rpc_only(argv[1], argv[3]);
     if (argc == 5 && std::string(argv[4]) == "--operations") return operations_test::run(argv[1], argv[2], argv[3]);
     if (argc == 5 && std::string(argv[4]) == "--video-stream") return video_stream_test::run(argv[1], argv[2], argv[3]);
     if (argc == 5 && std::string(argv[4]) == "--audio-stream") return audio_stream_test::run(argv[1], argv[2], argv[3]);
     if (argc == 5 && std::string(argv[4]) == "--video-source") return video_source_test::run(argv[1], argv[2], argv[3]);
+    if (argc == 5 && std::string(argv[4]) == "--video-source-rgba") return video_source_test::run(argv[1], argv[2], argv[3], true);
     if (argc == 5 && std::string(argv[4]) == "--audio-source") return audio_source_test::run(argv[1], argv[2], argv[3]);
     const int rounds = argc == 5 ? std::stoi(argv[4]) : 2;
     check(rounds >= 1 && rounds <= 1000, "Invalid recovery round count");

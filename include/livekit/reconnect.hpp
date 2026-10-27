@@ -13,6 +13,12 @@ struct RegionOptions {
   std::vector<std::string> trusted_endpoints;
   size_t max_redirects = 3;
   std::chrono::milliseconds discovery_timeout{2000};
+  bool initial_failover = true;
+  // Per-endpoint socket + JoinResponse budget, capped by connect_timeout.
+  std::chrono::milliseconds endpoint_timeout{5000};
+  // Optional ordered fallback candidates (also subject to trusted_endpoints /
+  // cloud policy). The trust list alone never causes connection attempts.
+  std::vector<std::string> fallback_endpoints;
 };
 struct ReconnectOptions {
   bool enabled = true;

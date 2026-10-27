@@ -16,8 +16,12 @@ void SignalSession::connect() {
   connect_deadline_ = std::min({recovery_.budget.deadline(), recovery_.session_deadline,
                               Clock::now() + std::chrono::seconds(options_.connect_timeout)});
   auto& regions = recovery_.regions;
-  if (recovery_.rejoining) {
+  initial_failover_=!recovery_.ever_connected && !recovery_.rejoining && options_.regions.initial_failover;
+  if (recovery_.rejoining || initial_failover_) {
     if (options_.regions.discovery && detail::signal_endpoint(options_.url).cloud && Clock::now() >= regions.expires) {
+      if(recovery_.token.empty() && options_.token_provider)
+        recovery_.token=detail::request_token(options_.token_provider,regions.active_url,TokenRequestReason::initial,
+            std::min(connect_deadline_,Clock::now()+options_.token_timeout),stop_);
       try {
         auto urls = fetch_regions(options_.url, recovery_.token, stop_,
             std::min(connect_deadline_, Clock::now() + options_.regions.discovery_timeout));
@@ -27,10 +31,40 @@ void SignalSession::connect() {
         // Discovery is best effort; retain a previously trusted list on failure.
       }
     }
-    regions.select();
+    if(initial_failover_) {
+      auto candidates=regions.candidates;
+      candidates.insert(candidates.end(),options_.regions.fallback_endpoints.begin(),options_.regions.fallback_endpoints.end());
+      regions.replace(options_.url,options_.regions,candidates);
+      regions.attempted.insert(regions.active_url);
+    } else regions.select();
   }
   redirects_ = 0; redirect_history_.clear(); redirect_history_.insert(regions.active_url);
-  connect_socket({}, connect_deadline_);
+  open_initial_socket();
+}
+bool SignalSession::select_initial_fallback(const SDKError& error) {
+  if(!initial_failover_ || stop_.stop_requested() || Clock::now()>=connect_deadline_ ||
+      error.domain()!=ErrorDomain::signaling || !error.retryable())return false;
+  auto& regions=recovery_.regions;
+  regions.attempted.insert(regions.active_url);
+  const auto previous=regions.active_url;
+  regions.select();
+  if(regions.active_url==previous)return false;
+  socket_.close();
+  events_("initial-region-failover",{{"endpoint",regions.active_url},{"attempt",regions.attempted.size()}});
+  return true;
+}
+void SignalSession::open_initial_socket() {
+  for(;;) {
+    const bool has_alternative=initial_failover_ && std::any_of(recovery_.regions.candidates.begin(),recovery_.regions.candidates.end(),
+        [&](const auto& candidate){return !recovery_.regions.attempted.contains(candidate);});
+    attempt_deadline_=has_alternative?std::min(connect_deadline_,Clock::now()+options_.regions.endpoint_timeout):connect_deadline_;
+    try {connect_socket({},attempt_deadline_);return;}
+    catch(const SDKError& error){if(!select_initial_fallback(error))throw;}
+  }
+}
+bool SignalSession::failover(const SDKError& error) {
+  if(!select_initial_fallback(error))return false;
+  open_initial_socket();return true;
 }
 void SignalSession::redirect(const std::string& url) {
   auto trusted = detail::trusted_destination(options_.url, url, options_.regions);
@@ -39,7 +73,8 @@ void SignalSession::redirect(const std::string& url) {
   if (++redirects_ > options_.regions.max_redirects || !redirect_history_.insert(trusted).second)
     throw SDKError(ErrorDomain::signaling, ErrorCode::recovery_failed, "Signaling redirect limit or cycle");
   recovery_.regions.active_url = std::move(trusted);
-  connect_socket({}, connect_deadline_);
+  recovery_.regions.attempted.insert(recovery_.regions.active_url);
+  open_initial_socket();
 }
 void SignalSession::update_regions(const livekit::RegionSettings& settings) {
   if (settings.regions_size() > 32)
@@ -65,7 +100,7 @@ void SignalSession::connect_socket(const std::string& sid, Clock::time_point dea
     open(); // Exactly one authenticated retry, sharing the original deadline.
   }
 }
-void SignalSession::bind_participant(std::string sid) { sid_ = std::move(sid); }
+void SignalSession::bind_participant(std::string sid) { sid_ = std::move(sid); initial_failover_=false; }
 void SignalSession::update_token(std::string token) { if (!token.empty()) recovery_.token = std::move(token); }
 void SignalSession::send(const livekit::SignalRequest& request) { socket_.send(request.SerializeAsString()); }
 void SignalSession::enqueue_ice(const livekit::SignalRequest& request) noexcept {

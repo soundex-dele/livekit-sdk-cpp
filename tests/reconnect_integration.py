@@ -270,7 +270,7 @@ async def run(args):
                             *(['--operations'] if args.scenario == 'operations' else []),
                             *(['--video-stream'] if args.scenario == 'video-stream' else []),
                             *(['--audio-stream'] if args.scenario == 'audio-stream' else []),
-                            *(['--video-source'] if args.scenario == 'video-source' else []),
+                            *(['--video-source-rgba' if args.rgba else '--video-source'] if args.scenario == 'video-source' else []),
                             *(['--audio-source'] if args.scenario == 'audio-source' else []),
                             stdout=out, stderr=err, creationflags=flags,
                             env=dict(os.environ, LIVEKIT_TEST_PROTOCOL=str(args.protocol)))
@@ -337,8 +337,11 @@ if __name__ == '__main__':
     parser.add_argument('--server', required=True)
     parser.add_argument('--scenario', choices=['resume', 'rejoin', 'restart', 'region', 'resume-disabled', 'operations', 'video-stream', 'audio-stream', 'video-source', 'audio-source'], default='resume')
     parser.add_argument('--rounds', type=int, default=2)
+    parser.add_argument('--rgba', action='store_true', help='Exercise rotated RGBA input in video-source scenario')
     parser.add_argument('--protocol', type=int, choices=[12, 15], default=12, help='Signal protocol for resume scenario')
     args = parser.parse_args()
+    if args.rgba and args.scenario != 'video-source':
+        parser.error('--rgba requires --scenario video-source')
     if args.protocol != 12 and args.scenario != 'resume':
         parser.error('--protocol applies to the resume scenario; operations always uses 15')
     asyncio.run(run(args))

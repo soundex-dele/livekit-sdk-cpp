@@ -12,6 +12,10 @@
 #include "audio_stream_contract.hpp"
 #include "video_source_contract.hpp"
 #include "audio_source_contract.hpp"
+#include "data_messages_contract.hpp"
+#include "subscription_permissions_contract.hpp"
+#include "rpc_contract.hpp"
+#include "capabilities_contract.hpp"
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -34,6 +38,10 @@ int main(int argc, char** argv) {
     audio_stream_contract();
     video_source_contract();
     audio_source_contract();
+    data_messages_contract();
+    subscription_permissions_contract();
+    rpc_contract();
+    capabilities_contract();
     livekit::ClientConfiguration client_config;
     check(!sdk::detail::relay_required(false, false, client_config), "Default relay policy");
     client_config.set_force_relay(livekit::ENABLED);

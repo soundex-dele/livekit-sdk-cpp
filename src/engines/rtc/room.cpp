@@ -1,8 +1,11 @@
 #include "engines/rtc/room.hpp"
 #include "engines/rtc/signal_session.hpp"
 #include "engines/rtc/client_configuration.hpp"
+#include "engines/rtc/capabilities.hpp"
 #include "engines/rtc/async_wait.hpp"
 #include "engines/rtc/pending_requests.hpp"
+#include "engines/rtc/data_messages.hpp"
+#include "engines/rtc/subscription_permissions.hpp"
 #include "support/net.hpp"
 #include "backends/webrtc/headless_audio.hpp"
 #include "media_nodes/render/video_playout.hpp"
@@ -213,8 +216,22 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
   }
   void OnStateChange() override {}
   void OnMessage(const webrtc::DataBuffer& buffer) override {
+    if (buffer.data.size()>16384) return;
     livekit::DataPacket packet;
     if (!packet.ParseFromArray(buffer.data.data(), static_cast<int>(buffer.data.size()))) return;
+    if(packet.has_rpc_request()||packet.has_rpc_ack()||packet.has_rpc_response())
+      event("rpc",{{"payload",base64url(packet.SerializeAsString())}});
+    try {
+      if (packet.has_sip_dtmf()) {
+        livekit::sdk::DtmfDigit digit{packet.sip_dtmf().code(),packet.sip_dtmf().digit()};
+        livekit::sdk::detail::validate_dtmf(digit);
+        event("dtmf", {{"code",digit.code},{"digit",digit.digit},{"identity",packet.participant_identity()},{"reliable",packet.kind()==0}});
+      } else if (packet.has_transcription()) {
+        const auto value=livekit::sdk::detail::transcription_json(packet.transcription());
+        livekit::sdk::detail::parse_transcription(value);
+        event("transcription", {{"value",value},{"identity",packet.participant_identity()},{"reliable",packet.kind()==0}});
+      }
+    } catch (const std::invalid_argument&) { return; }
     if (packet.has_user())
       event("data", {{"identity", packet.participant_identity().empty() ? packet.user().participant_identity() : packet.participant_identity()}, {"reliable", packet.kind() == 0}, {"topic", packet.user().topic()}, {"payloadBase64", base64url(packet.user().payload())}});
     if (packet.has_speaker()) {
@@ -324,6 +341,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   auto& recovery = session ? session->recovery : standalone;
   const bool restore_session = recovery.rejoining;
   if (!session) {
+    recovery.subscription_permissions=options.subscription_permissions;
     recovery.token = options.token; recovery.expected_room = options.room; recovery.budget = detail::RecoveryBudget(options.reconnect);
     for (const auto& media : options.media) recovery.publications.emplace(recovery.allocate_id(media.video), detail::DesiredPublication{media});
     if (options.microphone) recovery.publications.emplace("microphone", detail::DesiredPublication{{}, {}, true});
@@ -332,6 +350,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   socket.connect();
   livekit::JoinResponse join;
   while (!stop.stop_requested()) {
+    try {
     recovery.budget.check();
     event.dispatch(); event.rethrow();
     auto message = socket.receive(100);
@@ -346,6 +365,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       }
     }
     if (Clock::now() >= socket.connect_deadline()) throw SDKError(ErrorDomain::signaling, ErrorCode::timeout, "Timed out waiting for LiveKit JoinResponse", true);
+    } catch(const SDKError& error) { if(!socket.failover(error))throw; }
   }
   if (stop.stop_requested()) return;
   if (join.participant().sid().empty()) throw std::runtime_error("Join response has no participant");
@@ -359,6 +379,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   event("joined", {{"room", join.room().name()}, {"identity", join.participant().identity()}, {"sid", join.participant().sid()},
     {"roomInfo", {{"sid", join.room().sid()}, {"name", join.room().name()}, {"metadata", join.room().metadata()}, {"recording", join.room().active_recording()}}},
     {"localParticipant", participant_json(join.participant())}, {"participants", roster}});
+  event("session-capabilities",detail::session_capabilities_json(join,options.signal_protocol,relay_only));
   for (const auto& p : join.other_participants())
     event("participant", {{"identity", p.identity()}, {"sid", p.sid()}, {"state", p.state()}, {"participant", participant_json(p)}, {"initial", true}});
   Runtime runtime(options.audio_playout || options.microphone, options.microphone);
@@ -408,6 +429,15 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
     std::map<std::string, bool> subscription_overrides;
     if (!recovery.room_changed) for (const auto& sid : options.subscribe_tracks) subscription_overrides[sid] = true;
     auto send = [&](const livekit::SignalRequest& request) { socket.send(request); };
+    auto send_permissions = [&] {
+      if(!recovery.subscription_permissions)return;
+      livekit::SignalRequest request;
+      *request.mutable_subscription_permission()=detail::permissions_wire(*recovery.subscription_permissions,recovery.local_ids);
+      send(request);
+    };
+    // Enforce the policy before initial/recovered publication. Specific source
+    // grants start denied until TrackPublishedResponse supplies the new SID.
+    send_permissions();
     auto send_settings = [&](const std::string& sid, const Json& values) {
       livekit::SignalRequest request;
       auto* settings = request.mutable_track_setting(); settings->add_track_sids(sid);
@@ -460,6 +490,17 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       webrtc::RtpEncodingParameters encoding; encoding.max_bitrate_bps = track->kind() == "video" ? 2000000 : 64000; init.send_encodings.push_back(encoding);
       auto result = publisher->pc->AddTransceiver(track, init);
       if (!result.ok()) throw std::runtime_error(result.error().message());
+      if (track->kind() == "audio" && publication.disable_red) {
+        auto capabilities = runtime.factory->GetRtpSenderCapabilities(webrtc::MediaType::AUDIO);
+        std::vector<webrtc::RtpCodecCapability> selected;
+        for (const auto& codec : capabilities.codecs) {
+          auto name = codec.name;
+          std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+          if (name != "red") selected.push_back(codec);
+        }
+        auto error = result.value()->SetCodecPreferences(selected);
+        if (!error.ok()) throw std::runtime_error(error.message());
+      }
       if (track->kind() == "video") {
         auto capabilities = runtime.factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
         std::vector<webrtc::RtpCodecCapability> selected;
@@ -473,6 +514,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       livekit::SignalRequest request; auto* add = request.mutable_add_track();
       add->set_cid(track->id()); add->set_name(publication.name.empty() ? track->id() : publication.name); add->set_stream(init.stream_ids.front());
       add->set_type(track->kind() == "video" ? livekit::VIDEO : livekit::AUDIO);
+      if (track->kind() == "audio") add->set_disable_red(publication.disable_red);
       if (spec && spec->audio_source) add->set_stereo(spec->audio_source->options().channels == 2);
       const auto default_source = spec && spec->capture == livekit::sdk::CaptureKind::screen ? livekit::SCREEN_SHARE :
           track->kind() == "video" ? livekit::CAMERA : livekit::MICROPHONE;
@@ -583,6 +625,9 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         const auto error = peer->pc->SetConfiguration(updated);
         if (!error.ok()) throw detail::RejoinRequired("Unable to apply refreshed ICE configuration");
       }
+      Json capabilities{{"relayOnly",relay}};
+      if(response.has_server_info())capabilities["server"]=detail::server_capabilities_json(response.server_info());
+      event("session-capabilities",capabilities);
     };
     auto handle_moved = [&](const livekit::RoomMovedResponse& moved) {
       if (moved.room().sid().empty() || moved.room().name().empty() || moved.token().empty() ||
@@ -666,7 +711,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
               if (!exists) throw std::logic_error("Remote publication no longer exists");
             }
             livekit::SignalRequest request;
-            if (op != "data" && !command->begin_send()) continue;
+            if (op != "data" && op != "packet" && !command->begin_send()) continue;
             if (op == "publish") {
               if (publishing.size() >= 128) throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "Too many unconfirmed publications");
               need_publisher = true;
@@ -680,15 +725,20 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
               auto sid = a.at("sid").get<std::string>();
               if (!published_tracks.contains(sid)) throw std::invalid_argument("Local track is not published");
               remove_track(sid); event.dispatch(); event.rethrow();
-            } else if (op == "data") {
+            } else if (op == "data" || op == "packet") {
               need_publisher = true;
               auto channel = a.at("reliable").get<bool>() ? reliable : lossy_channel;
               if (!channel || channel->state() != webrtc::DataChannelInterface::kOpen) { deferred.push_back(command); continue; }
               if (!command->begin_send()) continue;
               livekit::DataPacket packet; packet.set_kind(a.at("reliable").get<bool>() ? 0 : 1);
               packet.set_participant_identity(join.participant().identity());
-              auto user = packet.mutable_user(); user->set_payload(livekit::sdk::base64_decode(a.at("payload").get<std::string>())); user->set_topic(a.at("topic").get<std::string>());
-              for (const auto& target : a.at("destinations")) { packet.add_destination_identities(target.get<std::string>()); user->add_destination_identities(target.get<std::string>()); }
+              if (op == "packet") {
+                if (!packet.ParseFromString(livekit::sdk::base64_decode(a.at("payload").get<std::string>()))) throw std::invalid_argument("Invalid data packet");
+                packet.set_kind(0); packet.set_participant_identity(join.participant().identity());
+              } else {
+                auto user = packet.mutable_user(); user->set_payload(livekit::sdk::base64_decode(a.at("payload").get<std::string>())); user->set_topic(a.at("topic").get<std::string>());
+                for (const auto& target : a.at("destinations")) { packet.add_destination_identities(target.get<std::string>()); user->add_destination_identities(target.get<std::string>()); }
+              }
               auto bytes = packet.SerializeAsString();
               if (bytes.size() > (packet.kind() == 0 ? 16384u : 1400u)) throw std::invalid_argument("Encoded data packet exceeds transport limit");
               if (!channel->Send(webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(bytes.data(), bytes.size()), true))) throw std::runtime_error("Data channel send failed");
@@ -709,6 +759,13 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
               auto& current = remote_settings[sid]; if (current.is_null()) current = Json::object(); current.update(a);
               send_settings(sid, current);
               remember_remote(sid, {}, current);
+            } else if (op == "permissions") {
+              auto policy=detail::parse_permissions(a);
+              for(const auto& p:policy.participants)for(const auto& id:p.track_client_ids)
+                if(!recovery.publications.contains(id) || std::none_of(recovery.local_ids.begin(),recovery.local_ids.end(),[&](const auto& item){return item.second==id;}))
+                  throw std::invalid_argument("Permission source is not a confirmed local publication");
+              *request.mutable_subscription_permission()=detail::permissions_wire(policy,recovery.local_ids);
+              send(request); recovery.subscription_permissions=std::move(policy);
             } else if (op == "metadata") {
               auto update = request.mutable_update_metadata();
               // Match Go setters: send only the requested field; empty scalar means unchanged.
@@ -727,6 +784,19 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         for (const auto& [id, command] : publishing) if (Clock::now() >= command->deadline) {
           command->expire(Clock::now());
           throw detail::RejoinRequired("Unconfirmed publication expired; transport must be reconciled");
+        }
+      }
+      if(session){
+        std::shared_ptr<detail::RpcSession> rpc;
+        {std::lock_guard lock(session->mutex);rpc=session->rpc;}
+        if(rpc&&rpc->has_outgoing()){
+          need_publisher=true;
+          if(reliable&&reliable->state()==webrtc::DataChannelInterface::kOpen&&reliable->buffered_amount()<256*1024){
+            for(auto packet:rpc->take_packets()){
+              packet.set_participant_identity(join.participant().identity());auto bytes=packet.SerializeAsString();
+              if(bytes.size()>16384||!reliable->Send(webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(bytes.data(),bytes.size()),true)))rpc->send_failed(packet);
+            }
+          }
         }
       }
       if (need_publisher && dirty && !offer_pending && awaiting_tracks.empty()) {
@@ -782,6 +852,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         if (cancelled_publication) {
           remove_track(sid); publishing.erase(cid); continue;
         }
+        send_permissions();
         auto info = track_json(response.track_published().track());
         info["clientId"] = cid;
         if (auto desired = recovery.publications.find(cid); desired != recovery.publications.end() && desired->second.muted) {
@@ -818,6 +889,10 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         event("server-leave", {{"reason", leave.reason()}}); break;
       }
       else if (response.has_subscription_response() && response.subscription_response().err()) event("subscription-failed", {{"sid", response.subscription_response().track_sid()}, {"error", response.subscription_response().err()}});
+      else if (response.has_subscription_permission_update()) {
+        const auto& update=response.subscription_permission_update();
+        event("subscription-permission",{{"participantSid",update.participant_sid()},{"trackSid",update.track_sid()},{"allowed",update.allowed()}});
+      }
       else if (response.has_room_update()) event("room-update", {{"metadata", response.room_update().room().metadata()}, {"recording", response.room_update().room().active_recording()}});
       else if (response.has_connection_quality()) { for (const auto& q : response.connection_quality().updates()) event("connection-quality", {{"sid", q.participant_sid()}, {"quality", q.quality()}}); }
       else if (response.has_speakers_changed()) { Json speakers = Json::array(); for (const auto& p : response.speakers_changed().speakers()) speakers.push_back({{"sid", p.sid()}, {"level", p.level()}, {"active", p.active()}}); event("speakers", {{"speakers", speakers}}); }
@@ -837,6 +912,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
             !connected || offer_pending || !awaiting_tracks.empty()) throw;
         pending_controls.interrupt("Connection lost before request confirmation; outcome is unknown");
         if (!socket.recover(build_sync, configure_resume, handle_moved)) { if (stop.stop_requested()) break; throw; }
+        send_permissions();
         publisher->transport_failed = false; subscriber->transport_failed = false;
         if (negotiated) {
           livekit::SignalRequest restart; *restart.mutable_offer() = publisher->local(true, true);

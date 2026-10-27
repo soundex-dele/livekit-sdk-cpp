@@ -2,6 +2,8 @@
 #include "livekit/auth.hpp"
 #include "livekit/media.hpp"
 #include "livekit/operation.hpp"
+#include "livekit/data_messages.hpp"
+#include "livekit/rpc.hpp"
 #include <future>
 #include <map>
 #include <memory>
@@ -32,6 +34,8 @@ struct ParticipantInfo {
 struct TrackPublishOptions {
   std::string name, stream;
   TrackSource source = TrackSource::unknown;
+  // Audio only. Negotiate Opus without RED for receivers that cannot decode RED.
+  bool disable_red = false;
 };
 struct DataPublishOptions {
   bool reliable = false; // matches Go: lossy unless explicitly enabled
@@ -42,6 +46,18 @@ struct DataReceiveParams {
   std::string sender_identity, topic;
   bool reliable = false;
 };
+enum class VideoQuality { low = 0, medium = 1, high = 2 };
+struct ParticipantTrackPermission {
+  std::string participant_identity;
+  bool all_tracks = true;
+  // Stable local TrackInfo.client_id values, not server SIDs. Required IDs must
+  // be confirmed publications when setting policy; recovery remaps them.
+  std::vector<std::string> track_client_ids;
+};
+struct SubscriptionPermissions {
+  bool all_participants = true;
+  std::vector<ParticipantTrackPermission> participants;
+};
 
 class TrackPublication {
  public:
@@ -51,6 +67,8 @@ class TrackPublication {
   std::future<void> set_subscribed(bool subscribed, const OperationOptions& operation = {}) const; // remote publication
   std::future<void> set_enabled(bool enabled, const OperationOptions& operation = {}) const; // remote stream settings
   std::future<void> set_video_dimensions(int width, int height, const OperationOptions& operation = {}) const;
+  // Mutually exclusive with requested dimensions; most recent call wins.
+  std::future<void> set_video_quality(VideoQuality quality, const OperationOptions& operation = {}) const;
   // Handles are normally obtained from participants/callbacks, not constructed by applications.
   TrackPublication(std::weak_ptr<detail::RoomState>, uint64_t generation, std::string owner, TrackInfo snapshot, bool local);
  private:
@@ -80,6 +98,15 @@ class LocalParticipant : public Participant {
   std::future<TrackPublication> publish_track(const MediaSpec& media, const TrackPublishOptions& options = {}, const OperationOptions& operation = {}) const;
   std::future<void> unpublish_track(const std::string& sid, const OperationOptions& operation = {}) const;
   std::future<void> publish_data(const std::vector<uint8_t>& payload, const DataPublishOptions& options = {}, const OperationOptions& operation = {}) const;
+  // Reliable official data messages. Completion means local channel submission,
+  // not remote receipt. Neither message is replayed after reconnect.
+  std::future<void> publish_dtmf(const DtmfDigit& digit, const OperationOptions& operation = {}) const;
+  // Official servers may only forward transcriptions from Agent participants;
+  // the application supplies an appropriately authorized join token.
+  std::future<void> publish_transcription(const Transcription& transcription, const OperationOptions& operation = {}) const;
+  // Replaces the entire policy. Future means signal submission, not server ACK.
+  std::future<void> set_subscription_permissions(const SubscriptionPermissions& permissions, const OperationOptions& operation = {}) const;
+  std::future<std::string> perform_rpc(const RpcCallOptions& options) const;
   std::future<void> set_name(const std::string& name, const OperationOptions& operation = {}) const;
   std::future<void> set_metadata(const std::string& metadata, const OperationOptions& operation = {}) const;
   std::future<void> set_attributes(const std::map<std::string, std::string>& attributes, const OperationOptions& operation = {}) const;

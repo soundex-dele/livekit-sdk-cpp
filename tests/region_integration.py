@@ -57,6 +57,12 @@ async def run(args):
     async def process_request(connection, request):
         nonlocal forbidden_requests
         path = request.path.split('?')[0]
+        if path == '/unavailable/rtc':
+            return connection.respond(HTTPStatus.SERVICE_UNAVAILABLE, 'retry another test endpoint')
+        if path == '/denied/rtc':
+            return connection.respond(HTTPStatus.FORBIDDEN, 'permission denied')
+        if path == '/unauthorized/rtc':
+            return connection.respond(HTTPStatus.UNAUTHORIZED, 'authentication required')
         if path == '/forbidden/rtc':
             forbidden_requests += 1
             return connection.respond(HTTPStatus.FORBIDDEN, 'must not receive credentials')
@@ -101,6 +107,13 @@ async def run(args):
 
     async def handler(connection):
         path = connection.request.path.split('?')[0]
+        if path in ('/silent/rtc', '/silent-2/rtc'):
+            await connection.wait_closed()
+            return
+        if path == '/malformed/rtc':
+            await connection.send(b'\xff')
+            await connection.wait_closed()
+            return
         if path == '/force-relay/rtc':
             join = field(2, field(1, b'PA_forced') + field(2, b'forced'))
             join += field(8, bytes.fromhex('2802'))
@@ -145,7 +158,7 @@ async def run(args):
                     client = await asyncio.create_subprocess_exec(str(Path(args.client).resolve()), server_url, fixture_url, http_url,
                         stdout=out, stderr=err, creationflags=flags)
                     try:
-                        code = await asyncio.wait_for(client.wait(), 45)
+                        code = await asyncio.wait_for(client.wait(), 90)
                     finally:
                         if client.returncode is None:
                             client.kill()

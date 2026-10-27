@@ -2,17 +2,35 @@
 #include "engines/rtc/room.hpp"
 #include "engines/rtc/session.hpp"
 #include "engines/rtc/reconnect_policy.hpp"
+#include "engines/rtc/subscription_permissions.hpp"
 #include <set>
 #include <algorithm>
 #include <random>
 
 namespace livekit::sdk {
+SdkCapabilities sdk_capabilities() {
+  SdkCapabilities result;result.version=version;result.signal_protocols={12,15};
+  for(auto feature:{ClientFeature::signal_resume,ClientFeature::full_rejoin,ClientFeature::initial_signal_failover,
+      ClientFeature::token_provider,ClientFeature::i420_input,ClientFeature::rgba_input,ClientFeature::pcm_input,
+      ClientFeature::video_pull,ClientFeature::audio_pull,ClientFeature::subscription_permissions,
+      ClientFeature::receive_quality,ClientFeature::dtmf,ClientFeature::transcription,ClientFeature::rpc})
+    result.features[feature]=CapabilitySupport::supported;
+  for(auto feature:{ClientFeature::text_stream,ClientFeature::byte_stream,ClientFeature::data_track,
+      ClientFeature::media_e2ee,ClientFeature::data_e2ee,ClientFeature::simulcast,ClientFeature::single_peer_connection,
+      ClientFeature::encoded_media,ClientFeature::rtp_access,ClientFeature::control_executor})
+    result.features[feature]=CapabilitySupport::unsupported;
+  return result;
+}
 namespace {
 void validate(const RoomOptions& o) {
+  if(o.subscription_permissions)detail::validate_permissions(*o.subscription_permissions);
   detail::validate_reconnect(o.reconnect);
   endpoint(o.url, true);
   detail::signal_endpoint(o.url);
   for (const auto& url : o.regions.trusted_endpoints) detail::trusted_destination(o.url, url, o.regions);
+  for (const auto& url : o.regions.fallback_endpoints) detail::trusted_destination(o.url,url,o.regions);
+  if(o.regions.fallback_endpoints.size()>32 || o.regions.endpoint_timeout<std::chrono::milliseconds(100) ||
+      o.regions.endpoint_timeout>std::chrono::minutes(5))throw std::invalid_argument("Invalid initial region failover options");
   if (o.regions.max_redirects > 10 || o.regions.discovery_timeout <= std::chrono::milliseconds::zero() ||
       o.regions.discovery_timeout > std::chrono::seconds(30)) throw std::invalid_argument("Invalid region discovery options");
   if (o.token.empty() && !o.token_provider) throw std::invalid_argument("Token or token provider is required");
@@ -52,10 +70,12 @@ void prepare(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o) 
   s->connection = ConnectionState::connecting; s->room = {}; s->local = {}; s->remote.clear(); s->subscriptions.clear();
   s->reason = 0; s->failure = {}; s->error.clear(); s->runner = {}; s->command_timeout = o.connect_timeout;
   s->signal_protocol = o.signal_protocol;
+  s->capabilities = {};
   s->recovery = detail::RecoveryState{};
   s->recovery.budget = detail::RecoveryBudget(o.reconnect);
   s->recovery.token = o.token;
   s->recovery.expected_room = o.room;
+  s->recovery.subscription_permissions=o.subscription_permissions;
   for (const auto& media : o.media) {
     const auto id = s->recovery.allocate_id(media.video);
     s->recovery.publications.emplace(id, detail::DesiredPublication{media, {}, false, false});
@@ -96,6 +116,7 @@ void execute(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o, 
           ++s->generation; // complete rejoin invalidates all old public handles
           s->connection = ConnectionState::reconnecting;
           s->remote.clear(); s->subscriptions.clear(); s->local = {}; s->room = {}; s->reason = 0;
+          s->capabilities = {};
           recovery.local_ids.clear();
         }
         const auto interrupted = std::make_exception_ptr(SDKError(ErrorDomain::lifecycle,
@@ -114,6 +135,9 @@ void execute(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o, 
   catch (...) { failure = std::current_exception(); events.dispatch(); }
   // Stop enqueueing before draining commands, including commands from callbacks.
   s->stop.request_stop();
+  std::shared_ptr<detail::RpcSession> rpc;
+  {std::lock_guard lock(s->mutex);rpc=s->rpc;}
+  if(rpc)rpc->disconnect();
   if (s->video_output) s->video_output->close();
   if (s->audio_output) s->audio_output->close();
   for (auto& command : s->take_commands()) command->interrupt(ErrorCode::session_closed, "Room disconnected before command completed");
@@ -134,6 +158,17 @@ struct Room::Impl {
   std::thread worker;
 };
 Room::Room(RoomCallback callbacks) : impl_(std::make_unique<Impl>()) { impl_->state->callbacks = std::move(callbacks); }
+SessionCapabilities Room::capabilities() const {
+  auto state=impl_->state;std::lock_guard lock(state->mutex);
+  auto result=state->connection==ConnectionState::disconnected?SessionCapabilities{}:state->capabilities;
+  result.generation=state->generation;result.connected=state->connection==ConnectionState::connected;return result;
+}
+void Room::register_rpc_method(const std::string& method,RpcHandler handler){
+  auto state=impl_->state;std::lock_guard lock(state->mutex);state->rpc_session()->register_method(method,std::move(handler));
+}
+void Room::unregister_rpc_method(const std::string& method){
+  auto state=impl_->state;std::lock_guard lock(state->mutex);if(state->rpc)state->rpc->unregister_method(method);
+}
 Room::~Room() {
   request_stop();
   std::thread worker;

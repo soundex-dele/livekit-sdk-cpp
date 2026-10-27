@@ -17,6 +17,8 @@ inline void room_moved_contract() {
   LocalParticipant old_local(state, 7, state->local, true);
   TrackPublication old_remote(state, 7, "peer", remote_track, false);
   auto queued = old_local.set_metadata("old-room-command");
+  auto old_rpc=old_local.perform_rpc({"peer","old-room",""});
+  state->capabilities.server.version="old-server";
   int removed = 0, added = 0, moved = 0, unpublished = 0, unsubscribed = 0, subscribed = 0;
   state->callbacks.on_participant_disconnected = [&](const RemoteParticipant& p) {
     require(p.sid() == "PA_old" && p.info().disconnect_reason == 8); ++removed;
@@ -46,6 +48,14 @@ inline void room_moved_contract() {
   require(failed && state->generation == 7 && state->room.sid == "RM_old" && moved == 0);
   detail::process_event(state, snapshot);
   require(state->generation == 8 && state->connection == ConnectionState::connected && state->room.recording);
+  require(state->capabilities.server.version.empty());
+  require(old_rpc.wait_for(std::chrono::seconds(1))==std::future_status::ready);
+  bool rpc_interrupted=false;
+  try{old_rpc.get();}catch(const RpcError& error){rpc_interrupted=error.code()==1503;}
+  require(rpc_interrupted&&state->rpc->take_packets().empty());
+  auto destination_rpc=LocalParticipant(state,state->generation,state->local,true).perform_rpc({"peer","new-room",""});
+  require(state->rpc->take_packets().size()==1);state->rpc->disconnect();
+  try{destination_rpc.get();require(false);}catch(const RpcError& error){require(error.code()==1503);}
   require(state->remote.size() == 1 && state->remote.at("peer").sid == "PA_new" && state->subscriptions.size() == 1 && state->subscriptions.at("TR_new"));
   require(state->local.tracks.at(0).client_id == "video-1" && state->recovery.local_snapshot->sid == "PA_local");
   require(moved == 1 && removed == 1 && added == 1 && unpublished == 1 && unsubscribed == 1 && subscribed == 1);

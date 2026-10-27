@@ -1,6 +1,6 @@
 # livekit-sdk-cpp
 
-[客户端能力补齐进度](docs/client-parity-progress.md)：已加入固定上游协议的字段合约检查、信令恢复、ICE restart、完整重新入会、异步 TokenProvider、操作取消/确认，以及首版应用 I420/PCM 输入和有界帧读取。恢复语义见 [连接恢复](docs/reconnection.md)，媒体接口见 [视频输入](docs/video-source.md)、[音频输入](docs/audio-source.md)、[视频读取](docs/video-stream.md)和[音频读取](docs/audio-stream.md)。Go 实际互通、其余媒体扩展、RPC/streams、DataTrack、E2EE 和跨平台验收仍待完成。
+[客户端能力补齐进度](docs/client-parity-progress.md)：已加入固定上游协议字段检查、连接恢复及首次信令 failover、TokenProvider、操作取消/确认、I420/RGBA/PCM 输入和有界帧读取，以及[订阅权限/接收质量](docs/subscription-permissions.md)、[DTMF/转写](docs/data-messages.md)、[RPC](docs/rpc.md)和[能力查询](docs/capabilities.md)。C++↔Go 单声道 PCM、官方数据消息与 RPC 已完成本机互通验证。恢复语义见[连接恢复](docs/reconnection.md)，媒体接口见[视频输入](docs/video-source.md)、[音频输入](docs/audio-source.md)、[视频读取](docs/video-stream.md)和[音频读取](docs/audio-stream.md)。编码帧/RTP、Simulcast、streams/files、DataTrack、E2EE 及跨平台验收仍待完成。
 
 [远程控制](../docs/integration/remote-control/README.md)：新增 `RemoteControlSession`、可靠键鼠协议、租约/心跳 watchdog 和 Windows 输入后端；搭配相邻 ImGui 被控端、浏览器及 Go 授权服务使用。自动化只验证合成媒体和输入记录器，实际桌面需人工验收。
 

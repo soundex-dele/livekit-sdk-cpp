@@ -29,6 +29,7 @@ struct RecoveryState {
   std::string expected_room;
   bool room_changed = false;
   RegionState regions;
+  std::optional<SubscriptionPermissions> subscription_permissions;
   std::optional<ParticipantInfo> local_snapshot;
   RecoveryBudget::Clock::time_point session_deadline = RecoveryBudget::Clock::time_point::max();
   std::map<std::string, DesiredPublication> publications;

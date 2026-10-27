@@ -17,10 +17,13 @@ class SignalSession {
   SignalSession(const RoomOptions& options, std::stop_token stop, EventEmitter events,
                 livekit::sdk::detail::RecoveryState* recovery = nullptr);
   void connect();
+  // Only before accepting JoinResponse. Closes the previous socket first and
+  // never retries permission/protocol errors or revisits an attempted endpoint.
+  bool failover(const livekit::sdk::SDKError& error);
   void redirect(const std::string& url);
   void update_regions(const livekit::RegionSettings& regions);
   void configure_client(const livekit::ClientConfiguration& config) { resume_allowed_ = config.resume_connection() != livekit::DISABLED; }
-  std::chrono::steady_clock::time_point connect_deadline() const noexcept { return connect_deadline_; }
+  std::chrono::steady_clock::time_point connect_deadline() const noexcept { return attempt_deadline_; }
   std::stop_token stop_token() const noexcept { return stop_; }
   std::chrono::steady_clock::time_point operation_deadline() const noexcept {
     auto deadline = std::min(recovery_.budget.deadline(), recovery_.session_deadline);
@@ -38,6 +41,8 @@ class SignalSession {
   void close();
  private:
   void connect_socket(const std::string& sid, std::chrono::steady_clock::time_point deadline);
+  bool select_initial_fallback(const livekit::sdk::SDKError& error);
+  void open_initial_socket();
   RoomOptions options_;
   std::stop_token stop_;
   EventEmitter events_;
@@ -53,5 +58,7 @@ class SignalSession {
   size_t redirects_ = 0;
   std::set<std::string> redirect_history_;
   std::chrono::steady_clock::time_point connect_deadline_ = std::chrono::steady_clock::time_point::max();
+  std::chrono::steady_clock::time_point attempt_deadline_ = std::chrono::steady_clock::time_point::max();
+  bool initial_failover_ = false;
 };
 }
