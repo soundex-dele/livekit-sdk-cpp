@@ -43,6 +43,10 @@ int main(int argc, char** argv) {
     // An already-cancelled valid session must not attempt a network connection.
     room.run(options, {}, stopped.get_token());
     room.run(options, {}, stopped.get_token());
+    options.subscribe=false;options.video_frame_handler=[](const sdk::VideoFrame&){};
+    rejects([&]{room.run(options,{},stopped.get_token());});
+    sdk::MediaSpec preview;preview.demo=true;preview.local_preview=true;options.media={preview};
+    room.run(options,{},stopped.get_token()); // publish-only local preview does not require subscription permission
     rejects([] { sdk::RoomServiceClient("http://localhost:7880", {}); });
     rejects([] { sdk::make_token("key", "secret", "id", {}, 0); });
 

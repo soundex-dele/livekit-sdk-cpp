@@ -18,6 +18,10 @@ if(VCPKG_TARGET_TRIPLET AND VCPKG_INSTALLED_DIR)
   endif()
 endif()
 add_subdirectory("${WEBRTC_SOURCE_DIR}" webrtc EXCLUDE_FROM_ALL)
+# The standalone C PFFFT target does not inherit WebRTC's Windows definitions.
+if(WIN32 AND TARGET webrtc_pffft)
+  target_compile_definitions(webrtc_pffft PRIVATE _USE_MATH_DEFINES)
+endif()
 # M137 VAD calls these iSAC helpers even when the iSAC codec is disabled.
 # Add only helpers absent from the external checkout's source manifest.
 get_target_property(_webrtc_sources webrtc WEBRTC_SOURCE_MANIFEST)

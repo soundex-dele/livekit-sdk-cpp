@@ -45,7 +45,8 @@ struct RoomOptions {
   // Optional native W3C media/transport stats emitted as "rtc-stats" events.
   // 0 disables collection; otherwise 200..60000 ms. Callbacks stay serialized.
   int stats_interval_ms = 0;
-  // Latest remote frame per track, serialized with events on the run thread.
+  // Latest remote frame per track, plus local frames when MediaSpec::local_preview is enabled.
+  // Serialized with events on the run thread; local preview also supports subscribe=false.
   // Copy the frame to retain it. Exceptions terminate and clean up the session.
   VideoFrameHandler video_frame_handler;
 };

@@ -2,6 +2,7 @@
 #include "engines/rtc/room.hpp"
 #include "engines/rtc/session.hpp"
 #include <set>
+#include <algorithm>
 
 namespace livekit::sdk {
 namespace {
@@ -12,8 +13,13 @@ void validate(const RoomOptions& o) {
   if (o.stats_interval_ms && (o.stats_interval_ms < 200 || o.stats_interval_ms > 60000))
     throw std::invalid_argument("stats_interval_ms must be 0 or 200..60000");
   if (o.relay_only && o.disable_turn) throw std::invalid_argument("relay_only conflicts with disable_turn");
-  if (!o.subscribe && (!o.record.empty() || o.video_playout || o.audio_playout || o.video_frame_handler || !o.subscribe_tracks.empty()))
-    throw std::invalid_argument("Recording/playout/track selection requires subscriptions");
+  const bool local_preview = std::any_of(o.media.begin(),o.media.end(),[](const auto& m){return m.video&&m.local_preview;});
+  if (!o.subscribe) {
+    if(!o.record.empty())throw std::invalid_argument("Recording requires subscriptions");
+    if(o.video_playout||o.audio_playout)throw std::invalid_argument("Remote playout requires subscriptions");
+    if(o.video_frame_handler&&!local_preview)throw std::invalid_argument("Frame callback requires subscriptions or a local preview source");
+    if(!o.subscribe_tracks.empty())throw std::invalid_argument("Track selection requires subscriptions");
+  }
   if (!std::set<std::string>{"vp8", "vp9", "h264", "av1"}.contains(o.codec)) throw std::invalid_argument("Unsupported video codec");
   if (o.exit_after_publish && (o.media.empty() || o.microphone)) throw std::invalid_argument("exit_after_publish requires finite media sources");
   for (const auto& m : o.media) {
