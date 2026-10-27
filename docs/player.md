@@ -2,37 +2,19 @@
 
 首版播放器按统一 SDK 架构落在本仓库中，入口为 `livekit::sdk::Player`、`LiveKit::Player`，与现有 `Room` / `LiveKit::SDK` 独立构建。FFmpeg 通过动态库解封装、软件解码和格式转换；SDK 不启动 ffmpeg 子进程播放。测试素材生成使用 ffmpeg 命令行。
 
-## 构建与运行（Windows x64）
+## 引擎构建
 
-需要 VS 2022 C++ 工具、Windows SDK、CMake 3.24+。当前验证使用用户提供的 FFmpeg 7.1 包：
-
-```powershell
-cd D:\workspace\av-platform\livekit-sdk-cpp
-.\scripts\build-player-windows.ps1 -FFmpegRoot 'D:\Downloads\ffmpeg-n7.1-241205-gpl-amd64-shared\bin'
-.\out\player-windows-ffmpeg71\Release\livekit_local_player.exe 'D:\media\example.mp4'
-```
-
-脚本接受包根目录或 `bin` 目录，完成配置、构建和 CTest。此 7.1 包的版本标识为 `b08d796`，导入库位于 `bin`，缺少 FFmpeg 和 SDL 公共头文件。脚本从 FFmpeg 官方仓库下载对应完整提交的源码头文件，并下载 SDL 2.30.9 官方开发包，校验 SHA-256，缓存到 `out/player-deps`；针对 Windows x64 生成公共 `avconfig.h`。不修改下载目录中的原始包。不同版本缺少头文件时需要自行提供匹配开发包，不会复用 6.x 的 FFmpeg 头文件。
-
-DLL 及其传递依赖自动复制到可执行文件旁边。分发时还需要遵守所选 FFmpeg、编解码库及 SDL 的许可证要求；本次采用的是用户提供的 GPL 构建。
-
-示例使用 Dear ImGui 1.91.9b + SDL2，可不带参数直接启动中文播放器窗口。支持系统文件选择、输入路径、文件拖放、播放/暂停、停止、拖动进度条、前后跳转、音量/静音和全屏；视频保持宽高比。打开、定位和关闭通过 future 异步处理，错误显示在界面中，音频设备不可用时提示并静音播放。
-
-快捷键：空格播放/暂停，左右方向键前后跳转 5 秒，S 停止并回到起点，M 静音，F 或双击画面切换全屏，Ctrl+O 打开文件；Esc 先退出全屏，窗口模式下退出程序。支持中文路径、纯音频、纯视频。暂停时拖动进度会清除旧画面，恢复播放后显示新位置；当前没有暂停定位后的单帧预览。
-
-`--auto-exit` 在播放结束后退出，`--hidden` 供无窗口烟测使用，`--frames N` 限制测试运行帧数，`--screenshot output.bmp` 导出程序内部渲染截图。首次构建界面会下载并校验固定版本 ImGui，亦可通过 `FETCHCONTENT_SOURCE_DIR_IMGUI` 指定已有源码目录。
-
-开发包齐全时也可直接配置：
+桌面界面、应用测试和 Windows 构建脚本已迁至 [livekit-app 播放器](../../livekit-app/apps/player/desktop/README.md)。SDK 仅提供 `LiveKit::Player`，不依赖 ImGui 或 SDL。
 
 ```powershell
-cmake -S . -B out/player -G 'Visual Studio 17 2022' -A x64 `
+cmake -S . -B out/player-engine -G 'Visual Studio 17 2022' -A x64 `
   -DLIVEKIT_BUILD_RTC=OFF -DLIVEKIT_BUILD_PLAYER=ON `
   -DLIVEKIT_FFMPEG_ROOT='D:/ffmpeg-dev'
-cmake --build out/player --config Release --parallel 4
-ctest --test-dir out/player -C Release --output-on-failure
+cmake --build out/player-engine --config Release --parallel 4
+ctest --test-dir out/player-engine -C Release --output-on-failure
 ```
 
-`LIVEKIT_FFMPEG_INCLUDE` 可指定独立头文件目录，`LIVEKIT_PLAYER_SDL_ROOT` 可指定独立 SDL 开发包。关闭 `LIVEKIT_PLAYER_BUILD_EXAMPLE` 后 SDK 本身不需要 SDL；关闭 `LIVEKIT_PLAYER_BUILD_TESTS` 后也不需要 ffmpeg 可执行文件。`LIVEKIT_BUILD_PLAYER` 默认关闭，`LIVEKIT_BUILD_RTC` 默认开启，保留原 RTC 构建入口。源码消费者只需链接 `LiveKit::Player`；目前尚未提供安装包/C ABI。
+需要匹配的 FFmpeg 头文件、库和运行时；可用 `LIVEKIT_FFMPEG_INCLUDE` 指定独立头文件目录。`LIVEKIT_PLAYER_BUILD_TESTS=OFF` 关闭引擎测试后不需要 ffmpeg 可执行文件。`LIVEKIT_BUILD_PLAYER` 默认关闭；目前仅提供源码集成，尚未提供安装包/C ABI。
 
 ## 分层与执行
 
@@ -40,12 +22,12 @@ ctest --test-dir out/player -C Release --output-on-failure
 | --- | --- |
 | `include/livekit/media_core` / `LiveKit::MediaCore` | SDK 自有 RGBA/PCM 帧、共享只读 Buffer、微秒时间戳、generation、steady clock |
 | `src/media_nodes` / `livekit_media_nodes_ffmpeg` | 独立的文件源、解封装、音视频解码、视频转换、音频重采样节点 |
-| `src/media_graph/playback_graph.*` / `LiveKit::Player` | GraphEngine::loadFromNodes 装配、引擎生命周期和播放控制 |
+| `src/engines/player/playback_graph.*` / `LiveKit::Player` | GraphEngine::loadFromNodes 装配、引擎生命周期和播放控制 |
 | `src/media_graph/media_flow.hpp` | 通用图执行器、类型化发布/订阅、接收确认、背压、epoch 和错误回传 |
 | `src/media_nodes/render/playback_output.hpp` / `LiveKit::Player` | 图内音视频输出节点，各自拥有有界 MediaChannel，支持跨线程拉取 |
-| `src/player` / `LiveKit::Player` | 场景状态机、命令队列、播放时钟和按时取帧 |
-| `examples/local_player/main.cpp` | ImGui/SDL 窗口入口、事件循环、快捷键和拖放 |
-| `examples/local_player/session.*`、`examples/local_player/ui.*` | SDK 公共 API 消费者；异步会话控制、音视频输出、中文播放器界面 |
+| `src/engines/player` / `LiveKit::Player` | 场景状态机、命令队列、播放时钟和按时取帧 |
+| `../livekit-app/apps/player/desktop/main.cpp` | ImGui/SDL 窗口入口、事件循环、快捷键和拖放 |
+| `../livekit-app/apps/player/desktop/session.*`、`ui.*` | SDK 公共 API 消费者；异步会话控制、音视频输出、中文播放器界面 |
 
 Player 独占内部图。`PlaybackGraph` 包含 **8 个实际 GraphNode 和 7 条带类型的媒体连接**：
 
@@ -124,3 +106,5 @@ SDK 使用 steady clock 作为主时钟。`poll_video()` 返回当前应显示�
 2026-10-26：Windows x64 / MSVC 19.44 / FFmpeg 7.1（`b08d796`）Release 构建通过；接入 GraphEngine::loadFromNodes 后 CTest **7/7 通过**。`playback_graph` 验证实际媒体订阅、收发计数、节点/连接、生命周期、输出背压、Seek 清空与代次、解码排空、重复播放、失败回滚、取消和 Buffer 生命周期。`media_flow` 通过 GraphEngine::loadFromNodes 加载独立的生产/处理/消费节点，验证引擎总线归属、节点和边总线释放，以及乱序注册后的拓扑调度、拒收重试、顺序、EOS、旧 epoch 丢弃、处理异常回传和共享数据所有权。保留 ImGui 空窗口、实际视频纹理渲染、异步暂停/Seek/停止、切换文件、错误恢复、窄窗口和打开过程关闭的回归测试。播放器继续独立于 WebRTC 构建。
 
 CTest 生成短媒体并验证：真实解封装/解码、B 帧尾部排空、44.1→48 kHz 重采样尾部、音画单流、非零起始时间、暂停冻结、连续 Seek 与旧代次隔离、EOS 重播、有界队列、关闭幂等、多实例隔离、错误路径、中文路径，以及 SDL dummy 音视频输出闭环。SDL dummy 测试不代表真实扬声器和显示器已人工验收。
+
+迁移后 SDK CTest 保留 `player_fixtures`、`local_player`、`playback_graph`、`media_flow` 四项；应用 CTest 在 livekit-app 中运行，以上 7/7 为迁移前历史记录。
