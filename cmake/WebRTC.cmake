@@ -35,3 +35,7 @@ foreach(_helper filter_functions.c isac_vad.c pitch_estimator.c pitch_filter.c)
     target_sources(webrtc PRIVATE "${_source}")
   endif()
 endforeach()
+
+if(MSVC)
+  file(WRITE "${CMAKE_BINARY_DIR}/livekit-msvc-runtime.txt" "${CMAKE_MSVC_RUNTIME_LIBRARY}")
+endif()

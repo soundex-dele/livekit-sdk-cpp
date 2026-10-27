@@ -81,6 +81,8 @@ class WindowsInput final:public ControlInputSink {
 }
 std::shared_ptr<ControlInputSink> detail::windows_input_with_api(std::shared_ptr<detail::WindowsInputApi> api){if(!api)throw std::invalid_argument("Windows input API required");return std::make_shared<WindowsInput>(std::move(api));}
 std::shared_ptr<ControlInputSink> make_windows_control_input(){return detail::windows_input_with_api(std::make_shared<SystemInputApi>());}
+std::shared_ptr<ControlInputSink> make_platform_control_input(){return make_windows_control_input();}
+ControlPermissions control_permissions(){SystemInputApi api;return {true,true,api.desktop_available()};}
 ControlLayout primary_control_layout(){
   const auto old=set_dpi(reinterpret_cast<HANDLE>(-4));
   MONITORINFO info{};info.cbSize=sizeof(info);POINT point{};
@@ -90,6 +92,10 @@ ControlLayout primary_control_layout(){
 }
 #else
 std::shared_ptr<ControlInputSink> make_windows_control_input(){throw std::runtime_error("Windows input unavailable");}
-ControlLayout primary_control_layout(){throw std::runtime_error("Windows screen unavailable");}
+#ifndef __APPLE__
+std::shared_ptr<ControlInputSink> make_platform_control_input(){return make_windows_control_input();}
+ControlPermissions control_permissions(){return {};}
+ControlLayout primary_control_layout(){throw std::runtime_error("Screen unavailable");}
+#endif
 #endif
 }
