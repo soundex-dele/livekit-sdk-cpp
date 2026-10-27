@@ -1,6 +1,7 @@
 #pragma once
 #include "livekit/auth.hpp"
 #include "livekit/media.hpp"
+#include "livekit/operation.hpp"
 #include <future>
 #include <map>
 #include <memory>
@@ -16,6 +17,9 @@ struct TrackInfo {
   TrackSource source = TrackSource::unknown;
   bool muted = false, subscribed = false;
   int width = 0, height = 0;
+  // Stable SDK source ID for local publications, including across full rejoin.
+  // Remote publications may leave this empty. sid remains the server ID.
+  std::string client_id;
 };
 struct ParticipantInfo {
   std::string sid, identity, name, metadata;
@@ -43,10 +47,10 @@ class TrackPublication {
  public:
   TrackInfo info() const;
   std::string sid() const { return snapshot_.sid; }
-  std::future<void> set_muted(bool muted) const; // local publication
-  std::future<void> set_subscribed(bool subscribed) const; // remote publication
-  std::future<void> set_enabled(bool enabled) const; // remote stream settings
-  std::future<void> set_video_dimensions(int width, int height) const;
+  std::future<void> set_muted(bool muted, const OperationOptions& operation = {}) const; // local publication
+  std::future<void> set_subscribed(bool subscribed, const OperationOptions& operation = {}) const; // remote publication
+  std::future<void> set_enabled(bool enabled, const OperationOptions& operation = {}) const; // remote stream settings
+  std::future<void> set_video_dimensions(int width, int height, const OperationOptions& operation = {}) const;
   // Handles are normally obtained from participants/callbacks, not constructed by applications.
   TrackPublication(std::weak_ptr<detail::RoomState>, uint64_t generation, std::string owner, TrackInfo snapshot, bool local);
  private:
@@ -73,11 +77,11 @@ class RemoteParticipant : public Participant { public: using Participant::Partic
 class LocalParticipant : public Participant {
  public:
   using Participant::Participant;
-  std::future<TrackPublication> publish_track(const MediaSpec& media, const TrackPublishOptions& options = {}) const;
-  std::future<void> unpublish_track(const std::string& sid) const;
-  std::future<void> publish_data(const std::vector<uint8_t>& payload, const DataPublishOptions& options = {}) const;
-  std::future<void> set_name(const std::string& name) const;
-  std::future<void> set_metadata(const std::string& metadata) const;
-  std::future<void> set_attributes(const std::map<std::string, std::string>& attributes) const;
+  std::future<TrackPublication> publish_track(const MediaSpec& media, const TrackPublishOptions& options = {}, const OperationOptions& operation = {}) const;
+  std::future<void> unpublish_track(const std::string& sid, const OperationOptions& operation = {}) const;
+  std::future<void> publish_data(const std::vector<uint8_t>& payload, const DataPublishOptions& options = {}, const OperationOptions& operation = {}) const;
+  std::future<void> set_name(const std::string& name, const OperationOptions& operation = {}) const;
+  std::future<void> set_metadata(const std::string& metadata, const OperationOptions& operation = {}) const;
+  std::future<void> set_attributes(const std::map<std::string, std::string>& attributes, const OperationOptions& operation = {}) const;
 };
 }

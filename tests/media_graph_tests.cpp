@@ -21,6 +21,7 @@
 #include <thread>
 #include <condition_variable>
 #include <future>
+#include "pcm_resampler_contract.hpp"
 
 using namespace webrtc;
 using namespace livekit::sdk::detail;
@@ -59,6 +60,11 @@ struct DecodedFrames : DecodedImageCallback {
 static void audio_codecs() {
   auto env = CreateEnvironment(); auto graph = std::make_shared<RtcGraph>();
   PeerConnectionFactoryDependencies deps; install_graph_codecs(deps, graph);
+  const auto audio_formats = deps.audio_decoder_factory->GetSupportedDecoders();
+  check(std::any_of(audio_formats.begin(), audio_formats.end(), [](const auto& codec) {
+    const auto stereo = codec.format.parameters.find("stereo");
+    return codec.format.name == "opus" && stereo != codec.format.parameters.end() && stereo->second == "1" && codec.info.num_channels == 2;
+  }), "Opus receiver advertises stereo capability");
   SdpAudioFormat format("opus", 48000, 2, {{"minptime", "10"}, {"useinbandfec", "1"}});
   AudioEncoderFactory::Options options; options.payload_type = 111;
   auto encoder = deps.audio_encoder_factory->Create(env, format, options);
@@ -395,7 +401,7 @@ static void recording() {
   std::filesystem::remove_all(directory);
 }
 int main() {
-  try { engine_routing(); channels(); audio_codecs(); graph_driven_video(); direct_receive_lifecycle(); receive_presentation_bounds(); receive_stop_barrier(); graph_encode_queues(); audio_device(); playback_only_audio_device(); source_and_render(); recording();
+  try { pcm_resampler_contract(); engine_routing(); channels(); audio_codecs(); graph_driven_video(); direct_receive_lifecycle(); receive_presentation_bounds(); receive_stop_barrier(); graph_encode_queues(); audio_device(); playback_only_audio_device(); source_and_render(); recording();
     std::cout << "media graph codec/source/render/channel tests passed\n"; return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

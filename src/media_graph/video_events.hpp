@@ -2,6 +2,7 @@
 #include "engines/rtc/rtc_graph.hpp"
 #include "api/video/video_frame.h"
 #include <functional>
+#include <optional>
 
 namespace livekit::sdk::detail {
 struct RawVideoFrame : graphflow::core::EventT<RawVideoFrame> {
@@ -15,11 +16,12 @@ struct EncodedVideoFrame : graphflow::core::EventT<EncodedVideoFrame> {
 // Synchronous edge only. Recording copies PCM into its bounded queue before
 // returning; the capture/WebRTC buffer remains valid throughout dispatch.
 struct PcmFrame : graphflow::core::EventT<PcmFrame> {
-  PcmFrame(const void* data, int bits, int rate, size_t channels, size_t frames)
-      : data(data), bits(bits), rate(rate), channels(channels), frames(frames) {}
+  PcmFrame(const void* data, int bits, int rate, size_t channels, size_t frames, std::optional<int64_t> capture_timestamp_ms = {})
+      : data(data), bits(bits), rate(rate), channels(channels), frames(frames), capture_timestamp_ms(capture_timestamp_ms) {}
   const void* data;
   int bits, rate;
   size_t channels, frames;
+  std::optional<int64_t> capture_timestamp_ms;
 };
 
 // Adapter at an external API boundary. Internal processing nodes subscribe to

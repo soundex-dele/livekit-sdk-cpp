@@ -2,6 +2,10 @@
 #include "livekit/auth.hpp"
 #include "livekit/media.hpp"
 #include "livekit/participant.hpp"
+#include "livekit/reconnect.hpp"
+#include "livekit/token_provider.hpp"
+#include "livekit/video_stream.hpp"
+#include "livekit/audio_stream.hpp"
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -10,8 +14,9 @@
 
 namespace livekit::sdk {
 using EventHandler = std::function<void(const Json&)>;
-enum class ConnectionState { disconnected, connecting, connected };
+enum class ConnectionState { disconnected, connecting, connected, reconnecting };
 struct RoomInfo { std::string sid, name, metadata; bool recording = false; };
+struct RoomMovedInfo { RoomInfo previous, current; };
 struct ConnectInfo {
   std::string api_key, api_secret, room_name, participant_identity, participant_name, participant_metadata;
   std::map<std::string, std::string> participant_attributes;
@@ -31,6 +36,12 @@ struct RoomCallback {
   std::function<void(const std::vector<Participant>&)> on_active_speakers_changed;
   std::function<void(const std::string& sid, int quality)> on_connection_quality_changed;
   std::function<void(const std::string& sid, int error)> on_track_subscription_failed;
+  std::function<void(const ReconnectInfo&)> on_reconnecting;
+  std::function<void(const ReconnectInfo&)> on_reconnected;
+  // State already names the destination. Reacquire Participant/Publication
+  // handles; a room boundary invalidates old handles even if media continues.
+  // The new server token is retained internally, never included in events.
+  std::function<void(const RoomMovedInfo&)> on_room_moved;
 };
 struct RoomOptions {
   std::string url, token, room, identity;
@@ -49,6 +60,22 @@ struct RoomOptions {
   // Serialized with events on the run thread; local preview also supports subscribe=false.
   // Copy the frame to retain it. Exceptions terminate and clean up the session.
   VideoFrameHandler video_frame_handler;
+  ReconnectOptions reconnect;
+  // Used when the initial token is empty, or once after an HTTP 401 on a
+  // connection attempt. Server refresh tokens remain preferred. A 403 does not
+  // trigger refresh. Provider time consumes the connection/recovery budget.
+  TokenProvider token_provider;
+  std::chrono::milliseconds token_timeout{10000};
+  RegionOptions regions;
+  // 12 preserves the baseline protocol. Opt into 15 for successful metadata
+  // RequestResponse acknowledgements. Other protocol versions are rejected.
+  int signal_protocol = 12;
+  // Bounded pull output, independent of application processing speed. Choose
+  // either this or video_frame_handler. Closed at logical session termination.
+  std::shared_ptr<VideoFrameStream> video_frame_stream;
+  // Decoded per-track PCM before device mixing/playout. Audio/video streams
+  // may be used together; each is bound to this logical session once.
+  std::shared_ptr<AudioFrameStream> audio_frame_stream;
 };
 
 class Room {

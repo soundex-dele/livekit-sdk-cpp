@@ -4,9 +4,10 @@
 namespace livekit::sdk::detail {
 void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
   std::vector<std::function<void()>> callbacks;
+  std::deque<std::shared_ptr<Command>> interrupted;
   {
     std::lock_guard lock(s->mutex);
-    auto& cb = s->callbacks; const auto g = s->generation;
+    auto& cb = s->callbacks; auto g = s->generation;
     const auto type = e.at("event").get<std::string>();
     auto tracks_changed = [&](const ParticipantInfo& old, const ParticipantInfo& now, bool local) {
       for (const auto& track : now.tracks) {
@@ -33,13 +34,91 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       s->room = {room.value("sid", ""), room.value("name", ""), room.value("metadata", ""), room.value("recording", false)};
       s->local = parse_participant(e.at("localParticipant"));
       for (const auto& p : e.at("participants")) { auto info = parse_participant(p); s->remote[info.identity] = std::move(info); }
+    } else if (type == "room-moved") {
+      const auto& room = e.at("roomInfo");
+      RoomMovedInfo moved{s->room, {room.value("sid", ""), room.value("name", ""),
+          room.value("metadata", ""), room.value("recording", false)}};
+      auto local = parse_participant(e.at("localParticipant"));
+      std::map<std::string, ParticipantInfo> remote;
+      std::map<std::string, bool> destination_subscriptions;
+      std::set<std::string> participant_sids{local.sid}, track_sids;
+      if (moved.current.sid.empty() || moved.current.name.empty() || local.sid.empty() || local.identity != s->local.identity)
+        throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message, "Invalid room migration snapshot");
+      for (auto& track : local.tracks) {
+        if (track.sid.empty() || !track_sids.insert(track.sid).second)
+          throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message, "Invalid migration publication snapshot");
+        if (const auto id = s->recovery.local_ids.find(track.sid); id != s->recovery.local_ids.end()) track.client_id = id->second;
+      }
+      for (const auto& p : e.at("participants")) {
+        auto info = parse_participant(p);
+        if (info.state == 3) continue;
+        if (info.identity.empty() || info.sid.empty() || info.identity == local.identity ||
+            !participant_sids.insert(info.sid).second || remote.contains(info.identity))
+          throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message, "Invalid migration participant snapshot");
+        for (auto& track : info.tracks) {
+          if (track.sid.empty() || !track_sids.insert(track.sid).second)
+            throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message, "Invalid migration track snapshot");
+          // OnTrack can precede the room snapshot on the native callback queue.
+          // Retain observed subscription only for tracks in the destination.
+          const auto observed = s->subscriptions.find(track.sid);
+          if (observed != s->subscriptions.end() && observed->second) {
+            track.subscribed = true; destination_subscriptions[track.sid] = true;
+          }
+        }
+        remote.emplace(info.identity, std::move(info));
+      }
+      // Validate the complete snapshot before mutating any public state.
+      for (const auto& [identity, old] : s->remote) {
+        auto removed = old; removed.state = 3; removed.disconnect_reason = 8; removed.tracks.clear();
+        tracks_changed(old, removed, false);
+        if (cb.on_participant_disconnected) callbacks.push_back([=, fn = cb.on_participant_disconnected] {
+          fn(RemoteParticipant(s, g, removed, false));
+        });
+      }
+      interrupted.swap(s->commands); // Reject old queued work, not work enqueued by new callbacks.
+      g = ++s->generation;
+      s->room = moved.current; s->local = std::move(local); s->remote = std::move(remote);
+      s->subscriptions = std::move(destination_subscriptions);
+      s->recovery.local_snapshot = s->local;
+      if (!e.value("transportRetained", true)) s->connection = ConnectionState::reconnecting;
+      if (moved.previous.metadata != moved.current.metadata && cb.on_room_metadata_changed)
+        callbacks.push_back([=, fn = cb.on_room_metadata_changed] { fn(moved.current.metadata); });
+      if (moved.previous.recording != moved.current.recording && cb.on_recording_status_changed)
+        callbacks.push_back([=, fn = cb.on_recording_status_changed] { fn(moved.current.recording); });
+      if (cb.on_room_moved) callbacks.push_back([=, fn = cb.on_room_moved] { fn(moved); });
+      for (const auto& [identity, now] : s->remote) {
+        if (cb.on_participant_connected) callbacks.push_back([=, fn = cb.on_participant_connected] {
+          fn(RemoteParticipant(s, g, now, false));
+        });
+        tracks_changed({}, now, false);
+        for (const auto& track : now.tracks) if (track.subscribed && cb.on_track_subscribed)
+          callbacks.push_back([=, fn = cb.on_track_subscribed] {
+            fn(TrackPublication(s, g, identity, track, false), RemoteParticipant(s, g, now, false));
+          });
+      }
     } else if (type == "connected") {
+      s->recovery.ever_connected = true;
+      s->recovery.budget.reset();
+      s->recovery.regions.attempted.clear();
       s->connection = ConnectionState::connected;
       s->cv.notify_all();
       if (cb.on_connected) callbacks.push_back(cb.on_connected);
+    } else if (type == "reconnecting" || type == "reconnected") {
+      const bool restored = type == "reconnected";
+      s->connection = restored ? ConnectionState::connected : ConnectionState::reconnecting;
+      ReconnectInfo info{e.value("mode", "resume") == "resume" ? ReconnectMode::resume : ReconnectMode::rejoin,
+                         e.value("attempt", size_t{0})};
+      auto fn = restored ? cb.on_reconnected : cb.on_reconnecting;
+      if (restored) { s->recovery.budget.reset(); s->recovery.rejoining = false; s->recovery.regions.attempted.clear(); }
+      if (fn) callbacks.push_back([=] { fn(info); });
+      s->cv.notify_all();
     } else if (type == "participant") {
       auto now = parse_participant(e.at("participant"));
       const bool local = now.sid == s->local.sid;
+      if (local) for (auto& t : now.tracks) {
+        const auto id = s->recovery.local_ids.find(t.sid);
+        if (id != s->recovery.local_ids.end()) t.client_id = id->second;
+      }
       auto found = s->remote.find(now.identity);
       const bool existed = local || found != s->remote.end();
       auto old = local ? s->local : existed ? found->second : ParticipantInfo{};
@@ -109,6 +188,11 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
     } else if (type == "subscription-failed") {
       if (cb.on_track_subscription_failed) callbacks.push_back([=, fn = cb.on_track_subscription_failed] { fn(e.at("sid"), e.at("error")); });
     } else if (type == "server-leave") s->reason = e.at("reason");
+  }
+  if (!interrupted.empty()) {
+    const auto failure = std::make_exception_ptr(SDKError(ErrorDomain::lifecycle,
+        ErrorCode::session_closed, "Command interrupted by room migration"));
+    for (auto& command : interrupted) command->reject(failure);
   }
   for (const auto& callback : callbacks) callback();
 }

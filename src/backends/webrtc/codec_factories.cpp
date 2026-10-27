@@ -177,7 +177,21 @@ class GraphAudioDecoderFactory : public AudioDecoderFactory {
  public:
   GraphAudioDecoderFactory(std::shared_ptr<RtcGraph> graph, scoped_refptr<AudioDecoderFactory> backend)
       : graph_(std::move(graph)), backend_(std::move(backend)) {}
-  std::vector<AudioCodecSpec> GetSupportedDecoders() override { return backend_->GetSupportedDecoders(); }
+  std::vector<AudioCodecSpec> GetSupportedDecoders() override {
+    auto formats = backend_->GetSupportedDecoders();
+    for (auto& codec : formats) {
+      auto name = codec.format.name;
+      std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (name != "opus" || codec.format.num_channels != 2) continue;
+      auto stereo = codec.format; stereo.parameters["stereo"] = "1";
+      if (!backend_->IsSupportedDecoder(stereo)) continue;
+      // Stock Opus can decode stereo but advertises mono by default. Advertise
+      // our actual receive capability so SDP configures NetEq for two channels;
+      // setting only AddTrack.stereo on the publisher cannot prevent downmix.
+      codec.format = std::move(stereo); codec.info.num_channels = 2;
+    }
+    return formats;
+  }
   bool IsSupportedDecoder(const SdpAudioFormat& format) override { return backend_->IsSupportedDecoder(format); }
   std::unique_ptr<AudioDecoder> Create(const Environment& env, const SdpAudioFormat& format, std::optional<AudioCodecPairId> id) override {
     auto codec = backend_->Create(env, format, id); if (!codec) return nullptr;

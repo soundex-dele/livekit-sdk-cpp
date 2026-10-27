@@ -1,22 +1,16 @@
 #pragma once
 #include "livekit/room.hpp"
+#include "engines/rtc/recovery_state.hpp"
+#include "engines/rtc/command.hpp"
+#include "engines/rtc/operation_deadlines.hpp"
+#include "media_nodes/render/video_stream.hpp"
+#include "media_nodes/render/audio_stream.hpp"
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
 
 namespace livekit::sdk::detail {
-struct Command {
-  std::string operation;
-  Json args;
-  MediaSpec media;
-  TrackPublishOptions publication;
-  std::chrono::steady_clock::time_point deadline;
-  std::function<void(const Json&, std::exception_ptr)> completion;
-  bool completed = false; // only the native session thread resolves a removed command
-  void resolve(const Json& result = Json::object()) { if (!completed) { completed = true; completion(result, {}); } }
-  void reject(std::exception_ptr error) { if (!completed) { completed = true; completion({}, error); } }
-};
 struct RoomState {
   mutable std::mutex mutex;
   std::condition_variable cv;
@@ -29,11 +23,16 @@ struct RoomState {
   std::map<std::string, bool> subscriptions;
   std::stop_source stop;
   int reason = 0, command_timeout = 30;
+  int signal_protocol = 12;
   std::exception_ptr failure;
   std::string error;
   std::thread::id runner;
   RoomCallback callbacks;
   std::deque<std::shared_ptr<Command>> commands;
+  std::unique_ptr<OperationDeadlines> deadlines;
+  std::shared_ptr<VideoFrameOutput> video_output;
+  std::shared_ptr<AudioFrameOutput> audio_output;
+  RecoveryState recovery; // runner-owned, no application-thread access
   void enqueue(uint64_t expected_generation, const std::shared_ptr<Command>& command);
   std::deque<std::shared_ptr<Command>> take_commands();
 };

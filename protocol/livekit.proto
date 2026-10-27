@@ -10,29 +10,41 @@ message Room { string sid = 1; string name = 2; string metadata = 8; bool active
 message TrackInfo { string sid = 1; TrackType type = 2; string name = 3; bool muted = 4; uint32 width = 5; uint32 height = 6; TrackSource source = 9; string mime_type = 11; string mid = 12; }
 message ParticipantInfo { string sid = 1; string identity = 2; int32 state = 3; repeated TrackInfo tracks = 4; string metadata = 5; string name = 9; int32 kind = 14; map<string,string> attributes = 15; int32 disconnect_reason = 16; }
 message ICEServer { repeated string urls = 1; string username = 2; string credential = 3; }
-message JoinResponse { Room room = 1; ParticipantInfo participant = 2; repeated ParticipantInfo other_participants = 3; string server_version = 4; repeated ICEServer ice_servers = 5; bool subscriber_primary = 6; string alternative_url = 7; int32 ping_timeout = 10; int32 ping_interval = 11; }
+enum ClientConfigSetting { UNSET = 0; DISABLED = 1; ENABLED = 2; }
+message ClientConfiguration { ClientConfigSetting resume_connection = 3; ClientConfigSetting force_relay = 5; }
+message JoinResponse { Room room = 1; ParticipantInfo participant = 2; repeated ParticipantInfo other_participants = 3; string server_version = 4; repeated ICEServer ice_servers = 5; bool subscriber_primary = 6; string alternative_url = 7; ClientConfiguration client_configuration = 8; int32 ping_timeout = 10; int32 ping_interval = 11; }
 message SessionDescription { string type = 1; string sdp = 2; uint32 id = 3; }
 message TrickleRequest { string candidateInit = 1; SignalTarget target = 2; bool final = 3; }
 message VideoLayer { int32 quality = 1; uint32 width = 2; uint32 height = 3; uint32 bitrate = 4; }
-message AddTrackRequest { string cid = 1; string name = 2; TrackType type = 3; uint32 width = 4; uint32 height = 5; TrackSource source = 8; repeated VideoLayer layers = 9; bool disable_red = 13; string stream = 15; }
+message AddTrackRequest { string cid = 1; string name = 2; TrackType type = 3; uint32 width = 4; uint32 height = 5; TrackSource source = 8; repeated VideoLayer layers = 9; bool stereo = 12 [deprecated = true]; bool disable_red = 13; string stream = 15; }
 message TrackPublishedResponse { string cid = 1; TrackInfo track = 2; }
 message TrackUnpublishedResponse { string track_sid = 1; }
 message ParticipantUpdate { repeated ParticipantInfo participants = 1; }
 message ParticipantTracks { string participant_sid = 1; repeated string track_sids = 2; }
 message UpdateSubscription { repeated string track_sids = 1; bool subscribe = 2; repeated ParticipantTracks participant_tracks = 3; }
-message LeaveRequest { bool can_reconnect = 1; int32 reason = 2; int32 action = 3; }
+message LeaveRequest { bool can_reconnect = 1; int32 reason = 2; int32 action = 3; RegionSettings regions = 4; }
+message RegionSettings { repeated RegionInfo regions = 1; }
+message RegionInfo { string region = 1; string url = 2; int64 distance = 3; }
+message RoomMovedResponse { Room room = 1; string token = 2; ParticipantInfo participant = 3; repeated ParticipantInfo other_participants = 4; }
 message MuteTrackRequest { string sid = 1; bool muted = 2; }
 message Ping { int64 timestamp = 1; int64 rtt = 2; }
 message Pong { int64 last_ping_timestamp = 1; int64 timestamp = 2; }
 message SubscriptionResponse { string track_sid = 1; int32 err = 2; }
+message RequestResponse {
+  enum Reason { OK = 0; NOT_FOUND = 1; NOT_ALLOWED = 2; LIMIT_EXCEEDED = 3; QUEUED = 4; UNSUPPORTED_TYPE = 5; UNCLASSIFIED_ERROR = 6; INVALID_HANDLE = 7; INVALID_NAME = 8; DUPLICATE_HANDLE = 9; DUPLICATE_NAME = 10; INVALID_REQUEST = 11; }
+  uint32 request_id = 1;
+  Reason reason = 2;
+  string message = 3;
+  oneof request { TrickleRequest trickle = 4; AddTrackRequest add_track = 5; MuteTrackRequest mute = 6; UpdateParticipantMetadata update_metadata = 7; }
+}
 message SignalRequest {
-  oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; }
+  oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; SyncState sync_state = 12; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; }
 }
 message SignalResponse {
-  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; }
+  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; ReconnectResponse reconnect = 19; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; RequestResponse request_response = 22; RoomMovedResponse room_moved = 24; }
 }
-message UserPacket { string participant_sid = 1; bytes payload = 2; string topic = 4; string participant_identity = 5; repeated string destination_identities = 6; bytes nonce = 11; }
-message DataPacket { int32 kind = 1; UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; string participant_identity = 4; repeated string destination_identities = 5; }
+message UserPacket { string participant_sid = 1; bytes payload = 2; optional string topic = 4; string participant_identity = 5; repeated string destination_identities = 6; bytes nonce = 11; }
+message DataPacket { int32 kind = 1; oneof value { UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; } string participant_identity = 4; repeated string destination_identities = 5; }
 
 message UpdateTrackSettings { repeated string track_sids = 1; bool disabled = 3; int32 quality = 4; uint32 width = 5; uint32 height = 6; uint32 fps = 7; uint32 priority = 8; }
 message UpdateParticipantMetadata { string metadata = 1; string name = 2; map<string,string> attributes = 3; uint32 request_id = 4; }
@@ -43,3 +55,14 @@ message ConnectionQualityInfo { string participant_sid = 1; int32 quality = 2; f
 message ConnectionQualityUpdate { repeated ConnectionQualityInfo updates = 1; }
 
 message ActiveSpeakerUpdate { repeated SpeakerInfo speakers = 1; }
+
+message ReconnectResponse { repeated ICEServer ice_servers = 1; ClientConfiguration client_configuration = 2; }
+message DataChannelInfo { string label = 1; uint32 id = 2; SignalTarget target = 3; }
+message SyncState {
+  SessionDescription answer = 1;
+  UpdateSubscription subscription = 2;
+  repeated TrackPublishedResponse publish_tracks = 3;
+  repeated DataChannelInfo data_channels = 4;
+  SessionDescription offer = 5;
+  repeated string track_sids_disabled = 6;
+}

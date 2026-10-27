@@ -1,5 +1,7 @@
 # livekit-sdk-cpp
 
+[客户端能力补齐进度](docs/client-parity-progress.md)：已加入固定上游协议的字段合约检查、信令恢复、ICE restart、完整重新入会、异步 TokenProvider、操作取消/确认，以及首版应用 I420/PCM 输入和有界帧读取。恢复语义见 [连接恢复](docs/reconnection.md)，媒体接口见 [视频输入](docs/video-source.md)、[音频输入](docs/audio-source.md)、[视频读取](docs/video-stream.md)和[音频读取](docs/audio-stream.md)。Go 实际互通、其余媒体扩展、RPC/streams、DataTrack、E2EE 和跨平台验收仍待完成。
+
 [远程控制](../docs/integration/remote-control/README.md)：新增 `RemoteControlSession`、可靠键鼠协议、租约/心跳 watchdog 和 Windows 输入后端；搭配相邻 ImGui 被控端、浏览器及 Go 授权服务使用。自动化只验证合成媒体和输入记录器，实际桌面需人工验收。
 
 [WebRTC 媒体图节点](docs/media-graph-webrtc.md)：采集、音视频编解码与渲染拆为独立节点，四类 Factory 默认接入 Room；支持摄像头/主屏输入、可选本地预览及节点统计。视频接收通过自定义 DecoderFactory 将待解码帧送入每轨完整接收图，解码像素直接进入图内呈现、渲染与录制，不回交 WebRTC；音画同步及统计边界见该文档。

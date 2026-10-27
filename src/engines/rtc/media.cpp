@@ -6,9 +6,9 @@
 namespace lk {
 void AudioSource::AddSink(webrtc::AudioTrackSinkInterface* sink) { std::lock_guard lock(mutex_); sinks_.push_back(sink); }
 void AudioSource::RemoveSink(webrtc::AudioTrackSinkInterface* sink) { std::lock_guard lock(mutex_); std::erase(sinks_, sink); }
-void AudioSource::push(const int16_t* samples) {
+void AudioSource::push(const livekit::sdk::detail::PcmFrame& frame) {
   std::lock_guard lock(mutex_);
-  for (auto* sink : sinks_) sink->OnData(samples, 16, 48000, 1, 480);
+  for (auto* sink : sinks_) sink->OnData(frame.data, frame.bits, frame.rate, frame.channels, frame.frames, frame.capture_timestamp_ms);
 }
 std::vector<MediaSpec> probe_media(const std::string& input, const std::string& ffmpeg, bool loop, int width, int height, int fps) {
   if (input.starts_with("camera://") || input == "screen://primary") {
@@ -60,7 +60,7 @@ MediaPump::MediaPump(MediaSpec value, std::shared_ptr<livekit::sdk::detail::RtcG
   } else {
     audio = webrtc::make_ref_counted<AudioSource>();
     auto output = std::make_shared<MediaEventNode<PcmFrame>>("AudioTrackInputNode", NodeExecution::sink,
-        [source = audio](PcmFrame& event) { source->push(static_cast<const int16_t*>(event.data)); });
+        [source = audio](PcmFrame& event) { source->push(event); });
     nodes.push_back(output); edges.push_back(RtcPipeline::connect<PcmFrame>(capture_, output));
   }
   pipeline_->build(nodes, edges);
@@ -73,8 +73,8 @@ bool MediaPump::start() {
   return true;
 }
 void MediaPump::stop() { pipeline_->stop(); }
-TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout, VideoFrames* frames, std::string track_id, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph, std::vector<uint32_t> ssrcs)
-    : track_(std::move(track)), track_id_(track_id.empty() ? track_->id() : std::move(track_id)), playout_(playout), frame_output_(frames) {
+TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout, VideoFrames* frames, std::string track_id, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph, std::vector<uint32_t> ssrcs, std::shared_ptr<livekit::sdk::detail::AudioFrameOutput> audio_output)
+    : track_(std::move(track)), track_id_(track_id.empty() ? track_->id() : std::move(track_id)), playout_(playout), frame_output_(frames), audio_output_(std::move(audio_output)) {
   if (!graph) graph = std::make_shared<livekit::sdk::detail::RtcGraph>();
   using namespace livekit::sdk::detail;
   registry_ = graph;
@@ -88,6 +88,12 @@ TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> tr
   subscribe_node_ = audio_input_;
   std::vector<std::shared_ptr<MediaNode>> nodes{subscribe_node_};
   std::vector<RtcPipeline::Connection> edges;
+  if (audio_output_) {
+    auto output = std::make_shared<MediaEventNode<PcmFrame>>("AudioFrameOutputNode", NodeExecution::sink,
+        [this](PcmFrame& frame) { audio_output_->submit(track_id_, audio_lease_, frame.data, frame.bits,
+            frame.rate, frame.channels, frame.frames, frame.capture_timestamp_ms); });
+    nodes.push_back(output); edges.push_back(RtcPipeline::connect<PcmFrame>(subscribe_node_, output));
+  }
   if (!directory.empty()) {
     recorder_ = std::make_shared<RecordingNode>(directory, track_id_, false);
     nodes.push_back(recorder_);
@@ -106,7 +112,13 @@ void TrackSink::attach() {
     return;
   }
   if (!pipeline_->start()) throw std::runtime_error("media_graph: receive pipeline start failed");
-  static_cast<webrtc::AudioTrackInterface*>(track_.get())->AddSink(this);
+  try {
+    if (audio_output_) audio_lease_ = audio_output_->add(track_id_);
+    static_cast<webrtc::AudioTrackInterface*>(track_.get())->AddSink(this);
+  } catch (...) {
+    if (audio_output_) audio_output_->remove(track_id_, audio_lease_);
+    pipeline_->stop(); throw;
+  }
   attached_ = true;
 }
 void TrackSink::detach() {
@@ -118,13 +130,17 @@ void TrackSink::detach() {
     return;
   }
   static_cast<webrtc::AudioTrackInterface*>(track_.get())->RemoveSink(this);
+  if (audio_output_) audio_output_->remove(track_id_, audio_lease_);
   pipeline_->stop();
   attached_ = false;
 }
 void TrackSink::OnData(const void* data, int bits, int rate, size_t channels, size_t frames) {
+  OnData(data, bits, rate, channels, frames, {});
+}
+void TrackSink::OnData(const void* data, int bits, int rate, size_t channels, size_t frames, std::optional<int64_t> capture_timestamp_ms) {
   try {
     { std::lock_guard lock(mutex_); ++frames_; bytes_ += frames * channels * (bits / 8); }
-    audio_input_->emit(livekit::sdk::detail::PcmFrame(data, bits, rate, channels, frames));
+    audio_input_->emit(livekit::sdk::detail::PcmFrame(data, bits, rate, channels, frames, capture_timestamp_ms));
   } catch (const std::exception& error) {
     ++subscribe_node_->errors; std::lock_guard lock(mutex_); error_ = error.what();
   }

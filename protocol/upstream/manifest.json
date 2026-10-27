@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/livekit/protocol",
+  "version": "v1.53.0",
+  "revision": "5f3bf01d03f8242c83eacf6bdb2d77142f7c8ac4",
+  "files": {
+    "livekit_rtc.proto": "785686c74a16dd59f21510e65c18554c0010039e41deb7cba88140b12936bcef",
+    "livekit_models.proto": "e91011464e2026276fccd4183dc27e9c11e94ad1a8803efca43725707b50e236",
+    "livekit_metrics.proto": "e36174bc6ac5e6fcd9faab8e9c889edccf630d04af349a85c2e3165fdd4edd22",
+    "logger/options.proto": "72fcda94abf7870ac8868f455825787d86a14ff8df8ef8ef131850b9668e1b21"
+  }
+}

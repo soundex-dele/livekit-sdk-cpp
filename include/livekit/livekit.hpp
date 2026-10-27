@@ -1,6 +1,10 @@
 #pragma once
+#include "livekit/version.hpp"
+#include "livekit/error.hpp"
 #include "livekit/auth.hpp"
 #include "livekit/media.hpp"
+#include "livekit/video_source.hpp"
+#include "livekit/audio_source.hpp"
 #include "livekit/room.hpp"
 #include "livekit/room_service.hpp"
 #include "livekit/api.hpp"

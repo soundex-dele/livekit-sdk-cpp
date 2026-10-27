@@ -1,12 +1,14 @@
 #include "media_nodes/capture/capture_source.hpp"
 #include "media_nodes/capture/capture.hpp"
 #include "media_graph/video_events.hpp"
+#include "backends/webrtc/pcm_resampler.hpp"
 #include "support/process.hpp"
 #include "api/video/i420_buffer.h"
 #include "rtc_base/time_utils.h"
 #include <cmath>
 #include <cstring>
 #include <numbers>
+#include <condition_variable>
 
 namespace lk {
 static std::vector<std::string> input_args(std::string input) {
@@ -29,6 +31,8 @@ CaptureNode::CaptureNode(MediaSpec value)
       spec.width % 2 || spec.height % 2 || spec.fps < 1 || spec.fps > 240 ||
       (spec.capture != livekit::sdk::CaptureKind::input && !spec.video))
     throw std::invalid_argument("Invalid capture format (even dimensions 2..8192, fps 1..240 required)");
+  if (spec.video_source) external_video_ = std::make_unique<livekit::sdk::detail::I420SourceReader>(spec.video_source);
+  if (spec.audio_source) external_audio_ = std::make_unique<livekit::sdk::detail::PcmSourceReader>(spec.audio_source);
 }
 CaptureNode::~CaptureNode() { release(); }
 bool CaptureNode::doStart() {
@@ -37,10 +41,15 @@ bool CaptureNode::doStart() {
   return true;
 }
 void CaptureNode::activate() {
+  if (external_video_ && !thread_.joinable()) { external_stop_ = std::stop_source{}; external_video_->start(); }
+  if (external_audio_ && !thread_.joinable()) { external_stop_ = std::stop_source{}; external_audio_->start(); }
   if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
 }
 void CaptureNode::doStop() {
   stop_ = true;
+  external_stop_.request_stop();
+  if (external_video_) external_video_->stop();
+  if (external_audio_) external_audio_->stop();
   { std::lock_guard lock(mutex_); if (process_) process_->terminate(); }
   if (thread_.joinable()) thread_.join();
 }
@@ -50,6 +59,53 @@ void CaptureNode::deliver(const webrtc::VideoFrame& frame) {
 std::string CaptureNode::error() const { std::lock_guard lock(mutex_); return error_; }
 void CaptureNode::run() {
   try {
+    if (external_audio_) {
+      using namespace std::chrono_literals;
+      const auto format = spec.audio_source->options();
+      livekit::sdk::detail::PcmResampler resampler(format.sample_rate, format.channels);
+      std::mutex pace_mutex; std::condition_variable_any pace;
+      std::optional<std::chrono::steady_clock::time_point> next;
+      while (!stop_) {
+        if (next) {
+          const auto now = std::chrono::steady_clock::now();
+          if (now > *next + 20ms) {
+            const auto skipped = (now - *next) / 10ms;
+            external_audio_->skip(static_cast<size_t>(skipped));
+            *next += 10ms * skipped; resampler.reset();
+          }
+          std::unique_lock lock(pace_mutex);
+          pace.wait_until(lock, external_stop_.get_token(), *next, [&] { return stop_.load(); });
+        }
+        auto input = external_audio_->read(external_stop_.get_token());
+        if (!input || stop_) break;
+        if (!next) next = std::chrono::steady_clock::now();
+        const auto samples = resampler.process(input->samples);
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - input->captured).count();
+        ++inputs;
+        publish(livekit::sdk::detail::PcmFrame(samples.data(), 16, 48000, format.channels, 480, webrtc::TimeMillis() - age));
+        ++outputs; ++frames; *next += 10ms;
+      }
+      finished_ = true; return;
+    }
+    if (external_video_) {
+      std::mutex pace_mutex;
+      std::condition_variable_any pace;
+      auto next = std::chrono::steady_clock::now();
+      const auto period = std::chrono::microseconds(1000000 / spec.fps);
+      while (!stop_) {
+        // Wait before dequeue so expired frames cannot be held across pacing.
+        { std::unique_lock lock(pace_mutex); pace.wait_until(lock, external_stop_.get_token(), next, [&] { return stop_.load(); }); }
+        auto input = external_video_->read(external_stop_.get_token());
+        if (!input || stop_) break;
+        const auto& f = input->frame;
+        auto buffer = webrtc::I420Buffer::Copy(f.width, f.height, f.y.data(), f.stride_y,
+            f.u.data(), f.stride_u, f.v.data(), f.stride_v);
+        const auto age = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - input->captured).count();
+        deliver(webrtc::VideoFrame::Builder().set_video_frame_buffer(buffer).set_timestamp_us(webrtc::TimeMicros() - age).build());
+        ++frames; next = std::chrono::steady_clock::now() + period;
+      }
+      finished_ = true; return;
+    }
     if (spec.capture != livekit::sdk::CaptureKind::input) {
       capture_device(spec, stop_, [this](const webrtc::VideoFrame& frame) { deliver(frame); ++frames; });
       finished_ = true; return;

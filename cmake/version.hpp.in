@@ -1,0 +1,7 @@
+#pragma once
+#include <string_view>
+namespace livekit::sdk {
+inline constexpr std::string_view version = "@PROJECT_VERSION@";
+// Do not advance until all behavior required by the newer protocol is tested.
+inline constexpr int protocol_version = 12;
+}

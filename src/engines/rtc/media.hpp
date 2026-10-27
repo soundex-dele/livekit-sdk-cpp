@@ -10,6 +10,7 @@
 #include "media_nodes/recording/recording.hpp"
 #include "backends/webrtc/graph_video_encoder.hpp"
 #include "engines/rtc/video_receive_graph.hpp"
+#include "media_nodes/render/audio_stream.hpp"
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -35,7 +36,7 @@ class AudioSource : public webrtc::Notifier<webrtc::AudioSourceInterface> {
   bool remote() const override { return false; }
   void AddSink(webrtc::AudioTrackSinkInterface* sink) override;
   void RemoveSink(webrtc::AudioTrackSinkInterface* sink) override;
-  void push(const int16_t* samples);
+  void push(const livekit::sdk::detail::PcmFrame& frame);
  private:
   std::mutex mutex_;
   std::vector<webrtc::AudioTrackSinkInterface*> sinks_;
@@ -64,11 +65,12 @@ class MediaPump {
 };
 class TrackSink : public webrtc::AudioTrackSinkInterface {
  public:
-  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {}, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {}, std::vector<uint32_t> ssrcs = {});
+  TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {}, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {}, std::vector<uint32_t> ssrcs = {}, std::shared_ptr<livekit::sdk::detail::AudioFrameOutput> audio_output = {});
   ~TrackSink();
   void attach();
   void detach();
   void OnData(const void* data, int bits, int rate, size_t channels, size_t frames) override;
+  void OnData(const void* data, int bits, int rate, size_t channels, size_t frames, std::optional<int64_t> capture_timestamp_ms) override;
   std::string error() const;
   Json stats() const;
   std::string track_id() const { return track_id_; }
@@ -78,6 +80,8 @@ class TrackSink : public webrtc::AudioTrackSinkInterface {
   std::string track_id_;
   VideoPlayout* playout_ = nullptr;
   VideoFrames* frame_output_ = nullptr;
+  std::shared_ptr<livekit::sdk::detail::AudioFrameOutput> audio_output_;
+  uint64_t audio_lease_ = 0;
   mutable std::mutex mutex_;
   uint64_t frames_ = 0, bytes_ = 0;
   bool attached_ = false;
