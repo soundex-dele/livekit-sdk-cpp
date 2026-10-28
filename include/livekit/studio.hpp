@@ -65,6 +65,8 @@ class Studio {
 };
 struct StudioDevice { std::string id,name; };
 std::vector<StudioDevice> studio_windows();
+std::vector<StudioDevice> studio_screens();
+std::vector<StudioDevice> studio_cameras();
 // Public pure operations for offline verification and media consumers.
 StudioImage studio_composite_cpu(int width,int height,const std::vector<std::pair<StudioSource,std::shared_ptr<const StudioImage>>>& layers);
 void studio_mix(std::vector<float>& target,const std::vector<float>& source,float gain);

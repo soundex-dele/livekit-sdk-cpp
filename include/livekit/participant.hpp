@@ -96,6 +96,9 @@ class LocalParticipant : public Participant {
  public:
   using Participant::Participant;
   std::future<TrackPublication> publish_track(const MediaSpec& media, const TrackPublishOptions& options = {}, const OperationOptions& operation = {}) const;
+  // Explicitly acquire the system microphone after joining; no capture before this call.
+  // Requires RoomOptions.audio_playout or microphone (a physical audio backend).
+  std::future<TrackPublication> publish_microphone(const OperationOptions& operation = {}) const;
   std::future<void> unpublish_track(const std::string& sid, const OperationOptions& operation = {}) const;
   std::future<void> publish_data(const std::vector<uint8_t>& payload, const DataPublishOptions& options = {}, const OperationOptions& operation = {}) const;
   // Reliable official data messages. Completion means local channel submission,

@@ -31,7 +31,26 @@ class GraphAudioDevice : public webrtc::AudioDeviceModule, private webrtc::Audio
     // WebRTC initializes recording even for externally supplied test/file PCM.
     // Keep that logical state off the physical microphone unless requested.
     if (!capture_enabled) recording_device_ = webrtc::make_ref_counted<lk::HeadlessAudioDevice>();
+    capture_enabled_.store(capture_enabled);
     capture_->start(); output_->start();
+  }
+  // Called only on WebRTC's ADM worker. Switching never happens on its callback thread.
+  int32_t enable_capture() {
+    if (capture_enabled_.load()) return 0;
+    recording_device_->StopRecording(); recording_device_->Terminate();
+    recording_device_=device_;
+    int32_t result=device_->SetRecordingDevice(uint16_t(0));
+    if(result==0) result=device_->InitMicrophone();
+    if(result==0) result=device_->InitRecording();
+    if(result==0) { capture_enabled_.store(true); result=device_->StartRecording(); }
+    if(result!=0) { capture_enabled_.store(false); device_->StopRecording(); recording_device_=webrtc::make_ref_counted<lk::HeadlessAudioDevice>(); recording_device_->Init(); }
+    return result;
+  }
+  void disable_capture() {
+    capture_enabled_.store(false);
+    device_->StopRecording();
+    recording_device_=webrtc::make_ref_counted<lk::HeadlessAudioDevice>();
+    recording_device_->Init(); recording_device_->InitRecording(); recording_device_->StartRecording();
   }
   ~GraphAudioDevice() override { Terminate(); capture_->release(); output_->release(); }
   int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override {
@@ -124,7 +143,7 @@ class GraphAudioDevice : public webrtc::AudioDeviceModule, private webrtc::Audio
       size_t channels, uint32_t rate, uint32_t delay, int32_t drift, uint32_t level,
       bool key, uint32_t& new_level, std::optional<int64_t> capture_time) override {
     new_level = level;
-    if (recording_device_.get() != device_.get()) return 0;
+    if (!capture_enabled_.load()) return 0;
     return capture_->capture([&] {
       auto* transport = transport_.load();
       return transport ? transport->RecordedDataIsAvailable(data, samples, bytes, channels,
@@ -153,5 +172,6 @@ class GraphAudioDevice : public webrtc::AudioDeviceModule, private webrtc::Audio
   std::shared_ptr<AudioCaptureNode> capture_;
   std::shared_ptr<AudioOutputNode> output_;
   std::atomic<webrtc::AudioTransport*> transport_{nullptr};
+  std::atomic<bool> capture_enabled_{false};
 };
 }

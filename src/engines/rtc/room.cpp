@@ -99,6 +99,7 @@ class Runtime {
   std::unique_ptr<webrtc::Thread> network, worker, signaling;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
   std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = std::make_shared<livekit::sdk::detail::RtcGraph>();
+  webrtc::scoped_refptr<livekit::sdk::detail::GraphAudioDevice> audio_device;
   Runtime(bool hardware, bool microphone = false) {
 #ifdef _WIN32
     if (winsock.error()) throw std::runtime_error("Winsock initialization failed");
@@ -121,7 +122,8 @@ class Runtime {
         return webrtc::make_ref_counted<HeadlessAudioDevice>();
       });
       if (!deps.adm) throw std::runtime_error("Cannot create WebRTC audio device");
-      deps.adm = webrtc::make_ref_counted<livekit::sdk::detail::GraphAudioDevice>(deps.adm, graph, microphone);
+      audio_device = webrtc::make_ref_counted<livekit::sdk::detail::GraphAudioDevice>(deps.adm, graph, microphone);
+      deps.adm = audio_device;
       livekit::sdk::detail::install_graph_codecs(deps, graph);
       webrtc::EnableMediaWithDefaults(deps);
       factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
@@ -139,6 +141,7 @@ class Runtime {
   void cleanup() {
     graph->close();
     if (factory) signaling->BlockingCall([&] { factory = nullptr; });
+    if (audio_device && worker) worker->BlockingCall([&] { audio_device = nullptr; });
     if (signaling) signaling->Stop(); if (worker) worker->Stop(); if (network) network->Stop();
     if (ssl_) { webrtc::CleanupSSL(); ssl_ = false; }
   }
@@ -384,7 +387,8 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   event("session-capabilities",detail::session_capabilities_json(join,options.signal_protocol,relay_only));
   for (const auto& p : join.other_participants())
     event("participant", {{"identity", p.identity()}, {"sid", p.sid()}, {"state", p.state()}, {"participant", participant_json(p)}, {"initial", true}});
-  Runtime runtime(options.audio_playout || options.microphone, options.microphone);
+  const bool restore_microphone=std::any_of(recovery.publications.begin(),recovery.publications.end(),[](const auto& p){return p.second.microphone;});
+  Runtime runtime(options.audio_playout || restore_microphone, restore_microphone);
   std::unique_ptr<VideoFrames> video_frames;
   if (options.video_frame_handler || options.video_frame_stream)
     video_frames = std::make_unique<VideoFrames>(options.video_frame_handler, session ? session->video_output : nullptr);
@@ -587,6 +591,8 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       auto pump = track_pumps.find(cid);
       if (pump != track_pumps.end()) { pump->second->stop(); started_pumps.erase(pump->second); std::erase_if(pumps, [&](const auto& p) { return p.get() == pump->second; }); track_pumps.erase(pump); }
       std::erase_if(tracks, [&](const auto& t) { return t->id() == cid; });
+      const bool is_microphone=(recovery.publications.contains(cid)&&recovery.publications.at(cid).microphone) || (publishing.contains(cid)&&publishing.at(cid)->operation=="publish-microphone");
+      if(is_microphone)runtime.worker->BlockingCall([&]{runtime.audio_device->disable_capture();});
       recovery.publications.erase(cid); recovery.local_ids.erase(sid);
       published_tracks.erase(found); published_info.erase(sid); dirty = true; event("track-unpublished", {{"sid", sid}});
     };
@@ -717,7 +723,16 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
             }
             livekit::SignalRequest request;
             if (op != "data" && op != "packet" && !command->begin_send()) continue;
-            if (op == "publish") {
+            if (op == "publish-microphone") {
+              if(!options.audio_playout && !options.microphone && !restore_microphone) throw std::logic_error("Dynamic microphone requires a hardware audio session");
+              if(std::any_of(publishing.begin(),publishing.end(),[](const auto&p){return p.second->operation=="publish-microphone";})) throw std::logic_error("Microphone publication is pending");
+              if (std::any_of(recovery.publications.begin(),recovery.publications.end(),[](const auto& p){return p.second.microphone;})) throw std::logic_error("Microphone is already published");
+              if(runtime.worker->BlockingCall([&]{return runtime.audio_device->enable_capture();})!=0) throw std::runtime_error("Cannot open system microphone");
+              need_publisher=true; const auto id=recovery.allocate_id(false);
+              auto source=runtime.factory->CreateAudioSource(webrtc::AudioOptions{});
+              add_track(runtime.factory->CreateAudioTrack(id,source.get()),nullptr,command->publication);
+              publishing[id]=command;dirty=true;continue;
+            } else if (op == "publish") {
               if (publishing.size() >= 128) throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "Too many unconfirmed publications");
               need_publisher = true;
               const auto id = recovery.allocate_id(command->media.video);
@@ -849,7 +864,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         if (pending_publication != publishing.end()) pending_publication->second->expire(Clock::now());
         const bool cancelled_publication = pending_publication != publishing.end() && pending_publication->second->done();
         if (auto pending = publishing.find(cid); pending != publishing.end() && !cancelled_publication)
-          recovery.publications[cid] = detail::DesiredPublication{pending->second->media, pending->second->publication};
+          recovery.publications[cid] = detail::DesiredPublication{pending->second->media, pending->second->publication, pending->second->operation == "publish-microphone"};
         recovery.local_ids[sid] = cid;
         published_info[response.track_published().track().sid()] = response.track_published();
         awaiting_tracks.erase(response.track_published().cid());

@@ -1,7 +1,9 @@
 #include "internal.hpp"
 #include "livekit/player.hpp"
+#ifdef _WIN32
 #include <windows.h>
 #include <objbase.h>
+#endif
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <atomic>
@@ -28,7 +30,11 @@ struct Studio::Impl {
  struct Source {StudioSource spec;std::unique_ptr<Capture>capture;std::unique_ptr<Player>player;std::shared_ptr<const StudioImage>image;std::deque<float>audio;std::string error;std::chrono::steady_clock::time_point attempt=std::chrono::steady_clock::now();};
  explicit Impl(StudioOptions o):options(o){if((o.width!=1280||o.height!=720)&&(o.width!=720||o.height!=1280)&&(o.width!=1920||o.height!=1080)&&(o.width!=1080||o.height!=1920))throw std::invalid_argument("请选择 720p 或 1080p 横竖屏");if(o.fps!=30)throw std::invalid_argument("首版帧率为 30 fps");I420SourceOptions v;v.width=o.width;v.height=o.height;programVideo=std::make_shared<I420VideoSource>(v);localVideo=std::make_shared<I420VideoSource>(v);programAudio=std::make_shared<PcmAudioSource>(audioOptions());localAudio=std::make_shared<PcmAudioSource>(audioOptions());worker=std::jthread([this]{run();});}
  ~Impl(){stop=true;if(worker.joinable())worker.join();programVideo->close();localVideo->close();programAudio->close();localAudio->close();}
- void run(){HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);std::unique_ptr<Recorder>recorder;try{
+ void run(){
+#ifdef _WIN32
+ HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+#endif
+ std::unique_ptr<Recorder>recorder;try{
   Compositor compositor(options.width,options.height,options.software_gpu);std::map<std::string,Source>sources;std::unique_ptr<AudioCapture>mic,system;std::unique_ptr<Monitor>monitor;auto nextAudio=std::chrono::steady_clock::now(),nextVideo=nextAudio,deviceRetry=nextAudio;auto videoStep=std::chrono::microseconds(1000000/options.fps);
   while(!stop){StudioScene current;StudioAudioSettings audio;bool recording;std::filesystem::path path;std::map<std::string,std::shared_ptr<const StudioImage>>remote;
    {std::lock_guard lock(mutex);current=scene;audio=settings;recording=recordWanted;path=recordPath;auto now=std::chrono::steady_clock::now();std::erase_if(remoteSeen,[&](const auto&e){if(now-e.second<std::chrono::seconds(5))return false;remoteVideo.erase(e.first);remoteAudio.erase(e.first);return true;});remote=remoteVideo;}
@@ -65,7 +71,10 @@ struct Studio::Impl {
   }
  }catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();}
  if(recorder){try{recorder->finish();}catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();}}
- {std::lock_guard lock(mutex);status.recording=false;}if(SUCCEEDED(com))CoUninitialize();
+ {std::lock_guard lock(mutex);status.recording=false;}
+#ifdef _WIN32
+ if(SUCCEEDED(com))CoUninitialize();
+#endif
  }
 };
 Studio::Studio(StudioOptions o):impl_(std::make_unique<Impl>(o)){}Studio::~Studio()=default;
@@ -84,7 +93,12 @@ std::shared_ptr<I420VideoSource>Studio::local_video_output()const{return impl_->
 void Studio::save_project(const std::filesystem::path&p,const std::vector<StudioScene>&scenes,size_t selected,StudioOptions o,StudioAudioSettings a){
  if(scenes.empty()||scenes.size()>20||selected>=scenes.size())throw std::invalid_argument("无效场景集合");Json j{{"version",1},{"selected",selected},{"width",o.width},{"height",o.height},{"audio",{{"microphone",a.microphone},{"system",a.system},{"monitor",a.monitor},{"mic_volume",a.microphone_volume},{"system_volume",a.system_volume},{"media_volume",a.media_volume},{"remote_volume",a.remote_volume}}},{"scenes",Json::array()}};
  for(auto&scene:scenes){validate(scene);Json items=Json::array();for(auto&s:scene.sources){if(s.kind==StudioSourceKind::remote)continue;auto&t=s.transform;items.push_back({{"id",s.id},{"name",s.name},{"kind",int(s.kind)},{"input",s.input},{"transform",{t.x,t.y,t.width,t.height,t.rotation,t.crop_left,t.crop_top,t.crop_right,t.crop_bottom}},{"color",s.color},{"visible",s.visible},{"locked",s.locked},{"loop",s.loop},{"muted",s.muted},{"volume",s.volume},{"chroma",{{"enabled",s.chroma.enabled},{"color",s.chroma.color},{"similarity",s.chroma.similarity},{"smoothness",s.chroma.smoothness},{"spill",s.chroma.spill}}}});}j["scenes"].push_back({{"id",scene.id},{"name",scene.name},{"sources",items}});}
- if(!p.parent_path().empty())std::filesystem::create_directories(p.parent_path());auto tmp=p;tmp+=L".tmp";{std::ofstream f(tmp,std::ios::binary|std::ios::trunc);if(!f||!(f<<j.dump(2)))throw std::runtime_error("无法保存场景");f.flush();if(!f)throw std::runtime_error("场景写入失败");}if(!MoveFileExW(tmp.c_str(),p.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))throw std::runtime_error("无法替换场景文件");
+ if(!p.parent_path().empty())std::filesystem::create_directories(p.parent_path());auto tmp=p;tmp+=L".tmp";{std::ofstream f(tmp,std::ios::binary|std::ios::trunc);if(!f||!(f<<j.dump(2)))throw std::runtime_error("无法保存场景");f.flush();if(!f)throw std::runtime_error("场景写入失败");}
+#ifdef _WIN32
+ if(!MoveFileExW(tmp.c_str(),p.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))throw std::runtime_error("无法替换场景文件");
+#else
+ std::filesystem::rename(tmp,p);
+#endif
 }
 std::vector<StudioScene>Studio::load_project(const std::filesystem::path&p,size_t&selected,StudioOptions&o,StudioAudioSettings&a){
  if(std::filesystem::file_size(p)>2*1024*1024)throw std::runtime_error("场景文件过大");std::ifstream f(p);auto j=Json::parse(f);if(j.at("version")!=1)throw std::runtime_error("不支持的场景版本");std::vector<StudioScene>out;for(auto&v:j.at("scenes")){StudioScene scene;scene.id=v.at("id");scene.name=v.at("name");for(auto&x:v.at("sources")){StudioSource s;s.id=x.at("id");s.name=x.at("name");int kind=x.at("kind");if(kind<0||kind>=int(StudioSourceKind::remote))throw std::runtime_error("无效素材类型");s.kind=StudioSourceKind(kind);s.input=x.at("input");auto t=x.at("transform").get<std::array<float,9>>();s.transform={t[0],t[1],t[2],t[3],t[4],t[5],t[6],t[7],t[8]};s.color=x.at("color").get<std::array<float,4>>();s.visible=x.at("visible");s.locked=x.at("locked");s.loop=x.at("loop");s.muted=x.at("muted");s.volume=x.at("volume");auto&k=x.at("chroma");s.chroma.enabled=k.at("enabled");s.chroma.color=k.at("color").get<std::array<float,3>>();s.chroma.similarity=k.at("similarity");s.chroma.smoothness=k.at("smoothness");s.chroma.spill=k.at("spill");scene.sources.push_back(s);}validate(scene);out.push_back(scene);}auto sel=j.at("selected").get<size_t>();if(out.empty()||out.size()>20||sel>=out.size())throw std::runtime_error("无效场景集合");StudioAudioSettings audio;auto&v=j.at("audio");audio.microphone=v.at("microphone");audio.system=v.at("system");audio.monitor=v.at("monitor");audio.microphone_volume=v.at("mic_volume");audio.system_volume=v.at("system_volume");audio.media_volume=v.at("media_volume");audio.remote_volume=v.at("remote_volume");int width=j.at("width"),height=j.at("height");if((width!=1280||height!=720)&&(width!=720||height!=1280)&&(width!=1920||height!=1080)&&(width!=1080||height!=1920))throw std::runtime_error("无效画布尺寸");for(float gain:{audio.microphone_volume,audio.system_volume,audio.media_volume,audio.remote_volume})if(!std::isfinite(gain)||gain<0||gain>2)throw std::runtime_error("无效音频配置");o.width=width;o.height=height;a=audio;selected=sel;return out;

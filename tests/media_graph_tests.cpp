@@ -320,7 +320,13 @@ static void playback_only_audio_device() {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   bridge->StopPlayout(); bridge->StopRecording();
   check(transport.rendered >= 3 && !bridge->Recording(), "playback works independently of microphone capture");
+  check(bridge->enable_capture()==0, "enable microphone after playback-only join");
+  check(device->microphone_initializations==1 && device->recording_starts==1, "explicit dynamic capture reaches the device once");
+  check(bridge->enable_capture()==0 && device->recording_starts==1, "dynamic enable is idempotent");
+  bridge->disable_capture();
+  check(!device->Recording(), "unpublishing microphone releases physical capture");
   bridge->Terminate(); bridge = nullptr;
+  device->microphone_initializations=0; device->recording_initializations=0; device->recording_starts=0;
   bridge = make_ref_counted<GraphAudioDevice>(device, graph, true);
   bridge->Init(); bridge->InitMicrophone(); bridge->InitRecording(); bridge->StartRecording();
   check(device->microphone_initializations == 1 && device->recording_initializations == 1 && device->recording_starts == 1,

@@ -57,3 +57,8 @@ std::shared_ptr<StudioImage>text_image(const std::string&text,const std::array<f
 namespace livekit::sdk {
 std::vector<StudioDevice>studio_windows(){std::vector<StudioDevice>out;EnumWindows([](HWND hwnd,LPARAM p)->BOOL{if(!IsWindowVisible(hwnd)||GetWindowTextLengthW(hwnd)==0)return TRUE;DWORD pid=0;GetWindowThreadProcessId(hwnd,&pid);if(pid==GetCurrentProcessId())return TRUE;wchar_t title[1024]{};GetWindowTextW(hwnd,title,1024);auto str=std::filesystem::path(title).u8string();reinterpret_cast<std::vector<StudioDevice>*>(p)->push_back({std::to_string(reinterpret_cast<uintptr_t>(hwnd)),std::string(str.begin(),str.end())});return TRUE;},reinterpret_cast<LPARAM>(&out));return out;}
 }
+
+namespace livekit::sdk {
+std::vector<StudioDevice> studio_screens(){std::vector<StudioDevice> out;for(auto& d:screen_capture_devices())out.push_back({d.id,d.name});return out;}
+std::vector<StudioDevice> studio_cameras(){std::vector<StudioDevice> out;int i=0;for(auto& d:video_capture_devices())out.push_back({std::to_string(i++),d.name});return out;}
+}

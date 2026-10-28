@@ -4,7 +4,7 @@
 
 ## 引擎构建
 
-桌面界面、应用测试和 Windows 构建脚本已迁至 [livekit-app 播放器](../../livekit-app/apps/player/desktop/README.md)。SDK 仅提供 `LiveKit::Player`，不依赖 ImGui 或 SDL。
+桌面界面、应用测试和 Windows 构建脚本已迁至 [livekit-app 播放器](../../livekit-app/apps/player/desktop/README.md)。SDK 仅提供 `LiveKit::Player`，不依赖 Qt、ImGui 或 SDL。桌面应用已迁移为 Qt6 Widgets，使用 QPainter / QAudioSink 消费 SDK 帧；公共播放器 API 保持不变。
 
 ```powershell
 cmake -S . -B out/player-engine -G 'Visual Studio 17 2022' -A x64 `
@@ -26,8 +26,8 @@ ctest --test-dir out/player-engine -C Release --output-on-failure
 | `src/media_graph/media_flow.hpp` | 通用图执行器、类型化发布/订阅、接收确认、背压、epoch 和错误回传 |
 | `src/media_nodes/render/playback_output.hpp` / `LiveKit::Player` | 图内音视频输出节点，各自拥有有界 MediaChannel，支持跨线程拉取 |
 | `src/engines/player` / `LiveKit::Player` | 场景状态机、命令队列、播放时钟和按时取帧 |
-| `../livekit-app/apps/player/desktop/main.cpp` | ImGui/SDL 窗口入口、事件循环、快捷键和拖放 |
-| `../livekit-app/apps/player/desktop/session.*`、`ui.*` | SDK 公共 API 消费者；异步会话控制、音视频输出、中文播放器界面 |
+| `../livekit-app/apps/player/desktop/main.cpp` | Qt6 应用入口、命令行、隔离设置和无窗口运行 |
+| `../livekit-app/apps/player/desktop/controller.*`、`window.*` | SDK 公共 API 消费者；异步会话控制、音视频输出、中文播放器界面 |
 
 Player 独占内部图。`PlaybackGraph` 包含 **8 个实际 GraphNode 和 7 条带类型的媒体连接**：
 
@@ -60,7 +60,7 @@ FileSourceNode → DemuxerNode
 
 节点初始化、启动、停止和释放统一由 GraphEngine 按下游到上游顺序执行，媒体准备按上游到下游顺序执行。初始化或准备失败都释放整图。Seek 递增内部 epoch，并清空各节点的输入/待发布事件、解码器、重采样器和输出队列；旧 epoch 事件会被丢弃。EOS 沿媒体边传播，解码器和重采样器完成尾部排空后才向下游发布 EOS，所有节点完成后图才返回 `end`。纯音频/纯视频仍保留固定拓扑，未使用的分支只转发 EOS。订阅回调的异常通过投递确认显式回传，避免 EventBus 日志捕获导致静默失败。`nodes()` / `edges()` 提供内部拓扑、生命周期和实际收发计数。
 
-播放器时钟仍由 Player 场景引擎管理；SDL 纹理上传、扬声器输出仍在界面线程，消费图的输出节点。这里的输出节点是 SDK 帧出口，不是 SDL 设备节点。本次没有开放通用高级图 API、Runtime 设备管理或动态拓扑。
+播放器时钟仍由 Player 场景引擎管理；Qt 图像呈现和音频设备提交仍在界面线程，消费图的输出节点。这里的输出节点是 SDK 帧出口，不是 Qt 设备节点。本次没有开放通用高级图 API、Runtime 设备管理或动态拓扑。
 
 视频为 CPU RGBA8，音频为 48000 Hz / FL、FR / 交错 float32。Buffer 使用 `shared_ptr<const vector<...>>`，取出后可跨线程保留；保留帧不会随 Seek/close 悬空。所有时间归一化到容器起始时刻，单位为微秒。每次 open、seek、stop、close 更新 generation；Seek 清理解码器、重采样器、待交付帧与通道，丢弃目标时间之前的视频，并裁掉跨越目标时间的 PCM 前缀。
 
@@ -98,11 +98,13 @@ player.close().get();
 
 SDK 使用 steady clock 作为主时钟。`poll_video()` 返回当前应显示的视频；`poll_audio()` 允许最多提前 100 ms 取出 PCM，以供设备缓冲。应用必须消费文件中存在的两种媒体；有界队列满后暂停解码，仍可处理控制命令。默认输出队列每支路最多 8 个视频帧 / 64 个音频帧及 128 MiB。此外，Demuxer 最多保留一个待发布包，每个解码/转换节点最多保留一个输入事件和一个待发布事件，另有 FFmpeg 内部缓冲。编码包限制为 64 MiB，视频转换限制为 32M 像素，超过输出队列字节限额的单帧报告错误。输出队列字节限额不代表整个图的总内存上限。
 
-暂停/Seek/stop/close 时，应用负责同步暂停或清理自己的音频设备、显示缓存。设备缓存不属于 SDK；跨控制操作保留的帧须检查 generation。当前示例已接入这些清理操作。慢消费者会产生播放迟到，示例只显示本轮最新到期视频。第一版不承诺音频硬件时钟主导的长期同步、无缝音频、实时低延迟或逐样本同步精度。
+暂停/Seek/stop/close 时，应用负责同步暂停或清理自己的音频设备、显示缓存。设备缓存不属于 SDK；跨控制操作保留的帧须检查 generation。当前 Qt6 应用已接入这些清理操作；暂停保留设备缓存，Seek/stop/close 清理设备缓存。慢消费者会产生播放迟到，示例只显示本轮最新到期视频。第一版不承诺音频硬件时钟主导的长期同步、无缝音频、实时低延迟或逐样本同步精度。
 
 当前选择第一条最佳音频/视频流，软件解码；暂不包含网络播放、倍速、硬件解码、音轨切换、字幕、HDR 色调映射、旋转元数据处理和共享音频设备/AEC 协调。解码音频中途变更格式会明确报错。Windows x64 为本次验证平台，其他平台尚未验收。
 
 ## 验证
+
+以下 2026-10-26 记录为历史 Windows/SDL 验证。当前 Qt6 应用的构建方法和自动化测试归属见应用 README；历史结果不代表 Qt6 Windows 版本已经验收。
 
 2026-10-26：Windows x64 / MSVC 19.44 / FFmpeg 7.1（`b08d796`）Release 构建通过；接入 GraphEngine::loadFromNodes 后 CTest **7/7 通过**。`playback_graph` 验证实际媒体订阅、收发计数、节点/连接、生命周期、输出背压、Seek 清空与代次、解码排空、重复播放、失败回滚、取消和 Buffer 生命周期。`media_flow` 通过 GraphEngine::loadFromNodes 加载独立的生产/处理/消费节点，验证引擎总线归属、节点和边总线释放，以及乱序注册后的拓扑调度、拒收重试、顺序、EOS、旧 epoch 丢弃、处理异常回传和共享数据所有权。保留 ImGui 空窗口、实际视频纹理渲染、异步暂停/Seek/停止、切换文件、错误恢复、窄窗口和打开过程关闭的回归测试。播放器继续独立于 WebRTC 构建。
 

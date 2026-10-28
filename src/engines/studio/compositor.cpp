@@ -1,9 +1,11 @@
 #include "internal.hpp"
 #include <algorithm>
 #include <cmath>
+#ifdef _WIN32
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#endif
 #include "libyuv/convert.h"
 #include "libyuv/convert_argb.h"
 namespace livekit::sdk {
@@ -18,6 +20,7 @@ StudioImage studio_composite_cpu(int w,int h,const studio_detail::Layers& layers
  }return out;
 }
 namespace studio_detail {
+#ifdef _WIN32
 using Microsoft::WRL::ComPtr;
 static void check(HRESULT hr){if(FAILED(hr))throw std::runtime_error("Studio D3D11 error: "+std::to_string(uint32_t(hr)));}
 static const char* shader=R"(
@@ -42,6 +45,8 @@ struct Compositor::Impl {
  }
 };
 Compositor::Compositor(int w,int h,bool soft):impl_(std::make_unique<Impl>(w,h,soft)){}Compositor::~Compositor()=default;StudioImage Compositor::render(const Layers&l){return impl_->render(l);}
+
+#endif
 std::shared_ptr<StudioImage> from_i420(const VideoFrame&f){auto img=std::make_shared<StudioImage>();img->width=f.width;img->height=f.height;img->rgba.resize(size_t(f.width)*f.height*4);if(libyuv::I420ToABGR(f.y.data(),f.stride_y,f.u.data(),f.stride_u,f.v.data(),f.stride_v,img->rgba.data(),f.width*4,f.width,f.height)!=0)throw std::runtime_error("Invalid I420 frame");return img;}
 VideoFrame to_i420(const StudioImage&i){VideoFrame f;f.width=i.width;f.height=i.height;f.stride_y=f.width;f.stride_u=f.stride_v=(f.width+1)/2;f.y.resize(size_t(f.width)*f.height);f.u.resize(size_t(f.stride_u)*((f.height+1)/2));f.v.resize(f.u.size());if(libyuv::ABGRToI420(i.rgba.data(),i.width*4,f.y.data(),f.stride_y,f.u.data(),f.stride_u,f.v.data(),f.stride_v,f.width,f.height)!=0)throw std::runtime_error("RGBA conversion failed");return f;}
 }

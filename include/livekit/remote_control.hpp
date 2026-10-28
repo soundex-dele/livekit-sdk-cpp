@@ -32,6 +32,13 @@ class ControlInputSink {
 };
 // Windows ordinary interactive desktop only. These functions never elevate.
 std::shared_ptr<ControlInputSink> make_windows_control_input();
+// Platform factory does not request permissions or inject input on construction.
+std::shared_ptr<ControlInputSink> make_platform_control_input();
+struct ControlPermissions {
+  bool screen = false, input = false, interactive = false;
+  bool ready() const { return screen && input && interactive; }
+};
+ControlPermissions control_permissions();
 ControlLayout primary_control_layout();
 // Portable browser KeyboardEvent.code -> PC set-1 scan code (bit 8 = extended).
 unsigned control_key_scan_code(const std::string& code);
