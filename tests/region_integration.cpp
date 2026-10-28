@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
     redirected.disconnect(); redirected.wait();
     // First-connect failures must not emit reconnect callbacks or retry the
     // same endpoint. Trust is separate from the ordered candidate list.
-    for(const auto& path:{"/unavailable","/silent"}) {
+    for(const auto& path:{"/unavailable","/silent","/media-stall"}) {
       std::atomic<int> connected{0},reconnecting{0};sdk::RoomCallback callbacks;
       callbacks.on_connected=[&]{++connected;};callbacks.on_reconnecting=[&](const auto&){++reconnecting;};
       sdk::Room first(callbacks);sdk::RoomOptions initial=options;
@@ -105,6 +105,6 @@ int main(int argc, char** argv) {
     check(cancelled && Clock::now() - cancel_start < 1500ms, "Region discovery cancellation not bounded");
     std::cout << sdk::Json{{"ok", true}, {"trustedRedirect", true}, {"httpRedirectRejected", true},
         {"discovery", true}, {"deadline", true}, {"cancelled", true}, {"relayConflictRejected", true},
-        {"initialFailover",true},{"initialFailoverTerminalErrors",true},{"initialFailoverDeadline",true},{"initialFailoverCancellation",true}}.dump() << '\n';
+        {"initialFailover",true},{"initialMediaFailover",true},{"initialFailoverTerminalErrors",true},{"initialFailoverDeadline",true},{"initialFailoverCancellation",true}}.dump() << '\n';
   } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

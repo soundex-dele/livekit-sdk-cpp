@@ -1,18 +1,20 @@
 #pragma once
 #include "engines/rtc/capabilities.hpp"
 #include "livekit/room.hpp"
+#include <source_location>
 inline void capabilities_contract(){
   using namespace livekit::sdk;
-  auto check=[](bool ok){if(!ok)throw std::runtime_error("Capabilities contract failed");};
+  auto check=[](bool ok,std::source_location at=std::source_location::current()){if(!ok)throw std::runtime_error("Capabilities contract failed at "+std::to_string(at.line()));};
   const auto sdk=sdk_capabilities();
-  check(sdk.version=="0.3.0"&&sdk.signal_protocols==std::vector<int>({12,15}));
+  check(sdk.version=="0.3.0"&&sdk.signal_protocols==std::vector<int>({12,15,17}));
   check(sdk.support(ClientFeature::rpc)==CapabilitySupport::supported);
-  check(sdk.support(ClientFeature::data_e2ee)==CapabilitySupport::unsupported);
+  check(sdk.support(ClientFeature::data_e2ee)==CapabilitySupport::supported);
   check(sdk.support(static_cast<ClientFeature>(999))==CapabilitySupport::unknown);
   Room room;auto snapshot=room.capabilities();check(!snapshot.connected&&!snapshot.signal_protocol&&!snapshot.server.advertised_protocol);
   livekit::JoinResponse join;join.set_server_version("legacy");join.set_subscriber_primary(true);
   detail::update_capabilities(snapshot,detail::session_capabilities_json(join,15,true));
-  check(snapshot.signal_protocol==15&&snapshot.relay_only==true&&snapshot.subscriber_primary==true&&snapshot.single_peer_connection==false);
+  check(snapshot.signal_protocol==15&&snapshot.relay_only==true&&snapshot.subscriber_primary==true&&!snapshot.single_peer_connection);
+  detail::update_capabilities(snapshot,{{"singlePeerConnection",true}});check(snapshot.single_peer_connection==true);
   check(snapshot.server.version=="legacy"&&!snapshot.server.enabled_publish_codecs&&!snapshot.server.advertised_protocol);
   check(snapshot.server.support(ClientFeature::rpc)==CapabilitySupport::unknown);
   join.mutable_server_info()->set_version("new");join.mutable_server_info()->set_protocol(18);join.mutable_server_info()->set_region("test");

@@ -8,6 +8,7 @@
 namespace livekit::sdk {
 class I420VideoSource;
 class PcmAudioSource;
+class EncodedMediaSource;
 // Owned I420 pixels, rotated upright. Chroma dimensions round up for odd sizes.
 struct VideoFrame {
   std::string track_id;
@@ -42,6 +43,7 @@ struct MediaSpec {
   // Supported for application-fed video, generated video and capture devices,
   // never files/network playback (which must not restart from the beginning).
   bool dynacast = false;
+  std::shared_ptr<EncodedMediaSource> encoded_source;
 };
 struct ScreenCaptureDevice {
   std::string id, name;

@@ -17,6 +17,7 @@ class SignalSession {
   SignalSession(const RoomOptions& options, std::stop_token stop, EventEmitter events,
                 livekit::sdk::detail::RecoveryState* recovery = nullptr);
   void connect();
+  void initial_offer(const livekit::SessionDescription& offer,const std::vector<livekit::AddTrackRequest>& tracks={}){initial_offer_=offer;initial_tracks_=tracks;}
   // Only before accepting JoinResponse. Closes the previous socket first and
   // never retries permission/protocol errors or revisits an attempted endpoint.
   bool failover(const livekit::sdk::SDKError& error);
@@ -43,6 +44,8 @@ class SignalSession {
   void connect_socket(const std::string& sid, std::chrono::steady_clock::time_point deadline);
   bool select_initial_fallback(const livekit::sdk::SDKError& error);
   void open_initial_socket();
+  livekit::SessionDescription initial_offer_;
+  std::vector<livekit::AddTrackRequest> initial_tracks_;
   RoomOptions options_;
   std::stop_token stop_;
   EventEmitter events_;

@@ -1,6 +1,7 @@
 #pragma once
 #include "engines/rtc/rpc_session.hpp"
 #include "livekit/error.hpp"
+#include "support/compression.hpp"
 #include <atomic>
 #include <source_location>
 #include <thread>
@@ -44,7 +45,8 @@ inline void run(){
   check(result.wait_for(0ms)!=std::future_status::ready);reply.set_kind(0);
   session.receive(reply);ready(result);check(result.get()=="reply");session.receive(reply);
   result=session.call(call);packets=session.take_packets();reply=response(packets[0]);
-  reply.mutable_rpc_response()->set_compressed_payload("unsupported");session.receive(reply);rpc_error(result,RpcErrorCode::unsupported_version);
+  reply.mutable_rpc_response()->set_compressed_payload("unsupported");session.receive(reply);rpc_error(result,RpcErrorCode::response_payload_too_large);
+  result=session.call(call);packets=session.take_packets();reply=response(packets[0]);reply.mutable_rpc_response()->set_compressed_payload(detail::deflate_raw("compressed reply"));session.receive(reply);ready(result);check(result.get()=="compressed reply");
   // Error payload is retained exactly.
   result=session.call(call);packets=session.take_packets();reply=response(packets[0]);
   reply.mutable_rpc_response()->mutable_error()->set_code(2010);reply.mutable_rpc_response()->mutable_error()->set_message("拒绝");
@@ -68,7 +70,8 @@ inline void run(){
   session.receive(req);check(read_response(session,"one").payload()=="hello 世界"&&handled==1);
   session.receive(request("unknown","absent"));check(read_response(session,"unknown").error().code()==1400);
   req=request("version");req.mutable_rpc_request()->set_version(2);session.receive(req);check(read_response(session,"version").error().code()==1404);
-  req=request("compressed");req.mutable_rpc_request()->set_compressed_payload("x");session.receive(req);check(read_response(session,"compressed").error().code()==1404);
+  req=request("compressed");req.mutable_rpc_request()->set_compressed_payload("x");session.receive(req);check(read_response(session,"compressed").error().code()==1402);
+  req=request("compressed-valid");req.mutable_rpc_request()->clear_payload();req.mutable_rpc_request()->set_compressed_payload(detail::deflate_raw("hello 世界"));session.receive(req);check(read_response(session,"compressed-valid").payload()=="hello 世界");
   session.receive(request("large","echo",std::string(15361,'x')));check(read_response(session,"large").error().code()==1402);
   session.register_method("throw",[](auto,auto){throw std::runtime_error("private application secret");});
   session.receive(request("exception","throw"));auto error=read_response(session,"exception").error();check(error.code()==1500&&error.message().find("secret")==std::string::npos);

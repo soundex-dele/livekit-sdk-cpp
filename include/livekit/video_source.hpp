@@ -11,6 +11,7 @@ struct I420SourceOptions {
   size_t max_frames = 3;
   size_t max_bytes = 32 * 1024 * 1024;
   std::chrono::milliseconds max_age{200};
+  bool dynamic_dimensions=false; // Accept even sizes up to 3840x2160.
 };
 enum class VideoWriteStatus { accepted, backpressure, closed };
 enum class VideoRotation { none = 0, clockwise90 = 90, clockwise180 = 180, clockwise270 = 270 };

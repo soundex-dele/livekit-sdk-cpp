@@ -5,6 +5,8 @@
 #include "livekit/media.hpp"
 #include "livekit/video_source.hpp"
 #include "livekit/audio_source.hpp"
+#include "livekit/encoded_file.hpp"
+#include "livekit/rtp.hpp"
 #include "livekit/room.hpp"
 #include "livekit/room_service.hpp"
 #include "livekit/api.hpp"

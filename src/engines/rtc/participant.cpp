@@ -44,11 +44,15 @@ ParticipantInfo parse_participant(const Json& v) {
   return p;
 }
 void validate_media(const MediaSpec& m) {
-  if (m.dynacast && (!m.video || (!m.video_source && !m.demo && m.capture == CaptureKind::input)))
+  if (m.dynacast && (!m.video || (!m.encoded_source && !m.video_source && !m.demo && m.capture == CaptureKind::input)))
     throw std::invalid_argument("Dynacast requires a live video source, not audio or file/network playback");
   if (m.width < 2 || m.width > 3840 || m.height < 2 || m.height > 2160 || m.width % 2 || m.height % 2 || m.fps < 1 || m.fps > 60)
     throw std::invalid_argument("Invalid media dimensions or frame rate");
-  if (!m.demo && !m.video_source && !m.audio_source && m.input.empty() && m.capture == CaptureKind::input) throw std::invalid_argument("Media input is required");
+  if (!m.demo && !m.video_source && !m.audio_source && !m.encoded_source && m.input.empty() && m.capture == CaptureKind::input) throw std::invalid_argument("Media input is required");
+  if(m.encoded_source){
+    const auto format=m.encoded_source->options();
+    if(m.video_source||m.audio_source||m.demo||m.loop||!m.input.empty()||m.capture!=CaptureKind::input||m.local_preview||m.video!=(format.codec!="opus")||(m.video&&(m.width!=format.width||m.height!=format.height)))throw std::invalid_argument("Invalid encoded media specification");
+  }
   if (m.audio_source && (m.video || m.video_source || m.demo || m.loop || !m.input.empty() ||
       m.capture != CaptureKind::input || m.local_preview)) throw std::invalid_argument("Invalid custom PCM media specification");
   if (m.video_source) {
@@ -102,6 +106,7 @@ TrackInfo TrackPublication::info() const {
   if (participant) for (const auto& t : participant->tracks) if (t.sid == snapshot_.sid) return t;
   return snapshot_;
 }
+std::future<void> TrackPublication::request_keyframe(const OperationOptions& operation) const{if(local_||snapshot_.kind!=TrackKind::video)throw std::invalid_argument("Keyframe request requires remote video");return submit_void(state_,generation_,"keyframe",{{"sid",sid()}},operation);}
 std::future<void> TrackPublication::set_muted(bool muted, const OperationOptions& operation) const {
   if (!local_) throw std::logic_error("Only local publications can be muted");
   return submit_void(state_, generation_, "mute", {{"sid", sid()}, {"muted", muted}}, operation);
@@ -148,6 +153,22 @@ std::future<TrackPublication> LocalParticipant::publish_microphone(const Operati
  MediaSpec spec; spec.video=false; TrackPublishOptions options; options.source=TrackSource::microphone; options.name="麦克风";
  return submit<TrackPublication>(state_,generation_,"publish-microphone",{},[weak=state_,generation=generation_,owner=identity()](const Json& result){return TrackPublication(weak,generation,owner,detail::parse_track(result),true);},spec,options,operation);
 }
+namespace {
+std::shared_ptr<detail::StreamSession> participant_streams(std::weak_ptr<detail::RoomState> weak,uint64_t generation){
+  auto s=weak.lock();if(!s)throw std::logic_error("Room destroyed");std::lock_guard lock(s->mutex);
+  if(!s->running||s->stop.stop_requested()||s->generation!=generation||s->connection!=ConnectionState::connected)throw std::logic_error("Participant is stale or disconnected");
+  return s->stream_session();
+}
+}
+std::future<LocalDataTrack> LocalParticipant::publish_data_track(std::string name,DataTrackOptions options,OperationOptions operation)const{
+  auto s=state_.lock();if(!s)throw std::logic_error("Room destroyed");std::lock_guard lock(s->mutex);
+  if(!s->running||s->stop.stop_requested()||s->generation!=generation_||s->connection!=ConnectionState::connected)throw std::logic_error("Participant is stale or disconnected");
+  return s->data_tracks->publish(std::move(name),std::move(options),operation);
+}
+std::shared_ptr<TextStreamWriter> LocalParticipant::stream_text(StreamOptions options)const{return participant_streams(state_,generation_)->open(true,std::move(options));}
+std::shared_ptr<ByteStreamWriter> LocalParticipant::stream_bytes(StreamOptions options)const{return participant_streams(state_,generation_)->open(false,std::move(options));}
+std::future<StreamInfo> LocalParticipant::send_text(std::string text,StreamOptions options,OperationOptions operation)const{return participant_streams(state_,generation_)->send_text(std::move(text),std::move(options),operation);}
+std::future<StreamInfo> LocalParticipant::send_file(const std::filesystem::path& path,StreamOptions options,OperationOptions operation)const{return participant_streams(state_,generation_)->send_file(path,std::move(options),operation);}
 std::future<void> LocalParticipant::unpublish_track(const std::string& sid, const OperationOptions& operation) const { return submit_void(state_, generation_, "unpublish", {{"sid", sid}}, operation); }
 std::future<void> LocalParticipant::publish_data(const std::vector<uint8_t>& payload, const DataPublishOptions& options, const OperationOptions& operation) const {
   // Leave room for DataPacket protobuf headers, identities and topic below the SCTP limit.

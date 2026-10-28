@@ -107,6 +107,16 @@ async def run(args):
 
     async def handler(connection):
         path = connection.request.path.split('?')[0]
+        if path == '/media-stall/rtc':
+            # Accept a real JoinResponse, then withhold SDP and ICE. The first
+            # endpoint succeeds at signaling but can never establish media.
+            query = connection.request.path.partition('?')[2]
+            async with connect(server_url.replace('http://', 'ws://') + '/rtc?' + query,
+                additional_headers={'Authorization': connection.request.headers['Authorization']},
+                proxy=None, compression=None) as upstream:
+                await connection.send(await asyncio.wait_for(upstream.recv(), 3))
+                await connection.wait_closed()
+            return
         if path in ('/silent/rtc', '/silent-2/rtc'):
             await connection.wait_closed()
             return

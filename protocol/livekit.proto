@@ -7,18 +7,20 @@ enum SignalTarget { PUBLISHER = 0; SUBSCRIBER = 1; }
 enum TrackType { AUDIO = 0; VIDEO = 1; DATA = 2; }
 enum TrackSource { UNKNOWN = 0; CAMERA = 1; MICROPHONE = 2; SCREEN_SHARE = 3; SCREEN_SHARE_AUDIO = 4; }
 message Room { string sid = 1; string name = 2; string metadata = 8; bool active_recording = 10; }
-message TrackInfo { string sid = 1; TrackType type = 2; string name = 3; bool muted = 4; uint32 width = 5; uint32 height = 6; TrackSource source = 9; string mime_type = 11; string mid = 12; }
-message ParticipantInfo { string sid = 1; string identity = 2; int32 state = 3; repeated TrackInfo tracks = 4; string metadata = 5; string name = 9; int32 kind = 14; map<string,string> attributes = 15; int32 disconnect_reason = 16; }
+message TrackInfo { string sid = 1; TrackType type = 2; string name = 3; bool muted = 4; uint32 width = 5; uint32 height = 6; TrackSource source = 9; string mime_type = 11; string mid = 12; Encryption.Type encryption = 16; string stream = 17; }
+message ParticipantInfo { string sid = 1; string identity = 2; int32 state = 3; repeated TrackInfo tracks = 4; string metadata = 5; string name = 9; int32 kind = 14; map<string,string> attributes = 15; int32 disconnect_reason = 16; repeated DataTrackInfo data_tracks = 19; }
 message ICEServer { repeated string urls = 1; string username = 2; string credential = 3; }
 enum ClientConfigSetting { UNSET = 0; DISABLED = 1; ENABLED = 2; }
-message ClientConfiguration { ClientConfigSetting resume_connection = 3; ClientConfigSetting force_relay = 5; }
+message VideoConfiguration { ClientConfigSetting hardware_encoder = 1; }
+message DisabledCodecs { repeated Codec codecs = 1; repeated Codec publish = 2; }
+message ClientConfiguration { VideoConfiguration video = 1; VideoConfiguration screen = 2; DisabledCodecs disabled_codecs = 4; ClientConfigSetting resume_connection = 3; ClientConfigSetting force_relay = 5; }
 message ServerInfo { string version = 2; int32 protocol = 3; string region = 4; }
 message Codec { string mime = 1; string fmtp_line = 2; }
-message JoinResponse { Room room = 1; ParticipantInfo participant = 2; repeated ParticipantInfo other_participants = 3; string server_version = 4; repeated ICEServer ice_servers = 5; bool subscriber_primary = 6; string alternative_url = 7; ClientConfiguration client_configuration = 8; int32 ping_timeout = 10; int32 ping_interval = 11; ServerInfo server_info = 12; repeated Codec enabled_publish_codecs = 14; }
-message SessionDescription { string type = 1; string sdp = 2; uint32 id = 3; }
+message JoinResponse { Room room = 1; ParticipantInfo participant = 2; repeated ParticipantInfo other_participants = 3; string server_version = 4; repeated ICEServer ice_servers = 5; bool subscriber_primary = 6; string alternative_url = 7; ClientConfiguration client_configuration = 8; int32 ping_timeout = 10; int32 ping_interval = 11; ServerInfo server_info = 12; repeated Codec enabled_publish_codecs = 14; bytes sif_trailer = 13; }
+message SessionDescription { string type = 1; string sdp = 2; uint32 id = 3; map<string,string> mid_to_track_id = 4; }
 message TrickleRequest { string candidateInit = 1; SignalTarget target = 2; bool final = 3; }
 message VideoLayer { int32 quality = 1; uint32 width = 2; uint32 height = 3; uint32 bitrate = 4; }
-message AddTrackRequest { string cid = 1; string name = 2; TrackType type = 3; uint32 width = 4; uint32 height = 5; TrackSource source = 8; repeated VideoLayer layers = 9; bool stereo = 12 [deprecated = true]; bool disable_red = 13; string stream = 15; }
+message AddTrackRequest { string cid = 1; string name = 2; TrackType type = 3; uint32 width = 4; uint32 height = 5; TrackSource source = 8; repeated VideoLayer layers = 9; bool stereo = 12 [deprecated = true]; bool disable_red = 13; string stream = 15; Encryption.Type encryption = 14; repeated SimulcastCodec simulcast_codecs = 10; string sid = 11; BackupCodecPolicy backup_codec_policy = 16; }
 message TrackPublishedResponse { string cid = 1; TrackInfo track = 2; }
 message TrackUnpublishedResponse { string track_sid = 1; }
 message ParticipantUpdate { repeated ParticipantInfo participants = 1; }
@@ -27,7 +29,8 @@ message UpdateSubscription { repeated string track_sids = 1; bool subscribe = 2;
 message TrackPermission { string participant_sid = 1; bool all_tracks = 2; repeated string track_sids = 3; string participant_identity = 4; }
 message SubscriptionPermission { bool all_participants = 1; repeated TrackPermission track_permissions = 2; }
 message SubscriptionPermissionUpdate { string participant_sid = 1; string track_sid = 2; bool allowed = 3; }
-message SubscribedQuality { int32 quality = 1; bool enabled = 2; }
+enum VideoQuality { LOW = 0; MEDIUM = 1; HIGH = 2; OFF = 3; }
+message SubscribedQuality { VideoQuality quality = 1; bool enabled = 2; }
 message SubscribedCodec { string codec = 1; repeated SubscribedQuality qualities = 2; }
 message SubscribedQualityUpdate { string track_sid = 1; repeated SubscribedQuality subscribed_qualities = 2; repeated SubscribedCodec subscribed_codecs = 3; }
 message LeaveRequest { bool can_reconnect = 1; int32 reason = 2; int32 action = 3; RegionSettings regions = 4; }
@@ -43,18 +46,32 @@ message RequestResponse {
   uint32 request_id = 1;
   Reason reason = 2;
   string message = 3;
-  oneof request { TrickleRequest trickle = 4; AddTrackRequest add_track = 5; MuteTrackRequest mute = 6; UpdateParticipantMetadata update_metadata = 7; }
+  oneof request { TrickleRequest trickle = 4; AddTrackRequest add_track = 5; MuteTrackRequest mute = 6; UpdateParticipantMetadata update_metadata = 7; PublishDataTrackRequest publish_data_track = 10; UnpublishDataTrackRequest unpublish_data_track = 11; }
 }
 message SignalRequest {
-  oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; SubscriptionPermission subscription_permission = 11; SyncState sync_state = 12; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; }
+  oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; SubscriptionPermission subscription_permission = 11; SyncState sync_state = 12; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; PublishDataTrackRequest publish_data_track_request = 19; UnpublishDataTrackRequest unpublish_data_track_request = 20; UpdateDataSubscription update_data_subscription = 21; }
 }
 message SignalResponse {
   // Wire field 14 is the server's aggregate publisher demand, not a viewer's
   // local subscription setting. Keep it in the same oneof as other responses.
-  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; SubscribedQualityUpdate subscribed_quality_update = 14; SubscriptionPermissionUpdate subscription_permission_update = 15; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; ReconnectResponse reconnect = 19; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; RequestResponse request_response = 22; RoomMovedResponse room_moved = 24; }
+  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; SubscribedQualityUpdate subscribed_quality_update = 14; SubscriptionPermissionUpdate subscription_permission_update = 15; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; ReconnectResponse reconnect = 19; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; RequestResponse request_response = 22; RoomMovedResponse room_moved = 24; MediaSectionsRequirement media_sections_requirement = 25; PublishDataTrackResponse publish_data_track_response = 27; UnpublishDataTrackResponse unpublish_data_track_response = 28; DataTrackSubscriberHandles data_track_subscriber_handles = 29; }
 }
 message UserPacket { string participant_sid = 1; bytes payload = 2; optional string topic = 4; string participant_identity = 5; repeated string destination_identities = 6; bytes nonce = 11; }
-message DataPacket { int32 kind = 1; oneof value { UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; SipDTMF sip_dtmf = 6; Transcription transcription = 7; RpcRequest rpc_request = 10; RpcAck rpc_ack = 11; RpcResponse rpc_response = 12; } string participant_identity = 4; repeated string destination_identities = 5; }
+message DataPacket { uint32 sequence = 16; string participant_sid = 17; int32 kind = 1; oneof value { UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; SipDTMF sip_dtmf = 6; Transcription transcription = 7; RpcRequest rpc_request = 10; RpcAck rpc_ack = 11; RpcResponse rpc_response = 12; DataStream.Header stream_header = 13; DataStream.Chunk stream_chunk = 14; DataStream.Trailer stream_trailer = 15; EncryptedPacket encrypted_packet = 18; } string participant_identity = 4; repeated string destination_identities = 5; }
+message DataStream {
+  enum OperationType { CREATE = 0; UPDATE = 1; DELETE = 2; REACTION = 3; }
+  enum CompressionType { NONE = 0; DEFLATE_RAW = 1; }
+  message TextHeader { OperationType operation_type = 1; int32 version = 2; string reply_to_stream_id = 3; repeated string attached_stream_ids = 4; bool generated = 5; }
+  message ByteHeader { string name = 1; }
+  message Header {
+    string stream_id = 1; int64 timestamp = 2; string topic = 3; string mime_type = 4;
+    optional uint64 total_length = 5; map<string,string> attributes = 8;
+    oneof content_header { TextHeader text_header = 9; ByteHeader byte_header = 10; }
+    optional bytes inline_content = 11; CompressionType compression = 12;
+  }
+  message Chunk { string stream_id = 1; uint64 chunk_index = 2; bytes content = 3; int32 version = 4; optional bytes iv = 5; }
+  message Trailer { string stream_id = 1; string reason = 2; map<string,string> attributes = 3; }
+}
 message RpcRequest { string id = 1; string method = 2; string payload = 3; uint32 response_timeout_ms = 4; uint32 version = 5; bytes compressed_payload = 6; }
 message RpcAck { string request_id = 1; }
 message RpcResponse { string request_id = 1; oneof value { string payload = 2; RpcError error = 3; bytes compressed_payload = 4; } }
@@ -82,4 +99,184 @@ message SyncState {
   repeated DataChannelInfo data_channels = 4;
   SessionDescription offer = 5;
   repeated string track_sids_disabled = 6;
+  repeated PublishDataTrackResponse publish_data_tracks = 8;
 }
+
+message Encryption {
+  enum Type {
+    NONE = 0;
+    GCM = 1;
+    CUSTOM = 2;
+  }
+}
+
+message DataTrackFrameEncoding {
+
+    // Well-known encoding for frame payloads.
+    //
+    // Mirrors the well-known message encodings from the MCAP spec:
+    // https://mcap.dev/spec/registry#message-encodings
+    //
+    enum WellKnownFrameEncoding {
+        WELL_KNOWN_FRAME_ENCODING_UNSPECIFIED = 0;
+        // ROS 1: must be described by `ROS1_MSG` schema encoding.
+        WELL_KNOWN_FRAME_ENCODING_ROS1 = 1;
+        // CDR: must be described by `ROS2_MSG`, `ROS2_IDL`, or `OMG_IDL` schema encoding.
+        WELL_KNOWN_FRAME_ENCODING_CDR = 2;
+        // Protocol Buffer: must be described by `PROTOBUF` schema encoding.
+        WELL_KNOWN_FRAME_ENCODING_PROTOBUF = 3;
+        // FlatBuffer: must be described by `FLATBUFFER` schema encoding.
+        WELL_KNOWN_FRAME_ENCODING_FLATBUFFER = 4;
+        // CBOR: self-describing.
+        WELL_KNOWN_FRAME_ENCODING_CBOR = 5;
+        // MessagePack: self-describing.
+        WELL_KNOWN_FRAME_ENCODING_MSGPACK = 6;
+        // JSON: self-describing or described by `JSON_SCHEMA` schema encoding.
+        WELL_KNOWN_FRAME_ENCODING_JSON = 7;
+    }
+
+    oneof value {
+        WellKnownFrameEncoding well_known = 1;
+        // Identifier of a custom encoding not covered by the well-known cases.
+        // This must be non-empty and no longer than 32 characters.
+        string custom = 2;
+    }
+}
+
+message DataTrackSchemaEncoding {
+    // Well-known encoding for schema definition.
+    //
+    // Mirrors the well-known schema encodings from the MCAP spec:
+    // https://mcap.dev/spec/registry#schema-encodings
+    //
+    enum WellKnownSchemaEncoding {
+      WELL_KNOWN_SCHEMA_ENCODING_UNSPECIFIED = 0;
+      // Protocol Buffer IDL: describes `PROTOBUF` frame encoding.
+      WELL_KNOWN_SCHEMA_ENCODING_PROTOBUF = 1;
+      // FlatBuffer IDL: describes `FLATBUFFER` frame encoding.
+      WELL_KNOWN_SCHEMA_ENCODING_FLATBUFFER = 2;
+      // ROS 1 Message: describes `ROS1` frame encoding.
+      WELL_KNOWN_SCHEMA_ENCODING_ROS1_MSG = 3;
+      // ROS 2 Message: describes `CDR` frame encoding.
+      WELL_KNOWN_SCHEMA_ENCODING_ROS2_MSG = 4;
+      // ROS 2 IDL: describes `CDR` frame encoding.
+      WELL_KNOWN_SCHEMA_ENCODING_ROS2_IDL = 5;
+      // OMG IDL: describes `CDR` frame encoding.
+      WELL_KNOWN_SCHEMA_ENCODING_OMG_IDL = 6;
+      // JSON Schema: describes `JSON` frame encoding.
+      WELL_KNOWN_SCHEMA_ENCODING_JSON_SCHEMA = 7;
+    }
+
+    oneof value {
+        WellKnownSchemaEncoding well_known = 1;
+        // Identifier of a custom encoding not covered by the well-known cases.
+        // This must be non-empty and no longer than 32 characters.
+        string custom = 2;
+    }
+}
+
+message DataTrackSchemaId {
+  // This must be non-empty and no longer than 256 characters.
+  string name = 1;
+  DataTrackSchemaEncoding encoding = 2;
+}
+
+message DataTrackInfo {
+  // Client-assigned, 16-bit identifier that will be attached to packets sent by the publisher.
+  uint32 pub_handle = 1;
+
+  // Server-assigned track identifier.
+  string sid = 2;
+
+  // Human-readable identifier (e.g., `geoLocation`, `servoPosition.x`, etc.), unique per publisher.
+  string name = 3;
+
+  // Method used for end-to-end encryption (E2EE) on packet payloads.
+  Encryption.Type encryption = 4;
+
+  // Encoding for frame payloads on this track. If unspecified, the track is untyped.
+  optional DataTrackFrameEncoding frame_encoding = 5;
+
+  // ID of the schema used by frames on this track if the track is typed.
+  optional DataTrackSchemaId schema = 6;
+}
+
+message DataTrackSubscriptionOptions {
+  // Rate in frames per second (FPS) the subscriber wants to receive frames at.
+  // If omitted, the subscriber defaults to the publisher's fps
+  optional uint32 target_fps = 1;
+}
+
+message PublishDataTrackRequest {
+  // Client-assigned, 16-bit identifier that will be attached to packets sent by the publisher.
+  // This must be non-zero and unique for each data track published by the publisher.
+  uint32 pub_handle = 1;
+
+  // Human-readable identifier (e.g., `geoLocation`, `servoPosition.x`, etc.), unique per publisher.
+  // This must be non-empty and no longer than 256 characters.
+  string name = 2;
+
+  // Method used for end-to-end encryption (E2EE) on frame payloads.
+  Encryption.Type encryption = 3;
+
+  // Encoding for frame payloads on this track. If unspecified, the track is untyped.
+  optional DataTrackFrameEncoding frame_encoding = 4;
+
+  // ID of the schema used by frames on this track if the track is typed.
+  // If set, the associated schema must be stored with `StoreDataBlobRequest`.
+  optional DataTrackSchemaId schema = 5;
+}
+
+message PublishDataTrackResponse {
+  // Information about the published track.
+  DataTrackInfo info = 1;
+}
+
+message UnpublishDataTrackRequest {
+  // Publisher handle of the track to unpublish.
+  uint32 pub_handle = 1;
+}
+
+message UnpublishDataTrackResponse {
+  // Information about the unpublished track.
+  DataTrackInfo info = 1;
+}
+
+message DataTrackSubscriberHandles {
+  message PublishedDataTrack {
+    string publisher_identity = 1;
+    string publisher_sid = 2;
+    string track_sid = 3;
+  }
+
+  // Maps handles from incoming packets to the track SIDs that the packets belong to.
+  map<uint32, PublishedDataTrack> sub_handles = 1;
+}
+
+message UpdateDataSubscription {
+  message Update {
+    string track_sid = 1;
+    bool subscribe = 2;
+    // Options to apply when initially subscribing or updating an existing subscription.
+    // When unsubscribing, this field is ignored.
+    DataTrackSubscriptionOptions options = 3;
+  }
+  repeated Update updates = 1;
+}
+
+message EncryptedPacket { Encryption.Type encryption_type = 1; bytes iv = 2; uint32 key_index = 3; bytes encrypted_value = 4; }
+message EncryptedPacketPayload {
+ oneof value { UserPacket user = 1; RpcRequest rpc_request = 4; RpcAck rpc_ack = 5; RpcResponse rpc_response = 6; DataStream.Header stream_header = 7; DataStream.Chunk stream_chunk = 8; DataStream.Trailer stream_trailer = 9; }
+}
+
+enum BackupCodecPolicy { PREFER_REGRESSION = 0; SIMULCAST = 1; REGRESSION = 2; }
+message SimulcastCodec { string codec = 1; string cid = 2; repeated VideoLayer layers = 4; }
+
+message ClientInfo {
+  enum SDK { UNKNOWN = 0; JS = 1; SWIFT = 2; ANDROID = 3; FLUTTER = 4; GO = 5; UNITY = 6; REACT_NATIVE = 7; RUST = 8; PYTHON = 9; CPP = 10; UNITY_WEB = 11; NODE = 12; UNREAL = 13; ESP32 = 14; DOTNET = 15; }
+  SDK sdk = 1; string version = 2; int32 protocol = 3; string os = 4;
+}
+message ConnectionSettings { bool auto_subscribe = 1; optional bool auto_subscribe_data_track = 5; }
+message JoinRequest { ClientInfo client_info = 1; ConnectionSettings connection_settings = 2; repeated AddTrackRequest add_track_requests = 5; SessionDescription publisher_offer = 6; bool reconnect = 7; string participant_sid = 9; SyncState sync_state = 10; }
+message WrappedJoinRequest { enum Compression { NONE = 0; GZIP = 1; } Compression compression = 1; bytes join_request = 2; }
+message MediaSectionsRequirement { uint32 num_audios = 1; uint32 num_videos = 2; }

@@ -1,0 +1,13 @@
+include(BundleUtilities)
+set(_app "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/livekit_conference_demo.app")
+fixup_bundle("${_app}" ""
+  "@LIVEKIT_LLVM_ROOT@/lib/c++;@LIVEKIT_LLVM_ROOT@/lib/unwind")
+# install_name_tool invalidates existing signatures, including Homebrew's.
+# Ad-hoc signing makes the local bundle usable on Apple Silicon. Distribution
+# still requires the distributor's Developer ID signing and notarization.
+find_program(_codesign codesign REQUIRED)
+execute_process(COMMAND "${_codesign}" --force --deep --sign - "${_app}"
+  RESULT_VARIABLE _sign_result ERROR_VARIABLE _sign_error)
+if(NOT _sign_result EQUAL 0)
+  message(FATAL_ERROR "Cannot ad-hoc sign conference bundle: ${_sign_error}")
+endif()

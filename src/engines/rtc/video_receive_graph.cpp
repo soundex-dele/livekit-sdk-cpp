@@ -1,5 +1,6 @@
 #include "engines/rtc/video_receive_graph.hpp"
 #include "media_graph/video_events.hpp"
+#include "media_nodes/capture/encoded_source.hpp"
 #include "media_nodes/render/video_render.hpp"
 #include "media_nodes/recording/recording.hpp"
 #include "modules/video_coding/include/video_error_codes.h"
@@ -23,14 +24,16 @@ struct VideoDecodeRequest : graphflow::core::EventT<VideoDecodeRequest> {
   int& result;
 };
 class ReceiveDecoderNode final : public MediaNode {
+  bool decode_;
  public:
-  ReceiveDecoderNode() : MediaNode("VideoDecoderNode", NodeExecution::backend) {}
+  explicit ReceiveDecoderNode(bool decode) : MediaNode("VideoDecoderNode", NodeExecution::backend),decode_(decode) {}
   void decoded(const webrtc::VideoFrame& frame) { ++outputs; publish(RawVideoFrame(frame)); }
  protected:
   bool doInit() override {
     subscribe<VideoDecodeRequest>([this](auto& request) {
       ++inputs;
       set_format(request.format);
+      if(!decode_){request.result=WEBRTC_VIDEO_CODEC_NO_OUTPUT;return;}
       request.result = request.missing ? request.codec.Decode(request.image, *request.missing, request.time)
                                        : request.codec.Decode(request.image, request.time);
       if (request.result < 0) ++errors;
@@ -42,7 +45,7 @@ class ReceiveDecoderNode final : public MediaNode {
 // Only decoded frames may be evicted; compressed reference frames are not lost.
 class VideoPresentNode final : public MediaNode {
  public:
-  VideoPresentNode() : MediaNode("VideoPresentNode", NodeExecution::backend) {}
+  VideoPresentNode(std::shared_ptr<RtcGraph> graph,std::string track) : MediaNode("VideoPresentNode", NodeExecution::backend),graph_(std::move(graph)),track_(std::move(track)) {}
   ~VideoPresentNode() override { stop(); }
   std::string error() const { std::lock_guard lock(mutex_); return error_; }
  protected:
@@ -80,7 +83,9 @@ class VideoPresentNode final : public MediaNode {
     while (running_) {
       if (queue_.empty()) { ready_.wait(lock, [&] { return !running_ || !queue_.empty(); }); continue; }
       const auto now = webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds();
-      const auto delay = queue_.front().frame.timestamp_us() - now;
+      const auto& front=queue_.front().frame;
+      const auto presentation=graph_->video_playout(track_,front.ntp_time_ms(),now);
+      const auto delay = presentation.value_or(front.timestamp_us()) - now;
       if (delay > 0) { ready_.wait_for(lock, std::chrono::microseconds(std::min<int64_t>(delay, 100000))); continue; }
       auto item = std::move(queue_.front()); queue_.pop_front(); bytes_ -= item.bytes;
       if (delay < -250000) { ++dropped; continue; }
@@ -90,6 +95,7 @@ class VideoPresentNode final : public MediaNode {
       lock.lock();
     }
   }
+  std::shared_ptr<RtcGraph> graph_;std::string track_;
   static constexpr uint64_t max_bytes = 64 * 1024 * 1024;
   mutable std::mutex mutex_;
   std::condition_variable ready_;
@@ -127,22 +133,31 @@ struct VideoReceiveGraph::Impl {
 };
 VideoReceiveGraph::VideoReceiveGraph(std::shared_ptr<RtcGraph> registry, std::string track_id,
     const std::filesystem::path& recording, lk::VideoPlayout* playout, lk::VideoFrames* frames)
-    : impl_(std::make_unique<Impl>(std::move(registry))) {
+    : impl_(std::make_unique<Impl>(registry)) {
   auto& p = *impl_;
   p.source = std::make_shared<MediaEventNode<VideoDecodeRequest>>("RtcEncodedSourceNode", NodeExecution::source);
-  p.decoder = std::make_shared<ReceiveDecoderNode>();
-  p.present = std::make_shared<VideoPresentNode>();
+  p.decoder = std::make_shared<ReceiveDecoderNode>(registry->decode_video);
+  p.present = std::make_shared<VideoPresentNode>(registry,track_id);
   p.renderer = std::make_shared<lk::VideoRenderNode>(track_id, playout, frames);
   std::vector<std::shared_ptr<MediaNode>> nodes{p.source, p.decoder, p.present, p.renderer};
   std::vector<RtcPipeline::Connection> edges{
       RtcPipeline::connect<VideoDecodeRequest>(p.source, p.decoder),
       RtcPipeline::connect<RawVideoFrame>(p.decoder, p.present),
       RtcPipeline::connect<RawVideoFrame>(p.present, p.renderer)};
+  if(registry->encoded_output){
+    auto output=registry->encoded_output;auto generation=output->generation();
+    auto tap=std::make_shared<MediaEventNode<VideoDecodeRequest>>("EncodedVideoOutputNode",NodeExecution::sink,[output,generation,track_id](VideoDecodeRequest& request){
+      EncodedMediaFrame frame;frame.codec=request.format;std::transform(frame.codec.begin(),frame.codec.end(),frame.codec.begin(),[](unsigned char c){return char(std::tolower(c));});
+      frame.track_id=track_id;frame.data.assign(request.image.data(),request.image.data()+request.image.size());frame.width=request.image._encodedWidth;frame.height=request.image._encodedHeight;
+      frame.keyframe=request.image._frameType==webrtc::VideoFrameType::kVideoFrameKey;frame.rtp_timestamp=request.image.RtpTimestamp();frame.captured=std::chrono::steady_clock::now();output->push(std::move(frame),generation);
+    });nodes.push_back(tap);edges.push_back(RtcPipeline::connect<VideoDecodeRequest>(p.source,tap));
+  }
   if (!recording.empty()) {
     p.recorder = std::make_shared<lk::RecordingNode>(recording, track_id, true);
     nodes.push_back(p.recorder);
     edges.push_back(RtcPipeline::connect<RawVideoFrame>(p.decoder, p.recorder));
   }
+  for (const auto& node : nodes) node->set_track_id(track_id);
   p.pipeline.build(nodes, edges);
 }
 VideoReceiveGraph::~VideoReceiveGraph() { stop(); }
@@ -176,6 +191,7 @@ void VideoReceiveGraph::decoded(uint64_t generation, const webrtc::VideoFrame& f
   try { impl_->decoder->decoded(frame); }
   catch (const std::exception& error) { std::lock_guard lock(impl_->mutex); impl_->failure = error.what(); }
 }
+std::vector<NodeMetrics> VideoReceiveGraph::metrics()const{return {impl_->decoder->snapshot(),impl_->present->snapshot(),impl_->renderer->snapshot()};}
 uint64_t VideoReceiveGraph::frames() const { return impl_->decoder->outputs; }
 std::string VideoReceiveGraph::error() const {
   { std::lock_guard lock(impl_->mutex); if (!impl_->failure.empty()) return impl_->failure; }

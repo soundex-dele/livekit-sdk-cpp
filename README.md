@@ -33,6 +33,7 @@ $env:VCPKG_ROOT = 'D:\vcpkg'
 - `out/windows-x64/Release/livekit_sdk.lib`：SDK 静态库，通过 CMake target 自动连接完整依赖。
 - `out/windows-x64/Release/lk.exe`：移植后的 CLI。
 - `out/windows-x64/Release/livekit_sdk_example.exe`：只调用公开 API 的示例。
+- `out/windows-x64/Release/livekit_conference_demo.exe`：[ImGui 多人视频会议 demo](examples/conference_viewer/README.md)，通过 `LIVEKIT_BUILD_DEMO` 控制构建，顶层工程默认开启。
 
 完整 CLI 用法、启动本机 LiveKit Server、发布/订阅、浏览器观看见 [CLI 文档](docs/cli.md)。支持的命令和参数保持兼容；浏览器页面在 `web/`，开发服务在 `scripts/viewer-server.cjs`。
 
@@ -47,6 +48,7 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 set(LIVEKIT_BUILD_CLI OFF CACHE BOOL "" FORCE)
+set(LIVEKIT_BUILD_DEMO OFF CACHE BOOL "" FORCE)
 set(LIVEKIT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LIVEKIT_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LIVEKIT_ENABLE_VIDEO_PLAYOUT OFF CACHE BOOL "" FORCE)
@@ -56,7 +58,7 @@ add_executable(my_app main.cpp)
 target_link_libraries(my_app PRIVATE LiveKit::SDK)
 ```
 
-Windows 配置时也要传入 vcpkg toolchain 与 `x64-windows-static` triplet。`tests/consumer/` 提供完整独立工程样例。关闭 CLI 后不引入 CLI11，关闭视频窗口后不引入 SDL2。SDK 提供 macOS 构建预设；会议应用及 `.app` 打包入口已迁至 [livekit-app](../livekit-app/apps/conference/desktop/README.md#macos-构建与打包)。Linux 提供 preset，但本次未验证。
+Windows 配置时也要传入 vcpkg toolchain 与 `x64-windows-static` triplet。`tests/consumer/` 提供完整独立工程样例。关闭 CLI 后不引入 CLI11，同时关闭 `LIVEKIT_BUILD_DEMO` 和 `LIVEKIT_ENABLE_VIDEO_PLAYOUT` 后不引入 SDL2。SDK 提供 macOS 构建预设；ImGui 示例的 `.app` 打包方式见 [demo 文档](examples/conference_viewer/README.md#macos-构建与打包)，产品会议应用见 [livekit-app](../livekit-app/apps/conference/desktop/README.md#macos-构建与打包)。Linux 提供 preset，但本次未验证。
 
 ```cpp
 #include <livekit/livekit.hpp>
@@ -146,4 +148,6 @@ python tests/api_contract.py --client out/windows-x64/Release/livekit_sdk_tests.
 
 许可证和来源声明见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
 
-目录重构与独立构建边界见 [仓库结构](../docs/architecture/repository-layout.md)。`LiveKit::ServerSDK` 可在关闭 RTC、Player 后独立构建。SDK 不再提供构建产品客户端的选项；远控、传屏、视频会议与播放器分别从 `livekit-app/apps/<业务>/desktop` 构建。
+目录重构与独立构建边界见 [仓库结构](../docs/architecture/repository-layout.md)。`LiveKit::ServerSDK` 可在关闭 RTC、Player 后独立构建。SDK 的 `examples/conference_viewer` 保留可独立启用的 ImGui 会议示例；远控、传屏、视频会议与播放器产品客户端分别从 `livekit-app/apps/<业务>/desktop` 构建。
+
+RTC 客户端新增流、DataTrack、编码媒体、多层发布和 E2EE 接口及边界见 [客户端扩展](docs/client-extensions.md)。

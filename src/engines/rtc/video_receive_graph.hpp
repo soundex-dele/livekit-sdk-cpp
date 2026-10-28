@@ -25,6 +25,7 @@ class VideoReceiveGraph final : public VideoDecodeTarget {
              int64_t render_time_ms, const std::string& format) override;
   void decoded(uint64_t generation, const webrtc::VideoFrame& frame) override;
   uint64_t frames() const;
+  std::vector<NodeMetrics> metrics() const;
   std::string error() const;
  private:
   struct Impl;

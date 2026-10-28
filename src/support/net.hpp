@@ -18,7 +18,7 @@ class SignalSocket {
   ~SignalSocket();
   void connect(const std::string& url, const std::string& token, bool subscribe, std::stop_token stop, int timeout_seconds,
                const std::string& resume_sid = {},
-               std::chrono::steady_clock::time_point deadline_limit = std::chrono::steady_clock::time_point::max(), int protocol = 12);
+               std::chrono::steady_clock::time_point deadline_limit = std::chrono::steady_clock::time_point::max(), int protocol = 12, const std::string& join_request = {});
   void send(const std::string& bytes);
   std::optional<std::string> receive(int timeout_ms);
   void close();

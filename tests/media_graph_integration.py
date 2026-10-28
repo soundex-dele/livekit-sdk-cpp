@@ -95,14 +95,15 @@ def main():
             "--duration", "6", "--publish-demo", "--publish-tone", "--publish-data", "graph-test", "--stats-interval-ms", "500"])
         wait_connected("publisher", publisher)
         assert publisher.wait(timeout=30) == 0 and subscriber.wait(timeout=30) == 0, f"RTC client failure; see {root}"
-        for kind in ("VideoSourceNode", "AudioSourceNode", "VideoEncodeInputNode",
+        for kind in ("VideoSourceNode", "AudioSourceNode", "RtcVideoTrackSinkNode",
                      "RtcPublishNode", "VideoEncoderNode", "AudioEncoderNode"):
             require_node("publisher", kind)
         for kind in ("VideoDecoderNode", "AudioDecoderNode", "RtcSubscribeNode", "VideoRenderNode", "AudioOutputNode", "RecordingNode"):
             require_node("subscriber", kind)
-        require_edge("publisher", "VideoSourceNode", "VideoEncodeInputNode", "RawVideoFrame")
-        require_edge("publisher", "VideoEncodeInputNode", "VideoEncoderNode", "RawVideoFrame")
-        require_edge("publisher", "VideoEncoderNode", "VideoTrackInputNode", "EncodedVideoFrame")
+        require_edge("publisher", "VideoSourceNode", "VideoEncoderNode", "RawVideoFrame")
+        require_edge("publisher", "VideoEncoderNode", "RtcVideoTrackSinkNode", "EncodedVideoFrame")
+        assert not any(node["kind"] == "VideoEncodeInputNode" for event in events("publisher")
+                       if event.get("event") == "media-graph-stats" for node in event["nodes"])
         require_edge("subscriber", "RtcEncodedSourceNode", "VideoDecoderNode", "VideoDecodeRequest")
         require_edge("subscriber", "VideoDecoderNode", "VideoPresentNode", "RawVideoFrame")
         require_edge("subscriber", "VideoPresentNode", "VideoRenderNode", "RawVideoFrame")

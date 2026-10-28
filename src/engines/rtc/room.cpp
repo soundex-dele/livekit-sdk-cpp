@@ -1,4 +1,5 @@
 #include "engines/rtc/room.hpp"
+#include "engines/rtc/encryption.hpp"
 #include "engines/rtc/signal_session.hpp"
 #include "engines/rtc/client_configuration.hpp"
 #include "engines/rtc/capabilities.hpp"
@@ -12,10 +13,19 @@
 #include "media_nodes/render/video_playout.hpp"
 #include "media_nodes/render/video_frames.hpp"
 #include "backends/webrtc/codec_factories.hpp"
+#include "backends/webrtc/encoded_transformer.hpp"
+#include "backends/webrtc/packet_observer.hpp"
+#include "backends/webrtc/audio_mixer.hpp"
+#include "backends/webrtc/ipv6_network.hpp"
+#include "engines/rtc/codec_policy.hpp"
+#include <cmath>
+#include "backends/webrtc/frame_cryptor.hpp"
+#include "backends/webrtc/transport_policy.hpp"
 #include "backends/webrtc/audio_device.hpp"
 #include "livekit.pb.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/enable_media_with_defaults.h"
+#include "api/field_trials.h"
 #include "api/audio/audio_device.h"
 #include "api/make_ref_counted.h"
 #include "api/task_queue/default_task_queue_factory.h"
@@ -101,7 +111,7 @@ class Runtime {
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
   std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = std::make_shared<livekit::sdk::detail::RtcGraph>();
   webrtc::scoped_refptr<livekit::sdk::detail::GraphAudioDevice> audio_device;
-  Runtime(bool hardware, bool microphone = false) {
+  Runtime(bool hardware, bool microphone = false, std::shared_ptr<livekit::sdk::PacketStream> packets = {},uint64_t generation=0,bool ipv6_only=false,bool encrypted_media=false) {
 #ifdef _WIN32
     if (winsock.error()) throw std::runtime_error("Winsock initialization failed");
 #endif
@@ -111,7 +121,12 @@ class Runtime {
       network = webrtc::Thread::CreateWithSocketServer(); worker = webrtc::Thread::Create(); signaling = webrtc::Thread::Create();
       if (!network->Start() || !worker->Start() || !signaling->Start()) throw std::runtime_error("Cannot start WebRTC threads");
       webrtc::PeerConnectionFactoryDependencies deps;
+      // Encrypted H264 leaves only two slice-header bytes clear. The legacy
+      // PPS tracker reads encrypted slice bits as a PPS id and drops frames.
+      // Use complete in-band SPS/PPS/IDR boundaries, without that inference.
+      if(encrypted_media)deps.trials=webrtc::FieldTrials::CreateNoGlobal("WebRTC-Video-H26xPacketBuffer/Enabled/WebRTC-SpsPpsIdrIsH264Keyframe/Enabled/");
       deps.network_thread = network.get(); deps.worker_thread = worker.get(); deps.signaling_thread = signaling.get();
+      if(ipv6_only)deps.network_manager=std::make_unique<detail::IPv6NetworkManager>(network->socketserver());
       deps.sctp_factory = std::make_unique<SctpFactory>(network.get());
 #ifdef _WIN32
       deps.task_queue_factory = webrtc::CreateTaskQueueWinFactory();
@@ -125,8 +140,10 @@ class Runtime {
       if (!deps.adm) throw std::runtime_error("Cannot create WebRTC audio device");
       audio_device = webrtc::make_ref_counted<livekit::sdk::detail::GraphAudioDevice>(deps.adm, graph, microphone);
       deps.adm = audio_device;
+      deps.audio_mixer=webrtc::make_ref_counted<detail::GraphAudioMixer>(graph);
       livekit::sdk::detail::install_graph_codecs(deps, graph);
       webrtc::EnableMediaWithDefaults(deps);
+      if(packets)deps.event_log_factory=std::make_unique<detail::PacketEventLogFactory>(packets,generation);
       factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
       if (!factory) throw std::runtime_error("Cannot create WebRTC factory");
       // SDK clients must also connect reliably to local development servers.
@@ -147,13 +164,25 @@ class Runtime {
     if (ssl_) { webrtc::CleanupSSL(); ssl_ = false; }
   }
 };
+class DataTrackObserver final : public webrtc::DataChannelObserver {
+ public:
+  explicit DataTrackObserver(EventEmitter event):event_(std::move(event)){}
+  void OnStateChange()override{}
+  void OnMessage(const webrtc::DataBuffer& buffer)override{
+    if(buffer.data.size()<=16384)event_("datatrack-packet",{{"payload",base64url(std::string(reinterpret_cast<const char*>(buffer.data.data()),buffer.data.size()))}});
+  }
+ private:EventEmitter event_;
+};
 class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelObserver {
  public:
   webrtc::scoped_refptr<PC> pc;
   std::atomic<bool> connected{false}, failed{false}, transport_failed{false};
   const livekit::SignalTarget target;
+  livekit::sdk::EncryptionOptions encryption;
+  std::shared_ptr<detail::MediaCryptorContext> media_cryptor;
+  std::shared_ptr<detail::EncodedOutput> encoded_output;
   Peer(Runtime& runtime, SignalSession& socket, livekit::SignalTarget which, const PC::RTCConfiguration& config, std::filesystem::path record, EventEmitter events, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::shared_ptr<detail::AudioFrameOutput> audio = {})
-      : target(which), event(std::move(events)), socket_(socket), record_(std::move(record)), playout_(playout), frames_(frames), graph_(runtime.graph), audio_output_(std::move(audio)) {
+      : target(which), event(std::move(events)), socket_(socket), record_(std::move(record)), playout_(playout), frames_(frames), graph_(runtime.graph), audio_output_(std::move(audio)), signaling_(runtime.signaling.get()) {
     auto result = runtime.factory->CreatePeerConnectionOrError(config, webrtc::PeerConnectionDependencies(this));
     if (!result.ok()) throw std::runtime_error(result.error().message());
     pc = result.MoveValue();
@@ -186,6 +215,7 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
       auto track = transceiver->receiver()->track();
       Json streams = Json::array();
       auto sid = track->id();
+      if(transceiver->mid()){auto mapped=mids_.find(*transceiver->mid());if(mapped!=mids_.end())sid=mapped->second;}
       for (const auto& stream : transceiver->receiver()->streams()) {
         const auto id = stream->id(); streams.push_back(id);
         // LiveKit encodes participant SID|track SID in the stream ID. A reused
@@ -195,10 +225,15 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
           sid = id.substr(separator + 1);
       }
       std::vector<uint32_t> ssrcs;
-      if (track->kind() == "video") {
-        for (const auto& encoding : transceiver->receiver()->GetParameters().encodings)
-          if (encoding.ssrc) ssrcs.push_back(*encoding.ssrc);
-      }
+      for(const auto& encoding:transceiver->receiver()->GetParameters().encodings)if(encoding.ssrc&&*encoding.ssrc)ssrcs.push_back(*encoding.ssrc);
+      // Single-PC preallocated sections have receivers but no actual source yet.
+      if(ssrcs.empty())return;
+      {std::lock_guard lock(mutex_);for(const auto& sink:sinks_)if(sink->owns_track(track.get())&&sink->track_id()==sid)return;}
+      OnRemoveTrack(transceiver->receiver());
+      if(media_cryptor&&media_cryptor->options.keys&&media_cryptor->options.media)
+        transceiver->receiver()->SetFrameDecryptor(webrtc::make_ref_counted<detail::NativeFrameDecryptor>(media_cryptor,sid));
+      if(encoded_output&&track->kind()=="audio")transceiver->receiver()->SetDepacketizerToDecoderFrameTransformer(webrtc::make_ref_counted<detail::EncodedFrameTransformer>(graph_,encoded_output,sid,track->kind()=="video"));
+      if(media_cryptor){std::lock_guard lock(media_cryptor->mutex);auto info=media_cryptor->tracks.find(sid);if(info!=media_cryptor->tracks.end())graph_->bind_sync(sid,info->second.sync_group,ssrcs);}
       auto sink = std::make_unique<TrackSink>(track, record_, playout_, frames_, sid, graph_, std::move(ssrcs), audio_output_);
       sink->attach();
       std::lock_guard lock(mutex_); sinks_.push_back(std::move(sink));
@@ -206,7 +241,10 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
     } catch (const std::exception& e) { event("media-error", {{"message", e.what()}}); failed = true; }
   }
   void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override {
-    channel->RegisterObserver(this); channels_.push_back(channel);
+    if(channel->label()=="_data_track"){
+      auto observer=std::make_unique<DataTrackObserver>(event);channel->RegisterObserver(observer.get());data_observers_.push_back(std::move(observer));
+    }else channel->RegisterObserver(this);
+    channels_.push_back(channel);
   }
   void OnRemoveTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) override {
     std::lock_guard lock(mutex_);
@@ -218,13 +256,17 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
       } else ++it;
     }
   }
+  void request_keyframe(const std::string& sid){std::lock_guard lock(mutex_);for(auto& sink:sinks_)if(sink->track_id()==sid){sink->request_keyframe();return;}throw std::invalid_argument("Remote video track is not subscribed");}
   void OnStateChange() override {}
   void OnMessage(const webrtc::DataBuffer& buffer) override {
     if (buffer.data.size()>16384) return;
     livekit::DataPacket packet;
     if (!packet.ParseFromArray(buffer.data.data(), static_cast<int>(buffer.data.size()))) return;
+    try{packet=detail::decrypt_packet(packet,encryption);}catch(...){event("encryption-error",{{"media",false}});return;}
     if(packet.has_rpc_request()||packet.has_rpc_ack()||packet.has_rpc_response())
       event("rpc",{{"payload",base64url(packet.SerializeAsString())}});
+    if(packet.has_stream_header()||packet.has_stream_chunk()||packet.has_stream_trailer())
+      event("stream",{{"payload",base64url(packet.SerializeAsString())}});
     try {
       if (packet.has_sip_dtmf()) {
         livekit::sdk::DtmfDigit digit{packet.sip_dtmf().code(),packet.sip_dtmf().digit()};
@@ -252,6 +294,7 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
     if (!connected || stats_pending_->exchange(true)) return;
     auto observer=webrtc::make_ref_counted<StatsObserver>(event,target,stats_pending_);
     pc->GetStats(observer.get());
+    Json tracks=Json::array();{std::lock_guard lock(mutex_);for(const auto& sink:sinks_)tracks.push_back(sink->stats());}event("graph-track-stats",{{"tracks",tracks},{"target",int(target)}});
   }
   livekit::SessionDescription last_local, last_remote;
   // Called on the signaling thread, which owns channels_.
@@ -268,8 +311,10 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
     auto sdp = webrtc::CreateSessionDescription(*type, description.sdp(), &error);
     if (!sdp) throw std::runtime_error("Invalid remote SDP: " + error.description);
     auto observer = webrtc::make_ref_counted<SetDescription>(); auto future = observer->result.get_future();
+    signaling_->BlockingCall([&]{mids_.clear();for(const auto& [mid,track]:description.mid_to_track_id())mids_[mid]=track;});
     pc->SetRemoteDescription(observer.get(), sdp.release());
     detail::await_native(future, socket_.stop_token(), socket_.operation_deadline());
+    signaling_->BlockingCall([&]{for(const auto& transceiver:pc->GetTransceivers()){const auto direction=transceiver->current_direction();if(direction&&(*direction==webrtc::RtpTransceiverDirection::kRecvOnly||*direction==webrtc::RtpTransceiverDirection::kSendRecv))OnTrack(transceiver);}});
     last_remote = description;
     remote_set_ = true;
     for (const auto& candidate : pending_ice_) add_ice(candidate);
@@ -303,6 +348,7 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
     if (!candidate) throw std::runtime_error("Invalid ICE candidate: " + error.description);
     if (!pc->AddIceCandidate(candidate.get())) throw std::runtime_error("WebRTC rejected ICE candidate");
   }
+  std::vector<std::unique_ptr<DataTrackObserver>> data_observers_;
   EventEmitter event;
   SignalSession& socket_;
   std::filesystem::path record_;
@@ -315,6 +361,8 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
   std::vector<webrtc::scoped_refptr<webrtc::DataChannelInterface>> channels_;
   std::vector<std::string> pending_ice_;
   bool remote_set_ = false;
+  webrtc::Thread* signaling_;
+  std::map<std::string,std::string> mids_;
   std::shared_ptr<std::atomic<bool>> stats_pending_=std::make_shared<std::atomic<bool>>(false);
 };
 void webrtc_smoke(EventEmitter event) {
@@ -353,6 +401,168 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
     if (options.microphone) recovery.publications.emplace("microphone", detail::DesiredPublication{{}, {}, true});
   }
   SignalSession socket(options, stop, event, &recovery);
+  const bool restore_microphone=std::any_of(recovery.publications.begin(),recovery.publications.end(),[](const auto& p){return p.second.microphone;});
+  Runtime runtime(options.audio_playout || restore_microphone, restore_microphone,options.packet_stream,session?session->generation:0,options.ipv6_only,options.encryption.keys&&options.encryption.media);
+  runtime.graph->synchronize_av=options.synchronize_av;runtime.graph->decode_video=options.decode_video;
+  runtime.graph->encoded_output=session?session->encoded_output:nullptr;
+  std::unique_ptr<VideoFrames> video_frames;
+  if (options.video_frame_handler || options.video_frame_stream)
+    video_frames = std::make_unique<VideoFrames>(options.video_frame_handler, session ? session->video_output : nullptr);
+  std::unique_ptr<VideoPlayout> playout;
+  if (options.video_playout) playout = std::make_unique<VideoPlayout>(event);
+  std::shared_ptr<Peer> publisher,subscriber;
+  webrtc::scoped_refptr<webrtc::DataChannelInterface> reliable,lossy_channel,data_track_channel;
+  auto make_channels=[&]{
+    for(bool lossy:{false,true}){webrtc::DataChannelInit init;init.ordered=true;if(lossy)init.maxRetransmits=0;
+      auto result=publisher->pc->CreateDataChannelOrError(lossy?"_lossy":"_reliable",&init);if(!result.ok())throw std::runtime_error(result.error().message());
+      if(lossy)lossy_channel=result.value();else reliable=result.value();publisher->OnDataChannel(result.value());}
+    if(session){webrtc::DataChannelInit init;init.ordered=false;init.maxRetransmits=0;auto result=publisher->pc->CreateDataChannelOrError("_data_track",&init);
+      if(!result.ok())throw std::runtime_error(result.error().message());data_track_channel=result.value();publisher->OnDataChannel(data_track_channel);}
+  };
+  auto add_receive_sections=[&](uint32_t audio,uint32_t video){
+    if(audio>64||video>64||publisher->pc->GetTransceivers().size()+audio+video>128)throw SDKError(ErrorDomain::protocol,ErrorCode::resource_exhausted,"Too many requested media sections");
+    for(auto kind:{webrtc::MediaType::AUDIO,webrtc::MediaType::VIDEO})for(uint32_t i=0;i<(kind==webrtc::MediaType::AUDIO?audio:video);++i){
+      webrtc::RtpTransceiverInit init;init.direction=webrtc::RtpTransceiverDirection::kRecvOnly;auto result=publisher->pc->AddTransceiver(kind,init);if(!result.ok())throw std::runtime_error(result.error().message());}
+  };
+  std::vector<std::shared_ptr<MediaPump>> pumps;
+  std::vector<webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface>> tracks;
+  std::map<std::string, MediaPump*> track_pumps;
+  std::map<std::string,std::string> backup_parents;
+  std::map<std::string,std::pair<std::string,Clock::time_point>> backup_pending;
+  std::set<std::string> retired_backups;
+  std::map<std::string,std::string> track_codecs;
+  std::map<std::string, webrtc::scoped_refptr<webrtc::RtpSenderInterface>> senders;
+    std::set<std::string> awaiting_tracks;
+  livekit::ClientConfiguration client_configuration;
+  uint32_t reliable_sequence=1;
+  auto serialize_packet=[&](livekit::DataPacket packet){if(packet.kind()==0)packet.set_sequence(reliable_sequence++);return detail::encrypt_packet(packet,options.encryption).SerializeAsString();};
+  bool preparing_join=options.single_peer_connection;
+  std::vector<livekit::AddTrackRequest> initial_tracks;
+    auto add_track = [&](webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const MediaSpec* spec, const livekit::sdk::TrackPublishOptions& publication = {}, std::shared_ptr<detail::EncodedSourceReader> encoded = {}, const std::string& existing_sid = {}) {
+      const auto codec=spec&&spec->encoded_source?spec->encoded_source->options().codec:(publication.codec.empty()?options.codec:publication.codec);
+      if(publication.backup_codec){
+        const auto& backup=*publication.backup_codec;
+        if(!spec||!spec->video||spec->encoded_source||backup.codec==codec||(backup.codec!="vp8"&&backup.codec!="h264"&&backup.codec!="h265")||publication.encryption_keys||(options.encryption.media&&options.encryption.keys))throw std::invalid_argument("Backup codec requires unencrypted raw video and a distinct supported codec");
+      }
+      const auto encryption_keys=publication.encryption_keys?publication.encryption_keys:(options.encryption.media?options.encryption.keys:nullptr);
+      if(encryption_keys){(void)detail::encryption_codec(track->kind()=="audio"?"opus":codec);(void)encryption_keys->key(encryption_keys->current_key_index());}
+      track_codecs[track->id()]=codec;
+      webrtc::RtpTransceiverInit init; init.direction = webrtc::RtpTransceiverDirection::kSendOnly; init.stream_ids = {publication.stream.empty() ? "livekit-sdk" : publication.stream};
+      webrtc::RtpEncodingParameters encoding;
+      encoding.max_bitrate_bps = track->kind() == "video" ? 2000000 : 64000;
+      if (spec && spec->video) encoding.max_framerate = spec->fps;
+      if(publication.video_encodings.empty())init.send_encodings.push_back(encoding);
+      else {
+        if(track->kind()!="video"||codec!="vp8"||encoded||publication.video_encodings.size()>3)throw std::invalid_argument("Simulcast requires raw VP8 video and at most three layers");
+        std::set<std::string> rids;double previous=100;
+        for(const auto& layer:publication.video_encodings){
+          if(layer.rid.empty()||layer.rid.size()>16||!std::all_of(layer.rid.begin(),layer.rid.end(),[](unsigned char c){return std::isalnum(c);})||!rids.insert(layer.rid).second||!std::isfinite(layer.scale_resolution_down_by)||layer.scale_resolution_down_by<1||layer.scale_resolution_down_by>=previous||layer.max_bitrate_bps<10000||layer.max_bitrate_bps>50000000||!std::isfinite(layer.max_framerate)||layer.max_framerate<1||layer.max_framerate>120)throw std::invalid_argument("Invalid simulcast encoding");
+          previous=layer.scale_resolution_down_by;auto layer_encoding=encoding;
+          layer_encoding.rid=layer.rid;layer_encoding.scale_resolution_down_by=layer.scale_resolution_down_by;
+          layer_encoding.max_bitrate_bps=layer.max_bitrate_bps;layer_encoding.max_framerate=layer.max_framerate;layer_encoding.active=layer.active;
+          init.send_encodings.push_back(layer_encoding);
+        }
+      }
+      auto result = publisher->pc->AddTransceiver(track, init);
+      if (!result.ok()) throw std::runtime_error(result.error().message());
+      try {
+      if (track->kind() == "audio" && (publication.disable_red || encoded)) {
+        auto capabilities = runtime.factory->GetRtpSenderCapabilities(webrtc::MediaType::AUDIO);
+        std::vector<webrtc::RtpCodecCapability> selected;
+        for (const auto& codec : capabilities.codecs) {
+          auto name = codec.name;
+          std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+          if (name != "red"&&!detail::disabled_codec(client_configuration,codec,true)) selected.push_back(codec);
+        }
+        auto error = result.value()->SetCodecPreferences(selected);
+        if (!error.ok()) throw std::runtime_error(error.message());
+      }
+      if (track->kind() == "video") {
+        auto capabilities = runtime.factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+        std::vector<webrtc::RtpCodecCapability> selected;
+        bool found_codec = false;
+        for (const auto& capability : capabilities.codecs) {
+          auto name = capability.name;
+          std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+          found_codec |= name == codec && !detail::disabled_codec(client_configuration,capability,true);
+          if (!detail::disabled_codec(client_configuration,capability,true) && (name == codec || name == "rtx" || name == "red" || name == "ulpfec")) selected.push_back(capability);
+        }
+        if (!found_codec) throw std::runtime_error("Video codec not available: " + codec);
+        // Advertise the backup in the primary m-section too: the SFU derives
+        // not-yet-published codec parameters from this SDP when a subscriber
+        // cannot receive the primary codec. Keep the primary first.
+        if (publication.backup_codec) {
+          std::vector<webrtc::RtpCodecCapability> ordered;
+          for (const auto& preferred : {codec, publication.backup_codec->codec}) {
+            const auto before = ordered.size();
+            for (const auto& capability : capabilities.codecs) {
+              auto name = capability.name;
+              std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+              if (name == preferred && !detail::disabled_codec(client_configuration, capability, true)) ordered.push_back(capability);
+            }
+            if (ordered.size() == before) throw std::runtime_error("Video codec not available: " + preferred);
+          }
+          for (const auto& capability : selected) {
+            auto name = capability.name;
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (name != codec) ordered.push_back(capability);
+          }
+          selected = std::move(ordered);
+        }
+        auto error = result.value()->SetCodecPreferences(selected); if (!error.ok()) throw std::runtime_error(error.message());
+      }
+      if(encryption_keys)result.value()->sender()->SetFrameEncryptor(webrtc::make_ref_counted<detail::NativeFrameEncryptor>(encryption_keys,detail::encryption_codec(track->kind()=="audio"?"opus":codec),[event,id=track->id()](bool ok,int key){event("encryption-state",{{"track",id},{"media",true},{"encrypting",true},{"ok",ok},{"keyIndex",key}});} ));
+      if(encoded&&track->kind()=="audio")result.value()->sender()->SetEncoderToPacketizerFrameTransformer(webrtc::make_ref_counted<detail::EncodedFrameTransformer>(runtime.graph,nullptr,track->id(),false,encoded));
+      senders[track->id()] = result.value()->sender();
+      tracks.push_back(track); awaiting_tracks.insert(track->id());
+      livekit::SignalRequest request; auto* add = request.mutable_add_track();
+      if(encryption_keys)add->set_encryption(livekit::Encryption::GCM);
+      add->set_cid(track->id()); add->set_name(publication.name.empty() ? track->id() : publication.name); add->set_stream(init.stream_ids.front());
+      add->set_type(track->kind() == "video" ? livekit::VIDEO : livekit::AUDIO);
+      if (track->kind() == "audio") add->set_disable_red(publication.disable_red || bool(encoded));
+      if (spec && spec->audio_source) add->set_stereo(spec->audio_source->options().channels == 2);
+      const auto default_source = spec && spec->capture == livekit::sdk::CaptureKind::screen ? livekit::SCREEN_SHARE :
+          track->kind() == "video" ? livekit::CAMERA : livekit::MICROPHONE;
+      add->set_source(publication.source == livekit::sdk::TrackSource::unknown ? default_source : static_cast<livekit::TrackSource>(publication.source));
+      if (spec && spec->video) {
+        add->set_width(spec->width);add->set_height(spec->height);
+        for(size_t i=0;i<init.send_encodings.size();++i){const auto& encoding=init.send_encodings[i];auto* layer=add->add_layers();
+          const auto scale=encoding.scale_resolution_down_by.value_or(1);layer->set_quality(i+1==init.send_encodings.size()?2:int(i));
+          layer->set_width(int(spec->width/scale));layer->set_height(int(spec->height/scale));layer->set_bitrate(encoding.max_bitrate_bps.value_or(2000000));}
+      }
+      if(track->kind()=="video"){
+        auto* primary=add->add_simulcast_codecs();primary->set_codec(codec);primary->set_cid(track->id());*primary->mutable_layers()=add->layers();
+        if(publication.backup_codec){auto* backup=add->add_simulcast_codecs();backup->set_codec(publication.backup_codec->codec);backup->set_cid(track->id()+"-backup");add->set_backup_codec_policy(static_cast<livekit::BackupCodecPolicy>(publication.backup_codec->policy));}
+      }
+      if(!existing_sid.empty())add->set_sid(existing_sid);
+      if(preparing_join)initial_tracks.push_back(request.add_track());else socket.send(request);
+      } catch (...) {result.value()->StopStandard();senders.erase(track->id());awaiting_tracks.erase(track->id());track_codecs.erase(track->id());std::erase_if(tracks,[&](const auto& t){return t->id()==track->id();});throw;}
+    };
+    auto publish_initial=[&]{
+    for (const auto& [id, desired] : recovery.publications) {
+      if (desired.microphone) {
+        auto source = runtime.factory->CreateAudioSource(webrtc::AudioOptions{});
+        auto track = runtime.factory->CreateAudioTrack(id, source.get());
+        track->set_enabled(!desired.muted); add_track(track, nullptr, desired.options);
+      } else {
+        const auto& spec = desired.media;
+        auto pump = std::make_shared<MediaPump>(spec, runtime.graph, playout.get(), video_frames.get(), id, bool(desired.options.backup_codec));
+        webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track;
+        if (spec.video) track = runtime.factory->CreateVideoTrack(pump->video, id);
+        else track = runtime.factory->CreateAudioTrack(id, pump->audio.get());
+        track->set_enabled(!desired.muted); add_track(track, &spec, desired.options, pump->encoded_source());
+        track_pumps[id] = pump.get(); pumps.push_back(std::move(pump));
+      }
+    }
+    };
+  if(options.single_peer_connection){
+    PC::RTCConfiguration initial;initial.sdp_semantics=webrtc::SdpSemantics::kUnifiedPlan;
+    detail::apply_media_transport(initial,options.media_transport,options.disable_turn||options.media_transport!=livekit::sdk::MediaTransport::automatic);
+    if(options.relay_only)initial.type=PC::kRelay;
+    if(options.encryption.keys&&options.encryption.media&&options.encryption.require_encrypted){initial.crypto_options=webrtc::CryptoOptions{};initial.crypto_options->sframe.require_frame_encryption=true;}
+    publisher=std::make_shared<Peer>(runtime,socket,livekit::PUBLISHER,initial,options.record,event,playout.get(),video_frames.get(),session?session->audio_output:nullptr);subscriber=publisher;
+    make_channels();if(options.subscribe)add_receive_sections(3,3);publish_initial();socket.initial_offer(publisher->local(true),initial_tracks);
+  }
   socket.connect();
   livekit::JoinResponse join;
   while (!stop.stop_requested()) {
@@ -378,41 +588,37 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   socket.bind_participant(join.participant().sid());
   if (!recovery.expected_room.empty() && join.room().name() != recovery.expected_room) throw std::runtime_error("Token room does not match the requested room");
   recovery.expected_room = join.room().name();
-  auto client_configuration = join.client_configuration();
+  preparing_join=false;client_configuration = join.client_configuration();
   socket.configure_client(client_configuration);
-  const bool relay_only = detail::relay_required(options.relay_only, options.disable_turn, client_configuration);
+  const bool disable_turn = options.disable_turn || options.media_transport != livekit::sdk::MediaTransport::automatic;
+  const bool relay_only = detail::relay_required(options.relay_only, disable_turn, client_configuration);
   Json roster = Json::array(); for (const auto& p : join.other_participants()) roster.push_back(participant_json(p));
   event("joined", {{"room", join.room().name()}, {"identity", join.participant().identity()}, {"sid", join.participant().sid()},
     {"roomInfo", {{"sid", join.room().sid()}, {"name", join.room().name()}, {"metadata", join.room().metadata()}, {"recording", join.room().active_recording()}}},
     {"localParticipant", participant_json(join.participant())}, {"participants", roster}});
-  event("session-capabilities",detail::session_capabilities_json(join,options.signal_protocol,relay_only));
+  auto capability=detail::session_capabilities_json(join,options.signal_protocol,relay_only);capability["singlePeerConnection"]=options.single_peer_connection;event("session-capabilities",capability);
   for (const auto& p : join.other_participants())
     event("participant", {{"identity", p.identity()}, {"sid", p.sid()}, {"state", p.state()}, {"participant", participant_json(p)}, {"initial", true}});
-  const bool restore_microphone=std::any_of(recovery.publications.begin(),recovery.publications.end(),[](const auto& p){return p.second.microphone;});
-  Runtime runtime(options.audio_playout || restore_microphone, restore_microphone);
-  std::unique_ptr<VideoFrames> video_frames;
-  if (options.video_frame_handler || options.video_frame_stream)
-    video_frames = std::make_unique<VideoFrames>(options.video_frame_handler, session ? session->video_output : nullptr);
-  std::unique_ptr<VideoPlayout> playout;
-  if (options.video_playout) playout = std::make_unique<VideoPlayout>(event);
-  PC::RTCConfiguration config; config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  if(session)for(const auto& p:join.other_participants())event("datatrack-participant",{{"payload",base64url(p.SerializeAsString())}});
+  PC::RTCConfiguration config;
+  if(options.encryption.keys&&options.encryption.media&&options.encryption.require_encrypted){config.crypto_options=webrtc::CryptoOptions{};config.crypto_options->sframe.require_frame_encryption=true;}
+  config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  detail::apply_media_transport(config, options.media_transport, disable_turn);
   for (const auto& ice : join.ice_servers()) {
-    PC::IceServer server; for (const auto& url : ice.urls()) if (!options.disable_turn || (!url.starts_with("turn:") && !url.starts_with("turns:"))) server.urls.push_back(url); server.username = ice.username(); server.password = ice.credential(); if (!server.urls.empty()) config.servers.push_back(std::move(server));
+    PC::IceServer server; for (const auto& url : ice.urls()) if (!disable_turn || (!url.starts_with("turn:") && !url.starts_with("turns:"))) server.urls.push_back(url); server.username = ice.username(); server.password = ice.credential(); if (!server.urls.empty()) config.servers.push_back(std::move(server));
   }
   if (relay_only) config.type = PC::kRelay;
-  std::unique_ptr<Peer> publisher, subscriber;
-  std::vector<std::shared_ptr<MediaPump>> pumps;
-  std::vector<webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface>> tracks;
-  webrtc::scoped_refptr<webrtc::DataChannelInterface> reliable, lossy_channel;
+  auto media_cryptor=std::make_shared<detail::MediaCryptorContext>();media_cryptor->options=options.encryption;
+  media_cryptor->report=[event](const std::string& id,bool ok,int key){event("encryption-state",{{"track",id},{"media",true},{"encrypting",false},{"ok",ok},{"keyIndex",key}});};
+  media_cryptor->sif.assign(join.sif_trailer().begin(),join.sif_trailer().end());
+  for(const auto& participant:join.other_participants())media_cryptor->participant(participant);
   using Command = livekit::sdk::detail::Command;
   std::map<std::string, std::shared_ptr<Command>> publishing;
   detail::PendingRequests pending_controls;
   std::map<std::string, Json> remote_settings;
   std::deque<std::shared_ptr<Command>> deferred;
-  std::map<std::string, MediaPump*> track_pumps;
   std::set<MediaPump*> started_pumps;
   std::set<MediaPump*> demand_paused;
-  std::map<std::string, webrtc::scoped_refptr<webrtc::RtpSenderInterface>> senders;
   auto cleanup = [&] {
     pending_controls.interrupt("Connection closed before request confirmation; outcome is unknown");
     runtime.graph->close();
@@ -422,16 +628,19 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
     for (auto& pump : pumps) pump->stop();
     try { livekit::SignalRequest leave; leave.mutable_leave(); socket.send(leave); } catch (...) {}
     socket.close();
-    runtime.signaling->BlockingCall([&] { reliable = nullptr; lossy_channel = nullptr; senders.clear(); publisher.reset(); subscriber.reset(); tracks.clear(); });
+    runtime.signaling->BlockingCall([&] { reliable = nullptr; lossy_channel = nullptr; data_track_channel = nullptr; senders.clear(); publisher.reset(); subscriber.reset(); tracks.clear(); });
     for (const auto& pump : pumps) event("publish-summary", {{"kind", pump->spec.video ? "video" : "audio"}, {"frames", pump->frames.load()}});
     pumps.clear();
   };
   try {
-    publisher = std::make_unique<Peer>(runtime, socket, livekit::PUBLISHER, config, std::filesystem::path{}, event);
+    if(!publisher)publisher = std::make_shared<Peer>(runtime, socket, livekit::PUBLISHER, config, std::filesystem::path{}, event);
+    else{auto error=publisher->pc->SetConfiguration(config);if(!error.ok())throw std::runtime_error(error.message());}
     auto recording = options.record;
     if (!recording.empty() && recovery.rejoining) recording /= "rejoin-" + std::to_string(session ? session->generation : 0);
-    subscriber = std::make_unique<Peer>(runtime, socket, livekit::SUBSCRIBER, config, recording, event, playout.get(), video_frames.get(), session ? session->audio_output : nullptr);
-    std::set<std::string> awaiting_tracks;
+    if(!subscriber)subscriber = std::make_shared<Peer>(runtime, socket, livekit::SUBSCRIBER, config, recording, event, playout.get(), video_frames.get(), session ? session->audio_output : nullptr);
+    if(session){publisher->encoded_output=session->encoded_output;subscriber->encoded_output=session->encoded_output;}
+    publisher->encryption=options.encryption;subscriber->encryption=options.encryption;
+    publisher->media_cryptor=media_cryptor;subscriber->media_cryptor=media_cryptor;
     std::map<std::string, webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface>> published_tracks;
     std::map<std::string, livekit::TrackPublishedResponse> published_info;
     std::map<std::string, bool> subscription_overrides;
@@ -493,70 +702,9 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         restored_intents[key] = intent.sid;
       }
     };
-    auto add_track = [&](webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const MediaSpec* spec, const livekit::sdk::TrackPublishOptions& publication = {}) {
-      webrtc::RtpTransceiverInit init; init.direction = webrtc::RtpTransceiverDirection::kSendOnly; init.stream_ids = {publication.stream.empty() ? "livekit-sdk" : publication.stream};
-      webrtc::RtpEncodingParameters encoding;
-      encoding.max_bitrate_bps = track->kind() == "video" ? 2000000 : 64000;
-      if (spec && spec->video) encoding.max_framerate = spec->fps;
-      init.send_encodings.push_back(encoding);
-      auto result = publisher->pc->AddTransceiver(track, init);
-      if (!result.ok()) throw std::runtime_error(result.error().message());
-      if (track->kind() == "audio" && publication.disable_red) {
-        auto capabilities = runtime.factory->GetRtpSenderCapabilities(webrtc::MediaType::AUDIO);
-        std::vector<webrtc::RtpCodecCapability> selected;
-        for (const auto& codec : capabilities.codecs) {
-          auto name = codec.name;
-          std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-          if (name != "red") selected.push_back(codec);
-        }
-        auto error = result.value()->SetCodecPreferences(selected);
-        if (!error.ok()) throw std::runtime_error(error.message());
-      }
-      if (track->kind() == "video") {
-        auto capabilities = runtime.factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
-        std::vector<webrtc::RtpCodecCapability> selected;
-        bool found_codec = false;
-        for (auto codec : capabilities.codecs) { auto name = codec.name; std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); }); found_codec |= name == options.codec; if (name == options.codec || name == "rtx" || name == "red" || name == "ulpfec") selected.push_back(codec); }
-        if (!found_codec) throw std::runtime_error("Video codec not available: " + options.codec);
-        auto error = result.value()->SetCodecPreferences(selected); if (!error.ok()) throw std::runtime_error(error.message());
-      }
-      senders[track->id()] = result.value()->sender();
-      tracks.push_back(track); awaiting_tracks.insert(track->id());
-      livekit::SignalRequest request; auto* add = request.mutable_add_track();
-      add->set_cid(track->id()); add->set_name(publication.name.empty() ? track->id() : publication.name); add->set_stream(init.stream_ids.front());
-      add->set_type(track->kind() == "video" ? livekit::VIDEO : livekit::AUDIO);
-      if (track->kind() == "audio") add->set_disable_red(publication.disable_red);
-      if (spec && spec->audio_source) add->set_stereo(spec->audio_source->options().channels == 2);
-      const auto default_source = spec && spec->capture == livekit::sdk::CaptureKind::screen ? livekit::SCREEN_SHARE :
-          track->kind() == "video" ? livekit::CAMERA : livekit::MICROPHONE;
-      add->set_source(publication.source == livekit::sdk::TrackSource::unknown ? default_source : static_cast<livekit::TrackSource>(publication.source));
-      if (spec && spec->video) { add->set_width(spec->width); add->set_height(spec->height); auto layer = add->add_layers(); layer->set_quality(2); layer->set_width(spec->width); layer->set_height(spec->height); layer->set_bitrate(2000000); }
-      send(request);
-    };
-    for (const auto& [id, desired] : recovery.publications) {
-      if (desired.microphone) {
-        auto source = runtime.factory->CreateAudioSource(webrtc::AudioOptions{});
-        auto track = runtime.factory->CreateAudioTrack(id, source.get());
-        track->set_enabled(!desired.muted); add_track(track, nullptr, desired.options);
-      } else {
-        const auto& spec = desired.media;
-        auto pump = std::make_shared<MediaPump>(spec, runtime.graph, playout.get(), video_frames.get(), id);
-        webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track;
-        if (spec.video) track = runtime.factory->CreateVideoTrack(pump->video, id);
-        else track = runtime.factory->CreateAudioTrack(id, pump->audio.get());
-        track->set_enabled(!desired.muted); add_track(track, &spec, desired.options);
-        track_pumps[id] = pump.get(); pumps.push_back(std::move(pump));
-      }
-    }
+    if(!options.single_peer_connection)publish_initial();
     bool need_publisher = !tracks.empty() || !options.publish_data.empty() || !join.subscriber_primary();
-    if (session || need_publisher) {
-      for (bool lossy : {false, true}) {
-        webrtc::DataChannelInit init; init.ordered = true; if (lossy) init.maxRetransmits = 0;
-        auto channel = publisher->pc->CreateDataChannelOrError(lossy ? "_lossy" : "_reliable", &init);
-        if (!channel.ok()) throw std::runtime_error(channel.error().message());
-        if (!lossy) reliable = channel.value(); else lossy_channel = channel.value();
-      }
-    }
+    if(!reliable&&(session||need_publisher))make_channels();
     if (!options.subscribe_tracks.empty() && !recovery.room_changed) {
       livekit::SignalRequest request; auto* subscription = request.mutable_subscription(); subscription->set_subscribe(true);
       for (const auto& sid : options.subscribe_tracks) subscription->add_track_sids(sid); send(request);
@@ -584,11 +732,16 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         if (!desired.attributes.contains(key)) { (*update->mutable_attributes())[key] = ""; changed = true; }
       if (changed) send(request);
     }
-    bool negotiated = false, dirty = true, offer_pending = false, pumping = false, connected = false,
+    bool negotiated = options.single_peer_connection, dirty = true, offer_pending = options.single_peer_connection, pumping = false, connected = false,
          data_sent = options.publish_data.empty() || recovery.initial_data_sent;
     auto remove_track = [&](const std::string& sid) {
       auto found = published_tracks.find(sid); if (found == published_tracks.end()) return;
-      auto cid = found->second->id(); auto sender = senders.find(cid);
+      auto cid = found->second->id();
+      for(auto it=backup_parents.begin();it!=backup_parents.end();)if(it->second==cid){
+        auto sender=senders.find(it->first);if(sender!=senders.end()){auto error=publisher->pc->RemoveTrackOrError(sender->second);if(!error.ok())throw std::runtime_error(error.message());senders.erase(sender);}
+        std::erase_if(tracks,[&](const auto& t){return t->id()==it->first;});track_codecs.erase(it->first);awaiting_tracks.erase(it->first);backup_pending.erase(it->first);retired_backups.insert(it->first);it=backup_parents.erase(it);
+      }else ++it;
+      track_codecs.erase(cid);auto sender = senders.find(cid);
       if (sender != senders.end()) { auto error = publisher->pc->RemoveTrackOrError(sender->second); if (!error.ok()) throw std::runtime_error(error.message()); senders.erase(sender); }
       auto pump = track_pumps.find(cid);
       if (pump != track_pumps.end()) { pump->second->stop(); started_pumps.erase(pump->second); demand_paused.erase(pump->second); std::erase_if(pumps, [&](const auto& p) { return p.get() == pump->second; }); track_pumps.erase(pump); }
@@ -605,8 +758,8 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
     bool recovering = false;
     auto recovery_deadline = Clock::time_point::max();
     auto build_sync = [&](livekit::SyncState& sync) {
-      *sync.mutable_answer() = subscriber->last_local;
-      *sync.mutable_offer() = subscriber->last_remote;
+      *sync.mutable_answer() = options.single_peer_connection?publisher->last_remote:subscriber->last_local;
+      *sync.mutable_offer() = options.single_peer_connection?publisher->last_local:subscriber->last_remote;
       const bool automatic = options.subscribe && options.subscribe_tracks.empty();
       auto* subscription = sync.mutable_subscription(); subscription->set_subscribe(!automatic);
       for (const auto& [sid, enabled] : subscription_overrides)
@@ -614,24 +767,38 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       for (const auto& [sid, info] : published_info) *sync.add_publish_tracks() = info;
       for (const auto& [sid, settings] : remote_settings)
         if (settings.value("disabled", false)) sync.add_track_sids_disabled(sid);
-      for (const auto& channel : {reliable, lossy_channel}) if (channel && channel->id() >= 0) {
+      for (const auto& channel : {reliable, lossy_channel, data_track_channel}) if (channel && channel->id() >= 0) {
         auto* info = sync.add_data_channels(); info->set_label(channel->label());
         info->set_id(channel->id()); info->set_target(livekit::PUBLISHER);
       }
+      if(session)session->data_tracks->sync(sync);
       runtime.signaling->BlockingCall([&] { subscriber->append_data_channels(sync); });
     };
+    auto apply_receiver_codecs=[&]{
+      for(const auto& peer:{publisher,subscriber})for(const auto& transceiver:peer->pc->GetTransceivers()){
+        if(transceiver->direction()==webrtc::RtpTransceiverDirection::kSendOnly)continue;
+        auto codecs=runtime.factory->GetRtpReceiverCapabilities(transceiver->media_type()).codecs;
+        std::erase_if(codecs,[&](const auto& codec){return detail::disabled_codec(client_configuration,codec,false);});
+        if(codecs.empty())throw SDKError(ErrorDomain::media,ErrorCode::unsupported,"Server disabled all receive codecs");
+        auto error=transceiver->SetCodecPreferences(codecs);if(!error.ok())throw std::runtime_error(error.message());
+      }
+    };
+    apply_receiver_codecs();
+    if(client_configuration.video().hardware_encoder()==livekit::ENABLED||client_configuration.screen().hardware_encoder()==livekit::ENABLED)
+      event("codec-policy",{{"hardwareEncoderRequested",true},{"hardwareEncoderAvailable",false},{"implementation","software"}});
     auto configure_resume = [&](const livekit::ReconnectResponse& response) {
       // An omitted configuration doesn't silently undo an earlier relay policy.
       if (response.has_client_configuration()) client_configuration = response.client_configuration();
-      const bool relay = detail::relay_required(options.relay_only, options.disable_turn, client_configuration);
-      socket.configure_client(client_configuration);
+      const bool relay = detail::relay_required(options.relay_only, disable_turn, client_configuration);
+      socket.configure_client(client_configuration);apply_receiver_codecs();
       for (const auto& peer : {publisher.get(), subscriber.get()}) {
         auto updated = peer->pc->GetConfiguration();
+        detail::apply_media_transport(updated, options.media_transport, disable_turn);
         updated.type = relay ? PC::kRelay : PC::kAll;
         updated.servers.clear();
         for (const auto& ice : response.ice_servers()) {
           PC::IceServer server;
-          for (const auto& url : ice.urls()) if (!options.disable_turn || (!url.starts_with("turn:") && !url.starts_with("turns:"))) server.urls.push_back(url);
+          for (const auto& url : ice.urls()) if (!disable_turn || (!url.starts_with("turn:") && !url.starts_with("turns:"))) server.urls.push_back(url);
           server.username = ice.username(); server.password = ice.credential();
           if (!server.urls.empty()) updated.servers.push_back(std::move(server));
         }
@@ -648,9 +815,12 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message, "Incomplete or inconsistent room migration");
       if (moved.room().sid() == join.room().sid() && moved.room().name() == join.room().name() &&
           moved.participant().sid() == join.participant().sid()) { socket.update_token(moved.token()); return; }
+      {std::lock_guard lock(media_cryptor->mutex);media_cryptor->tracks.clear();}
+      for(const auto& participant:moved.other_participants())media_cryptor->participant(participant);
       // Keep transport only when the confirmed publication mapping is unchanged.
       bool keep_transport = connected && !offer_pending && awaiting_tracks.empty() &&
           moved.participant().sid() == join.participant().sid() && moved.participant().tracks_size() == published_info.size();
+      if(session&&(session->data_tracks->needs_publisher()||!session->data_tracks->remote_tracks().empty()))keep_transport=false;
       std::set<std::string> moved_sids;
       for (const auto& track : moved.participant().tracks())
         keep_transport &= moved_sids.insert(track.sid()).second && published_info.contains(track.sid());
@@ -688,6 +858,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       if (Clock::now() >= recovery.session_deadline) break;
       recovery.budget.check();
       pending_controls.poll();
+      for(const auto& [cid,pending]:backup_pending)if(Clock::now()>=pending.second)throw SDKError(ErrorDomain::signaling,ErrorCode::timeout,"Backup codec publication confirmation timed out",true);
       socket.flush_ice();
       if (playout && !playout->poll()) break;
       if (publisher->failed || subscriber->failed) throw std::runtime_error("WebRTC transport or media failed");
@@ -695,15 +866,22 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         throw SDKError(ErrorDomain::transport, ErrorCode::connection_lost, "WebRTC transport failed", true);
       publisher->check_recordings(); subscriber->check_recordings();
       if (options.stats_interval_ms && Clock::now()>=next_stats) {
-        publisher->request_stats(); subscriber->request_stats();
+        publisher->request_stats(); if(subscriber!=publisher)subscriber->request_stats();
         Json nodes = Json::array();
+        Json local_tracks = Json::object();
+        for (const auto& [sid, track] : published_tracks) {
+          local_tracks[track->id()] = sid;
+          local_tracks[track->id() + "-backup"] = sid;
+        }
         for (const auto& node : runtime.graph->snapshot()) nodes.push_back({{"id", node.id}, {"name", node.name}, {"kind", node.kind},
+          {"trackId", local_tracks.value(node.track_id, node.track_id)},
           {"format", node.format}, {"inputs", node.inputs}, {"outputs", node.outputs},
           {"errors", node.errors}, {"dropped", node.dropped}, {"generation", node.generation}});
         Json edges = Json::array();
         for (const auto& edge : runtime.graph->connections())
           edges.push_back({{"from", edge.from}, {"to", edge.to}, {"dataType", edge.data_type}});
-        event("media-graph-stats", {{"nodes", std::move(nodes)}, {"edges", std::move(edges)}});
+        event("media-graph-stats", {{"nodes", std::move(nodes)}, {"edges", std::move(edges)}, {"localTracks", std::move(local_tracks)},
+          {"timestampUs", std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count()}});
         next_stats=Clock::now()+std::chrono::milliseconds(options.stats_interval_ms);
       }
       if (video_frames) video_frames->dispatch();
@@ -711,6 +889,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       if (session) {
         auto queued = session->take_commands();
         deferred.insert(deferred.end(), queued.begin(), queued.end());
+        size_t data_packets=0;
         const auto count = deferred.size();
         for (size_t index = 0; index < count; ++index) {
           auto command = deferred.front(); deferred.pop_front();
@@ -738,19 +917,23 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
               if (publishing.size() >= 128) throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "Too many unconfirmed publications");
               need_publisher = true;
               const auto id = recovery.allocate_id(command->media.video);
-              auto pump = std::make_shared<MediaPump>(command->media, runtime.graph, playout.get(), video_frames.get(), id);
-              if (command->media.video) add_track(runtime.factory->CreateVideoTrack(pump->video, id), &command->media, command->publication);
-              else add_track(runtime.factory->CreateAudioTrack(id, pump->audio.get()), &command->media, command->publication);
+              auto pump = std::make_shared<MediaPump>(command->media, runtime.graph, playout.get(), video_frames.get(), id, bool(command->publication.backup_codec));
+              if (command->media.video) add_track(runtime.factory->CreateVideoTrack(pump->video, id), &command->media, command->publication, pump->encoded_source());
+              else add_track(runtime.factory->CreateAudioTrack(id, pump->audio.get()), &command->media, command->publication, pump->encoded_source());
               track_pumps[id] = pump.get(); pumps.push_back(std::move(pump));
               publishing[id] = command; dirty = true; continue;
+            } else if(op=="keyframe"){subscriber->request_keyframe(a.at("sid").get<std::string>());
             } else if (op == "unpublish") {
               auto sid = a.at("sid").get<std::string>();
               if (!published_tracks.contains(sid)) throw std::invalid_argument("Local track is not published");
               remove_track(sid); event.dispatch(); event.rethrow();
             } else if (op == "data" || op == "packet") {
               need_publisher = true;
+              if(data_packets>=4){deferred.push_back(command);continue;}
+              ++data_packets;
               auto channel = a.at("reliable").get<bool>() ? reliable : lossy_channel;
               if (!channel || channel->state() != webrtc::DataChannelInterface::kOpen) { deferred.push_back(command); continue; }
+              if(channel->buffered_amount()>=128*1024){deferred.push_back(command);continue;}
               if (!command->begin_send()) continue;
               livekit::DataPacket packet; packet.set_kind(a.at("reliable").get<bool>() ? 0 : 1);
               packet.set_participant_identity(join.participant().identity());
@@ -761,13 +944,14 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
                 auto user = packet.mutable_user(); user->set_payload(livekit::sdk::base64_decode(a.at("payload").get<std::string>())); user->set_topic(a.at("topic").get<std::string>());
                 for (const auto& target : a.at("destinations")) { packet.add_destination_identities(target.get<std::string>()); user->add_destination_identities(target.get<std::string>()); }
               }
-              auto bytes = packet.SerializeAsString();
+              auto bytes = serialize_packet(packet);
               if (bytes.size() > (packet.kind() == 0 ? 16384u : 1400u)) throw std::invalid_argument("Encoded data packet exceeds transport limit");
               if (!channel->Send(webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(bytes.data(), bytes.size()), true))) throw std::runtime_error("Data channel send failed");
             } else if (op == "mute") {
               auto sid = a.at("sid").get<std::string>(); auto track = published_tracks.find(sid);
               if (track == published_tracks.end()) throw std::invalid_argument("Local track is not published");
               const bool muted = a.at("muted"); track->second->set_enabled(!muted);
+              for(const auto& candidate:tracks)if(backup_parents.contains(candidate->id())&&backup_parents.at(candidate->id())==track->second->id())candidate->set_enabled(!muted);
               request.mutable_mute()->set_sid(sid); request.mutable_mute()->set_muted(muted); send(request);
               if (auto info = published_info.find(sid); info != published_info.end()) info->second.mutable_track()->set_muted(muted);
               if (auto id = recovery.local_ids.find(sid); id != recovery.local_ids.end()) recovery.publications.at(id->second).muted = muted;
@@ -814,10 +998,33 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         if(rpc&&rpc->has_outgoing()){
           need_publisher=true;
           if(reliable&&reliable->state()==webrtc::DataChannelInterface::kOpen&&reliable->buffered_amount()<256*1024){
-            for(auto packet:rpc->take_packets()){
-              packet.set_participant_identity(join.participant().identity());auto bytes=packet.SerializeAsString();
+            for(auto packet:rpc->take_packets(4)){
+              packet.set_participant_identity(join.participant().identity());auto bytes=serialize_packet(packet);
               if(bytes.size()>16384||!reliable->Send(webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(bytes.data(),bytes.size()),true)))rpc->send_failed(packet);
             }
+          }
+        }
+      }
+      if(session){
+        std::shared_ptr<detail::StreamSession> streams;
+        {std::lock_guard lock(session->mutex);streams=session->streams;}
+        if(streams&&streams->has_outgoing()){
+          need_publisher=true;
+          if(reliable&&reliable->state()==webrtc::DataChannelInterface::kOpen&&reliable->buffered_amount()<192*1024)
+            streams->pump([&](const livekit::DataPacket& input){
+              auto packet=input;packet.set_participant_identity(join.participant().identity());auto bytes=serialize_packet(packet);
+              return bytes.size()<=16384&&reliable->Send(webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(bytes.data(),bytes.size()),true));
+            });
+        }
+      }
+      if(session){
+        auto data=session->data_tracks;
+        if(data->needs_publisher())need_publisher=true;
+        for(const auto& request:data->take_signals())send(request);
+        if(data_track_channel&&data_track_channel->state()==webrtc::DataChannelInterface::kOpen){
+          for(int i=0;i<8&&data_track_channel->buffered_amount()<=8192;++i){
+            auto packet=data->take_packet();if(!packet)break;
+            const bool sent=data_track_channel->Send(webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(packet->data(),packet->size()),true));data->packet_sent(*packet,sent);if(!sent)break;
           }
         }
       }
@@ -845,13 +1052,13 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       }
       if (!data_sent && reliable && reliable->state() == webrtc::DataChannelInterface::kOpen) {
         livekit::DataPacket packet; packet.set_participant_identity(join.participant().identity()); packet.mutable_user()->set_payload(options.publish_data); packet.mutable_user()->set_topic(options.topic);
-        auto bytes = packet.SerializeAsString();
+        auto bytes = serialize_packet(packet);
         if (!reliable->Send(webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(bytes.data(), bytes.size()), true))) throw std::runtime_error("Data channel send failed");
         data_sent = true; recovery.initial_data_sent = true; event("data-published");
       }
       if (connected && options.duration > 0 && Clock::now() - connected_at >= std::chrono::seconds(options.duration)) break;
       if (connected && pumping && options.exit_after_publish && !pumps.empty() && data_sent && std::all_of(pumps.begin(), pumps.end(), [](const auto& p) { return p->finished(); })) break;
-      if (!connected && Clock::now() - joined_at > std::chrono::seconds(options.connect_timeout)) throw SDKError(ErrorDomain::transport, ErrorCode::timeout, "Timed out establishing WebRTC transports or publishing tracks", true);
+      if (!connected && Clock::now() >= socket.connect_deadline()) throw SDKError(ErrorDomain::transport, ErrorCode::timeout, "Timed out establishing WebRTC transports or publishing tracks", true);
       if (Clock::now() - last_ping >= ping_interval) {
         livekit::SignalRequest request; request.mutable_ping_req()->set_timestamp(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()); send(request); last_ping = Clock::now();
       }
@@ -859,8 +1066,10 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         throw livekit::sdk::SDKError(livekit::sdk::ErrorDomain::signaling, livekit::sdk::ErrorCode::timeout, "LiveKit signal heartbeat timed out", true);
       auto message = socket.receive((playout || video_frames) ? 10 : 50); if (!message) continue;
       livekit::SignalResponse response; if (!response.ParseFromString(*message)) throw std::runtime_error("Malformed LiveKit signal message");
-      if (response.has_offer()) { subscriber->remote(response.offer()); livekit::SignalRequest request; *request.mutable_answer() = subscriber->local(false); request.mutable_answer()->set_id(response.offer().id()); send(request); }
+      if(session&&(response.has_publish_data_track_response()||response.has_unpublish_data_track_response()||response.has_data_track_subscriber_handles()||response.has_request_response()))session->data_tracks->receive_signal(response);
+      if (response.has_offer()) { subscriber->remote(response.offer());apply_receiver_codecs(); livekit::SignalRequest request; *request.mutable_answer() = subscriber->local(false); request.mutable_answer()->set_id(response.offer().id()); send(request); }
       else if (response.has_answer()) { publisher->remote(response.answer()); offer_pending = false; }
+      else if(response.has_media_sections_requirement()&&options.single_peer_connection){const auto& request=response.media_sections_requirement();add_receive_sections(request.num_audios(),request.num_videos());dirty=true;}
       else if (response.has_trickle()) (response.trickle().target() == livekit::PUBLISHER ? publisher : subscriber)->ice(response.trickle());
       else if (response.has_subscribed_quality_update()) {
         const auto& update = response.subscribed_quality_update();
@@ -869,29 +1078,49 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         const auto local = recovery.local_ids.find(update.track_sid());
         if (local == recovery.local_ids.end()) continue;
         const auto pump = track_pumps.find(local->second);
-        if (pump == track_pumps.end() || !pump->second->spec.dynacast) continue;
-        const auto enabled = detail::subscribed_video_enabled(update, options.codec);
-        if (!enabled) continue;
-        const bool paused = demand_paused.contains(pump->second);
-        if (paused == !*enabled) continue;
-        const auto sender = senders.find(local->second);
-        if (sender == senders.end()) continue;
-        auto parameters = sender->second->GetParameters();
-        for (auto& encoding : parameters.encodings) encoding.active = *enabled;
-        const auto error = sender->second->SetParameters(parameters);
-        if (!error.ok()) throw std::runtime_error("Dynacast sender update failed: " + std::string(error.message()));
-        if (*enabled) demand_paused.erase(pump->second); // started by the normal readiness gate
-        else {
-          demand_paused.insert(pump->second);
-          if (started_pumps.erase(pump->second)) pump->second->stop();
+        if(pump==track_pumps.end())continue;
+        auto desired=recovery.publications.find(local->second);if(desired==recovery.publications.end())continue;
+        const auto& publication=desired->second.options;
+        if(!pump->second->spec.dynacast&&!publication.backup_codec)continue;
+        const auto backup_id=local->second+"-backup";
+        bool backup_demand=false;
+        if(publication.backup_codec){
+          auto demand=detail::subscribed_video_enabled(update,publication.backup_codec->codec);backup_demand=demand.value_or(false);
+          if(backup_demand&&!senders.contains(backup_id)){
+            auto extra=publication;extra.codec=publication.backup_codec->codec;extra.video_encodings=publication.backup_codec->video_encodings;extra.backup_codec.reset();
+            auto track=runtime.factory->CreateVideoTrack(pump->second->backup_video,backup_id);track->set_enabled(!desired->second.muted);
+            add_track(track,&pump->second->spec,extra,{},update.track_sid());backup_parents[backup_id]=local->second;backup_pending[backup_id]={update.track_sid(),Clock::now()+std::chrono::seconds(30)};dirty=true;
+          }
         }
-        event("source-demand", {{"sid", update.track_sid()}, {"clientId", local->second},
-          {"enabled", *enabled}, {"codec", options.codec}});
+        bool any=false;
+        for(const auto& cid:std::vector<std::string>{local->second,backup_id}){
+          auto sender=senders.find(cid);if(sender==senders.end())continue;
+          const auto& codec=track_codecs.at(cid);const auto enabled=detail::subscribed_video_enabled(update,codec);
+          auto parameters=sender->second->GetParameters();
+          if(enabled){
+            auto qualities=&update.subscribed_qualities();
+            for(const auto& subscribed:update.subscribed_codecs())if(subscribed.codec()==codec||subscribed.codec()=="video/"+codec)qualities=&subscribed.qualities();
+            for(size_t i=0;i<parameters.encodings.size();++i){
+              const int quality=i+1==parameters.encodings.size()?2:int(i);
+              if(parameters.encodings.size()==1)parameters.encodings[i].active=*enabled;
+              else for(const auto& q:*qualities)if(q.quality()==quality)parameters.encodings[i].active=q.enabled();
+            }
+          }
+          if(cid==local->second&&backup_demand&&publication.backup_codec&&publication.backup_codec->policy==livekit::sdk::BackupCodecPolicy::regression)
+            for(auto& encoding:parameters.encodings)encoding.active=false;
+          for(const auto& encoding:parameters.encodings)any|=encoding.active;
+          auto error=sender->second->SetParameters(parameters);if(!error.ok())throw std::runtime_error("Video layer update failed: "+std::string(error.message()));
+        }
+        if(any)demand_paused.erase(pump->second);
+        else{demand_paused.insert(pump->second);if(started_pumps.erase(pump->second))pump->second->stop();}
+        event("source-demand",{{"sid",update.track_sid()},{"clientId",local->second},{"enabled",any}});
       }
       else if (response.has_track_published()) {
         const auto& cid = response.track_published().cid();
         const auto& sid = response.track_published().track().sid();
+        if(retired_backups.contains(cid))continue;
         if (!awaiting_tracks.contains(cid)) throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message, "Unexpected publication confirmation");
+        if(backup_parents.contains(cid)){if(!backup_pending.contains(cid)||backup_pending.at(cid).first!=sid||!published_info.contains(sid))throw SDKError(ErrorDomain::protocol,ErrorCode::malformed_message,"Backup codec SID changed");*published_info.at(sid).mutable_track()=response.track_published().track();backup_pending.erase(cid);awaiting_tracks.erase(cid);event("backup-codec-published",{{"sid",sid},{"clientId",backup_parents.at(cid)},{"codec",track_codecs.at(cid)}});continue;}
         const auto pending_publication = publishing.find(cid);
         if (pending_publication != publishing.end()) pending_publication->second->expire(Clock::now());
         const bool cancelled_publication = pending_publication != publishing.end() && pending_publication->second->done();
@@ -921,6 +1150,8 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         }
       }
       else if (response.has_update()) { for (const auto& p : response.update().participants()) {
+        media_cryptor->participant(p);
+        if(session)event("datatrack-participant",{{"payload",base64url(p.SerializeAsString())}});
         event("participant", {{"identity", p.identity()}, {"sid", p.sid()}, {"state", p.state()}, {"participant", participant_json(p)}});
         restore_remote(p);
       } }
@@ -950,7 +1181,8 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       else if (response.has_speakers_changed()) { Json speakers = Json::array(); for (const auto& p : response.speakers_changed().speakers()) speakers.push_back({{"sid", p.sid()}, {"level", p.level()}, {"active", p.active()}}); event("speakers", {{"speakers", speakers}}); }
       else if (response.has_mute()) {
         auto track = published_tracks.find(response.mute().sid());
-        if (track != published_tracks.end()) track->second->set_enabled(!response.mute().muted());
+        if (track != published_tracks.end()) {track->second->set_enabled(!response.mute().muted());
+          for(const auto& candidate:tracks)if(backup_parents.contains(candidate->id())&&backup_parents.at(candidate->id())==track->second->id())candidate->set_enabled(!response.mute().muted());}
         if (auto info = published_info.find(response.mute().sid()); info != published_info.end()) info->second.mutable_track()->set_muted(response.mute().muted());
         if (auto id = recovery.local_ids.find(response.mute().sid()); id != recovery.local_ids.end()) recovery.publications.at(id->second).muted = response.mute().muted();
         event("track-muted", {{"sid", response.mute().sid()}, {"muted", response.mute().muted()}});

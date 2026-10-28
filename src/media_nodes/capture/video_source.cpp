@@ -18,8 +18,8 @@ struct I420VideoSource::Impl {
   std::deque<std::shared_ptr<const detail::I420SourceFrame>> frames;
   size_t bytes() const { return static_cast<size_t>(options.width) * options.height * 3 / 2; }
   void discard() {
-    frames.pop_front(); ++stats.dropped;
-    stats.queued_bytes -= bytes(); stats.queued_frames = frames.size();
+    stats.queued_bytes -= frames.front()->frame.y.size()+frames.front()->frame.u.size()+frames.front()->frame.v.size();
+    frames.pop_front(); ++stats.dropped; stats.queued_frames = frames.size();
   }
   void clear() { while (!frames.empty()) discard(); }
   void expire() {
@@ -52,32 +52,34 @@ VideoWriteStatus I420VideoSource::write(const VideoFrame& frame, std::optional<s
   const auto valid = [](const std::vector<uint8_t>& pixels, int stride, int width, int height) {
     return stride >= width && pixels.size() >= static_cast<size_t>(stride) * (height - 1) + width;
   };
-  if (frame.width != o.width || frame.height != o.height ||
-      !valid(frame.y, frame.stride_y, o.width, o.height) ||
-      !valid(frame.u, frame.stride_u, o.width / 2, o.height / 2) ||
-      !valid(frame.v, frame.stride_v, o.width / 2, o.height / 2))
+  const int width=frame.width,height=frame.height;
+  const size_t bytes=width>0&&height>0?size_t(width)*height*3/2:0;
+  if (width<2||width>3840||height<2||height>2160||width%2||height%2||(!o.dynamic_dimensions&&(width!=o.width||height!=o.height))||
+      !valid(frame.y, frame.stride_y, width, height) ||
+      !valid(frame.u, frame.stride_u, width / 2, height / 2) ||
+      !valid(frame.v, frame.stride_v, width / 2, height / 2))
     throw std::invalid_argument("I420 source requires matching dimensions and complete positive-stride planes");
   s.expire();
-  if (!s.stats.accepting || now-timestamp>o.max_age || s.frames.size() >= o.max_frames || s.stats.queued_bytes > o.max_bytes - s.bytes()) {
+  if (!s.stats.accepting || now-timestamp>o.max_age || s.frames.size() >= o.max_frames || bytes>o.max_bytes || s.stats.queued_bytes > o.max_bytes - bytes) {
     ++s.stats.rejected; return VideoWriteStatus::backpressure;
   }
   auto owned = std::make_shared<detail::I420SourceFrame>();
   owned->captured = timestamp;
   auto& f = owned->frame;
-  f.width = o.width; f.height = o.height;
-  f.stride_y = o.width; f.stride_u = f.stride_v = o.width / 2;
+  f.width = width; f.height = height;
+  f.stride_y = width; f.stride_u = f.stride_v = width / 2;
   f.stream_generation = s.stats.generation;
   const auto copy = [](auto& to, const auto& from, int stride, int width, int height) {
     to.resize(static_cast<size_t>(width) * height);
     for (int row = 0; row < height; ++row)
       std::memcpy(to.data() + static_cast<size_t>(row) * width, from.data() + static_cast<size_t>(row) * stride, width);
   };
-  copy(f.y, frame.y, frame.stride_y, o.width, o.height);
-  copy(f.u, frame.u, frame.stride_u, o.width / 2, o.height / 2);
-  copy(f.v, frame.v, frame.stride_v, o.width / 2, o.height / 2);
+  copy(f.y, frame.y, frame.stride_y, width, height);
+  copy(f.u, frame.u, frame.stride_u, width / 2, height / 2);
+  copy(f.v, frame.v, frame.stride_v, width / 2, height / 2);
   s.frames.push_back(std::move(owned)); ++s.stats.accepted;
   s.last_capture=timestamp;
-  s.stats.queued_bytes += s.bytes(); s.stats.queued_frames = s.frames.size();
+  s.stats.queued_bytes += bytes; s.stats.queued_frames = s.frames.size();
   s.changed.notify_one(); return VideoWriteStatus::accepted;
 }
 VideoWriteStatus I420VideoSource::write_rgba(const RgbaInputFrame& input,
@@ -87,7 +89,7 @@ VideoWriteStatus I420VideoSource::write_rgba(const RgbaInputFrame& input,
   if (rotation!=0 && rotation!=90 && rotation!=180 && rotation!=270) throw std::invalid_argument("Invalid video rotation");
   const auto& o=impl_->options;
   const bool swap=rotation==90 || rotation==270;
-  if (input.width!=(swap?o.height:o.width) || input.height!=(swap?o.width:o.height) ||
+  if (input.width<2||input.width>3840||input.height<2||input.height>3840||input.width%2||input.height%2||(!o.dynamic_dimensions&&(input.width!=(swap?o.height:o.width)||input.height!=(swap?o.width:o.height)))||
       input.stride<input.width*4 || input.pixels.size()<static_cast<size_t>(input.stride)*(input.height-1)+input.width*4)
     throw std::invalid_argument("RGBA dimensions/stride/pixels do not match rotated source");
   auto allocate=[](int width,int height){
@@ -99,7 +101,7 @@ VideoWriteStatus I420VideoSource::write_rgba(const RgbaInputFrame& input,
   if(libyuv::ABGRToI420(input.pixels.data(),input.stride,frame.y.data(),frame.stride_y,
       frame.u.data(),frame.stride_u,frame.v.data(),frame.stride_v,input.width,input.height)) throw std::runtime_error("RGBA conversion failed");
   if(!rotation)return write(frame,captured);
-  auto upright=allocate(o.width,o.height);
+  auto upright=allocate(swap?input.height:input.width,swap?input.width:input.height);
   if(libyuv::I420Rotate(frame.y.data(),frame.stride_y,frame.u.data(),frame.stride_u,frame.v.data(),frame.stride_v,
       upright.y.data(),upright.stride_y,upright.u.data(),upright.stride_u,upright.v.data(),upright.stride_v,
       frame.width,frame.height,static_cast<libyuv::RotationMode>(rotation))) throw std::runtime_error("I420 rotation failed");
@@ -136,7 +138,7 @@ std::shared_ptr<const I420SourceFrame> I420SourceReader::read(std::stop_token st
     if (stop.stop_requested() || !s.stats.accepting) return {};
     if (!s.frames.empty()) {
       auto result = std::move(s.frames.front()); s.frames.pop_front(); ++s.stats.consumed;
-      s.stats.queued_bytes -= s.bytes(); s.stats.queued_frames = s.frames.size(); return result;
+      s.stats.queued_bytes -= result->frame.y.size()+result->frame.u.size()+result->frame.v.size(); s.stats.queued_frames = s.frames.size(); return result;
     }
     s.changed.wait(lock, stop, [&] { return !s.stats.accepting || !s.frames.empty(); });
   }

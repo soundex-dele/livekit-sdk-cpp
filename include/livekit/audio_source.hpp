@@ -9,8 +9,10 @@ struct PcmSourceOptions {
   AudioSampleFormat format = AudioSampleFormat::pcm16;
   std::chrono::milliseconds max_queue_duration{200};
   size_t max_bytes = 1024 * 1024;
+  bool drift_compensation=false; // Requires capture_time on successive writes.
+  int max_drift_ppm=1000;
 };
-// Interleaved PCM, in multiples of 10 ms (10..100 ms per write). Exactly one
+// Interleaved PCM, 1 sample..100 ms per write, buffered into 10 ms blocks. Exactly one
 // sample vector is populated. Format/rate/channels are fixed by the source.
 struct PcmInputFrame {
   std::vector<int16_t> samples;
@@ -26,6 +28,8 @@ struct AudioSourceStats {
   uint64_t accepted_samples = 0, consumed_samples = 0, dropped_samples = 0;
   uint64_t silence_samples = 0, skipped_samples = 0, rejected_writes = 0, generation = 0;
   bool attached = false, accepting = false, closed = false;
+  double estimated_drift_ppm=0;
+  int64_t corrected_samples=0;
 };
 class PcmAudioSource {
  public:

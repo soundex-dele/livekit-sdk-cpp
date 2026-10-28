@@ -9,7 +9,7 @@
 
 namespace livekit::sdk {
 SdkCapabilities sdk_capabilities() {
-  SdkCapabilities result;result.version=version;result.signal_protocols={12,15};
+  SdkCapabilities result;result.version=version;result.signal_protocols={12,15,17};
   for(auto feature:{ClientFeature::signal_resume,ClientFeature::full_rejoin,ClientFeature::initial_signal_failover,
       ClientFeature::token_provider,ClientFeature::i420_input,ClientFeature::rgba_input,ClientFeature::pcm_input,
       ClientFeature::video_pull,ClientFeature::audio_pull,ClientFeature::subscription_permissions,
@@ -18,11 +18,12 @@ SdkCapabilities sdk_capabilities() {
   for(auto feature:{ClientFeature::text_stream,ClientFeature::byte_stream,ClientFeature::data_track,
       ClientFeature::media_e2ee,ClientFeature::data_e2ee,ClientFeature::simulcast,ClientFeature::single_peer_connection,
       ClientFeature::encoded_media,ClientFeature::rtp_access,ClientFeature::control_executor})
-    result.features[feature]=CapabilitySupport::unsupported;
+    result.features[feature]=CapabilitySupport::supported;
   return result;
 }
 namespace {
 void validate(const RoomOptions& o) {
+  if(o.control_callback_capacity<1||o.control_callback_capacity>4096)throw std::invalid_argument("Invalid control callback capacity");
   if(o.subscription_permissions)detail::validate_permissions(*o.subscription_permissions);
   detail::validate_reconnect(o.reconnect);
   endpoint(o.url, true);
@@ -37,10 +38,19 @@ void validate(const RoomOptions& o) {
   if (o.token_timeout <= std::chrono::milliseconds::zero() || o.token_timeout > std::chrono::minutes(5))
     throw std::invalid_argument("Invalid token provider timeout");
   if (o.connect_timeout <= 0 || o.duration < 0) throw std::invalid_argument("Invalid room timeout/duration");
-  if (o.signal_protocol != 12 && o.signal_protocol != 15) throw std::invalid_argument("Supported signal protocols are 12 and 15");
+  if (o.signal_protocol != 12 && o.signal_protocol != 15 && o.signal_protocol != 17) throw std::invalid_argument("Supported signal protocols are 12, 15 and 17");
+  if(o.single_peer_connection&&o.signal_protocol!=17)throw std::invalid_argument("Single PC requires protocol 17");
   if (o.stats_interval_ms && (o.stats_interval_ms < 200 || o.stats_interval_ms > 60000))
     throw std::invalid_argument("stats_interval_ms must be 0 or 200..60000");
   if (o.relay_only && o.disable_turn) throw std::invalid_argument("relay_only conflicts with disable_turn");
+  switch (o.media_transport) {
+    case MediaTransport::automatic: break;
+    case MediaTransport::udp_only:
+    case MediaTransport::tcp_only:
+      if (o.relay_only) throw std::invalid_argument("relay_only conflicts with direct media_transport");
+      break;
+    default: throw std::invalid_argument("Invalid media_transport");
+  }
   const bool local_preview = std::any_of(o.media.begin(),o.media.end(),[](const auto& m){return m.video&&m.local_preview;});
   if (o.video_frame_handler && o.video_frame_stream) throw std::invalid_argument("Choose video_frame_handler or video_frame_stream");
   if (!o.subscribe) {
@@ -63,16 +73,21 @@ void prepare(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o) 
   if (s->running) throw std::logic_error("Room session is already active");
   auto video_output = o.video_frame_stream ? std::make_shared<detail::VideoFrameOutput>(o.video_frame_stream) : nullptr;
   auto audio_output = o.audio_frame_stream ? std::make_shared<detail::AudioFrameOutput>(o.audio_frame_stream) : nullptr;
+  s->encoded_output=o.encoded_frame_stream?std::make_shared<detail::EncodedOutput>(o.encoded_frame_stream):nullptr;
   s->video_output = std::move(video_output); s->audio_output = std::move(audio_output);
   if (s->video_output) s->video_output->advance();
   if (s->audio_output) s->audio_output->advance();
+        if(s->encoded_output)s->encoded_output->advance();
   s->running = true; ++s->generation; s->stop = std::stop_source{};
+  s->control=o.control_callback_thread?std::make_shared<detail::ControlExecutor>(o.control_callback_capacity,[stop=s->stop]() mutable {stop.request_stop();}):nullptr;
   s->connection = ConnectionState::connecting; s->room = {}; s->local = {}; s->remote.clear(); s->subscriptions.clear();
   s->reason = 0; s->failure = {}; s->error.clear(); s->runner = {}; s->command_timeout = o.connect_timeout;
   s->signal_protocol = o.signal_protocol;
+  s->data_tracks->configure(o.encryption);
   s->capabilities = {};
   s->recovery = detail::RecoveryState{};
   s->recovery.budget = detail::RecoveryBudget(o.reconnect);
+  s->recovery.initial_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(o.connect_timeout);
   s->recovery.token = o.token;
   s->recovery.expected_room = o.room;
   s->recovery.subscription_permissions=o.subscription_permissions;
@@ -84,10 +99,10 @@ void prepare(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o) 
 }
 void execute(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o, EventHandler handler, std::stop_token external) noexcept {
   { std::lock_guard lock(s->mutex); s->runner = std::this_thread::get_id(); }
-  std::stop_callback cancel(external, [s] { s->stop.request_stop(); if (s->video_output) s->video_output->close(); if (s->audio_output) s->audio_output->close(); });
+  std::stop_callback cancel(external, [s] { s->stop.request_stop(); if (s->video_output) s->video_output->close(); if (s->audio_output) s->audio_output->close(); if(s->encoded_output)s->encoded_output->close(); });
   std::exception_ptr failure;
-  lk::EventEmitter events([s, handler = std::move(handler)](const Json& event) {
-    detail::process_event(s, event); if (handler) handler(event);
+  lk::EventEmitter events([s, log=o.log_sink, handler = std::move(handler)](const Json& event) {
+    detail::process_event(s, event); if(log)s->callback([log,event]{log(event);}); if (handler) s->callback([handler,event]{handler(event);});
   });
   try {
     std::mt19937 random(std::random_device{}());
@@ -103,12 +118,22 @@ void execute(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o, 
         if (s->stop.stop_requested()) break;
         auto& recovery = s->recovery;
         if (std::chrono::steady_clock::now() >= recovery.session_deadline) break;
+        if(!recovery.ever_connected&&o.regions.initial_failover&&error.retryable()&&(error.domain()==ErrorDomain::transport||error.domain()==ErrorDomain::signaling)&&std::chrono::steady_clock::now()<recovery.initial_deadline){
+          auto& regions=recovery.regions;const auto previous=regions.active_url;regions.attempted.insert(previous);regions.select();
+          if(regions.active_url!=previous){
+            if(s->video_output)s->video_output->advance();if(s->audio_output)s->audio_output->advance();if(s->encoded_output)s->encoded_output->advance();
+            {std::lock_guard lock(s->mutex);++s->generation;s->remote.clear();s->local={};s->room={};s->subscriptions.clear();s->capabilities={};recovery.local_ids.clear();}
+            s->data_tracks->disconnect();
+            events("initial-region-failover",{{"endpoint",regions.active_url},{"phase","media"}});continue;
+          }
+        }
         if (!o.reconnect.enabled || !recovery.ever_connected || !error.retryable() ||
             (error.domain() != ErrorDomain::signaling && error.domain() != ErrorDomain::transport)) throw;
         recovery.validate_sources();
         const auto attempt = recovery.budget.next_attempt();
         if (s->video_output) s->video_output->advance();
         if (s->audio_output) s->audio_output->advance();
+        if(s->encoded_output)s->encoded_output->advance();
         {
           std::lock_guard lock(s->mutex);
           if (!recovery.rejoining) recovery.local_snapshot = s->local;
@@ -138,12 +163,17 @@ void execute(const std::shared_ptr<detail::RoomState>& s, const RoomOptions& o, 
   std::shared_ptr<detail::RpcSession> rpc;
   {std::lock_guard lock(s->mutex);rpc=s->rpc;}
   if(rpc)rpc->disconnect();
+  std::shared_ptr<detail::StreamSession> streams;
+  {std::lock_guard lock(s->mutex);streams=s->streams;}
+  if(streams)streams->disconnect();
+  s->data_tracks->disconnect();
+  if(o.packet_stream)o.packet_stream->close();
   if (s->video_output) s->video_output->close();
-  if (s->audio_output) s->audio_output->close();
+  if (s->audio_output) s->audio_output->close(); if(s->encoded_output)s->encoded_output->close();
   for (auto& command : s->take_commands()) command->interrupt(ErrorCode::session_closed, "Room disconnected before command completed");
   int reason;
   { std::lock_guard lock(s->mutex); s->connection = ConnectionState::disconnected; if (!s->reason) s->reason = failure ? 9 : 1; reason = s->reason; }
-  try { if (s->callbacks.on_disconnected) s->callbacks.on_disconnected(reason); }
+  try { if (s->callbacks.on_disconnected) s->callback([fn=s->callbacks.on_disconnected,reason]{fn(reason);}); if(s->control)s->control->drain(); }
   catch (...) { if (!failure) failure = std::current_exception(); }
   {
     std::lock_guard lock(s->mutex); s->failure = failure;
@@ -169,20 +199,28 @@ void Room::register_rpc_method(const std::string& method,RpcHandler handler){
 void Room::unregister_rpc_method(const std::string& method){
   auto state=impl_->state;std::lock_guard lock(state->mutex);if(state->rpc)state->rpc->unregister_method(method);
 }
+void Room::register_text_stream_handler(const std::string& topic,StreamHandler handler){auto s=impl_->state;std::lock_guard lock(s->mutex);s->stream_session()->register_handler(true,topic,std::move(handler));}
+void Room::register_byte_stream_handler(const std::string& topic,StreamHandler handler){auto s=impl_->state;std::lock_guard lock(s->mutex);s->stream_session()->register_handler(false,topic,std::move(handler));}
+void Room::unregister_text_stream_handler(const std::string& topic){auto s=impl_->state;std::lock_guard lock(s->mutex);if(s->streams)s->streams->unregister_handler(true,topic);}
+void Room::unregister_byte_stream_handler(const std::string& topic){auto s=impl_->state;std::lock_guard lock(s->mutex);if(s->streams)s->streams->unregister_handler(false,topic);}
+std::vector<LocalDataTrack> Room::local_data_tracks() const{return impl_->state->data_tracks->local_tracks();}
+std::vector<RemoteDataTrack> Room::remote_data_tracks() const{return impl_->state->data_tracks->remote_tracks();}
 Room::~Room() {
   request_stop();
   std::thread worker;
   { std::lock_guard lock(impl_->lifecycle); worker = std::move(impl_->worker); }
-  if (worker.joinable()) { if (worker.get_id() == std::this_thread::get_id()) worker.detach(); else worker.join(); }
+  if (worker.joinable()) { if (worker.get_id() == std::this_thread::get_id() || (impl_->state->control && impl_->state->control->current())) worker.detach(); else worker.join(); }
 }
 void Room::request_stop() noexcept {
   std::stop_source stop;
   std::shared_ptr<detail::VideoFrameOutput> video;
   std::shared_ptr<detail::AudioFrameOutput> audio;
-  { std::lock_guard lock(impl_->state->mutex); stop = impl_->state->stop; video = impl_->state->video_output; audio = impl_->state->audio_output; }
+  std::shared_ptr<detail::EncodedOutput> encoded;
+  { std::lock_guard lock(impl_->state->mutex); stop = impl_->state->stop; video = impl_->state->video_output; audio = impl_->state->audio_output; encoded = impl_->state->encoded_output; }
   stop.request_stop();
   if (video) video->close();
   if (audio) audio->close();
+  if (encoded) encoded->close();
 }
 void Room::run(const RoomOptions& options, EventHandler handler, std::stop_token external) {
   auto s = impl_->state;
@@ -201,7 +239,7 @@ void Room::join_with_token(const std::string& url, const std::string& token, Roo
     prepare(s, options);
     try { impl_->worker = std::thread([s, options, stop] { execute(s, options, {}, stop); }); }
     catch (...) { std::lock_guard state_lock(s->mutex); s->running = false; s->connection = ConnectionState::disconnected;
-      if (s->video_output) s->video_output->close(); if (s->audio_output) s->audio_output->close(); throw; }
+      if (s->video_output) s->video_output->close(); if (s->audio_output) s->audio_output->close(); if(s->encoded_output)s->encoded_output->close(); throw; }
   }
   std::unique_lock lock(s->mutex);
   s->cv.wait(lock, [&] { return s->connection == ConnectionState::connected || !s->running; });
@@ -217,12 +255,12 @@ void Room::join(const std::string& url, const ConnectInfo& info, RoomOptions opt
 void Room::disconnect() {
   request_stop();
   std::thread worker;
-  { std::lock_guard lock(impl_->lifecycle); if (impl_->worker.get_id() == std::this_thread::get_id()) return; worker = std::move(impl_->worker); }
+  { std::lock_guard lock(impl_->lifecycle); if (impl_->worker.get_id() == std::this_thread::get_id() || (impl_->state->control&&impl_->state->control->current())) return; worker = std::move(impl_->worker); }
   if (worker.joinable()) worker.join();
 }
 void Room::wait() {
   auto s = impl_->state;
-  { std::unique_lock lock(s->mutex); if (s->runner == std::this_thread::get_id()) throw std::logic_error("Cannot wait on the callback thread"); s->cv.wait(lock, [&] { return !s->running; }); }
+  { std::unique_lock lock(s->mutex); if (s->runner == std::this_thread::get_id() || (s->control&&s->control->current())) throw std::logic_error("Cannot wait on the callback thread"); s->cv.wait(lock, [&] { return !s->running; }); }
   std::thread worker;
   { std::lock_guard lock(impl_->lifecycle); worker = std::move(impl_->worker); }
   if (worker.joinable()) worker.join();

@@ -14,7 +14,7 @@ SignalSession::SignalSession(const RoomOptions& options, std::stop_token stop, E
 }
 void SignalSession::connect() {
   connect_deadline_ = std::min({recovery_.budget.deadline(), recovery_.session_deadline,
-                              Clock::now() + std::chrono::seconds(options_.connect_timeout)});
+                              Clock::now() + std::chrono::seconds(options_.connect_timeout),recovery_.ever_connected?Clock::time_point::max():recovery_.initial_deadline});
   auto& regions = recovery_.regions;
   initial_failover_=!recovery_.ever_connected && !recovery_.rejoining && options_.regions.initial_failover;
   if (recovery_.rejoining || initial_failover_) {
@@ -90,8 +90,15 @@ void SignalSession::connect_socket(const std::string& sid, Clock::time_point dea
   };
   if (recovery_.token.empty() && options_.token_provider) refresh(TokenRequestReason::initial);
   auto open = [&] {
+    std::string wrapped_join;
+    if(options_.single_peer_connection){
+      livekit::JoinRequest request;request.mutable_client_info()->set_sdk(livekit::ClientInfo::CPP);request.mutable_client_info()->set_version("0.3.0");request.mutable_client_info()->set_protocol(options_.signal_protocol);
+      request.mutable_connection_settings()->set_auto_subscribe(options_.subscribe&&options_.subscribe_tracks.empty());request.mutable_connection_settings()->set_auto_subscribe_data_track(false);
+      if(sid.empty()){*request.mutable_publisher_offer()=initial_offer_;for(const auto& track:initial_tracks_)*request.add_add_track_requests()=track;}else{request.set_reconnect(true);request.set_participant_sid(sid);}
+      livekit::WrappedJoinRequest wrapped;wrapped.set_join_request(request.SerializeAsString());wrapped_join=base64url(wrapped.SerializeAsString());while(wrapped_join.size()%4)wrapped_join+='=';
+    }
     socket_.connect(recovery_.regions.active_url, recovery_.token, options_.subscribe && options_.subscribe_tracks.empty(),
-                    stop_, options_.connect_timeout, sid, deadline, options_.signal_protocol);
+                    stop_, options_.connect_timeout, sid, deadline, options_.signal_protocol,wrapped_join);
   };
   try { open(); }
   catch (const SDKError& error) {

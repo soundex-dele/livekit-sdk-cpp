@@ -15,6 +15,10 @@ struct PcmAudioSource::Impl {
   std::condition_variable_any changed;
   AudioSourceStats stats;
   std::list<detail::PcmSourceBlock> queue;
+  std::vector<int16_t> remainder;
+  std::chrono::steady_clock::time_point remainder_time{};
+  std::optional<std::chrono::steady_clock::time_point> previous_input_time;
+  size_t previous_input_frames=0;double ratio=1,fraction=0;
   std::optional<std::chrono::steady_clock::time_point> written_end, next_capture;
   size_t samples() const { return options.sample_rate / 100; }
   size_t bytes() const { return samples() * options.channels * sizeof(int16_t); }
@@ -22,7 +26,7 @@ struct PcmAudioSource::Impl {
     queue.pop_front(); stats.dropped_samples += samples();
     stats.queued_blocks = queue.size(); stats.queued_bytes -= bytes();
   }
-  void clear() { while (!queue.empty()) drop(); written_end.reset(); next_capture.reset(); }
+  void clear() { stats.dropped_samples+=remainder.size()/options.channels;stats.queued_bytes-=remainder.size()*2;remainder.clear();while (!queue.empty()) drop(); written_end.reset(); next_capture.reset();previous_input_time.reset();previous_input_frames=0;ratio=1;fraction=0; }
 };
 PcmAudioSource::PcmAudioSource(PcmSourceOptions options) {
   const std::vector<int> rates{8000, 16000, 24000, 32000, 44100, 48000, 96000};
@@ -31,7 +35,7 @@ PcmAudioSource::PcmAudioSource(PcmSourceOptions options) {
       (options.format != AudioSampleFormat::pcm16 && options.format != AudioSampleFormat::float32) ||
       options.max_queue_duration < 10ms || options.max_queue_duration > 5s || options.max_queue_duration.count() % 10 ||
       options.max_bytes < static_cast<size_t>(options.sample_rate / 100) * options.channels * 2 ||
-      options.max_bytes > 64u * 1024 * 1024)
+      options.max_bytes > 64u * 1024 * 1024 || options.max_drift_ppm<0 || options.max_drift_ppm>5000)
     throw std::invalid_argument("Invalid PCM source rate, channels, format or queue capacity");
   impl_ = std::make_unique<Impl>(options);
 }
@@ -41,39 +45,49 @@ AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame) {
   auto& s = *impl_; std::lock_guard lock(s.mutex);
   if (s.stats.closed) return AudioWriteStatus::closed;
   const bool floating = s.options.format == AudioSampleFormat::float32;
-  const auto count = floating ? frame.float_samples.size() : frame.samples.size();
+  const auto input_count = floating ? frame.float_samples.size() : frame.samples.size();
+  auto count=input_count;
   const auto block_samples = s.samples() * s.options.channels;
-  if ((floating ? !frame.samples.empty() : !frame.float_samples.empty()) ||
-      !count || count % block_samples || count / block_samples > 10)
-    throw std::invalid_argument("PCM input must contain 10..100ms of complete interleaved samples in the source format");
-  if (floating && !std::all_of(frame.float_samples.begin(), frame.float_samples.end(),
-      [](float value) { return std::isfinite(value) && value >= -1 && value <= 1; }))
-    throw std::invalid_argument("Float PCM samples must be finite and normalized to [-1,1]");
-  const auto blocks = count / block_samples;
-  const auto now = std::chrono::steady_clock::now();
-  auto captured = frame.capture_time.value_or(s.written_end.value_or(s.next_capture.value_or(now)));
-  if (!frame.capture_time && s.next_capture && captured < *s.next_capture) captured = *s.next_capture;
-  if (frame.capture_time && (captured < now - 5s || captured > now + 100ms ||
-      (s.written_end && captured < *s.written_end)))
-    throw std::invalid_argument("PCM capture time is outside the live clock window or overlaps accepted samples");
-  const auto max_blocks = static_cast<size_t>(s.options.max_queue_duration.count() / 10);
-  if (!s.stats.accepting || blocks > max_blocks || s.queue.size() > max_blocks - blocks ||
-      blocks > s.options.max_bytes / s.bytes() || s.stats.queued_bytes > s.options.max_bytes - blocks * s.bytes()) {
-    ++s.stats.rejected_writes; return AudioWriteStatus::backpressure;
+  if ((floating ? !frame.samples.empty() : !frame.float_samples.empty()) || !count || count%s.options.channels || count>block_samples*10)
+    throw std::invalid_argument("PCM input requires complete interleaved samples, at most 100ms");
+  if(floating&&!std::all_of(frame.float_samples.begin(),frame.float_samples.end(),[](float v){return std::isfinite(v)&&v>=-1&&v<=1;}))throw std::invalid_argument("Invalid float PCM sample");
+  const auto now=std::chrono::steady_clock::now();
+  auto captured=frame.capture_time.value_or(s.written_end.value_or(s.next_capture.value_or(now)));
+  if(s.remainder.empty()&&!frame.capture_time&&s.next_capture&&captured<*s.next_capture)captured=*s.next_capture;
+  if(frame.capture_time&&(captured<now-5s||captured>now+100ms||(!s.options.drift_compensation&&s.written_end&&captured+1us<*s.written_end)))throw std::invalid_argument("Invalid PCM capture time");
+  std::vector<int16_t> samples;samples.reserve(input_count);
+  if(floating)for(float value:frame.float_samples)samples.push_back(static_cast<int16_t>(std::clamp(std::lround(value*32768.0f),-32768l,32767l)));
+  else samples=frame.samples;
+  double ratio=s.ratio,fraction=s.fraction;
+  if(s.options.drift_compensation){
+    if(frame.capture_time&&s.previous_input_time&&s.previous_input_frames){
+      const double elapsed=std::chrono::duration<double>(*frame.capture_time-*s.previous_input_time).count();
+      if(elapsed<=0)throw std::invalid_argument("Non-monotonic PCM capture clock");
+      const double observed=elapsed*s.options.sample_rate/s.previous_input_frames;
+      if(observed>.95&&observed<1.05){const double bound=s.options.max_drift_ppm/1000000.0;ratio=.95*ratio+.05*std::clamp(observed,1-bound,1+bound);}
+    }
+    const auto frames=input_count/s.options.channels;const double target=frames*ratio+fraction;
+    const size_t output_frames=size_t(target);fraction=target-output_frames;
+    std::vector<int16_t> adjusted(output_frames*s.options.channels);
+    for(size_t i=0;i<output_frames;++i){const double at=output_frames>1?double(i)*(frames-1)/(output_frames-1):0;const auto first=size_t(at),next=std::min(first+1,frames-1);const double blend=at-first;
+      for(size_t c=0;c<s.options.channels;++c)adjusted[i*s.options.channels+c]=int16_t(std::lround(samples[first*s.options.channels+c]*(1-blend)+samples[next*s.options.channels+c]*blend));}
+    samples=std::move(adjusted);count=samples.size();if(s.written_end)captured=*s.written_end;
   }
-  // Build new nodes before committing so allocation failure cannot
-  // partially admit a multi-block write or advance its timeline.
+  if(!s.remainder.empty()&&s.written_end&&std::chrono::abs(captured-*s.written_end)>1ms)throw std::invalid_argument("Discontinuous PCM input with partial block");
+  const size_t max_samples=size_t(s.options.sample_rate)*s.options.channels*s.options.max_queue_duration.count()/1000;
+  if(!s.stats.accepting||count>max_samples||s.stats.queued_bytes/2>max_samples-count||count>s.options.max_bytes/2||s.stats.queued_bytes>s.options.max_bytes-count*2){++s.stats.rejected_writes;return AudioWriteStatus::backpressure;}
+  auto combined=s.remainder;combined.reserve(combined.size()+count);
+  combined.insert(combined.end(),samples.begin(),samples.end());
+  const auto begin=s.remainder.empty()?captured:s.remainder_time;
+  const auto blocks=combined.size()/block_samples;
   std::list<detail::PcmSourceBlock> pending;
-  for (size_t i = 0; i < blocks; ++i) {
-    detail::PcmSourceBlock block; block.captured = captured + 10ms * i; block.generation = s.stats.generation;
-    block.samples.resize(block_samples);
-    if (floating) for (size_t n = 0; n < block_samples; ++n)
-      block.samples[n] = static_cast<int16_t>(std::clamp(std::lround(frame.float_samples[i * block_samples + n] * 32768.0f), -32768l, 32767l));
-    else std::copy_n(frame.samples.data() + i * block_samples, block_samples, block.samples.data());
-    pending.push_back(std::move(block));
-  }
-  s.queue.splice(s.queue.end(), pending); s.stats.queued_blocks = s.queue.size(); s.stats.queued_bytes += blocks * s.bytes();
-  s.stats.accepted_samples += blocks * s.samples(); s.written_end = captured + 10ms * blocks;
+  for(size_t i=0;i<blocks;++i){detail::PcmSourceBlock b;b.captured=begin+10ms*i;b.generation=s.stats.generation;b.samples.assign(combined.begin()+i*block_samples,combined.begin()+(i+1)*block_samples);pending.push_back(std::move(b));}
+  std::vector<int16_t> tail(combined.begin()+blocks*block_samples,combined.end());
+  s.queue.splice(s.queue.end(),pending);s.remainder=std::move(tail);s.remainder_time=begin+10ms*blocks;
+  s.stats.queued_blocks=s.queue.size();s.stats.queued_bytes+=count*2;s.stats.accepted_samples+=input_count/s.options.channels;
+  s.ratio=ratio;s.fraction=fraction;s.previous_input_time=frame.capture_time;s.previous_input_frames=input_count/s.options.channels;
+  s.stats.estimated_drift_ppm=(ratio-1)*1000000;s.stats.corrected_samples+=(int64_t(count)-int64_t(input_count))/int64_t(s.options.channels);
+  s.written_end=begin+std::chrono::nanoseconds((int64_t(combined.size()/s.options.channels)*1000000000)/s.options.sample_rate);
   s.changed.notify_one(); return AudioWriteStatus::accepted;
 }
 AudioSourceStats PcmAudioSource::stats() const { std::lock_guard lock(impl_->mutex); return impl_->stats; }

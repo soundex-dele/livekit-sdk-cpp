@@ -16,10 +16,10 @@ inline void subscribed_quality_contract() {
   auto* c = update.mutable_subscribed_codecs(0);
   c->set_codec("video/H264"); c->mutable_qualities(0)->set_enabled(true);
   check(subscribed_video_enabled(update, "h264") == true);
-  c->mutable_qualities(0)->set_quality(17);
+  c->mutable_qualities(0)->set_quality(static_cast<livekit::VideoQuality>(17));
   check(!subscribed_video_enabled(update, "h264").has_value());
   update.Clear(); check(!subscribed_video_enabled(update, "h264").has_value());
-  auto* legacy = update.add_subscribed_qualities(); legacy->set_quality(2); legacy->set_enabled(true);
+  auto* legacy = update.add_subscribed_qualities(); legacy->set_quality(livekit::HIGH); legacy->set_enabled(true);
   check(subscribed_video_enabled(update, "h264") == true);
   legacy->set_enabled(false); check(subscribed_video_enabled(update, "h264") == false);
   // A foreign-codec message must never fall back to the deprecated qualities.

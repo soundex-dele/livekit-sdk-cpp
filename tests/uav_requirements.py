@@ -6,6 +6,7 @@ when executed checks pass without a detected gap. Even 0 is NOT full acceptance:
 the report retains untested requirements, device tests and capacity separately.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
@@ -14,6 +15,7 @@ from pathlib import Path
 import socket
 import subprocess
 import time
+from simulation_acceptance import simulation_rows
 
 SDK = Path(__file__).resolve().parents[1]
 WORKSPACE = SDK.parent
@@ -53,6 +55,18 @@ REQUIREMENTS = {
     "N-05": ("节点故障重建", "", "终止独立测试节点，检查重新授权/媒体重建/幽灵成员清理"),
     "N-08": ("机载资源/长时运行", "", "目标 ARM64 板/手机 8 h，硬编/温度/功耗/资源释放"),
     "N-09": ("可观测追溯", "go", "业务 ID 关联、终端质量与故障看板"),
+}
+
+# Source assessment, separate from executed measurements. Review these entries
+# when the corresponding implementation is delivered; successful static-codec
+# smoke tests cannot clear an absent regression/FEC/business pipeline.
+KNOWN_IMPLEMENTATION_GAPS = {
+    "V-12": "SDK 尚未实现首位能力决策及备用编码 REGRESSION 发布，分别解码 H.264/H.265 不证明全体回退。",
+    "Q-06": "当前发送路径缺少与 BWE 联动的 pacing、队列字节/时长硬边界及完整帧依赖恢复。",
+    "Q-07": "视频 FEC 协商、生成及恢复尚无端到端实现；Opus FEC 或 RTX 不能替代。",
+    "Q-08": "1 s 基础统计已接通，但业务标识、冻结/音频中断及重连增量基线仍未闭环。",
+    "P-11": "尚缺源/转发/连接/总缓存的严格动态原子准入；Windows CPU 容量监控不可用。",
+    "N-09": "尚缺 deviceId/cameraId/playbackSessionId/epoch 全链路关联及终端质量看板。",
 }
 
 
@@ -96,14 +110,17 @@ def protocol_evidence(log, protocol, scenario):
             continue
         pair = row.get("pair", {})
         pairs.append({"participant": row.get("participant"), "transport": row.get("transport"), **pair})
+    if scenario == "transport-reject":
+        return {"id": "no_selected_ice_pair", "status": "PASS" if not pairs else "FAIL", "pairs": pairs}
     required = ({("drone", "PUBLISHER"), ("viewer-a", "SUBSCRIBER"), ("viewer-b", "SUBSCRIBER")}
                 if scenario in ("video", "dynacast") else
                 {(p, t) for p in ("drone", "viewer-a", "viewer-b") for t in ("PUBLISHER", "SUBSCRIBER")})
-    observed = {(p["participant"], p["transport"]) for p in pairs
-                if p.get("localProtocol") == protocol and p.get("remoteProtocol") == protocol
-                and p.get("localCandidateType") != "relay" and p.get("remoteCandidateType") != "relay"}
-    invalid = [p for p in pairs if p.get("localProtocol") != protocol or p.get("remoteProtocol") != protocol
-               or "relay" in (p.get("localCandidateType"), p.get("remoteCandidateType"))]
+    def direct_pair(p):
+        return (p.get("localProtocol") == protocol and p.get("remoteProtocol") == protocol
+                and p.get("localCandidateType") in ("host", "srflx", "prflx")
+                and p.get("remoteCandidateType") in ("host", "srflx", "prflx"))
+    observed = {(p["participant"], p["transport"]) for p in pairs if direct_pair(p)}
+    invalid = [p for p in pairs if not direct_pair(p)]
     return {"id": "selected_ice_protocol", "status": "PASS" if required <= observed and not invalid else "FAIL",
             "expected": protocol, "missing": sorted(required - observed), "pairs": pairs}
 
@@ -127,7 +144,7 @@ def run_case(server, client, root, protocol, scenario, codec):
         "  uav-test: uav-local-test-secret-at-least-32-characters\n"
         "logging:\n  level: debug\n  json: true\n", encoding="utf-8")
     result = {"scenario": scenario, "protocol": protocol, "codec": codec, "folder": folder.name,
-              "ok": False, "checks": []}
+              "ok": False, "checks": [], "started_at": datetime.now(timezone.utc).isoformat()}
     with (folder / "server.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen([str(server), "--config", str(config)], stdout=log, stderr=subprocess.STDOUT, creationflags=FLAGS)
         try:
@@ -142,7 +159,8 @@ def run_case(server, client, root, protocol, scenario, codec):
                     if time.monotonic() > deadline:
                         raise RuntimeError("server readiness timeout")
                     time.sleep(.1)
-            rc = command([client, f"ws://127.0.0.1:{port}", scenario, codec, folder], SDK, folder / "client.log", timeout=130)
+            client_transport = ("tcp" if protocol == "udp" else "udp") if scenario == "transport-reject" else protocol
+            rc = command([client, f"ws://127.0.0.1:{port}", scenario, codec, folder, client_transport], SDK, folder / "client.log", timeout=130)
             if (folder / "client-result.json").exists():
                 result.update(json.loads((folder / "client-result.json").read_text(encoding="utf-8")))
             result["exit_code"] = rc
@@ -163,6 +181,7 @@ def run_case(server, client, root, protocol, scenario, codec):
         protocol_check = protocol_evidence(folder / "server.log", protocol, scenario)
         result["checks"].append(protocol_check)
         result["ok"] = result["ok"] and protocol_check["status"] == "PASS"
+    result["finished_at"] = datetime.now(timezone.utc).isoformat()
     (folder / "result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"{folder.name}: {'PASS' if result['ok'] else 'FAIL'}", flush=True)
     return result
@@ -194,11 +213,27 @@ def go_probes(args, root, env):
 def finish(report, root):
     scenarios = report.get("scenarios", [])
     groups = {"video": [r for r in scenarios if r["protocol"] == "udp" and r["scenario"] == "video" and r["codec"] == "h264"],
-              "tcp": [r for r in scenarios if r["protocol"] == "tcp"],
-              "audio": [r for r in scenarios if r["scenario"] == "audio"],
+              "tcp": [r for r in scenarios if r["protocol"] == "tcp" and r["scenario"] != "transport-reject"],
+              "audio": [r for r in scenarios if r["scenario"] in ("audio", "mixed")],
               "h265": [r for r in scenarios if r["codec"] == "h265"],
               "dynacast": [r for r in scenarios if r["scenario"] == "dynacast"]}
-    gaps = {}
+    # Do not attribute implementation failures when setup never reached a build.
+    assessed = dict(KNOWN_IMPLEMENTATION_GAPS) if report.get("sha256", {}).get("server") else {}
+    report["source_assessment_gaps"] = assessed
+    gaps = dict(assessed)
+    # A failed executed child assertion must not disappear into "untested".
+    for r in scenarios:
+        if not r.get("ok") and not r.get("setup_error"):
+            policy = r["protocol"]
+            if r["scenario"] == "transport-reject":
+                policy = "tcp" if policy == "udp" else "udp"
+            affected = (["V-13"] if policy == "udp" else ["B-07"])
+            if r["scenario"] in ("audio", "mixed"):
+                affected += ["A-01", "A-02", "A-05"]
+            elif r["scenario"] == "video":
+                affected += (["V-01", "V-02", "V-04", "Q-05"] if r["protocol"] == "udp" else ["B-01", "B-03", "B-04", "B-06"])
+            for rid in affected:
+                gaps[rid] = f"关联自动化场景 {r['folder']} 未通过（不表示本行所有子项均失败）：" + str(r.get("error", "见场景日志"))
     for r in groups["tcp"]:
         if not r.get("ok"):
             gaps["B-07"] = "本次 TCP 媒体子项失败：" + str(r.get("error", r.get("setup_error", "见场景日志")))
@@ -223,22 +258,36 @@ def finish(report, root):
             refs = ["go-probes.jsonl"]
         if rid == "V-08":
             refs += [r["folder"] for r in groups["dynacast"]]
+        if rid in ("V-13", "B-07"):
+            refs += [r["folder"] for r in scenarios if r["scenario"] == "transport-reject"
+                     and r["protocol"] == ("udp" if rid == "B-07" else "tcp")]
+        if rid in ("V-01", "V-02", "V-13", "A-01", "A-02", "A-05"):
+            refs += [r["folder"] for r in scenarios if r["scenario"] == "mixed" and r["folder"] not in refs]
         rows.append({"id": rid, "title": title, "status": "未通过" if rid in gaps else "未测",
                      "evidence": refs, "reason": gaps.get(rid, "仅覆盖子项或尚无自动化证据；完整需求未验收"), "remaining": remaining})
+    report["product_requirements"] = rows
+    gaps.update(report.get("open_issues", {}))
+    rows = simulation_rows(rows, scenarios, report.get("recovery", []), gaps,
+                           report.get("component_evidence", False))
     report["requirements"] = rows
+    report["acceptance_scope"] = "simulation"
+    report["simulation_acceptance"] = (bool(rows) and not report.get("setup_error") and
+        report.get("go", {}).get("exit_code") == 0 and all(r["status"] in ("通过", "不适用") for r in rows))
     report["full_acceptance"] = False
-    report["device_acceptance"] = "未测"
+    report["device_acceptance"] = "不适用：用户要求模拟验收，不要求真机"
     report["gaps"] = gaps
     (root / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = ["# Go SFU + C++ SDK 自动化需求验证", "", f"运行时间：{report['started_at']}", "",
-             "自动化子项与 34 项完整验收分开记录。合成画面/PCM、Windows 回环网络；不代表实机、AEC、真实回放、弱网、P95、容量或 8 h 已通过。", "",
+             "按用户要求以模拟测试验收，真机不作为门槛。缺失的软件行为、弱网、P95、容量及 8 h 模拟证据仍需补齐；保留实际解码、协议及失败断言。", "",
              "## 执行结果", "", "| 场景 | 结果 | 证据 |", "| --- | --- | --- |"]
     for r in scenarios:
-        lines.append(f"| {r['folder']} | {'通过' if r['ok'] else '未通过'} | [{r['folder']}/result.json]({r['folder']}/result.json) |")
-    lines += ["", "## 34 项需求", "", "| 编号 | 需求 | 完整验收 | 子项证据 | 剩余验收 |", "| --- | --- | --- | --- | --- |"]
+        source = Path(report.get("evidence_reuse", {}).get("media_report", str(root / "result.json"))).parent
+        target = Path(os.path.relpath(source / r['folder'] / 'result.json', root)).as_posix()
+        lines.append(f"| {r['folder']} | {'通过' if r['ok'] else '未通过'} | [{r['folder']}/result.json]({target}) |")
+    lines += ["", "## 34 项模拟验收", "", "| 编号 | 需求 | 模拟状态 | 覆盖情况 | 子项证据 | 结论或待补模拟 |", "| --- | --- | --- | --- | --- | --- |"]
     for r in rows:
         refs = ", ".join(r["evidence"]) or "无"
-        lines.append(f"| {r['id']} | {r['title']} | {r['status']} | {refs} | {gaps.get(r['id'], r['remaining'])} |")
+        lines.append(f"| {r['id']} | {r['title']} | {r['status']} | {r['coverage']} | {refs} | {r['reason']} |")
     if "setup_error" in report:
         lines += ["", "环境阻塞：" + report["setup_error"]]
     lines += ["", "版本、工作区修改状态、二进制 SHA256、Go 测试结果见 [result.json](result.json)。", ""]
@@ -253,7 +302,10 @@ def main():
     p.add_argument("--client", type=Path, default=SDK / "out/windows-x64/Release/livekit_uav_requirements.exe")
     p.add_argument("--goproxy", help="Process-local module proxy; go.mod/go.sum stay readonly")
     p.add_argument("--output", type=Path)
+    p.add_argument("--tcp-repeats", type=int, default=1, help="Total isolated TCP video rounds per codec (1..20)")
     args = p.parse_args()
+    if not 1 <= args.tcp_repeats <= 20:
+        p.error("--tcp-repeats must be 1..20")
     args.server_source, args.go, args.client = (x.resolve() for x in (args.server_source, args.go, args.client))
     now = datetime.now(timezone(timedelta(hours=8)))
     root = (args.output or WORKSPACE / "out/uav-sfu-go" / now.strftime("%Y%m%d-%H%M%S-%f")).resolve()
@@ -280,8 +332,26 @@ def main():
         report["go"] = go_probes(args, root, env)
         for protocol, scenario, codec in [("udp", "video", "h264"), ("tcp", "video", "h264"),
                                           ("udp", "audio", "h264"), ("udp", "video", "h265"),
-                                          ("udp", "dynacast", "h264"), ("udp", "dynacast", "h265")]:
+                                          ("udp", "dynacast", "h264"), ("udp", "dynacast", "h265"),
+                                          ("tcp", "video", "h265"),
+                                          ("udp", "transport-reject", "h264"), ("tcp", "transport-reject", "h264")]:
             report["scenarios"].append(run_case(server, args.client, root, protocol, scenario, codec))
+        mixed_root = root / "simultaneous"
+        mixed_root.mkdir()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(run_case, server, args.client, mixed_root, protocol, scenario, "h265")
+                    for protocol, scenario in [("udp", "mixed"), ("tcp", "video")]]
+            for job in jobs:
+                result = job.result()
+                result["folder"] = "simultaneous/" + result["folder"]
+                report["scenarios"].append(result)
+        for repeat in range(2, args.tcp_repeats + 1):
+            repeat_root = root / f"tcp-repeat-{repeat}"
+            repeat_root.mkdir()
+            for codec in ("h264", "h265"):
+                result = run_case(server, args.client, repeat_root, "tcp", "video", codec)
+                result["folder"] = repeat_root.name + "/" + result["folder"]
+                report["scenarios"].append(result)
         finish(report, root)
         return 1 if report["gaps"] or report["go"]["exit_code"] or any(not r["ok"] for r in report["scenarios"]) else 0
     except Exception as e:

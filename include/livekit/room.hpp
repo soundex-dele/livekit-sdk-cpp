@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/rtp.hpp"
 #include "livekit/auth.hpp"
 #include "livekit/media.hpp"
 #include "livekit/participant.hpp"
@@ -7,6 +8,8 @@
 #include "livekit/video_stream.hpp"
 #include "livekit/audio_stream.hpp"
 #include "livekit/capabilities.hpp"
+#include "livekit/encryption.hpp"
+#include "livekit/encoded_media.hpp"
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -16,6 +19,9 @@
 namespace livekit::sdk {
 using EventHandler = std::function<void(const Json&)>;
 enum class ConnectionState { disconnected, connecting, connected, reconnecting };
+// Applies to both media PeerConnections, including ICE restart and full rejoin.
+// Strict modes require direct ICE and never use TURN or the other protocol.
+enum class MediaTransport { automatic, udp_only, tcp_only };
 struct RoomInfo { std::string sid, name, metadata; bool recording = false; };
 struct RoomMovedInfo { RoomInfo previous, current; };
 struct ConnectInfo {
@@ -48,8 +54,12 @@ struct RoomCallback {
   // ID in the application. params.sender_identity is distinct from the subject.
   std::function<void(const Transcription&, const DataReceiveParams&)> on_transcription_received;
   std::function<void(const std::string& participant_sid, const std::string& track_sid, bool allowed)> on_subscription_permission_changed;
-  // Serialized W3C media statistics; enabled by RoomOptions::stats_interval_ms.
+  // Statistics enabled by RoomOptions::stats_interval_ms. Inspect "event":
+  // rtc-stats contains W3C reports, graph-track-stats contains track counters,
+  // media-graph-stats contains node/edge counters and monotonic timestampUs.
   std::function<void(const Json&)> on_stats;
+  std::function<void(const RemoteDataTrack&)> on_data_track_published, on_data_track_unpublished;
+  std::function<void(const EncryptionStateEvent&)> on_encryption_state_changed;
 };
 struct RoomOptions {
   std::string url, token, room, identity;
@@ -86,6 +96,19 @@ struct RoomOptions {
   std::shared_ptr<AudioFrameStream> audio_frame_stream;
   // Applied before publishing any initial/recovered track. Empty uses server default.
   std::optional<SubscriptionPermissions> subscription_permissions;
+  MediaTransport media_transport = MediaTransport::automatic;
+  std::shared_ptr<EncodedMediaStream> encoded_frame_stream;
+  EncryptionOptions encryption;
+  // Dedicated ordered callback worker. Queue overflow terminates the session.
+  // wait()/blocking join from this worker is forbidden; request_stop is safe.
+  bool control_callback_thread=false;
+  size_t control_callback_capacity=256;
+  std::shared_ptr<PacketStream> packet_stream;
+  bool ipv6_only=false; // Restricts media ICE interfaces; signaling follows its URL.
+  bool synchronize_av=true;
+  bool decode_video=true; // false retains encoded output without software video decoding.
+  std::function<void(const Json&)> log_sink; // Ordered SDK diagnostics; no key material.
+  bool single_peer_connection=false; // Requires protocol 17 and /rtc/v1.
 };
 
 class Room {
@@ -111,6 +134,12 @@ class Room {
   // are rejected; unregister affects new calls, not already dispatched work.
   void register_rpc_method(const std::string& method, RpcHandler handler);
   void unregister_rpc_method(const std::string& method);
+  void register_text_stream_handler(const std::string& topic, StreamHandler handler);
+  void register_byte_stream_handler(const std::string& topic, StreamHandler handler);
+  void unregister_text_stream_handler(const std::string& topic);
+  void unregister_byte_stream_handler(const std::string& topic);
+  std::vector<RemoteDataTrack> remote_data_tracks() const;
+  std::vector<LocalDataTrack> local_data_tracks() const;
   ConnectionState connection_state() const;
   // Current-generation snapshot. Server codec lists are advertised policy,
   // not proof that a track negotiated or decoded a codec.

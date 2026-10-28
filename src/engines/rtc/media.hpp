@@ -48,25 +48,26 @@ std::vector<MediaSpec> probe_media(const std::string& input, const std::string& 
 class MediaPump {
  private:
   std::shared_ptr<CaptureNode> capture_;
-  std::unique_ptr<livekit::sdk::detail::GraphVideoSender> sender_;
   std::unique_ptr<livekit::sdk::detail::RtcPipeline> pipeline_;
  public:
   explicit MediaPump(MediaSpec spec, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {},
-                    VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string id = {});
+                    VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string id = {}, bool backup_video = false);
   ~MediaPump();
   bool start();
   void stop();
+  std::shared_ptr<livekit::sdk::detail::EncodedSourceReader> encoded_source() const{return capture_->encoded_source();}
   bool finished() const { return capture_->finished(); }
   std::string error() const { return capture_->error(); }
   const MediaSpec& spec;
   std::atomic<uint64_t>& frames;
-  webrtc::scoped_refptr<VideoSource> video;
+  webrtc::scoped_refptr<VideoSource> video, backup_video;
   webrtc::scoped_refptr<AudioSource> audio;
 };
 class TrackSink : public webrtc::AudioTrackSinkInterface {
  public:
   TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const std::filesystem::path& directory, VideoPlayout* playout = nullptr, VideoFrames* frames = nullptr, std::string track_id = {}, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph = {}, std::vector<uint32_t> ssrcs = {}, std::shared_ptr<livekit::sdk::detail::AudioFrameOutput> audio_output = {});
   ~TrackSink();
+  void request_keyframe(){if(!receive_video_)throw std::invalid_argument("Keyframe request requires video");receive_video_->keyframe_requested=true;}
   void attach();
   void detach();
   void OnData(const void* data, int bits, int rate, size_t channels, size_t frames) override;

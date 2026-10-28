@@ -31,6 +31,7 @@ struct RpcCallOptions {
   std::string destination_identity,method,payload;
   std::chrono::milliseconds response_timeout{15000};
   std::stop_token stop;
+  bool compress=false; // Opt-in only for peers supporting compressed RPC payloads.
 };
 struct RpcInvocation {
   std::string request_id,caller_identity,payload;

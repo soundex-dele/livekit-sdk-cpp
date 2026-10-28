@@ -84,7 +84,7 @@ SignalSocket::SignalSocket() {
 }
 SignalSocket::~SignalSocket() { close(); }
 void SignalSocket::connect(const std::string& url, const std::string& token, bool subscribe, std::stop_token stop, int timeout_seconds, const std::string& resume_sid,
-                           std::chrono::steady_clock::time_point deadline_limit, int protocol) {
+                           std::chrono::steady_clock::time_point deadline_limit, int protocol, const std::string& join_request) {
   close(); // joins the old reader before resetting its state
   { std::lock_guard lock(mutex_); opened_ = false; closing_ = false; error_.clear(); messages_.clear(); http_status_ = 0; overflow_ = false; }
   if (stop.stop_requested()) return;
@@ -94,6 +94,7 @@ void SignalSocket::connect(const std::string& url, const std::string& token, boo
   auto address = endpoint(url, true) + "/rtc?protocol=" + std::to_string(protocol) +
       "&sdk=cpp&version=" + std::string(livekit::sdk::version) + "&auto_subscribe=" + (subscribe ? "1" : "0");
   if (!resume_sid.empty()) address += "&reconnect=1&sid=" + percent_encode(resume_sid);
+  if(!join_request.empty())address=endpoint(url,true)+"/rtc/v1?join_request="+percent_encode(join_request);
   socket_.setUrl(address);
   socket_.setExtraHeaders({{"Authorization", "Bearer " + token}});
   socket_.setHandshakeTimeout(timeout_seconds); socket_.start();

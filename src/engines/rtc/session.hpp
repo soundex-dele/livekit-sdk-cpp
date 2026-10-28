@@ -6,10 +6,14 @@
 #include "media_nodes/render/video_stream.hpp"
 #include "media_nodes/render/audio_stream.hpp"
 #include "engines/rtc/rpc_session.hpp"
+#include "engines/rtc/stream_session.hpp"
+#include "engines/rtc/data_track_session.hpp"
+#include "media_nodes/capture/encoded_source.hpp"
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include "support/control_executor.hpp"
 
 namespace livekit::sdk::detail {
 struct RoomState {
@@ -30,11 +34,22 @@ struct RoomState {
   std::string error;
   std::thread::id runner;
   RoomCallback callbacks;
+  std::shared_ptr<ControlExecutor> control;
+  void callback(std::function<void()> fn){if(control)control->post(std::move(fn));else fn();}
   std::deque<std::shared_ptr<Command>> commands;
   std::unique_ptr<OperationDeadlines> deadlines;
   std::shared_ptr<VideoFrameOutput> video_output;
   std::shared_ptr<AudioFrameOutput> audio_output;
+  std::shared_ptr<EncodedOutput> encoded_output;
   std::shared_ptr<RpcSession> rpc;
+  std::shared_ptr<StreamSession> streams;
+  std::shared_ptr<DataTrackSession> data_tracks=std::make_shared<DataTrackSession>();
+  // Caller holds mutex. Handler registrations survive explicit Room reuse.
+  std::shared_ptr<StreamSession> stream_session() {
+    if(!streams)streams=std::make_shared<StreamSession>();
+    if(running&&!stop.stop_requested()&&!local.sid.empty()&&connection==ConnectionState::connected)streams->connect();
+    return streams;
+  }
   RecoveryState recovery; // runner-owned, no application-thread access
   void enqueue(uint64_t expected_generation, const std::shared_ptr<Command>& command);
   std::deque<std::shared_ptr<Command>> take_commands();

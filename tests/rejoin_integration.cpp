@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include "media_transport_options.hpp"
 
 namespace sdk = livekit::sdk;
 using namespace std::chrono_literals;
@@ -30,6 +31,7 @@ int main(int argc, char** argv) {
     observe.on_data_received = [&](const auto& data, const auto&) { if (data == std::vector<uint8_t>{4, 5}) ++messages; };
     sdk::Room observer(observe);
     sdk::RoomOptions watch;
+    test_media_transport(watch);
     watch.video_frame_handler = [&](const sdk::VideoFrame&) { ++frames; };
     observer.join_with_token(argv[1], token("observer"), watch);
     sdk::MediaSpec demo; demo.demo = true;
@@ -42,6 +44,7 @@ int main(int argc, char** argv) {
     cb.on_disconnected = [&](int) { ++disconnected; };
     sdk::Room publisher(cb);
     sdk::RoomOptions options;
+    test_media_transport(options);
     options.reconnect.initial_delay = 100ms;
     options.regions.trusted_endpoints = {std::string(argv[2]) + "/alternate"};
     options.video_frame_handler = [&](const sdk::VideoFrame&) { ++muted_frames; };

@@ -11,6 +11,7 @@
 #include "video_source_integration.hpp"
 #include "audio_source_integration.hpp"
 #include "go_interop_integration.hpp"
+#include "media_transport_options.hpp"
 
 namespace sdk = livekit::sdk;
 using namespace std::chrono_literals;
@@ -63,13 +64,15 @@ int main(int argc, char** argv) {
     sdk::Room subscriber(cb), publisher;
     subscriber_ptr = &subscriber;
     sdk::RoomOptions options;
+    test_media_transport(options);
     if (const auto protocol = std::getenv("LIVEKIT_TEST_PROTOCOL")) options.signal_protocol = std::stoi(protocol);
     options.video_frame_handler = [&](const sdk::VideoFrame& frame) {
       check(frame.width == 640 && frame.height == 360 && !frame.y.empty(), "Invalid decoded frame"); ++frames;
     };
     options.reconnect.initial_delay = 100ms;
     subscriber.join_with_token(argv[2], token("subscriber"), options);
-    publisher.join_with_token(argv[1], token("publisher"));
+    sdk::RoomOptions publishing_options; test_media_transport(publishing_options);
+    publisher.join_with_token(argv[1], token("publisher"), publishing_options);
     sdk::MediaSpec video; video.demo = true;
     auto outgoing = subscriber.local_participant().publish_track(video, {"resume-outgoing"}).get();
     auto publication = publisher.local_participant().publish_track(video, {"resume-video"}).get();
@@ -111,6 +114,7 @@ int main(int argc, char** argv) {
     check(permission_error, "Invalid token must fail without automatic retries");
     int token_requests = 0;
     sdk::RoomOptions refresh;
+    test_media_transport(refresh);
     refresh.token_provider = [&](sdk::TokenRequest request, sdk::TokenCompletion done) {
       check(request.reason == sdk::TokenRequestReason::authentication_failed, "Wrong refresh reason");
       check(request.url == "ws" + std::string(argv[1]).substr(4), "Wrong refresh endpoint");

@@ -19,7 +19,8 @@ def main():
     stage = root / 'out/go-interop-peer'
     stage.mkdir(parents=True, exist_ok=True)
     sdk = args.sdk.resolve()
-    shutil.copy2(Path(__file__).with_name('main.go'), stage / 'main.go')
+    for source in Path(__file__).parent.glob('*.go'):
+        shutil.copy2(source, stage / source.name)
     shutil.copy2(sdk / 'go.sum', stage / 'go.sum')
     (stage / 'go.mod').write_text('module livekit-cpp-interop\n\ngo 1.26.8\n\nrequire github.com/livekit/server-sdk-go/v2 v2.19.0\n\nreplace github.com/livekit/server-sdk-go/v2 => ' + json.dumps(sdk.as_posix()) + '\n')
     env = dict(os.environ, CGO_ENABLED='1', GOTOOLCHAIN='local', GOMODCACHE=str(root / 'out/go-mod-cache'), GOCACHE=str(root / 'out/go-build-cache'))

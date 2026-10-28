@@ -40,6 +40,7 @@ struct Packet {
   EncodedImage image;
   CodecSpecificInfo info;
   uint64_t revision, recovery;
+  std::vector<std::pair<EncodedImage,CodecSpecificInfo>> layers;
 };
 // The packet and its trigger travel together in one refcounted object. There
 // is no separate FIFO (which would drift when WebRTC discards trigger frames),
@@ -69,6 +70,15 @@ class PacketBuffer : public VideoFrameBuffer {
   int width_, height_;
 };
 
+class ExternalPacketBuffer : public VideoFrameBuffer {
+ public:
+  ExternalPacketBuffer(EncodedMediaFrame value,std::shared_ptr<EncodedSourceReader> input):frame(std::move(value)),source(std::move(input)){}
+  ~ExternalPacketBuffer(){if(!consumed)source->feedback(true);}
+  Type type()const override{return Type::kNative;}
+  int width()const override{return frame.width;}int height()const override{return frame.height;}
+  scoped_refptr<I420BufferInterface> ToI420()override{return nullptr;}
+  EncodedMediaFrame frame;std::shared_ptr<EncodedSourceReader> source;std::atomic<bool> consumed{false};
+};
 class PassthroughEncoder final : public VideoEncoder {
  public:
   PassthroughEncoder(const Environment& env, const SdpVideoFormat& format,
@@ -79,7 +89,7 @@ class PassthroughEncoder final : public VideoEncoder {
   }
   ~PassthroughEncoder() override { Release(); node_->stop(); }
   int InitEncode(const VideoCodec* codec, const Settings& settings) override {
-    if (!codec || codec->numberOfSimulcastStreams > 1 ||
+    if (!codec || (codec->numberOfSimulcastStreams > 1 && codec->codecType != kVideoCodecVP8) ||
         (codec->codecType == kVideoCodecVP9 && codec->VP9().numberOfSpatialLayers > 1) ||
         (codec->GetScalabilityMode() && ScalabilityModeToNumSpatialLayers(*codec->GetScalabilityMode()) > 1))
       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
@@ -102,6 +112,23 @@ class PassthroughEncoder final : public VideoEncoder {
       ++node_->dropped; session_->request_keyframe();
       if (callback_) callback_->OnDroppedFrame(EncodedImageCallback::DropReason::kDroppedByEncoder);
       return WEBRTC_VIDEO_CODEC_OK;
+    }
+    if(auto* external=dynamic_cast<ExternalPacketBuffer*>(frame.video_frame_buffer().get())){
+      if(external->consumed.exchange(true))return WEBRTC_VIDEO_CODEC_OK;
+      auto config=session_->snapshot();external_=external->source;
+      std::string codec=session_->format.name;std::transform(codec.begin(),codec.end(),codec.begin(),[](unsigned char c){return char(std::tolower(c));});
+      if(!config.active||!callback_||external->frame.codec!=codec||external->frame.width!=config.codec.width||external->frame.height!=config.codec.height)return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+      const bool requested=types&&std::find(types->begin(),types->end(),VideoFrameType::kVideoFrameKey)!=types->end();
+      if((requested||session_->recovery>session_->recovered)&&!external->frame.keyframe){external->source->feedback(true);return WEBRTC_VIDEO_CODEC_OK;}
+      EncodedImage image;image.SetEncodedData(EncodedImageBuffer::Create(external->frame.data.data(),external->frame.data.size()));
+      image._encodedWidth=external->frame.width;image._encodedHeight=external->frame.height;image._frameType=external->frame.keyframe?VideoFrameType::kVideoFrameKey:VideoFrameType::kVideoFrameDelta;image.SetRtpTimestamp(frame.rtp_timestamp());
+      CodecSpecificInfo info{};info.codecType=config.codec.codecType;
+      if(info.codecType==kVideoCodecVP8){info.codecSpecific.VP8.temporalIdx=kNoTemporalIdx;info.codecSpecific.VP8.keyIdx=kNoKeyIdx;}
+      if(info.codecType==kVideoCodecH264)info.codecSpecific.H264.packetization_mode=H264PacketizationMode::NonInterleaved;
+      auto result=callback_->OnEncodedImage(image,&info);
+      if(result.error!=EncodedImageCallback::Result::OK||result.drop_next_frame)external->source->feedback(true);
+      else if(external->frame.keyframe)session_->recovered=session_->recovery.load();
+      ++node_->inputs;++node_->outputs;return result.error==EncodedImageCallback::Result::OK?WEBRTC_VIDEO_CODEC_OK:WEBRTC_VIDEO_CODEC_ERROR;
     }
     auto* buffer = dynamic_cast<PacketBuffer*>(frame.video_frame_buffer().get());
     if (!buffer) { ++node_->errors; return WEBRTC_VIDEO_CODEC_ERR_PARAMETER; }
@@ -133,6 +160,11 @@ class PassthroughEncoder final : public VideoEncoder {
       callback_->OnDroppedFrame(EncodedImageCallback::DropReason::kDroppedByEncoder);
       return WEBRTC_VIDEO_CODEC_OK;
     }
+    for(const auto& layer:buffer->packet->layers){
+      auto image=layer.first;image.SetRtpTimestamp(frame.rtp_timestamp());
+      const auto result=callback_->OnEncodedImage(image,&layer.second);
+      if(result.error!=EncodedImageCallback::Result::OK||result.drop_next_frame)session_->request_keyframe();
+    }
     auto image = buffer->packet->image;
     // Use the exact timestamp of this trigger after WebRTC's clock mapping.
     image.SetRtpTimestamp(frame.rtp_timestamp());
@@ -149,6 +181,7 @@ class PassthroughEncoder final : public VideoEncoder {
     ++node_->outputs; return WEBRTC_VIDEO_CODEC_OK;
   }
   void SetRates(const RateControlParameters& rates) override {
+    if(auto source=external_.lock())source->feedback(false,rates.bitrate.get_sum_bps());
     std::lock_guard lock(session_->mutex);
     if (!session_->config.rates || session_->config.rates->bitrate.get_sum_bps() == 0)
       session_->request_keyframe();
@@ -168,6 +201,7 @@ class PassthroughEncoder final : public VideoEncoder {
     EncoderInfo info;
     info.implementation_name = "media_graph/passthrough";
     info.supports_native_handle = true;
+    info.supports_simulcast = session_->format.name == "VP8";
     info.has_trusted_rate_controller = true;
     info.scaling_settings = ScalingSettings::kOff;
     info.is_hardware_accelerated = false;
@@ -179,6 +213,7 @@ class PassthroughEncoder final : public VideoEncoder {
     session_->request_keyframe(); return WEBRTC_VIDEO_CODEC_OK;
   }
  private:
+  std::weak_ptr<EncodedSourceReader> external_;
   std::shared_ptr<EncoderSession> session_;
   std::shared_ptr<MediaNode> node_;
   EncodedImageCallback* callback_ = nullptr; // stock WebRTC encoder sequence only
@@ -323,12 +358,22 @@ class VideoEncoderNode final : public MediaNode, public std::enable_shared_from_
       if (metadata_.size() == 64) { metadata_.pop_front(); session_->request_keyframe(); }
       metadata_.push_back(metadata);
     }
-    std::vector<VideoFrameType> types(1, recovery > session_->recovered
+    std::vector<VideoFrameType> types(std::max<int>(1,config.codec.numberOfSimulcastStreams), recovery > session_->recovered
         ? VideoFrameType::kVideoFrameKey : VideoFrameType::kVideoFrameDelta);
+    // Libvpx VP8 emits every simulcast layer synchronously from Encode().
+    // Bundle them into one native trigger so cadence cannot discard sibling layers.
+    batching_=config.codec.codecType==kVideoCodecVP8&&config.codec.numberOfSimulcastStreams>1;
+    batch_.clear();
     auto result = encoder_->Encode(frame, &types);
+    batching_=false;
+    if(!batch_.empty()){auto last=std::move(batch_.back());batch_.pop_back();emit_encoded(last.first,&last.second,std::move(batch_));batch_.clear();}
     if (result < 0) { ++errors; session_->request_keyframe(); }
   }
   Result OnEncodedImage(const webrtc::EncodedImage& image, const webrtc::CodecSpecificInfo* info) override {
+    if(batching_&&info){batch_.emplace_back(image,*info);return Result(Result::OK);}
+    return emit_encoded(image,info,{});
+  }
+  Result emit_encoded(const webrtc::EncodedImage& image,const webrtc::CodecSpecificInfo* info,std::vector<std::pair<webrtc::EncodedImage,webrtc::CodecSpecificInfo>> layers){
     using namespace webrtc;
     if (paused_ || !info) return Result(Result::OK);
     std::optional<Metadata> metadata;
@@ -339,7 +384,7 @@ class VideoEncoderNode final : public MediaNode, public std::enable_shared_from_
     }
     if (!metadata) { ++dropped; session_->request_keyframe(); return Result(Result::OK); }
     auto buffer = make_ref_counted<PacketBuffer>(metadata->width, metadata->height, binding(),
-                                                session_, Packet{image, *info, revision_, metadata->recovery});
+                                                session_, Packet{image, *info, revision_, metadata->recovery,std::move(layers)});
     auto frame = VideoFrame::Builder().set_video_frame_buffer(buffer)
         .set_timestamp_us(metadata->time_us).set_ntp_time_ms(metadata->ntp_ms)
         .set_rtp_timestamp(image.RtpTimestamp()).set_rotation(metadata->rotation)
@@ -360,29 +405,19 @@ class VideoEncoderNode final : public MediaNode, public std::enable_shared_from_
   std::optional<int64_t> last_frame_us_, next_frame_us_;
   std::mutex metadata_mutex_;
   std::deque<Metadata> metadata_;
+  bool batching_=false;
+  std::vector<std::pair<webrtc::EncodedImage,webrtc::CodecSpecificInfo>> batch_;
   EncodeExecutor executor_;
 };
-GraphVideoSender::GraphVideoSender(std::shared_ptr<RtcGraph> graph, Output output, bool standalone)
-    : impl_(std::make_shared<VideoEncoderNode>()),
-      input_(std::make_shared<MediaEventNode<RawVideoFrame>>("VideoEncodeInputNode", NodeExecution::source)),
-      output_(std::make_shared<MediaEventNode<EncodedVideoFrame>>("VideoTrackInputNode", NodeExecution::sink,
-          [output = std::move(output)](EncodedVideoFrame& event) { output(event.frame); })) {
-  // Input is an ingress and relay: external graph edges feed it in embedded mode.
-  if (standalone) {
-    pipeline_ = std::make_unique<RtcPipeline>(std::move(graph));
-    pipeline_->build(nodes(), connections());
-    if (!pipeline_->start()) throw std::runtime_error("media_graph: sender start failed");
-  }
+std::shared_ptr<MediaNode> create_video_encoder_node() {
+  return std::make_shared<VideoEncoderNode>();
 }
-GraphVideoSender::~GraphVideoSender() { if (pipeline_) pipeline_->release(); else impl_->shutdown(); }
-std::vector<std::shared_ptr<MediaNode>> GraphVideoSender::nodes() const { return {input_, impl_, output_}; }
-std::vector<RtcPipeline::Connection> GraphVideoSender::connections() const {
-  return {RtcPipeline::connect<RawVideoFrame>(input_, impl_),
-          RtcPipeline::connect<EncodedVideoFrame>(impl_, output_)};
+webrtc::VideoFrame external_encoded_video(EncodedMediaFrame frame,std::shared_ptr<EncodedSourceReader> source){
+  const auto age=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-frame.captured).count();
+  const auto time=webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds()-age;
+  auto buffer=webrtc::make_ref_counted<ExternalPacketBuffer>(std::move(frame),std::move(source));
+  return webrtc::VideoFrame::Builder().set_video_frame_buffer(buffer).set_timestamp_us(time).build();
 }
-void GraphVideoSender::submit(const webrtc::VideoFrame& frame) { input_->emit(RawVideoFrame(frame)); }
-void GraphVideoSender::pause() { if (pipeline_) pipeline_->stop(); }
-void GraphVideoSender::resume() { if (pipeline_ && !pipeline_->start()) throw std::runtime_error("media_graph: sender restart failed"); }
 std::unique_ptr<webrtc::VideoEncoder> create_passthrough_video_encoder(
     const webrtc::Environment& env, const webrtc::SdpVideoFormat& format,
     std::shared_ptr<RtcGraph> graph, VideoCodecCreator create) {

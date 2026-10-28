@@ -71,7 +71,7 @@ class DecoderAdapter final : public webrtc::VideoDecoder, private webrtc::Decode
     if (result < 0 || result == WEBRTC_VIDEO_CODEC_NO_OUTPUT) {
       std::lock_guard lock(mutex_); pending_.erase(image.RtpTimestamp());
     }
-    return result;
+    return route->keyframe_requested.exchange(false)&&result>=0?WEBRTC_VIDEO_CODEC_OK_REQUEST_KEYFRAME:result;
   }
   void output(webrtc::VideoFrame& decoded) {
     std::optional<Metadata> metadata;

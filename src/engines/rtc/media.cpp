@@ -39,7 +39,7 @@ std::vector<MediaSpec> probe_media(const std::string& input, const std::string& 
   return result;
 }
 MediaPump::MediaPump(MediaSpec value, std::shared_ptr<livekit::sdk::detail::RtcGraph> graph,
-                     VideoPlayout* playout, VideoFrames* output_frames, std::string id)
+                     VideoPlayout* playout, VideoFrames* output_frames, std::string id, bool backup)
     : capture_(std::make_shared<CaptureNode>(std::move(value))), spec(capture_->spec), frames(capture_->frames) {
   using namespace livekit::sdk::detail;
   if (!graph) graph = std::make_shared<RtcGraph>();
@@ -48,11 +48,27 @@ MediaPump::MediaPump(MediaSpec value, std::shared_ptr<livekit::sdk::detail::RtcG
   std::vector<RtcPipeline::Connection> edges;
   if (spec.video) {
     video = webrtc::make_ref_counted<VideoSource>(spec.capture == livekit::sdk::CaptureKind::screen);
-    sender_ = std::make_unique<GraphVideoSender>(graph,
-        [source = video](const webrtc::VideoFrame& frame) { source->push(frame); }, false);
-    auto encoding = sender_->nodes(); nodes.insert(nodes.end(), encoding.begin(), encoding.end());
-    edges = sender_->connections();
-    edges.push_back(RtcPipeline::connect<RawVideoFrame>(capture_, sender_->input_node()));
+    auto output = std::make_shared<MediaEventNode<EncodedVideoFrame>>("RtcVideoTrackSinkNode", NodeExecution::sink,
+        [source = video](EncodedVideoFrame& event) { source->push(event.frame); });
+    if (spec.encoded_source) {
+      edges.push_back(RtcPipeline::connect<EncodedVideoFrame>(capture_, output));
+    } else {
+      auto encoder = create_video_encoder_node();
+      nodes.push_back(encoder);
+      edges.push_back(RtcPipeline::connect<RawVideoFrame>(capture_, encoder));
+      edges.push_back(RtcPipeline::connect<EncodedVideoFrame>(encoder, output));
+    }
+    nodes.push_back(output);
+    if(backup){
+      if(spec.encoded_source)throw std::invalid_argument("Backup codec requires raw video input");
+      backup_video=webrtc::make_ref_counted<VideoSource>(spec.capture==livekit::sdk::CaptureKind::screen);
+      auto encoder = create_video_encoder_node();
+      auto sink = std::make_shared<MediaEventNode<EncodedVideoFrame>>("RtcVideoTrackSinkNode", NodeExecution::sink,
+          [source = backup_video](EncodedVideoFrame& event) { source->push(event.frame); });
+      nodes.push_back(encoder); nodes.push_back(sink);
+      edges.push_back(RtcPipeline::connect<RawVideoFrame>(capture_, encoder));
+      edges.push_back(RtcPipeline::connect<EncodedVideoFrame>(encoder, sink));
+    }
     if (spec.local_preview) {
       auto preview = std::make_shared<VideoRenderNode>("local-" + id, playout, output_frames);
       nodes.push_back(preview); edges.push_back(RtcPipeline::connect<RawVideoFrame>(capture_, preview));
@@ -63,6 +79,7 @@ MediaPump::MediaPump(MediaSpec value, std::shared_ptr<livekit::sdk::detail::RtcG
         [source = audio](PcmFrame& event) { source->push(event); });
     nodes.push_back(output); edges.push_back(RtcPipeline::connect<PcmFrame>(capture_, output));
   }
+  for (const auto& node : nodes) node->set_track_id(id);
   pipeline_->build(nodes, edges);
 }
 MediaPump::~MediaPump() { pipeline_->release(); }
@@ -101,7 +118,7 @@ TrackSink::TrackSink(webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> tr
   }
   pipeline_->build(nodes, edges);
 }
-TrackSink::~TrackSink() { detach(); }
+TrackSink::~TrackSink() { detach(); if(registry_)registry_->unbind_sync(track_id_); }
 void TrackSink::attach() {
   if (attached_) return;
   if (receive_video_) {
@@ -150,5 +167,6 @@ std::string TrackSink::error() const {
   { std::lock_guard lock(mutex_); if (!error_.empty()) return error_; }
   return recorder_ ? recorder_->error() : std::string{};
 }
-Json TrackSink::stats() const { std::lock_guard lock(mutex_); return {{"track", track_id_}, {"kind", track_->kind()}, {"frames", receive_video_ ? receive_video_->frames() : frames_}}; }
+Json TrackSink::stats() const {std::lock_guard lock(mutex_);Json result{{"track",track_id_},{"ssrcs",ssrcs_},{"kind",track_->kind()},{"frames",receive_video_?receive_video_->frames():frames_},{"source","GraphEngine"}};
+  if(receive_video_){auto nodes=receive_video_->metrics();result["decoded"]=nodes[0].outputs;result["codec"]=nodes[0].format;result["decodeErrors"]=nodes[0].errors;result["presented"]=nodes[1].outputs;result["presentationDropped"]=nodes[1].dropped;result["renderSubmitted"]=nodes[2].outputs;}return result; }
 }

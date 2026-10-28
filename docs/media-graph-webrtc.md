@@ -12,9 +12,8 @@
 视频发送：
 VideoSourceNode / CameraCaptureNode / ScreenCaptureNode
   ├─ VideoRenderNode → 已有 latest-frame 输出（可选本地预览）
-  └─ VideoEncodeInputNode（图入口）
-      → VideoEncoderNode（有界编码队列 + 真实编码）
-      → VideoTrackInputNode / 自定义 native VideoFrame 携带编码包
+  └─ VideoEncoderNode（有界编码队列 + 真实编码）
+      → RtcVideoTrackSinkNode / 订阅 EncodedVideoFrame，将 native 编码包送入 WebRTC
       → WebRTC VideoStreamEncoder → PassthroughEncoder / RtcPublishNode
       → OnEncodedImage → WebRTC RTP / pacer
 
@@ -51,7 +50,7 @@ WebRTC NetEq → AudioDecoderAdapter → AudioDecoderNode → 返回 NetEq / 混
 
 `RtcPipeline` 持有 `graphflow::engine::GraphEngine`，通过 `loadFromNodes(nodes, connections)` 建图，再由引擎统一执行 init/start/stop/release。使用默认 EventBus 传输，不使用只描述拓扑的 External 边；媒体确实通过节点的 `publish<Event>()` / `subscribe<Event>()` 流动。
 
-- 每个发布轨道拥有一张图：CaptureNode → VideoEncodeInputNode → VideoEncoderNode → VideoTrackInputNode；CaptureNode 可分流到 VideoRenderNode。MediaPump 只负责组装与控制，采集线程、设备和文件输入实现在独立的 `media_nodes/capture_source.*`。
+- 每个原始视频发布轨道拥有一张图：CaptureNode → VideoEncoderNode → RtcVideoTrackSinkNode；CaptureNode 可分流到 VideoRenderNode。输出节点通过 GraphEngine 的 `EncodedVideoFrame` 边订阅编码节点，再调用 WebRTC 视频源；编码节点不持有输出目标或回调。外部已编码输入直接连接同一个输出节点。MediaPump 只负责组装与控制，采集线程、设备和文件输入实现在独立的 `media_nodes/capture/capture_source.*`。
 - 每个接收视频轨道拥有一张完整的 `VideoReceiveGraph`：RtcEncodedSourceNode → VideoDecoderNode → VideoPresentNode → VideoRenderNode，解码节点另分流到 RecordingNode。统一由该轨道的 GraphEngine 管理；不是全会议所有轨道共用一个可变拓扑。
 - DecoderFactory 创建标准 DecoderAdapter 和真实 codec 租约。适配器在 Decode 中依据 EncodedImage.PacketInfos 的 SSRC 查找接收图，使用同步事件调用 VideoDecoderNode，返回真实解码返回码；真实 codec 回调只将像素送回这张图。
 - OnTrack 从 RtpReceiver.GetParameters().encodings 注册 SSRC 与轨道的关联；缺失、混合或冲突的 SSRC 明确拒绝，不按格式或创建顺序猜测。TrackSink 管理接收图租约，视频不再注册原生 VideoTrack sink。音频继续使用 RtcSubscribeNode → RecordingNode。
@@ -79,7 +78,7 @@ pipeline.start();
 
 `src/backends/webrtc/codec_factories.*` 实现四类 Graph factories。视频 EncoderFactory 的 `Create(env, format)` 创建透传适配器，协商参数与源绑定后由已建图的 VideoEncoderNode 创建真实 codec；DecoderFactory 创建接收图入口适配器，不再创建回交 WebRTC 的独立解码子图。`room.cpp` 在 `EnableMediaWithDefaults(deps)` **之前**注入 factories；内置 helper 只补空缺配置。
 
-视频编码 codec 由 VideoEncoderNode 持有；解码 codec 由 DecoderAdapter 持有生命周期租约，实际 Decode 只通过接收图的 VideoDecoderNode 执行；音频保留 `CodecNode<Backend>`。GraphVideoSender 负责提供编码子图的节点与边，视频透传适配器持有每轨协商/反馈状态。默认 delegate 使用 WebRTC builtin factories；私有 `CodecBackends` 注入结构允许替换后端及测试工厂，不是对外稳定的插件 ABI。
+视频编码 codec 由 VideoEncoderNode 持有；解码 codec 由 DecoderAdapter 持有生命周期租约，实际 Decode 只通过接收图的 VideoDecoderNode 执行；音频保留 `CodecNode<Backend>`。`create_video_encoder_node()` 仅创建未初始化的编码节点，由外层 GraphEngine 连接输入输出并管理生命周期；不再提供独立编码子图模式或输入中转节点。测试同样组装“测试帧源 → VideoEncoderNode → 测试结果收集节点”，通过所属图执行停止、重启和释放。视频透传适配器持有每轨协商/反馈状态。默认 delegate 使用 WebRTC builtin factories；私有 `CodecBackends` 注入结构允许替换后端及测试工厂，不是对外稳定的插件 ABI。
 
 节点保持编码参数、单空间层的时间层码率、关键帧请求和 RTT/loss 反馈；音频保留 FEC 等原生控制。编码包、codec-specific 元数据及 native frame 直接按 WebRTC 引用契约传递，不经过有损的公共字节数组转换。发送侧编码 callback 回交 WebRTC；接收侧解码 callback 直接进入图的呈现与录制分支，不再回交 WebRTC。
 
@@ -156,6 +155,14 @@ python tests/media_graph_integration.py `
 透传回归还验证真实编码在透传 Encode 被调用前完成、源/编码器逐轨绑定、丢弃触发帧后的关键帧恢复、重复 native buffer 去重、静音黑帧不会透传源内容、源暂停/恢复及关闭后不保留图节点。
 
 集成脚本启动独立本地 C++ SFU，验证真实音视频、数据通道、四类 codec 节点和录制输出；可同时运行既有动态发布订阅/Room 复用回归。所有进程由脚本创建并清理，输出保存在 `out/media-graph-integration/`。
+
+直接编码节点连接改造验证（2026-10-28，Windows x64 Release）：
+
+- 删除输入中转节点和独立 `GraphVideoSender` 模式，生产与测试均由外层 GraphEngine 组图。实际发布图为 `VideoSourceNode → VideoEncoderNode → RtcVideoTrackSinkNode`。
+- SDK、CLI、会议 Demo 和会议集成客户端构建通过，见 `out/encoder-direct-edges-build.log`。最新媒体图测试重新构建后，`ctest -R '^media_graph$'` 通过（2.40 s），覆盖直接边、真实编码、多实例、停止拒收、重启与释放；构建日志为 `out/encoder-direct-edges-test-build.log`。
+- 官方 Go Server 的隔离端到端测试通过，验证运行图的直接连接、移除输入中转节点、VP8/Opus 收发与 WAV/Y4M 录制。该测试仅在 `out/` 下将原脚本的服务器配置和健康检查适配为 Go 格式，保留全部媒体与拓扑断言。[结果](../out/encoder-direct-edges-go-integration/20261028-125000/result.json)。
+- 额外回归未全通过：C++ SFU 测试中发送侧编码和 RTP 输出有数据，但订阅端视频 RTP 为零，失败于 `VideoDecoderNode` 活动检查，见 `out/encoder-direct-edges-integration/20261028-124334/`；官方 Go Server 的完整会议回归运行到最终移除参与者检查时，报 `Server removal not observed`，见 `out/sdk-integration/20261028-124724/client.stderr.log`。这两项不能报告为通过，仍需进一步排查。
+- 所有检查均为自动化、无窗口运行，不代表实际设备人工验收。
 
 直接接收版本验证（2026-10-26，Windows x64 Release）：
 

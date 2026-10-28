@@ -4,6 +4,9 @@
 #include "livekit/operation.hpp"
 #include "livekit/data_messages.hpp"
 #include "livekit/rpc.hpp"
+#include "livekit/streams.hpp"
+#include "livekit/data_track.hpp"
+#include "livekit/encryption.hpp"
 #include <future>
 #include <map>
 #include <memory>
@@ -31,11 +34,25 @@ struct ParticipantInfo {
   bool speaking = false;
   float audio_level = 0;
 };
+struct VideoEncoding {
+  std::string rid;
+  double scale_resolution_down_by=1;
+  int max_bitrate_bps=2000000;
+  double max_framerate=30;
+  bool active=true;
+};
+enum class BackupCodecPolicy {prefer_regression=0,simulcast=1,regression=2};
+struct BackupCodecOptions {std::string codec="h264";BackupCodecPolicy policy=BackupCodecPolicy::prefer_regression;std::vector<VideoEncoding> video_encodings;};
 struct TrackPublishOptions {
   std::string name, stream;
   TrackSource source = TrackSource::unknown;
   // Audio only. Negotiate Opus without RED for receivers that cannot decode RED.
   bool disable_red = false;
+  std::shared_ptr<KeyProvider> encryption_keys;
+  // VP8, up to three independently encoded layers, lowest resolution first.
+  std::vector<VideoEncoding> video_encodings;
+  std::string codec; // Empty uses RoomOptions::codec.
+  std::optional<BackupCodecOptions> backup_codec;
 };
 struct DataPublishOptions {
   bool reliable = false; // matches Go: lossy unless explicitly enabled
@@ -63,6 +80,8 @@ class TrackPublication {
  public:
   TrackInfo info() const;
   std::string sid() const { return snapshot_.sid; }
+  // Requests native PLI recovery when the next encoded video frame arrives.
+  std::future<void> request_keyframe(const OperationOptions& operation = {}) const;
   std::future<void> set_muted(bool muted, const OperationOptions& operation = {}) const; // local publication
   std::future<void> set_subscribed(bool subscribed, const OperationOptions& operation = {}) const; // remote publication
   std::future<void> set_enabled(bool enabled, const OperationOptions& operation = {}) const; // remote stream settings
@@ -95,6 +114,11 @@ class RemoteParticipant : public Participant { public: using Participant::Partic
 class LocalParticipant : public Participant {
  public:
   using Participant::Participant;
+  std::future<LocalDataTrack> publish_data_track(std::string name, DataTrackOptions options = {}, OperationOptions operation = {}) const;
+  std::shared_ptr<TextStreamWriter> stream_text(StreamOptions options = {}) const;
+  std::shared_ptr<ByteStreamWriter> stream_bytes(StreamOptions options = {}) const;
+  std::future<StreamInfo> send_text(std::string text, StreamOptions options = {}, OperationOptions operation = {}) const;
+  std::future<StreamInfo> send_file(const std::filesystem::path& path, StreamOptions options = {}, OperationOptions operation = {}) const;
   std::future<TrackPublication> publish_track(const MediaSpec& media, const TrackPublishOptions& options = {}, const OperationOptions& operation = {}) const;
   // Explicitly acquire the system microphone after joining; no capture before this call.
   // Requires RoomOptions.audio_playout or microphone (a physical audio backend).

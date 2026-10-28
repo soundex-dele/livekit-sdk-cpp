@@ -49,7 +49,8 @@ func rpcChecks(room *lksdk.Room) error {
  return nil
 }
 func run() error {
- url:=flag.String("url", "", "local server URL"); dir:=flag.String("out", "", "result directory"); rpcOnly:=flag.Bool("rpc-only",false,"No media publication");flag.Parse()
+ url:=flag.String("url", "", "local server URL"); dir:=flag.String("out", "", "result directory"); rpcOnly:=flag.Bool("rpc-only",false,"No media publication");extensions:=flag.String("extensions","","Extension mode");flag.Parse()
+ if *extensions!="" {return extensionsRun(*url,*dir,*extensions)}
  m:=&meter{}; failures:=make(chan error, 1)
  cb:=lksdk.NewRoomCallback()
  cb.OnDataPacket=func(packet lksdk.DataPacket, params lksdk.DataReceiveParams) {

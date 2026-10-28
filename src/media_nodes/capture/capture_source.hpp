@@ -4,6 +4,7 @@
 #include "api/video/video_frame.h"
 #include "media_nodes/capture/video_source.hpp"
 #include "media_nodes/capture/audio_source.hpp"
+#include "media_nodes/capture/encoded_source.hpp"
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -16,6 +17,7 @@ class CaptureNode final : public livekit::sdk::detail::MediaNode {
   explicit CaptureNode(MediaSpec spec);
   ~CaptureNode();
   void activate(); // Start production only after every downstream node is ready.
+  std::shared_ptr<livekit::sdk::detail::EncodedSourceReader> encoded_source() const{return external_encoded_;}
   bool finished() const { return finished_; }
   std::string error() const;
   const MediaSpec spec;
@@ -29,6 +31,7 @@ class CaptureNode final : public livekit::sdk::detail::MediaNode {
   std::thread thread_;
   std::unique_ptr<livekit::sdk::detail::I420SourceReader> external_video_;
   std::unique_ptr<livekit::sdk::detail::PcmSourceReader> external_audio_;
+  std::shared_ptr<livekit::sdk::detail::EncodedSourceReader> external_encoded_;
   std::stop_source external_stop_;
   std::atomic<bool> stop_{false}, finished_{false};
   mutable std::mutex mutex_;

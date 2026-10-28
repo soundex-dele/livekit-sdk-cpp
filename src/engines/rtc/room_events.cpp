@@ -5,7 +5,7 @@
 
 namespace livekit::sdk::detail {
 void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
-  std::vector<std::function<void()>> callbacks;
+  std::vector<std::function<void()>> callbacks, lifecycle;
   std::deque<std::shared_ptr<Command>> interrupted;
   {
     std::lock_guard lock(s->mutex);
@@ -31,11 +31,15 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
         if (!local && cb.on_track_unpublished) callbacks.push_back([=, fn = cb.on_track_unpublished] { fn(pub, RemoteParticipant(s, g, old, false)); });
       }
     };
-    if (type == "session-capabilities") {
+    if(type=="encryption-state"||type=="encryption-error"){
+      EncryptionStateEvent state{e.value("track",""),e.value("media",false),e.value("encrypting",false),e.value("ok",false),e.value("keyIndex",-1)};
+      if(cb.on_encryption_state_changed)callbacks.push_back([state,fn=cb.on_encryption_state_changed]{fn(state);});
+    }else if (type == "session-capabilities") {
       update_capabilities(s->capabilities,e);
-    } else if (type == "rtc-stats") {
+    } else if (type == "rtc-stats" || type=="graph-track-stats" || type=="media-graph-stats") {
       if(cb.on_stats) callbacks.push_back([e,fn=cb.on_stats]{fn(e);});
     } else if (type == "joined") {
+      s->data_tracks->connect();
       const auto& room = e.at("roomInfo");
       s->room = {room.value("sid", ""), room.value("name", ""), room.value("metadata", ""), room.value("recording", false)};
       s->local = parse_participant(e.at("localParticipant"));
@@ -74,8 +78,10 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
         remote.emplace(info.identity, std::move(info));
       }
       // Validate the complete snapshot before mutating any public state.
+      if(s->streams){auto streams=s->streams;const bool retained=e.value("transportRetained",true);lifecycle.push_back([streams,retained]{streams->disconnect();if(retained)streams->connect();});}
+      s->data_tracks->resume();
       if(s->rpc){auto rpc=s->rpc;const bool retained=e.value("transportRetained",true);
-        callbacks.push_back([rpc,retained]{rpc->disconnect();if(retained)rpc->connect();});}
+        lifecycle.push_back([rpc,retained]{rpc->disconnect();if(retained)rpc->connect();});}
       for (const auto& [identity, old] : s->remote) {
         auto removed = old; removed.state = 3; removed.disconnect_reason = 8; removed.tracks.clear();
         tracks_changed(old, removed, false);
@@ -113,12 +119,17 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       s->recovery.regions.attempted.clear();
       s->connection = ConnectionState::connected;
       if(s->rpc)s->rpc->connect();
+      if(s->streams)s->streams->connect();
+      s->data_tracks->connect();
       s->cv.notify_all();
       if (cb.on_connected) callbacks.push_back(cb.on_connected);
     } else if (type == "reconnecting" || type == "reconnected") {
       const bool restored = type == "reconnected";
+      if(!restored){if(e.value("mode","resume")=="resume")s->data_tracks->resume();else s->data_tracks->rejoin();}
+      else s->data_tracks->connect();
       s->connection = restored ? ConnectionState::connected : ConnectionState::reconnecting;
-      if(s->rpc){auto rpc=s->rpc;callbacks.push_back([rpc,restored]{if(restored)rpc->connect();else rpc->disconnect();});}
+      if(s->streams){auto streams=s->streams;lifecycle.push_back([streams,restored]{if(restored)streams->connect();else streams->disconnect();});}
+      if(s->rpc){auto rpc=s->rpc;lifecycle.push_back([rpc,restored]{if(restored)rpc->connect();else rpc->disconnect();});}
       ReconnectInfo info{e.value("mode", "resume") == "resume" ? ReconnectMode::resume : ReconnectMode::rejoin,
                          e.value("attempt", size_t{0})};
       auto fn = restored ? cb.on_reconnected : cb.on_reconnecting;
@@ -139,7 +150,8 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       for (auto& track : now.tracks) track.subscribed = s->subscriptions[track.sid];
       if (now.state == 3) {
         if (!local && existed) {
-          if(s->rpc){auto rpc=s->rpc;callbacks.push_back([rpc,identity=now.identity]{rpc->participant_left(identity);});}
+          if(s->streams){auto streams=s->streams;lifecycle.push_back([streams,identity=now.identity]{streams->participant_left(identity);});}
+          if(s->rpc){auto rpc=s->rpc;lifecycle.push_back([rpc,identity=now.identity]{rpc->participant_left(identity);});}
           auto empty = now; empty.tracks.clear(); tracks_changed(old, empty, false);
           s->remote.erase(now.identity);
           if (cb.on_participant_disconnected) callbacks.push_back([=, fn = cb.on_participant_disconnected] { fn(RemoteParticipant(s, g, now, false)); });
@@ -179,6 +191,19 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
       std::vector<uint8_t> payload(bytes.begin(), bytes.end());
       DataReceiveParams params{e.value("identity", ""), e.value("topic", ""), e.value("reliable", true)};
       if (cb.on_data_received) callbacks.push_back([=, fn = cb.on_data_received] { fn(payload, params); });
+    } else if(type=="datatrack-participant"){
+      livekit::ParticipantInfo participant;
+      if(participant.ParseFromString(base64_decode(e.at("payload").get<std::string>()))){
+        auto previous=s->data_tracks->remote_tracks();s->data_tracks->participant(participant);auto current=s->data_tracks->remote_tracks();
+        for(const auto& track:previous)if(std::none_of(current.begin(),current.end(),[&](auto& v){return v.info().sid==track.info().sid;})&&cb.on_data_track_unpublished)callbacks.push_back([track,fn=cb.on_data_track_unpublished]{fn(track);});
+        for(const auto& track:current)if(std::none_of(previous.begin(),previous.end(),[&](auto& v){return v.info().sid==track.info().sid;})&&cb.on_data_track_published)callbacks.push_back([track,fn=cb.on_data_track_published]{fn(track);});
+      }
+    } else if(type=="datatrack-packet"){
+      const auto bytes=base64_decode(e.at("payload").get<std::string>());s->data_tracks->receive_packet({reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size()});
+    } else if (type == "stream") {
+      livekit::DataPacket packet;
+      if(packet.ParseFromString(base64_decode(e.at("payload").get<std::string>()))&&s->remote.contains(packet.participant_identity()))
+        s->stream_session()->receive(packet);
     } else if (type == "rpc") {
       livekit::DataPacket packet;
       if(packet.ParseFromString(base64_decode(e.at("payload").get<std::string>()))&&s->remote.contains(packet.participant_identity()))
@@ -224,6 +249,7 @@ void process_event(const std::shared_ptr<RoomState>& s, const Json& e) {
         ErrorCode::session_closed, "Command interrupted by room migration"));
     for (auto& command : interrupted) command->reject(failure);
   }
-  for (const auto& callback : callbacks) callback();
+  for(auto& action:lifecycle)action();
+  for (auto& callback : callbacks) s->callback(std::move(callback));
 }
 }

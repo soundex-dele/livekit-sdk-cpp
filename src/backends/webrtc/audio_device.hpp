@@ -26,7 +26,7 @@ class GraphAudioDevice : public webrtc::AudioDeviceModule, private webrtc::Audio
  public:
   GraphAudioDevice(webrtc::scoped_refptr<webrtc::AudioDeviceModule> device, const std::shared_ptr<RtcGraph>& graph,
                    bool capture_enabled)
-      : device_(std::move(device)), recording_device_(device_), capture_(graph->add(std::make_shared<AudioCaptureNode>())),
+      : graph_(graph), device_(std::move(device)), recording_device_(device_), capture_(graph->add(std::make_shared<AudioCaptureNode>())),
         output_(graph->add(std::make_shared<AudioOutputNode>())) {
     // WebRTC initializes recording even for externally supplied test/file PCM.
     // Keep that logical state off the physical microphone unless requested.
@@ -152,6 +152,7 @@ class GraphAudioDevice : public webrtc::AudioDeviceModule, private webrtc::Audio
   }
   int32_t NeedMorePlayData(size_t samples, size_t bytes, size_t channels, uint32_t rate,
       void* data, size_t& count, int64_t* elapsed, int64_t* ntp) override {
+    uint16_t delay=0;if(device_->PlayoutDelay(&delay)==0)graph_->audio_device_delay_us=int64_t(delay)*1000;
     return output_->render([&] {
       if (auto* transport = transport_.load())
         return transport->NeedMorePlayData(samples, bytes, channels, rate, data, count, elapsed, ntp);
@@ -168,6 +169,7 @@ class GraphAudioDevice : public webrtc::AudioDeviceModule, private webrtc::Audio
       return int32_t(0);
     });
   }
+  std::shared_ptr<RtcGraph> graph_;
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> device_, recording_device_;
   std::shared_ptr<AudioCaptureNode> capture_;
   std::shared_ptr<AudioOutputNode> output_;

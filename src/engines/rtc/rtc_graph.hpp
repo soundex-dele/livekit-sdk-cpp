@@ -7,16 +7,18 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <optional>
 
 namespace livekit::sdk::detail {
 class VideoDecodeTarget;
+class EncodedOutput;
 enum class NodeExecution { source, backend, sink };
 struct NodeMetrics {
   uint64_t id = 0;
   std::string kind, format;
   NodeExecution execution = NodeExecution::backend;
   uint64_t inputs = 0, outputs = 0, errors = 0, dropped = 0, generation = 0;
-  std::string name;
+  std::string name, track_id;
 };
 
 // Lifecycle is owned by the node's creating/releasing sequence. Media methods
@@ -26,13 +28,15 @@ class MediaNode : public graphflow::core::GraphNode {
   MediaNode(std::string kind, NodeExecution execution, std::string format = {});
   ~MediaNode() override = default;
   NodeMetrics snapshot() const;
+  // Set by the track owner before registering the immutable topology.
+  void set_track_id(std::string id) { std::lock_guard lock(format_mutex_); track_id_ = std::move(id); }
   std::atomic<uint64_t> inputs{0}, outputs{0}, errors{0}, dropped{0}, generation{0};
  protected:
   void set_format(std::string format) { std::lock_guard lock(format_mutex_); format_ = std::move(format); }
  private:
   friend class RtcGraph;
   uint64_t id_ = 0;
-  std::string kind_, format_;
+  std::string kind_, format_, track_id_;
   NodeExecution execution_;
   mutable std::mutex format_mutex_;
 };
@@ -63,6 +67,13 @@ class RtcGraph {
     return node;
   }
   std::vector<NodeMetrics> snapshot();
+  void bind_sync(const std::string& track,const std::string& group,const std::vector<uint32_t>& ssrcs);
+  void unbind_sync(const std::string& track);
+  void audio_playout(uint32_t ssrc,int64_t ntp_ms,int64_t local_us);
+  std::optional<int64_t> video_playout(const std::string& track,int64_t ntp_ms,int64_t now_us);
+  std::atomic<int64_t> audio_device_delay_us{0};
+  bool synchronize_av=true,decode_video=true;
+  std::shared_ptr<EncodedOutput> encoded_output;
   void close(); // closes admission; PC/source owners quiesce before releasing nodes
  private:
   std::mutex mutex_;
@@ -70,6 +81,10 @@ class RtcGraph {
   uint64_t next_id_ = 1;
   std::map<uint64_t, std::weak_ptr<MediaNode>> nodes_;
   std::map<uint32_t, std::weak_ptr<VideoDecodeTarget>> video_routes_;
+  struct SyncTrack {std::string group;std::vector<uint32_t> ssrcs;};
+  struct AudioClock {int64_t ntp_ms=0,local_us=0,updated_us=0;};
+  std::map<std::string,SyncTrack> sync_tracks_;
+  std::map<std::string,AudioClock> audio_clocks_;
 };
 
 // One immutable topology per track/codec instance. All lifecycle operations run

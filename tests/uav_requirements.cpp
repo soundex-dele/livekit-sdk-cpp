@@ -1,6 +1,7 @@
 // Headless C++ clients for the Go SFU requirement assessment. No capture devices.
 #include <livekit/livekit.hpp>
 #include "rtc_base/logging.h"
+#include "api/peer_connection_interface.h"
 #include <cstdlib>
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@
 using namespace livekit::sdk;
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
+static MediaTransport test_transport = MediaTransport::automatic;
 static void require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);
 }
@@ -53,7 +55,7 @@ struct Peer {
   Peer(const std::string& url, const std::string& identity, const std::string& codec,
        const std::filesystem::path& directory) : events(directory / (identity + ".jsonl")) {
     RoomOptions o; o.url = url; o.token = token(identity); o.codec = codec;
-    o.disable_turn = true; o.stats_interval_ms = 1000; o.audio_frame_stream = audio;
+    o.disable_turn = true; o.media_transport = test_transport; o.stats_interval_ms = 1000; o.audio_frame_stream = audio;
     o.video_frame_handler = [this](const VideoFrame& f) {
       std::lock_guard lock(mutex);
       auto& v = video[f.track_id]; ++v.frames; v.width = f.width; v.height = f.height;
@@ -216,8 +218,19 @@ static void video_case(const std::string& url, const std::string& codec,
   verify_video(a, renewed.sid(), 80); verify_video(b, renewed.sid(), 80);
   passed(report, "republish_new_sid", {{"old_sid", t1.sid()}, {"new_sid", renewed.sid()}});
 }
-static void audio_case(const std::string& url, const std::filesystem::path& out, Json& report) {
-  Peer drone(url, "drone", "h264", out), a(url, "viewer-a", "h264", out), b(url, "viewer-b", "h264", out);
+static void audio_case(const std::string& url, const std::string& codec,
+                       const std::filesystem::path& out, Json& report, bool mixed = false) {
+  Peer drone(url, "drone", codec, out), a(url, "viewer-a", codec, out), b(url, "viewer-b", codec, out);
+  std::unique_ptr<VideoInput> front, rear;
+  std::optional<TrackPublication> front_track, rear_track;
+  if (mixed) {
+    front = std::make_unique<VideoInput>(80); rear = std::make_unique<VideoInput>(160);
+    front_track = front->publish(drone, "mixed-front"); rear_track = rear->publish(drone, "mixed-rear");
+    for (auto* viewer : {&a, &b}) {
+      verify_video(*viewer, front_track->sid(), 80); verify_video(*viewer, rear_track->sid(), 160);
+    }
+    passed(report, "two_sources_two_viewers", {{"codec", codec}, {"sources", 2}, {"subscriptions", 4}});
+  }
   std::array<Peer*, 3> peers{&drone, &a, &b};
   AudioInput s0(440), s1(660), s2(880);
   std::array<TrackPublication, 3> tracks{s0.publish(drone, "drone-440"), s1.publish(a, "a-660"), s2.publish(b, "b-880")};
@@ -273,6 +286,13 @@ static void audio_case(const std::string& url, const std::filesystem::path& out,
   }
   require(remaining[0] > 20 && remaining[1] > 20, "remaining voice stalled in one direction");
   passed(report, "voice_leave_preserves_video_and_other_voice", {{"remaining_audio_blocks", remaining}});
+  if (mixed) {
+    for (auto* viewer : {&a, &b}) {
+      verify_video(*viewer, front_track->sid(), 80, viewer->observation(front_track->sid()).frames);
+      verify_video(*viewer, rear_track->sid(), 160, viewer->observation(rear_track->sid()).frames);
+    }
+    passed(report, "video_continues_after_concurrent_audio_and_voice_leave");
+  }
 }
 
 static void dynacast_case(const std::string& url, const std::string& codec,
@@ -314,18 +334,51 @@ static void dynacast_case(const std::string& url, const std::string& codec,
     {"resumed_same_sid", track.sid()}, {"single_remaining_viewer_seconds", 6}, {"codec", codec}});
 }
 
+static void transport_reject_case(const std::string& url, Json& report) {
+  Room room;
+  RoomOptions o; o.url = url; o.token = token("drone");
+  o.media_transport = test_transport; o.connect_timeout = 4; o.reconnect.enabled = false;
+  require(test_transport != MediaTransport::automatic, "negative test requires strict transport");
+  bool joined = false, connected = false;
+  const auto start = Clock::now();
+  try {
+    room.run(o, [&](const Json& event) {
+      if (event.value("event", "") == "joined") joined = true;
+      if (event.value("event", "") == "transport" && event.value("state", -1) ==
+          static_cast<int>(webrtc::PeerConnectionInterface::PeerConnectionState::kConnected)) {
+        connected = true; room.request_stop();
+      }
+    });
+  } catch (const SDKError& e) {
+    require(joined && !connected && e.domain() == ErrorDomain::transport &&
+      (e.code() == ErrorCode::timeout || e.code() == ErrorCode::connection_lost),
+      "failure was not an expected media transport rejection");
+    passed(report, "opposite_protocol_rejected", {{"signaling_joined", joined}, {"error", e.what()},
+      {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count()}});
+    return;
+  }
+  throw std::runtime_error("opposite protocol unexpectedly connected or returned without transport failure");
+}
+
 int main(int argc, char** argv) {
   if (std::getenv("LIVEKIT_UAV_NATIVE_LOG")) {
     webrtc::LogMessage::LogToDebug(webrtc::LS_INFO);
     webrtc::LogMessage::SetLogToStderr(true);
   }
-  if (argc != 5) { std::cerr << "Usage: livekit_uav_requirements URL video|audio|dynacast CODEC OUTPUT_DIR\n"; return 2; }
+  if (argc != 5 && argc != 6) { std::cerr << "Usage: livekit_uav_requirements URL video|audio|dynacast|transport-reject CODEC OUTPUT_DIR [auto|udp|tcp]\n"; return 2; }
   const std::filesystem::path out(argv[4]); std::filesystem::create_directories(out);
   Json report{{"ok", false}, {"checks", Json::array()}, {"scenario", argv[2]}, {"codec", argv[3]}, {"device_acceptance", false}};
   try {
+    const std::string transport = argc == 6 ? argv[5] : "auto";
+    if (transport == "udp") test_transport = MediaTransport::udp_only;
+    else if (transport == "tcp") test_transport = MediaTransport::tcp_only;
+    else require(transport == "auto", "unknown media transport");
+    report["client_transport"] = transport;
     if (std::string(argv[2]) == "video") video_case(argv[1], argv[3], out, report);
-    else if (std::string(argv[2]) == "audio") audio_case(argv[1], out, report);
+    else if (std::string(argv[2]) == "audio") audio_case(argv[1], argv[3], out, report);
+    else if (std::string(argv[2]) == "mixed") audio_case(argv[1], argv[3], out, report, true);
     else if (std::string(argv[2]) == "dynacast") dynacast_case(argv[1], argv[3], out, report);
+    else if (std::string(argv[2]) == "transport-reject") transport_reject_case(argv[1], report);
     else throw std::runtime_error("unknown scenario");
     report["ok"] = true;
   } catch (const std::exception& e) { report["error"] = e.what(); std::cerr << e.what() << '\n'; }

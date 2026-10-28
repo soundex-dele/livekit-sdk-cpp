@@ -21,7 +21,7 @@ inline void update_capabilities(SessionCapabilities& capabilities,const Json& va
   if(value.contains("protocol"))capabilities.signal_protocol=value.at("protocol").get<int>();
   if(value.contains("subscriberPrimary"))capabilities.subscriber_primary=value.at("subscriberPrimary").get<bool>();
   if(value.contains("relayOnly"))capabilities.relay_only=value.at("relayOnly").get<bool>();
-  capabilities.single_peer_connection=false;
+  if(value.contains("singlePeerConnection"))capabilities.single_peer_connection=value.at("singlePeerConnection").get<bool>();
   if(value.contains("server")) {
     const auto& server=value.at("server");capabilities.server={};
     capabilities.server.version=server.value("version","");capabilities.server.region=server.value("region","");

@@ -1,6 +1,7 @@
 #include "engines/rtc/rpc_session.hpp"
 #include "engines/rtc/data_messages.hpp"
 #include "livekit/error.hpp"
+#include "support/compression.hpp"
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
@@ -165,6 +166,7 @@ std::future<std::string> RpcSession::call(const RpcCallOptions& options){
     request->ack_deadline=now+7s;request->stop=options.stop;
     const auto id=request_id();livekit::DataPacket packet;packet.add_destination_identities(options.destination_identity);
     auto* wire=packet.mutable_rpc_request();wire->set_id(id);wire->set_method(options.method);wire->set_payload(options.payload);wire->set_version(1);
+    if(options.compress){wire->clear_payload();wire->set_compressed_payload(deflate_raw(options.payload));}
     wire->set_response_timeout_ms(static_cast<uint32_t>(std::max(1000ms,options.response_timeout-7000ms).count()));
     std::lock_guard lock(state_->mutex);
     if(!state_->active)throw failure(RpcErrorCode::recipient_disconnected);
@@ -190,7 +192,8 @@ void RpcSession::receive(const livekit::DataPacket& packet){
     else if(!request.acknowledged&&now>=request.ack_deadline)terminal=std::make_exception_ptr(failure(RpcErrorCode::connection_timeout));
     if(terminal){request.promise.set_exception(terminal);state_->outgoing.erase(found);return;}
     if(packet.has_rpc_ack()){request.acknowledged=true;return;}
-    const auto& response=packet.rpc_response();
+    auto response=packet.rpc_response();
+    if(response.has_compressed_payload())try{response.set_payload(inflate_raw(response.compressed_payload(),max_payload));}catch(...){request.promise.set_exception(std::make_exception_ptr(failure(RpcErrorCode::response_payload_too_large)));state_->outgoing.erase(found);return;}
     if(response.has_error()){
       const auto& error=response.error();
       if(error.message().size()>256||error.data().size()>max_payload||!valid_utf8(error.message())||!valid_utf8(error.data()))return;
@@ -201,7 +204,10 @@ void RpcSession::receive(const livekit::DataPacket& packet){
     state_->outgoing.erase(found);return;
   }
   if(!packet.has_rpc_request())return;
-  const auto& wire=packet.rpc_request();if(!identifier(wire.id(),128))return;
+  auto wire=packet.rpc_request();if(!identifier(wire.id(),128))return;
+  if(!wire.compressed_payload().empty())try{wire.set_payload(inflate_raw(wire.compressed_payload(),max_payload));wire.clear_compressed_payload();}catch(...){
+    livekit::DataPacket rejected;rejected.add_destination_identities(sender);auto* response=rejected.mutable_rpc_response();response->set_request_id(wire.id());response->mutable_error()->set_code(uint32_t(RpcErrorCode::request_payload_too_large));response->mutable_error()->set_message("Invalid or oversized compressed RPC payload");state_->enqueue(std::move(rejected));return;
+  }
   const Key key{sender,wire.id()};
   livekit::DataPacket ack;ack.add_destination_identities(sender);ack.mutable_rpc_ack()->set_request_id(wire.id());
   if(!state_->enqueue(std::move(ack)))return;

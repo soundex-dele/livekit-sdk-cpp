@@ -121,6 +121,23 @@ struct TriggerFrames {
     auto frame = frames.front(); frames.pop_front(); return frame;
   }
 };
+// The test owns the whole graph, just like MediaPump. Only the source and sink
+// differ: generated frames enter through a test node and packets are collected.
+struct TestVideoGraph {
+  std::shared_ptr<MediaEventNode<RawVideoFrame>> source;
+  RtcPipeline pipeline;
+  TestVideoGraph(const std::shared_ptr<RtcGraph>& graph, TriggerFrames& frames)
+      : source(std::make_shared<MediaEventNode<RawVideoFrame>>("TestVideoSourceNode", NodeExecution::source)),
+        pipeline(graph) {
+    auto encoder = create_video_encoder_node();
+    auto sink = std::make_shared<MediaEventNode<EncodedVideoFrame>>("TestEncodedSinkNode", NodeExecution::sink,
+        [&frames](EncodedVideoFrame& event) { frames.push(event.frame); });
+    pipeline.build({source, encoder, sink}, {
+      RtcPipeline::connect<RawVideoFrame>(source, encoder),
+      RtcPipeline::connect<EncodedVideoFrame>(encoder, sink)});
+    check(pipeline.start(), "test video graph starts");
+  }
+};
 static void graph_driven_video() {
   auto env = CreateEnvironment(); auto graph = std::make_shared<RtcGraph>();
   int displayed = 0;
@@ -149,18 +166,18 @@ static void graph_driven_video() {
   encoder->SetRates(VideoEncoder::RateControlParameters(allocation, 30));
   encoder2->SetRates(VideoEncoder::RateControlParameters(allocation, 30));
   TriggerFrames triggers, triggers2;
-  auto sender = std::make_unique<GraphVideoSender>(graph, [&](const auto& frame) { triggers.push(frame); });
-  auto sender2 = std::make_unique<GraphVideoSender>(graph, [&](const auto& frame) { triggers2.push(frame); });
-  check(has_edge(graph, "VideoEncodeInputNode", "VideoEncoderNode", "RawVideoFrame") &&
-        has_edge(graph, "VideoEncoderNode", "VideoTrackInputNode", "EncodedVideoFrame"),
-        "GraphEngine connects raw input, real encoder and native track output");
+  auto sender = std::make_unique<TestVideoGraph>(graph, triggers);
+  auto sender2 = std::make_unique<TestVideoGraph>(graph, triggers2);
+  check(has_edge(graph, "TestVideoSourceNode", "VideoEncoderNode", "RawVideoFrame") &&
+        has_edge(graph, "VideoEncoderNode", "TestEncodedSinkNode", "EncodedVideoFrame"),
+        "test source and sink connect directly to the embedded encoder");
   check(has_edge(graph, "RtcEncodedSourceNode", "VideoDecoderNode", "VideoDecodeRequest") &&
         has_edge(graph, "VideoDecoderNode", "VideoPresentNode", "RawVideoFrame") &&
         has_edge(graph, "VideoPresentNode", "VideoRenderNode", "RawVideoFrame"),
         "one GraphEngine connects encoded ingress, decoder, presentation and renderer");
   auto push = [&](auto& source) {
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    auto frame = video_frame(); frame.set_timestamp_us(env.clock().CurrentTime().us()); source->submit(frame);
+    auto frame = video_frame(); frame.set_timestamp_us(env.clock().CurrentTime().us()); source->source->emit(RawVideoFrame(frame));
   };
   std::vector<VideoFrameType> delta{VideoFrameType::kVideoFrameDelta}, key{VideoFrameType::kVideoFrameKey};
   // Probe obtains the negotiated codec, bound by source identity in its buffer.
@@ -213,16 +230,61 @@ static void graph_driven_video() {
   check(encoded.count == before_rate_recovery + 6,
         "observed low framerate must not throttle a recovering live source");
   encoder->SetRates(VideoEncoder::RateControlParameters(allocation, 30));
-  sender->pause(); sender->resume();
+  sender->pipeline.stop();
+  const auto stopped_drops = sender->source->dropped.load();
+  push(sender);
+  check(sender->source->dropped == stopped_drops + 1, "stopped graph rejects new test frames");
+  { std::lock_guard lock(triggers.mutex); check(triggers.frames.empty(), "no output after graph stop"); }
+  check(sender->pipeline.start(), "restart embedded encoder graph");
   push(sender); encoder->Encode(triggers.take(), &delta); // new source binding probe
   push(sender); encoder->Encode(triggers.take(), &delta);
   check(encoded.frame->_frameType == VideoFrameType::kVideoFrameKey, "source pause/resume rebuilds codec safely");
-  sender->pause(); sender2->pause();
+  sender->pipeline.stop(); sender2->pipeline.stop();
+  sender->pipeline.release(); sender2->pipeline.release();
+  check(sender->source->state() == graphflow::core::LifecycleState::Released, "outer graph releases source");
+  const auto released_drops = sender->source->dropped.load();
+  push(sender);
+  check(sender->source->dropped == released_drops + 1, "released graph rejects new test frames");
   sender.reset(); sender2.reset();
   encoder.reset(); encoder2.reset(); decoder->Release(); decoder.reset();
   graph->unbind_video(receiver.get()); receiver->stop(); receiver.reset();
   check(graph->snapshot().empty(), "native envelope weak leases do not retain graph nodes");
 }
+
+static void audio_video_clock() {
+  auto graph=std::make_shared<RtcGraph>();graph->bind_sync("audio","alice",{1});graph->bind_sync("video","alice",{2});graph->bind_sync("other","bob",{3});
+  graph->audio_device_delay_us=20000;graph->audio_playout(1,1000,2000000);
+  check(graph->video_playout("video",1010,2000100)==2030000,"audio device delay and media clock mapping");
+  check(!graph->video_playout("other",1010,2000100),"participant clocks remain isolated");
+  check(!graph->video_playout("video",1010,4000000),"stale audio clock falls back");graph->close();check(!graph->video_playout("video",1010,2000100),"rejoin clears clock state");
+}
+static void simulcast_video() {
+  auto env=CreateEnvironment();auto graph=std::make_shared<RtcGraph>();
+  PeerConnectionFactoryDependencies deps;install_graph_codecs(deps,graph);
+  auto encoder=deps.video_encoder_factory->Create(env,SdpVideoFormat("VP8"));
+  VideoCodec config;config.codecType=kVideoCodecVP8;config.width=160;config.height=120;config.maxFramerate=30;
+  config.startBitrate=600;config.minBitrate=30;config.maxBitrate=1000;config.active=true;config.qpMax=56;config.mode=VideoCodecMode::kRealtimeVideo;
+  *config.VP8()=VideoEncoder::GetDefaultVp8Settings();config.numberOfSimulcastStreams=3;
+  for(int i=0;i<3;++i){auto& layer=config.simulcastStream[i];layer.width=40<<i;layer.height=30<<i;layer.maxFramerate=30;layer.numberOfTemporalLayers=1;layer.minBitrate=10;layer.targetBitrate=50<<i;layer.maxBitrate=100<<i;layer.qpMax=56;layer.active=true;}
+  struct Layers:EncodedImageCallback {std::map<int,EncodedImage> images;Result OnEncodedImage(const EncodedImage& image,const CodecSpecificInfo*)override{images[image.SimulcastIndex().value_or(0)]=image;return Result(Result::OK);}} layers;
+  check(encoder->InitEncode(&config,VideoEncoder::Settings(VideoEncoder::Capabilities(false),1,1200))==0,"simulcast init");encoder->RegisterEncodeCompleteCallback(&layers);
+  VideoBitrateAllocation rates;for(int i=0;i<3;++i)rates.SetBitrate(i,0,50000u<<i);encoder->SetRates(VideoEncoder::RateControlParameters(rates,30));
+  TriggerFrames triggers;TestVideoGraph sender(graph,triggers);std::vector<VideoFrameType> types(3,VideoFrameType::kVideoFrameDelta);
+  auto push=[&]{auto frame=video_frame();frame.set_timestamp_us(env.clock().CurrentTime().us());sender.source->emit(RawVideoFrame(frame));encoder->Encode(triggers.take(),&types);};
+  push();std::this_thread::sleep_for(std::chrono::milliseconds(40));push();
+  check(layers.images.size()==3,"three actual simulcast access units");
+  auto backend=builtin_codecs();
+  for(int i=0;i<3;++i){
+    struct Pixels:DecodedImageCallback {int width=0,height=0;int32_t Decoded(webrtc::VideoFrame& frame)override{width=frame.width();height=frame.height();return 0;}} pixels;
+    auto decoder=backend.video_decoder->Create(env,SdpVideoFormat("VP8"));VideoDecoder::Settings settings;settings.set_codec_type(kVideoCodecVP8);settings.set_number_of_cores(1);
+    check(decoder->Configure(settings),"simulcast decoder init");decoder->RegisterDecodeCompleteCallback(&pixels);
+    check(decoder->Decode(layers.images.at(i),0)==0,"independent simulcast decode");check(pixels.width==(40<<i)&&pixels.height==(30<<i),"independent layer dimensions");decoder->Release();
+  }
+  rates.SetBitrate(0,0,0);rates.SetBitrate(1,0,0);encoder->SetRates(VideoEncoder::RateControlParameters(rates,30));layers.images.clear();
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));push();check(layers.images.size()==1&&layers.images.contains(2),"inactive simulcast layers stop encoding");
+  sender.pipeline.release();encoder->Release();
+}
+
 #include "direct_receive_tests.inc"
 static void graph_encode_queues() {
   auto env = CreateEnvironment(); EncodeExecutor executor(env, "graph-queue-test", 1);
@@ -344,8 +406,9 @@ static void source_and_render() {
   while (capture->frames < 4 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(10));
   output.dispatch(); check(callbacks > 0, "local preview branch works without a sender");
   capture->stop(); check(capture->error().empty(), "capture succeeded");
-  auto nodes = graph->snapshot(); check(nodes.size() == 5, "capture/input/encoder/publish/render are separate engine nodes");
-  check(has_edge(graph, "VideoSourceNode", "VideoEncodeInputNode", "RawVideoFrame") &&
+  auto nodes = graph->snapshot(); check(nodes.size() == 4, "capture/encoder/WebRTC sink/render are separate engine nodes");
+  check(has_edge(graph, "VideoSourceNode", "VideoEncoderNode", "RawVideoFrame") &&
+        has_edge(graph, "VideoEncoderNode", "RtcVideoTrackSinkNode", "EncodedVideoFrame") &&
         has_edge(graph, "VideoSourceNode", "VideoRenderNode", "RawVideoFrame"), "capture fan-out uses graph edges");
   output.dispatch(); check(callbacks == 1, "no late preview after stop");
   const auto previous_frames = capture->frames.load();
@@ -413,7 +476,23 @@ static void recording() {
   std::filesystem::remove_all(directory);
 }
 int main() {
-  try { pcm_resampler_contract(); engine_routing(); channels(); audio_codecs(); graph_driven_video(); direct_receive_lifecycle(); receive_presentation_bounds(); receive_stop_barrier(); graph_encode_queues(); audio_device(); playback_only_audio_device(); source_and_render(); recording();
+  auto run = [](const char* name, auto test) { std::cerr << "Running " << name << std::endl; test(); };
+  try {
+    run("pcm_resampler_contract", pcm_resampler_contract);
+    run("engine_routing", engine_routing);
+    run("channels", channels);
+    run("audio_codecs", audio_codecs);
+    run("graph_driven_video", graph_driven_video);
+    run("simulcast_video", simulcast_video);
+    run("audio_video_clock", audio_video_clock);
+    run("direct_receive_lifecycle", direct_receive_lifecycle);
+    run("receive_presentation_bounds", receive_presentation_bounds);
+    run("receive_stop_barrier", receive_stop_barrier);
+    run("graph_encode_queues", graph_encode_queues);
+    run("audio_device", audio_device);
+    run("playback_only_audio_device", playback_only_audio_device);
+    run("source_and_render", source_and_render);
+    run("recording", recording);
     std::cout << "media graph codec/source/render/channel tests passed\n"; return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

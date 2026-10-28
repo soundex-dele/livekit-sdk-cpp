@@ -83,6 +83,9 @@ async def run(args):
         udp = free_port(socket.SOCK_DGRAM)
     config = root / 'server.yaml'
     config.write_text(f'port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n  tcp_port: {rtc}\n  udp_port: {udp}\n  use_external_ip: false\n  node_ip: 127.0.0.1\n  ips:\n    includes: [127.0.0.1/32]\n  enable_loopback_candidate: true\nkeys:\n  reconnect-test: reconnect-integration-secret-32-characters\nlogging:\n  level: info\n')
+    if args.media_transport != 'auto':
+        # Keep BOTH protocols available: only the C++ client policy chooses one.
+        config.write_text(config.read_text().replace('  level: info\n', '  level: debug\n  json: true\n'))
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     connections = set()
     requests = []
@@ -278,7 +281,8 @@ async def run(args):
                             *(['--video-source-rgba' if args.rgba else '--video-source'] if args.scenario == 'video-source' else []),
                             *(['--audio-source'] if args.scenario == 'audio-source' else []),
                             stdout=out, stderr=err, creationflags=flags,
-                            env=dict(os.environ, LIVEKIT_TEST_PROTOCOL=str(args.protocol)))
+                            env=dict(os.environ, LIVEKIT_TEST_PROTOCOL=str(args.protocol),
+                                     LIVEKIT_TEST_MEDIA_TRANSPORT=args.media_transport))
                         try:
                             code = await asyncio.wait_for(process.wait(), timeout=max(75, 30 + args.rounds * 4))
                         finally:
@@ -316,6 +320,29 @@ async def run(args):
                           distinctPublisherICEOffers=len(offer_ufrags), syncStates=sync_states,
                           clientSHA256=hashlib.sha256(Path(args.client).read_bytes()).hexdigest(),
                           serverSHA256=hashlib.sha256(Path(args.server).read_bytes()).hexdigest())
+            if args.media_transport != 'auto':
+                log.flush()
+                pairs = []
+                for line in (root / 'server.log').read_text(encoding='utf-8', errors='replace').splitlines():
+                    if 'selected ICE candidate pair changed' not in line:
+                        continue
+                    entry = json.loads(line[line.index('{'):])
+                    if entry.get('participant') == 'readiness':
+                        continue
+                    pair = entry['pair']
+                    assert pair.get('localProtocol') == pair.get('remoteProtocol') == args.media_transport, entry
+                    assert pair.get('localCandidateType') in ('host', 'srflx', 'prflx'), entry
+                    assert pair.get('remoteCandidateType') in ('host', 'srflx', 'prflx'), entry
+                    pairs.append({'participant': entry.get('participant'), 'sid': entry.get('participantID'),
+                                  'transport': entry.get('transport'), **pair})
+                expected = ({('subscriber', 'PUBLISHER'), ('subscriber', 'SUBSCRIBER'), ('publisher', 'PUBLISHER')}
+                            if args.scenario == 'resume' else
+                            {('publisher', 'PUBLISHER'), ('publisher', 'SUBSCRIBER'), ('observer', 'PUBLISHER'), ('observer', 'SUBSCRIBER')})
+                assert expected <= {(p['participant'], p['transport']) for p in pairs}, pairs
+                if args.scenario in ('rejoin', 'restart'):
+                    assert len({p['sid'] for p in pairs if p['participant'] == 'publisher'}) >= 3, pairs
+                report['mediaTransport'] = args.media_transport
+                report['selectedPairs'] = pairs
             if args.scenario == 'region':
                 report['trustedRegionRejoin'] = True
             if args.scenario == 'resume-disabled':
@@ -344,9 +371,12 @@ if __name__ == '__main__':
     parser.add_argument('--rounds', type=int, default=2)
     parser.add_argument('--rgba', action='store_true', help='Exercise rotated RGBA input in video-source scenario')
     parser.add_argument('--protocol', type=int, choices=[12, 15], default=12, help='Signal protocol for resume scenario')
+    parser.add_argument('--media-transport', choices=['auto', 'udp', 'tcp'], default='auto')
     args = parser.parse_args()
     if args.rgba and args.scenario != 'video-source':
         parser.error('--rgba requires --scenario video-source')
     if args.protocol != 12 and args.scenario != 'resume':
         parser.error('--protocol applies to the resume scenario; operations always uses 15')
+    if args.media_transport != 'auto' and args.scenario not in ('resume', 'rejoin', 'restart'):
+        parser.error('--media-transport applies to resume/rejoin/restart')
     asyncio.run(run(args))

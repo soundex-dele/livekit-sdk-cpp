@@ -1,11 +1,13 @@
 #pragma once
 #include "api/video_codecs/video_decoder.h"
 #include <string>
+#include <atomic>
 
 namespace livekit::sdk::detail {
 // Backend-facing lease; keeps codec adapters independent of SDK output targets.
 class VideoDecodeTarget {
  public:
+  std::atomic<bool> keyframe_requested{false};
   virtual ~VideoDecodeTarget() = default;
   virtual uint64_t generation() const = 0;
   virtual int decode(uint64_t generation, webrtc::VideoDecoder& codec,

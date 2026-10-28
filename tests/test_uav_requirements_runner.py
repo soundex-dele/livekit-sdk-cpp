@@ -37,6 +37,35 @@ class EvidenceTests(unittest.TestCase):
         rows[0] = self.row("drone", "PUBLISHER", kind="relay")
         self.assertEqual(self.pairs(rows)["status"], "FAIL")
 
+    def test_missing_candidate_type_is_not_proof_of_direct_transport(self):
+        rows = self.valid()
+        del rows[0]["pair"]["remoteCandidateType"]
+        self.assertEqual(self.pairs(rows)["status"], "FAIL")
+
+    def test_negative_transport_test_rejects_any_selected_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text("")
+            self.assertEqual(protocol_evidence(log, "udp", "transport-reject")["status"], "PASS")
+            log.write_text(json.dumps({"msg": "selected ICE candidate pair changed", **self.valid()[0]}))
+            self.assertEqual(protocol_evidence(log, "udp", "transport-reject")["status"], "FAIL")
+
+    def test_udp_media_failure_is_not_hidden_as_untested(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            report = {"started_at": "test", "scenarios": [{"protocol": "udp", "scenario": "video",
+                "codec": "h264", "folder": "udp-video-h264", "ok": False, "error": "no decoded video"}]}
+            finish(report, Path(directory))
+            for rid in ("V-01", "V-02", "V-04", "V-13", "Q-05"):
+                self.assertIn(rid, report["gaps"])
+
+    def test_negative_failure_is_assigned_to_client_policy(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            report = {"started_at": "test", "scenarios": [{"protocol": "udp", "scenario": "transport-reject",
+                "codec": "h264", "folder": "udp-transport-reject-h264", "ok": False}]}
+            finish(report, Path(directory))
+            self.assertIn("B-07", report["gaps"])
+            self.assertNotIn("V-13", report["gaps"])
+
     def test_setup_failure_preserves_all_untested_requirements(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             report = {"started_at": "test", "setup_error": "build failed"}
@@ -46,6 +75,15 @@ class EvidenceTests(unittest.TestCase):
             self.assertTrue(all(r["status"] == "未测" for r in report["requirements"]))
             self.assertFalse(report["full_acceptance"])
             self.assertFalse(report["gaps"])
+
+    def test_successful_smoke_does_not_erase_known_implementation_gaps(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            report = {"started_at": "test", "sha256": {"server": "test-build"}, "scenarios": []}
+            finish(report, Path(directory))
+            for rid in ("V-12", "Q-06", "Q-07", "Q-08", "P-11", "N-09"):
+                self.assertIn(rid, report["source_assessment_gaps"])
+                self.assertIn(rid, report["gaps"])
+            self.assertFalse(report["full_acceptance"])
 
     def test_failed_h265_probe_cannot_be_counted_as_success(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):

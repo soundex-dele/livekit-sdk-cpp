@@ -1,3 +1,5 @@
+#include <array>
+#include "backends/webrtc/graph_video_encoder.hpp"
 #include "media_nodes/capture/capture_source.hpp"
 #include "media_nodes/capture/capture.hpp"
 #include "media_graph/video_events.hpp"
@@ -31,6 +33,7 @@ CaptureNode::CaptureNode(MediaSpec value)
       spec.width % 2 || spec.height % 2 || spec.fps < 1 || spec.fps > 240 ||
       (spec.capture != livekit::sdk::CaptureKind::input && !spec.video))
     throw std::invalid_argument("Invalid capture format (even dimensions 2..8192, fps 1..240 required)");
+  if(spec.encoded_source)external_encoded_=std::make_shared<livekit::sdk::detail::EncodedSourceReader>(spec.encoded_source);
   if (spec.video_source) external_video_ = std::make_unique<livekit::sdk::detail::I420SourceReader>(spec.video_source);
   if (spec.audio_source) external_audio_ = std::make_unique<livekit::sdk::detail::PcmSourceReader>(spec.audio_source);
 }
@@ -41,6 +44,7 @@ bool CaptureNode::doStart() {
   return true;
 }
 void CaptureNode::activate() {
+  if(external_encoded_&&!thread_.joinable()){external_stop_=std::stop_source{};external_encoded_->start();}
   if (external_video_ && !thread_.joinable()) { external_stop_ = std::stop_source{}; external_video_->start(); }
   if (external_audio_ && !thread_.joinable()) { external_stop_ = std::stop_source{}; external_audio_->start(); }
   if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
@@ -50,6 +54,7 @@ void CaptureNode::doStop() {
   external_stop_.request_stop();
   if (external_video_) external_video_->stop();
   if (external_audio_) external_audio_->stop();
+  if (external_encoded_) external_encoded_->stop();
   { std::lock_guard lock(mutex_); if (process_) process_->terminate(); }
   if (thread_.joinable()) thread_.join();
 }
@@ -59,6 +64,17 @@ void CaptureNode::deliver(const webrtc::VideoFrame& frame) {
 std::string CaptureNode::error() const { std::lock_guard lock(mutex_); return error_; }
 void CaptureNode::run() {
   try {
+    if(external_encoded_&&spec.video){
+      while(!stop_){auto frame=external_encoded_->read(external_stop_.get_token());if(!frame)break;
+        ++inputs;publish(livekit::sdk::detail::EncodedVideoFrame(livekit::sdk::detail::external_encoded_video(std::move(*frame),external_encoded_)));++outputs;++frames;
+      }finished_=true;return;
+    }
+    if(external_encoded_&&!spec.video){
+      std::mutex mutex;std::condition_variable_any pace;std::unique_lock lock(mutex);std::array<int16_t,480> silence{};auto next=std::chrono::steady_clock::now();
+      while(!stop_){++inputs;publish(livekit::sdk::detail::PcmFrame(silence.data(),16,48000,1,480));++outputs;++frames;next+=std::chrono::milliseconds(10);
+        pace.wait_until(lock,external_stop_.get_token(),next,[&]{return stop_.load();});
+      }finished_=true;return;
+    }
     if (external_audio_) {
       using namespace std::chrono_literals;
       const auto format = spec.audio_source->options();

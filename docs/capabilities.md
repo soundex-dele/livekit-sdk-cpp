@@ -11,7 +11,9 @@ if (local.support(livekit::sdk::ClientFeature::rpc) ==
 const auto current = room.capabilities();
 ```
 
-`Room::capabilities()` 返回线程安全的当前会话快照：generation、是否 connected、已接受 JoinResponse 使用的信令版本、subscriber-primary、实际配置的 relay-only，以及当前 dual-PC 模式。尚未收到 JoinResponse、完整 rejoin 等待期间和断开后，未知字段保持 `nullopt`；恢复原会话时保留已知策略并将 connected 置 false。不能把 relay-only 配置当成实际选中 TURN candidate 的证明。
+`Room::capabilities()` 返回线程安全的当前会话快照：generation、是否 connected、已接受 JoinResponse 使用的信令版本、subscriber-primary、实际配置的 relay-only，以及当前 single/dual-PC 模式。尚未收到 JoinResponse、完整 rejoin 等待期间和断开后，未知字段保持 `nullopt`；恢复原会话时保留已知策略并将 connected 置 false。不能把 relay-only 配置当成实际选中 TURN candidate 的证明。
+
+可选择协议 12、15、17；单 PC 要求 17。文本/字节流、DataTrack、媒体/数据 E2EE、Simulcast、编码媒体、RTP 观察和控制执行器已提供本地实现，各项支持范围见 [RTC 客户端扩展](client-extensions.md)。
 
 `server` 中的版本、区域和 advertised_protocol 来自官方 ServerInfo；老服务端版本可来自已废弃的 server_version 字段。服务端声明 protocol 18 不会将本地协议 12 自动升级到 18。`enabled_publish_codecs` 是服务器发布策略列表，不是某条轨道实际协商、编码或解码的 codec。服务端省略列表时为 `nullopt`，不会猜测为全部允许或全部禁止。
 
