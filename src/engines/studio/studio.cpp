@@ -1,5 +1,5 @@
 #include "internal.hpp"
-#include "livekit/player.hpp"
+#include "studio_graph.hpp"
 #include <windows.h>
 #include <objbase.h>
 #include <nlohmann/json.hpp>
@@ -15,57 +15,28 @@ using namespace studio_detail;
 using Json=nlohmann::json;
 namespace {
 void validate(const StudioScene&s){if(s.sources.size()>32)throw std::invalid_argument("最多支持 32 个素材");std::set<std::string>ids;for(const auto&v:s.sources){if(v.id.empty()||!ids.insert(v.id).second)throw std::invalid_argument("素材 ID 无效或重复");auto&t=v.transform;for(float f:{t.x,t.y,t.width,t.height,t.rotation,t.crop_left,t.crop_top,t.crop_right,t.crop_bottom,v.volume,v.chroma.similarity,v.chroma.smoothness,v.chroma.spill})if(!std::isfinite(f))throw std::invalid_argument("无效素材参数");if(t.width<=0||t.height<=0||t.width>8||t.height>8||std::abs(t.x)>8||std::abs(t.y)>8||t.crop_left<0||t.crop_right<0||t.crop_top<0||t.crop_bottom<0||t.crop_left+t.crop_right>=1||t.crop_top+t.crop_bottom>=1||v.volume<0||v.volume>4)throw std::invalid_argument("素材变换或音量超出范围");for(float f:v.color)if(!std::isfinite(f)||f<0||f>1)throw std::invalid_argument("无效颜色");}}
-float peak(const std::vector<float>&samples){float p=0;for(float v:samples)p=std::max(p,std::abs(v));return p;}
-std::vector<float>take(std::deque<float>&q,size_t n=960){std::vector<float>out(n);for(size_t i=0;i<n&&!q.empty();++i){out[i]=q.front();q.pop_front();}return out;}
 void append(std::deque<float>&q,const std::vector<float>&p){q.insert(q.end(),p.begin(),p.end());while(q.size()>19200)q.pop_front();}
-PcmSourceOptions audioOptions(){PcmSourceOptions o;o.channels=2;o.max_queue_duration=std::chrono::milliseconds(60);o.format=AudioSampleFormat::float32;return o;}
 }
-struct Studio::Impl {
- StudioOptions options;mutable std::mutex mutex;StudioScene scene;StudioAudioSettings settings;StudioSnapshot status;
- std::map<std::string,std::chrono::steady_clock::time_point>remoteSeen;std::map<std::string,std::shared_ptr<const StudioImage>>remoteVideo;std::map<std::string,std::deque<float>>remoteAudio;
- std::shared_ptr<I420VideoSource>programVideo,localVideo;std::shared_ptr<PcmAudioSource>programAudio,localAudio;
- bool recordWanted=false;std::filesystem::path recordPath;std::atomic<bool>stop{false};std::jthread worker;
- struct Source {StudioSource spec;std::unique_ptr<Capture>capture;std::unique_ptr<Player>player;std::shared_ptr<const StudioImage>image;std::deque<float>audio;std::string error;std::chrono::steady_clock::time_point attempt=std::chrono::steady_clock::now();};
- explicit Impl(StudioOptions o):options(o){if((o.width!=1280||o.height!=720)&&(o.width!=720||o.height!=1280)&&(o.width!=1920||o.height!=1080)&&(o.width!=1080||o.height!=1920))throw std::invalid_argument("请选择 720p 或 1080p 横竖屏");if(o.fps!=30)throw std::invalid_argument("首版帧率为 30 fps");I420SourceOptions v;v.width=o.width;v.height=o.height;programVideo=std::make_shared<I420VideoSource>(v);localVideo=std::make_shared<I420VideoSource>(v);programAudio=std::make_shared<PcmAudioSource>(audioOptions());localAudio=std::make_shared<PcmAudioSource>(audioOptions());worker=std::jthread([this]{run();});}
- ~Impl(){stop=true;if(worker.joinable())worker.join();programVideo->close();localVideo->close();programAudio->close();localAudio->close();}
- void run(){HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);std::unique_ptr<Recorder>recorder;try{
-  Compositor compositor(options.width,options.height,options.software_gpu);std::map<std::string,Source>sources;std::unique_ptr<AudioCapture>mic,system;std::unique_ptr<Monitor>monitor;auto nextAudio=std::chrono::steady_clock::now(),nextVideo=nextAudio,deviceRetry=nextAudio;auto videoStep=std::chrono::microseconds(1000000/options.fps);
-  while(!stop){StudioScene current;StudioAudioSettings audio;bool recording;std::filesystem::path path;std::map<std::string,std::shared_ptr<const StudioImage>>remote;
-   {std::lock_guard lock(mutex);current=scene;audio=settings;recording=recordWanted;path=recordPath;auto now=std::chrono::steady_clock::now();std::erase_if(remoteSeen,[&](const auto&e){if(now-e.second<std::chrono::seconds(5))return false;remoteVideo.erase(e.first);remoteAudio.erase(e.first);return true;});remote=remoteVideo;}
-   if(recording&&!recorder){try{recorder=std::make_unique<Recorder>(path,options.width,options.height,options.fps);std::lock_guard lock(mutex);status.recording=true;status.recording_path=path.string();}catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();recordWanted=false;}}
-   if(!recording&&recorder){try{recorder->finish();}catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();}recorder.reset();std::lock_guard lock(mutex);status.recording=false;}
-   if(std::chrono::steady_clock::now()>=deviceRetry){deviceRetry=std::chrono::steady_clock::now()+std::chrono::seconds(5);if(mic&&!mic->error().empty())mic.reset();if(system&&!system->error().empty())system.reset();if(monitor&&!monitor->error().empty())monitor.reset();}
-   if(audio.microphone&&!mic)mic=std::make_unique<AudioCapture>(false);if(!audio.microphone)mic.reset();if(audio.system&&!system)system=std::make_unique<AudioCapture>(true);if(!audio.system)system.reset();if(audio.monitor&&!monitor)monitor=std::make_unique<Monitor>();if(!audio.monitor)monitor.reset();
-   std::set<std::string>active;std::map<std::string,std::string>errors;if(monitor&&!monitor->error().empty())errors["monitor"]=monitor->error();
-   for(const auto&s:current.sources){if(s.kind==StudioSourceKind::remote||!s.visible)continue;active.insert(s.id);auto it=sources.find(s.id);if(it!=sources.end()&&(it->second.spec.kind!=s.kind||it->second.spec.input!=s.input||it->second.spec.color!=s.color||(!it->second.error.empty()&&std::chrono::steady_clock::now()-it->second.attempt>std::chrono::seconds(5))))sources.erase(it);
-    auto[entry,inserted]=sources.try_emplace(s.id);auto&source=entry->second;auto previousError=source.error;
-    if(inserted){source.spec=s;try{if(s.kind==StudioSourceKind::camera||s.kind==StudioSourceKind::screen||s.kind==StudioSourceKind::window)source.capture=std::make_unique<Capture>(s);else if(s.kind==StudioSourceKind::image)source.image=load_image(s.input);else if(s.kind==StudioSourceKind::text)source.image=text_image(s.input,s.color);else if(s.kind==StudioSourceKind::video){source.player=std::make_unique<Player>();source.player->open(s.input).get();source.player->play().get();}else{auto img=std::make_shared<StudioImage>();img->width=img->height=2;img->rgba.resize(16);for(int p=0;p<4;++p)for(int c=0;c<4;++c)img->rgba[p*4+c]=uint8_t(s.color[c]*255);source.image=img;}}catch(const std::exception&e){source.error=e.what();}}
-    source.spec=s;if(source.capture){source.error=source.capture->error();if(source.error.empty())source.image=source.capture->frame();}
-    if(source.player){while(auto frame=source.player->poll_video()){auto img=std::make_shared<StudioImage>();img->width=frame->width;img->height=frame->height;img->rgba.resize(size_t(img->width)*img->height*4);for(int y=0;y<img->height;++y)memcpy(img->rgba.data()+size_t(y)*img->width*4,frame->rgba->data()+size_t(y)*frame->stride,size_t(img->width)*4);source.image=img;}while(auto frame=source.player->poll_audio())append(source.audio,*frame->pcm);auto p=source.player->snapshot();if(p.state==PlayerState::ended&&s.loop){source.player->seek(std::chrono::microseconds(0)).get();source.player->play().get();}if(!p.error.empty())source.error=p.error;}
-    if(!source.error.empty()){if(source.error!=previousError)source.image.reset();errors[s.id]=source.error;if(!source.image)source.image=text_image("素材不可用 · 正在重试",{.7f,.72f,.78f,1});}
-   }
-   std::erase_if(sources,[&](auto&entry){return !active.contains(entry.first);});
-   auto now=std::chrono::steady_clock::now();int catchup=0;
-   while(now>=nextAudio&&catchup++<10){std::vector<float>mixed(960),micSamples(960),systemSamples(960);if(mic){micSamples=mic->take(480);if(!mic->error().empty())errors["microphone"]=mic->error();}if(system){systemSamples=system->take(480);if(!system->error().empty())errors["system"]=system->error();}studio_mix(mixed,micSamples,audio.microphone_volume);studio_mix(mixed,systemSamples,audio.system_volume);for(auto&[id,s]:sources){auto samples=take(s.audio);if(!s.spec.muted)studio_mix(mixed,samples,audio.media_volume*s.spec.volume);}for(auto&v:mixed)v=std::clamp(v,-1.f,1.f);PcmInputFrame input;input.capture_time=nextAudio;input.float_samples=mixed;localAudio->write(input);std::vector<float>returnAudio(960);{std::lock_guard lock(mutex);for(auto&[id,q]:remoteAudio)studio_mix(returnAudio,take(q),audio.remote_volume);}studio_mix(mixed,returnAudio,1);for(auto&v:mixed)v=std::clamp(v,-1.f,1.f);input.float_samples=mixed;programAudio->write(input);if(monitor)monitor->write(returnAudio);
-    if(recorder){try{recorder->audio(mixed,nextAudio);}catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();recordWanted=false;}}
-    {std::lock_guard lock(mutex);status.microphone_peak=peak(micSamples)*audio.microphone_volume;status.system_peak=peak(systemSamples)*audio.system_volume;status.output_peak=peak(mixed);}nextAudio+=std::chrono::milliseconds(10);
-   }
-   if(now-nextAudio>std::chrono::milliseconds(100))nextAudio=now;
-   if(now>=nextVideo){Layers local,program;for(auto&s:current.sources){std::shared_ptr<const StudioImage>image;if(s.kind==StudioSourceKind::remote){auto it=remote.find(s.input);if(it!=remote.end())image=it->second;}else{auto it=sources.find(s.id);if(it!=sources.end())image=it->second.image;}if(image){program.emplace_back(s,image);if(s.kind!=StudioSourceKind::remote)local.emplace_back(s,image);}}
-    auto localImage=std::make_shared<StudioImage>(compositor.render(local));
-    // Interactive output uses a clean full-canvas local feed; return feeds are
-    // placed only in the program. This also makes PK layouts non-recursive.
-    bool explicitRemote=std::any_of(current.sources.begin(),current.sources.end(),[](const auto&s){return s.kind==StudioSourceKind::remote;});
-    if(!remote.empty()&&!explicitRemote){program.clear();StudioSource base;base.id="program-local";base.transform={0,0,.5f,1};program.emplace_back(base,localImage);int i=0;for(auto&[id,image]:remote){StudioSource tile;tile.id=id;tile.transform={.5f,float(i)/float(remote.size()),.5f,1.f/float(remote.size())};program.emplace_back(tile,image);++i;}}
-    auto composed=(remote.empty()&&local.size()==program.size())?localImage:std::make_shared<StudioImage>(compositor.render(program));auto video=to_i420(*composed);auto result=programVideo->write(video);localVideo->write(composed==localImage?video:to_i420(*localImage));
-    if(recorder){try{recorder->video(*composed,now);}catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();recordWanted=false;}}
-    {std::lock_guard lock(mutex);status.preview=composed;status.frames++;if(result==VideoWriteStatus::backpressure&&programVideo->stats().attached)status.dropped++;status.source_errors=errors;}nextVideo+=videoStep;if(now-nextVideo>videoStep){std::lock_guard lock(mutex);status.dropped+=uint64_t((now-nextVideo)/videoStep);nextVideo=now+videoStep;}
-   }
-   std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  }
- }catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();}
- if(recorder){try{recorder->finish();}catch(const std::exception&e){std::lock_guard lock(mutex);status.error=e.what();}}
- {std::lock_guard lock(mutex);status.recording=false;}if(SUCCEEDED(com))CoUninitialize();
+struct Studio::Impl : StudioGraphState {
+ std::atomic<bool> stop{false};
+ std::jthread worker;
+ explicit Impl(StudioOptions options):StudioGraphState(options),worker([this]{run();}){}
+ ~Impl(){
+  stop=true;if(worker.joinable())worker.join();
+  programVideo->close();localVideo->close();programAudio->close();localAudio->close();
+ }
+ void run(){
+  HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+  try{
+   if(FAILED(com))throw std::runtime_error("Studio COM initialization failed");
+   StudioGraph graph(*this);
+   graph.start();
+   while(!stop){graph.step();std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+   graph.stop();
+   // Graph-owned D3D, captures and recorder are released before CoUninitialize.
+  }catch(const std::exception& e){std::lock_guard lock(mutex);status.error=e.what();}
+  {std::lock_guard lock(mutex);status.recording=false;}
+  if(SUCCEEDED(com))CoUninitialize();
  }
 };
 Studio::Studio(StudioOptions o):impl_(std::make_unique<Impl>(o)){}Studio::~Studio()=default;
