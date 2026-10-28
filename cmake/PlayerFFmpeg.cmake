@@ -1,3 +1,4 @@
+include_guard(GLOBAL)
 set(LIVEKIT_FFMPEG_ROOT "" CACHE PATH "FFmpeg shared prefix (include and lib or bin)")
 find_path(LIVEKIT_FFMPEG_INCLUDE libavformat/avformat.h HINTS "${LIVEKIT_FFMPEG_ROOT}/include" REQUIRED)
 foreach(component avformat avcodec avutil swscale swresample)

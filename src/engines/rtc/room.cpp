@@ -285,7 +285,9 @@ class Peer : public webrtc::PeerConnectionObserver, public webrtc::DataChannelOb
     detail::await_native(set_result, socket_.stop_token(), deadline); last_local = result; return result;
   }
   void ice(const livekit::TrickleRequest& request) {
-    if (request.final() || request.candidateinit().empty()) return;
+    // LiveKit may mark the last actual candidate as final. In a TCP-only
+    // deployment this can be the sole usable candidate, not an empty marker.
+    if (request.candidateinit().empty()) return;
     if (!remote_set_) pending_ice_.push_back(request.candidateinit()); else add_ice(request.candidateinit());
   }
  private:
@@ -487,7 +489,10 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
     };
     auto add_track = [&](webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track, const MediaSpec* spec, const livekit::sdk::TrackPublishOptions& publication = {}) {
       webrtc::RtpTransceiverInit init; init.direction = webrtc::RtpTransceiverDirection::kSendOnly; init.stream_ids = {publication.stream.empty() ? "livekit-sdk" : publication.stream};
-      webrtc::RtpEncodingParameters encoding; encoding.max_bitrate_bps = track->kind() == "video" ? 2000000 : 64000; init.send_encodings.push_back(encoding);
+      webrtc::RtpEncodingParameters encoding;
+      encoding.max_bitrate_bps = track->kind() == "video" ? 2000000 : 64000;
+      if (spec && spec->video) encoding.max_framerate = spec->fps;
+      init.send_encodings.push_back(encoding);
       auto result = publisher->pc->AddTransceiver(track, init);
       if (!result.ok()) throw std::runtime_error(result.error().message());
       if (track->kind() == "audio" && publication.disable_red) {

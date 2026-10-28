@@ -122,6 +122,7 @@ def run_case(server, client, root, protocol, scenario, codec):
         f"  force_tcp: {'true' if protocol == 'tcp' else 'false'}\n"
         "  allow_tcp_fallback: false\n  allow_udp_unstable_fallback: false\n"
         "  turn_servers: []\n  use_external_ip: false\n  node_ip: 127.0.0.1\n"
+        "  ips:\n    includes: [127.0.0.1/32]\n"
         "  enable_loopback_candidate: true\nturn:\n  enabled: false\nkeys:\n"
         "  uav-test: uav-local-test-secret-at-least-32-characters\n"
         "logging:\n  level: debug\n  json: true\n", encoding="utf-8")
@@ -197,6 +198,9 @@ def finish(report, root):
               "audio": [r for r in scenarios if r["scenario"] == "audio"],
               "h265": [r for r in scenarios if r["codec"] == "h265"]}
     gaps = {}
+    for r in groups["tcp"]:
+        if not r.get("ok"):
+            gaps["B-07"] = "本次 TCP 媒体子项失败：" + str(r.get("error", r.get("setup_error", "见场景日志")))
     for r in groups["h265"]:
         if r.get("error") == "Unsupported video codec":
             gaps["V-12"] = "C++ SDK 在连接前拒绝 H.265：Unsupported video codec。无法完成全体回退。"

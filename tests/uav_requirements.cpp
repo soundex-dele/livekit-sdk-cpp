@@ -1,5 +1,7 @@
 // Headless C++ clients for the Go SFU requirement assessment. No capture devices.
 #include <livekit/livekit.hpp>
+#include "rtc_base/logging.h"
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -62,7 +64,8 @@ struct Peer {
       try {
         room.run(o, [this](const Json& event) {
           // Never retain SDP or access tokens in this evidence file.
-          if (event.value("event", "") == "rtc-stats") events << event.dump() << '\n';
+          const auto kind = event.value("event", "");
+          if (kind == "rtc-stats" || kind == "media-graph-stats") events << event.dump() << '\n';
         }, stop);
       } catch (...) { failure = std::current_exception(); }
       finished.store(true);
@@ -93,7 +96,11 @@ struct VideoInput {
     f.y.assign(320 * 180, luma); f.u.assign(160 * 90, 100); f.v.assign(160 * 90, 160);
     while (!stop.stop_requested()) { source->write(f); std::this_thread::sleep_for(33ms); }
   }) {}
-  ~VideoInput() { writer.request_stop(); writer.join(); source->close(); }
+  ~VideoInput() {
+    writer.request_stop(); writer.join(); const auto s = source->stats();
+    std::cerr << Json{{"video_source_accepted", s.accepted}, {"consumed", s.consumed}, {"dropped", s.dropped}, {"accepting", s.accepting}}.dump() << '\n';
+    source->close();
+  }
   TrackPublication publish(Peer& p, const std::string& name) {
     MediaSpec m; m.width = 320; m.height = 180; m.video_source = source;
     return done(p.room.local_participant().publish_track(m, {name, "device-01", TrackSource::camera}));
@@ -105,14 +112,21 @@ struct AudioInput {
   explicit AudioInput(int hz) : writer([this, hz](std::stop_token stop) {
     uint64_t offset = 0;
     while (!stop.stop_requested()) {
-      PcmInputFrame f; f.samples.resize(480);
+      // Two 10 ms blocks per write: Windows may round sleep_for(2ms) to
+      // a 15.6 ms tick, so a single block would underfeed a 48 kHz source.
+      PcmInputFrame f; f.samples.resize(960);
       for (size_t i = 0; i < f.samples.size(); ++i)
         f.samples[i] = static_cast<int16_t>(6000 * std::sin(2 * std::numbers::pi * hz * (offset + i) / 48000));
       if (source->write(f) == AudioWriteStatus::accepted) offset += f.samples.size();
       std::this_thread::sleep_for(2ms);
     }
   }) {}
-  ~AudioInput() { writer.request_stop(); writer.join(); source->close(); }
+  ~AudioInput() {
+    writer.request_stop(); writer.join(); const auto s = source->stats();
+    std::cerr << Json{{"audio_source_accepted", s.accepted_samples}, {"consumed", s.consumed_samples},
+      {"silence", s.silence_samples}, {"skipped", s.skipped_samples}, {"dropped", s.dropped_samples}}.dump() << '\n';
+    source->close();
+  }
   TrackPublication publish(Peer& p, const std::string& name) {
     MediaSpec m; m.video = false; m.audio_source = source;
     TrackPublishOptions o; o.name = name; o.source = TrackSource::microphone; o.disable_red = true;
@@ -121,13 +135,19 @@ struct AudioInput {
 };
 struct Tone {
   uint64_t count = 0, crossings = 0; int previous = 0, rate = 0, peak = 0;
+  uint64_t next_sample = 0, discontinuities = 0;
+  std::vector<int16_t> pcm;
   void add(const AudioFrame& f) {
     require(f.format == AudioSampleFormat::pcm16 && f.channels > 0, "invalid PCM");
+    if (rate && rate != f.sample_rate) { count = crossings = 0; previous = peak = 0; pcm.clear(); }
+    if (count && f.sample_index != next_sample) ++discontinuities;
+    next_sample = f.sample_index + f.samples_per_channel;
     rate = f.sample_rate;
     for (size_t i = 0; i < f.samples_per_channel; ++i) {
       const int sample = f.samples.at(i * f.channels);
       if (previous < 0 && sample >= 0) ++crossings;
       previous = sample; peak = std::max(peak, std::abs(sample)); ++count;
+      if (pcm.size() < 192000) pcm.push_back(static_cast<int16_t>(sample));
     }
   }
   double hz() const { return count ? double(crossings) * rate / count : 0; }
@@ -210,6 +230,13 @@ static void audio_case(const std::string& url, const std::filesystem::path& out,
   Json links = Json::array();
   for (size_t i = 0; i < 3; ++i) for (size_t j = 0; j < 3; ++j) if (i != j) {
     const auto& t = tones[i][tracks[j].sid()];
+    std::ofstream pcm(out / ("audio-" + std::to_string(j) + "-to-" + std::to_string(i) + ".s16le"), std::ios::binary);
+    pcm.write(reinterpret_cast<const char*>(t.pcm.data()), t.pcm.size() * sizeof(int16_t));
+    std::cerr << Json{{"from", j}, {"to", i}, {"expected_hz", frequencies[j]}, {"decoded_hz", t.hz()},
+      {"samples", t.count}, {"peak", t.peak}, {"sample_rate", t.rate}, {"discontinuities", t.discontinuities}}.dump() << '\n';
+  }
+  for (size_t i = 0; i < 3; ++i) for (size_t j = 0; j < 3; ++j) if (i != j) {
+    const auto& t = tones[i][tracks[j].sid()];
     require(t.peak > 500 && std::abs(t.hz() - frequencies[j]) < frequencies[j] * .06, "wrong audio source/frequency");
     links.push_back({{"from", j}, {"to", i}, {"expected_hz", frequencies[j]}, {"decoded_hz", t.hz()}, {"samples", t.count}});
   }
@@ -237,6 +264,10 @@ static void audio_case(const std::string& url, const std::filesystem::path& out,
 }
 
 int main(int argc, char** argv) {
+  if (std::getenv("LIVEKIT_UAV_NATIVE_LOG")) {
+    webrtc::LogMessage::LogToDebug(webrtc::LS_INFO);
+    webrtc::LogMessage::SetLogToStderr(true);
+  }
   if (argc != 5) { std::cerr << "Usage: livekit_uav_requirements URL video|audio CODEC OUTPUT_DIR\n"; return 2; }
   const std::filesystem::path out(argv[4]); std::filesystem::create_directories(out);
   Json report{{"ok", false}, {"checks", Json::array()}, {"scenario", argv[2]}, {"codec", argv[3]}, {"device_acceptance", false}};

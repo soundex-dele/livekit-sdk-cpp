@@ -1,4 +1,7 @@
 #include "backends/webrtc/codec_factories.hpp"
+#ifdef LIVEKIT_RTC_FFMPEG_CODECS
+#include "backends/webrtc/ffmpeg_video_codecs.hpp"
+#endif
 #include "backends/webrtc/graph_video_encoder.hpp"
 #include "backends/webrtc/graph_video_decoder.hpp"
 #include "api/make_ref_counted.h"
@@ -206,8 +209,13 @@ class GraphAudioDecoderFactory : public AudioDecoderFactory {
 }
 
 CodecBackends builtin_codecs() {
-  return {CreateBuiltinVideoEncoderFactory(), CreateBuiltinVideoDecoderFactory(),
-          CreateBuiltinAudioEncoderFactory(), CreateBuiltinAudioDecoderFactory()};
+  CodecBackends result{CreateBuiltinVideoEncoderFactory(), CreateBuiltinVideoDecoderFactory(),
+                       CreateBuiltinAudioEncoderFactory(), CreateBuiltinAudioDecoderFactory()};
+#ifdef LIVEKIT_RTC_FFMPEG_CODECS
+  result.video_encoder = with_ffmpeg_encoders(std::move(result.video_encoder));
+  result.video_decoder = with_ffmpeg_decoders(std::move(result.video_decoder));
+#endif
+  return result;
 }
 void install_graph_codecs(webrtc::PeerConnectionFactoryDependencies& deps,
                           std::shared_ptr<RtcGraph> graph, CodecBackends backends) {

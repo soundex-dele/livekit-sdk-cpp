@@ -50,7 +50,7 @@ void validate(const RoomOptions& o) {
     if((o.video_frame_handler||o.video_frame_stream)&&!local_preview)throw std::invalid_argument("Frame output requires subscriptions or a local preview source");
     if(!o.subscribe_tracks.empty())throw std::invalid_argument("Track selection requires subscriptions");
   }
-  if (!std::set<std::string>{"vp8", "vp9", "h264", "av1"}.contains(o.codec)) throw std::invalid_argument("Unsupported video codec");
+  if (!std::set<std::string>{"vp8", "vp9", "h264", "h265", "av1"}.contains(o.codec)) throw std::invalid_argument("Unsupported video codec");
   if (o.exit_after_publish && (o.media.empty() || o.microphone)) throw std::invalid_argument("exit_after_publish requires finite media sources");
   for (const auto& m : o.media) {
     detail::validate_media(m);

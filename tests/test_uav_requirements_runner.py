@@ -55,6 +55,15 @@ class EvidenceTests(unittest.TestCase):
             self.assertIn("V-12", report["gaps"])
             self.assertFalse(report["full_acceptance"])
 
+    def test_failed_tcp_media_is_reported_as_a_gap(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            report = {"started_at": "test", "scenarios": [{"protocol": "tcp", "scenario": "video",
+                "codec": "h264", "folder": "tcp-video-h264", "ok": False, "error": "WebRTC transport failed"}]}
+            finish(report, Path(directory))
+            self.assertIn("B-07", report["gaps"])
+            row = next(r for r in report["requirements"] if r["id"] == "B-07")
+            self.assertEqual(row["status"], "未通过")
+
 
 if __name__ == "__main__":
     unittest.main()
