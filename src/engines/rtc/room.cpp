@@ -6,6 +6,7 @@
 #include "engines/rtc/pending_requests.hpp"
 #include "engines/rtc/data_messages.hpp"
 #include "engines/rtc/subscription_permissions.hpp"
+#include "engines/rtc/subscribed_quality.hpp"
 #include "support/net.hpp"
 #include "backends/webrtc/headless_audio.hpp"
 #include "media_nodes/render/video_playout.hpp"
@@ -410,6 +411,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
   std::deque<std::shared_ptr<Command>> deferred;
   std::map<std::string, MediaPump*> track_pumps;
   std::set<MediaPump*> started_pumps;
+  std::set<MediaPump*> demand_paused;
   std::map<std::string, webrtc::scoped_refptr<webrtc::RtpSenderInterface>> senders;
   auto cleanup = [&] {
     pending_controls.interrupt("Connection closed before request confirmation; outcome is unknown");
@@ -589,7 +591,7 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       auto cid = found->second->id(); auto sender = senders.find(cid);
       if (sender != senders.end()) { auto error = publisher->pc->RemoveTrackOrError(sender->second); if (!error.ok()) throw std::runtime_error(error.message()); senders.erase(sender); }
       auto pump = track_pumps.find(cid);
-      if (pump != track_pumps.end()) { pump->second->stop(); started_pumps.erase(pump->second); std::erase_if(pumps, [&](const auto& p) { return p.get() == pump->second; }); track_pumps.erase(pump); }
+      if (pump != track_pumps.end()) { pump->second->stop(); started_pumps.erase(pump->second); demand_paused.erase(pump->second); std::erase_if(pumps, [&](const auto& p) { return p.get() == pump->second; }); track_pumps.erase(pump); }
       std::erase_if(tracks, [&](const auto& t) { return t->id() == cid; });
       const bool is_microphone=(recovery.publications.contains(cid)&&recovery.publications.at(cid).microphone) || (publishing.contains(cid)&&publishing.at(cid)->operation=="publish-microphone");
       if(is_microphone)runtime.worker->BlockingCall([&]{runtime.audio_device->disable_capture();});
@@ -836,7 +838,11 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
         if (recovery.rejoining) event("reconnected", {{"mode", "rejoin"}, {"attempt", recovery.budget.attempts()}});
         else event("connected", {{"room", join.room().name()}});
       }
-      if (publisher->connected && negotiated && !offer_pending) { for (auto& pump : pumps) if (started_pumps.insert(pump.get()).second) pump->start(); pumping = true; }
+      if (publisher->connected && negotiated && !offer_pending) {
+        for (auto& pump : pumps) if (!demand_paused.contains(pump.get()) && started_pumps.insert(pump.get()).second)
+          if (!pump->start()) throw std::runtime_error("Media graph source failed to start");
+        pumping = true;
+      }
       if (!data_sent && reliable && reliable->state() == webrtc::DataChannelInterface::kOpen) {
         livekit::DataPacket packet; packet.set_participant_identity(join.participant().identity()); packet.mutable_user()->set_payload(options.publish_data); packet.mutable_user()->set_topic(options.topic);
         auto bytes = packet.SerializeAsString();
@@ -856,6 +862,32 @@ void join_room(const RoomOptions& options, std::stop_token stop, EventEmitter ev
       if (response.has_offer()) { subscriber->remote(response.offer()); livekit::SignalRequest request; *request.mutable_answer() = subscriber->local(false); request.mutable_answer()->set_id(response.offer().id()); send(request); }
       else if (response.has_answer()) { publisher->remote(response.answer()); offer_pending = false; }
       else if (response.has_trickle()) (response.trickle().target() == livekit::PUBLISHER ? publisher : subscriber)->ice(response.trickle());
+      else if (response.has_subscribed_quality_update()) {
+        const auto& update = response.subscribed_quality_update();
+        // Resolve only current-generation, confirmed publications. Old SIDs,
+        // removed sources and non-opted-in tracks cannot change another source.
+        const auto local = recovery.local_ids.find(update.track_sid());
+        if (local == recovery.local_ids.end()) continue;
+        const auto pump = track_pumps.find(local->second);
+        if (pump == track_pumps.end() || !pump->second->spec.dynacast) continue;
+        const auto enabled = detail::subscribed_video_enabled(update, options.codec);
+        if (!enabled) continue;
+        const bool paused = demand_paused.contains(pump->second);
+        if (paused == !*enabled) continue;
+        const auto sender = senders.find(local->second);
+        if (sender == senders.end()) continue;
+        auto parameters = sender->second->GetParameters();
+        for (auto& encoding : parameters.encodings) encoding.active = *enabled;
+        const auto error = sender->second->SetParameters(parameters);
+        if (!error.ok()) throw std::runtime_error("Dynacast sender update failed: " + std::string(error.message()));
+        if (*enabled) demand_paused.erase(pump->second); // started by the normal readiness gate
+        else {
+          demand_paused.insert(pump->second);
+          if (started_pumps.erase(pump->second)) pump->second->stop();
+        }
+        event("source-demand", {{"sid", update.track_sid()}, {"clientId", local->second},
+          {"enabled", *enabled}, {"codec", options.codec}});
+      }
       else if (response.has_track_published()) {
         const auto& cid = response.track_published().cid();
         const auto& sid = response.track_published().track().sid();

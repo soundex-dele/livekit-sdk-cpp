@@ -64,6 +64,17 @@ class EvidenceTests(unittest.TestCase):
             row = next(r for r in report["requirements"] if r["id"] == "B-07")
             self.assertEqual(row["status"], "未通过")
 
+    def test_dynacast_failure_is_a_gap_and_success_is_not_device_acceptance(self):
+        for ok in (False, True):
+            with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+                report = {"started_at": "test", "scenarios": [{"protocol": "udp", "scenario": "dynacast",
+                    "codec": "h264", "folder": "udp-dynacast-h264", "ok": ok}]}
+                finish(report, Path(directory))
+                self.assertEqual("V-08" in report["gaps"], not ok)
+                row = next(r for r in report["requirements"] if r["id"] == "V-08")
+                self.assertIn("udp-dynacast-h264", row["evidence"])
+                self.assertFalse(report["full_acceptance"])
+
 
 if __name__ == "__main__":
     unittest.main()

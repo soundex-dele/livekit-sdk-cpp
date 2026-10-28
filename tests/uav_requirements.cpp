@@ -42,6 +42,8 @@ struct Peer {
   // The worker is joined before any state used by callbacks is destroyed.
   std::mutex mutex;
   std::map<std::string, VideoObservation> video;
+  std::map<std::string, bool> demand;
+  std::atomic<uint64_t> video_bytes{0}, video_stats_rows{0}, stats_samples{0};
   std::shared_ptr<AudioFrameStream> audio = std::make_shared<AudioFrameStream>(AudioStreamOptions{500});
   Room room;
   std::ofstream events;
@@ -65,7 +67,14 @@ struct Peer {
         room.run(o, [this](const Json& event) {
           // Never retain SDP or access tokens in this evidence file.
           const auto kind = event.value("event", "");
-          if (kind == "rtc-stats" || kind == "media-graph-stats") events << event.dump() << '\n';
+          if (kind == "rtc-stats" || kind == "media-graph-stats" || kind == "source-demand" || kind == "transport") events << event.dump() << '\n';
+          if (kind == "source-demand") { std::lock_guard lock(mutex); demand[event.at("sid").get<std::string>()] = event.at("enabled").get<bool>(); }
+          if (kind == "rtc-stats" && event.value("target", -1) == 0) {
+            uint64_t bytes = 0, rows = 0;
+            for (const auto& row : event.at("stats"))
+              if (row.value("type", "") == "outbound-rtp" && row.value("kind", "") == "video") { bytes += row.value("bytesSent", uint64_t(0)); ++rows; }
+            video_bytes.store(bytes); video_stats_rows.store(rows); ++stats_samples;
+          }
         }, stop);
       } catch (...) { failure = std::current_exception(); }
       finished.store(true);
@@ -76,6 +85,9 @@ struct Peer {
   ~Peer() { worker.request_stop(); room.request_stop(); if (worker.joinable()) worker.join(); }
   VideoObservation observation(const std::string& sid) {
     std::lock_guard lock(mutex); return video[sid];
+  }
+  bool has_demand(const std::string& sid, bool enabled) {
+    std::lock_guard lock(mutex); const auto it = demand.find(sid); return it != demand.end() && it->second == enabled;
   }
   TrackPublication remote(const std::string& who, const std::string& sid) {
     std::optional<TrackPublication> publication;
@@ -101,8 +113,8 @@ struct VideoInput {
     std::cerr << Json{{"video_source_accepted", s.accepted}, {"consumed", s.consumed}, {"dropped", s.dropped}, {"accepting", s.accepting}}.dump() << '\n';
     source->close();
   }
-  TrackPublication publish(Peer& p, const std::string& name) {
-    MediaSpec m; m.width = 320; m.height = 180; m.video_source = source;
+  TrackPublication publish(Peer& p, const std::string& name, bool dynacast = false) {
+    MediaSpec m; m.width = 320; m.height = 180; m.video_source = source; m.dynacast = dynacast;
     return done(p.room.local_participant().publish_track(m, {name, "device-01", TrackSource::camera}));
   }
 };
@@ -263,17 +275,57 @@ static void audio_case(const std::string& url, const std::filesystem::path& out,
   passed(report, "voice_leave_preserves_video_and_other_voice", {{"remaining_audio_blocks", remaining}});
 }
 
+static void dynacast_case(const std::string& url, const std::string& codec,
+                          const std::filesystem::path& out, Json& report) {
+  Peer drone(url, "drone", codec, out);
+  VideoInput source(80); auto track = source.publish(drone, "demand-camera", true);
+  auto stopped = [&] {
+    until([&] { return drone.has_demand(track.sid(), false) && !source.source->stats().accepting; }, "no aggregate OFF at publisher");
+    const auto samples = drone.stats_samples.load();
+    until([&] { return drone.stats_samples.load() >= samples + 2; }, "missing publisher stats after OFF");
+    const auto consumed = source.source->stats().consumed, bytes = drone.video_bytes.load();
+    require(drone.video_stats_rows.load() > 0 && bytes > 0, "missing retained outbound RTP statistics");
+    const auto stable = drone.stats_samples.load();
+    until([&] { return drone.stats_samples.load() >= stable + 2; }, "missing paused publisher stats");
+    require(source.source->stats().attached && !source.source->stats().accepting, "paused source lost ownership");
+    require(source.source->stats().consumed == consumed && drone.video_stats_rows.load() > 0 && drone.video_bytes.load() == bytes,
+      "OFF did not stop source/actual video RTP");
+    return Json{{"consumed", consumed}, {"video_bytes", bytes}, {"stable_stats_intervals", 2}};
+  };
+  auto initial = stopped();
+  Peer a(url, "viewer-a", codec, out);
+  verify_video(a, track.sid(), 80);
+  Peer b(url, "viewer-b", codec, out);
+  verify_video(b, track.sid(), 80);
+  auto ta = a.remote("drone", track.sid()), tb = b.remote("drone", track.sid());
+  done(ta.set_subscribed(false));
+  // Outlast the server's default 5 s pause debounce. Otherwise a broken
+  // per-viewer OFF decision could be hidden by immediately removing viewer B.
+  std::this_thread::sleep_for(6s);
+  verify_video(b, track.sid(), 80, b.observation(track.sid()).frames);
+  require(source.source->stats().accepting, "one viewer leaving stopped shared source");
+  done(tb.set_subscribed(false));
+  auto empty = stopped();
+  const auto before = a.observation(track.sid()).frames;
+  done(ta.set_subscribed(true)); verify_video(a, track.sid(), 80, before);
+  until([&] { return drone.has_demand(track.sid(), true); }, "missing aggregate ON");
+  require(drone.room.local_participant().track_publications().size() == 1, "dynacast republished source instead of resuming");
+  passed(report, "aggregate_demand_stops_source_and_rtp", {{"initial_zero_viewers", initial}, {"last_viewer_left", empty},
+    {"resumed_same_sid", track.sid()}, {"single_remaining_viewer_seconds", 6}, {"codec", codec}});
+}
+
 int main(int argc, char** argv) {
   if (std::getenv("LIVEKIT_UAV_NATIVE_LOG")) {
     webrtc::LogMessage::LogToDebug(webrtc::LS_INFO);
     webrtc::LogMessage::SetLogToStderr(true);
   }
-  if (argc != 5) { std::cerr << "Usage: livekit_uav_requirements URL video|audio CODEC OUTPUT_DIR\n"; return 2; }
+  if (argc != 5) { std::cerr << "Usage: livekit_uav_requirements URL video|audio|dynacast CODEC OUTPUT_DIR\n"; return 2; }
   const std::filesystem::path out(argv[4]); std::filesystem::create_directories(out);
   Json report{{"ok", false}, {"checks", Json::array()}, {"scenario", argv[2]}, {"codec", argv[3]}, {"device_acceptance", false}};
   try {
     if (std::string(argv[2]) == "video") video_case(argv[1], argv[3], out, report);
     else if (std::string(argv[2]) == "audio") audio_case(argv[1], out, report);
+    else if (std::string(argv[2]) == "dynacast") dynacast_case(argv[1], argv[3], out, report);
     else throw std::runtime_error("unknown scenario");
     report["ok"] = true;
   } catch (const std::exception& e) { report["error"] = e.what(); std::cerr << e.what() << '\n'; }

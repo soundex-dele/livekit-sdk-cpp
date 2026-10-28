@@ -97,7 +97,7 @@ def protocol_evidence(log, protocol, scenario):
         pair = row.get("pair", {})
         pairs.append({"participant": row.get("participant"), "transport": row.get("transport"), **pair})
     required = ({("drone", "PUBLISHER"), ("viewer-a", "SUBSCRIBER"), ("viewer-b", "SUBSCRIBER")}
-                if scenario == "video" else
+                if scenario in ("video", "dynacast") else
                 {(p, t) for p in ("drone", "viewer-a", "viewer-b") for t in ("PUBLISHER", "SUBSCRIBER")})
     observed = {(p["participant"], p["transport"]) for p in pairs
                 if p.get("localProtocol") == protocol and p.get("remoteProtocol") == protocol
@@ -196,11 +196,15 @@ def finish(report, root):
     groups = {"video": [r for r in scenarios if r["protocol"] == "udp" and r["scenario"] == "video" and r["codec"] == "h264"],
               "tcp": [r for r in scenarios if r["protocol"] == "tcp"],
               "audio": [r for r in scenarios if r["scenario"] == "audio"],
-              "h265": [r for r in scenarios if r["codec"] == "h265"]}
+              "h265": [r for r in scenarios if r["codec"] == "h265"],
+              "dynacast": [r for r in scenarios if r["scenario"] == "dynacast"]}
     gaps = {}
     for r in groups["tcp"]:
         if not r.get("ok"):
             gaps["B-07"] = "本次 TCP 媒体子项失败：" + str(r.get("error", r.get("setup_error", "见场景日志")))
+    for r in groups["dynacast"]:
+        if not r.get("ok"):
+            gaps["V-08"] = "发布端聚合需求控制失败：" + str(r.get("error", r.get("setup_error", "见场景日志")))
     for r in groups["h265"]:
         if r.get("error") == "Unsupported video codec":
             gaps["V-12"] = "C++ SDK 在连接前拒绝 H.265：Unsupported video codec。无法完成全体回退。"
@@ -217,6 +221,8 @@ def finish(report, root):
         refs = [r["folder"] for r in groups.get(group, [])]
         if group == "go" and "go" in report:
             refs = ["go-probes.jsonl"]
+        if rid == "V-08":
+            refs += [r["folder"] for r in groups["dynacast"]]
         rows.append({"id": rid, "title": title, "status": "未通过" if rid in gaps else "未测",
                      "evidence": refs, "reason": gaps.get(rid, "仅覆盖子项或尚无自动化证据；完整需求未验收"), "remaining": remaining})
     report["requirements"] = rows
@@ -273,7 +279,8 @@ def main():
         command([args.go, "version", "-m", server], args.server_source, root / "server-build-info.txt", env)
         report["go"] = go_probes(args, root, env)
         for protocol, scenario, codec in [("udp", "video", "h264"), ("tcp", "video", "h264"),
-                                          ("udp", "audio", "h264"), ("udp", "video", "h265")]:
+                                          ("udp", "audio", "h264"), ("udp", "video", "h265"),
+                                          ("udp", "dynacast", "h264"), ("udp", "dynacast", "h265")]:
             report["scenarios"].append(run_case(server, args.client, root, protocol, scenario, codec))
         finish(report, root)
         return 1 if report["gaps"] or report["go"]["exit_code"] or any(not r["ok"] for r in report["scenarios"]) else 0

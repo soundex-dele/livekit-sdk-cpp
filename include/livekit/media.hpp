@@ -37,6 +37,11 @@ struct MediaSpec {
   std::shared_ptr<I420VideoSource> video_source;
   // Independent application PCM track; set video=false.
   std::shared_ptr<PcmAudioSource> audio_source;
+  // Opt-in single-layer live-video demand control. The server's aggregate
+  // OFF stops this graph's capture/encoder and RTP sender; ON restarts them.
+  // Supported for application-fed video, generated video and capture devices,
+  // never files/network playback (which must not restart from the beginning).
+  bool dynacast = false;
 };
 struct ScreenCaptureDevice {
   std::string id, name;

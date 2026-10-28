@@ -44,6 +44,8 @@ ParticipantInfo parse_participant(const Json& v) {
   return p;
 }
 void validate_media(const MediaSpec& m) {
+  if (m.dynacast && (!m.video || (!m.video_source && !m.demo && m.capture == CaptureKind::input)))
+    throw std::invalid_argument("Dynacast requires a live video source, not audio or file/network playback");
   if (m.width < 2 || m.width > 3840 || m.height < 2 || m.height > 2160 || m.width % 2 || m.height % 2 || m.fps < 1 || m.fps > 60)
     throw std::invalid_argument("Invalid media dimensions or frame rate");
   if (!m.demo && !m.video_source && !m.audio_source && m.input.empty() && m.capture == CaptureKind::input) throw std::invalid_argument("Media input is required");

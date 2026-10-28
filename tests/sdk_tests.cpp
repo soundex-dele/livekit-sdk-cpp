@@ -16,6 +16,7 @@
 #include "subscription_permissions_contract.hpp"
 #include "rpc_contract.hpp"
 #include "capabilities_contract.hpp"
+#include "subscribed_quality_contract.hpp"
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -42,6 +43,7 @@ int main(int argc, char** argv) {
     subscription_permissions_contract();
     rpc_contract();
     capabilities_contract();
+    subscribed_quality_contract();
     livekit::ClientConfiguration client_config;
     check(!sdk::detail::relay_required(false, false, client_config), "Default relay policy");
     client_config.set_force_relay(livekit::ENABLED);

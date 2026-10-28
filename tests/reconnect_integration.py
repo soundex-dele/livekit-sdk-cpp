@@ -25,8 +25,8 @@ from websockets.exceptions import ConnectionClosed
 from protocol_contract import fields, first
 
 
-def free_port():
-    with socket.socket() as sock:
+def free_port(kind=socket.SOCK_STREAM):
+    with socket.socket(socket.AF_INET, kind) as sock:
         sock.bind(('127.0.0.1', 0))
         return sock.getsockname()[1]
 
@@ -73,11 +73,16 @@ async def run(args):
                 audio.setparams((1, 2, 48000, 48000, 'NONE', 'not compressed'))
                 audio.writeframes(struct.pack('<48000h', *(int(6000 * math.sin(2 * math.pi * frequency * i / 48000)) for i in range(48000))))
     ports = set()
-    while len(ports) < 4:
+    while len(ports) < 3:
         ports.add(free_port())
-    port, rtc, udp, proxy_port = ports
+    port, rtc, proxy_port = ports
+    # TCP availability does not imply UDP availability on Windows (including
+    # excluded UDP ranges). Probe the protocol the media listener will use.
+    udp = free_port(socket.SOCK_DGRAM)
+    while udp in ports:
+        udp = free_port(socket.SOCK_DGRAM)
     config = root / 'server.yaml'
-    config.write_text(f'port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n  tcp_port: {rtc}\n  udp_port: {udp}\n  use_external_ip: false\n  node_ip: 127.0.0.1\n  enable_loopback_candidate: true\nkeys:\n  reconnect-test: reconnect-integration-secret-32-characters\nlogging:\n  level: info\n')
+    config.write_text(f'port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n  tcp_port: {rtc}\n  udp_port: {udp}\n  use_external_ip: false\n  node_ip: 127.0.0.1\n  ips:\n    includes: [127.0.0.1/32]\n  enable_loopback_candidate: true\nkeys:\n  reconnect-test: reconnect-integration-secret-32-characters\nlogging:\n  level: info\n')
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     connections = set()
     requests = []

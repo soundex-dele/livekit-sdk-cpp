@@ -27,6 +27,9 @@ message UpdateSubscription { repeated string track_sids = 1; bool subscribe = 2;
 message TrackPermission { string participant_sid = 1; bool all_tracks = 2; repeated string track_sids = 3; string participant_identity = 4; }
 message SubscriptionPermission { bool all_participants = 1; repeated TrackPermission track_permissions = 2; }
 message SubscriptionPermissionUpdate { string participant_sid = 1; string track_sid = 2; bool allowed = 3; }
+message SubscribedQuality { int32 quality = 1; bool enabled = 2; }
+message SubscribedCodec { string codec = 1; repeated SubscribedQuality qualities = 2; }
+message SubscribedQualityUpdate { string track_sid = 1; repeated SubscribedQuality subscribed_qualities = 2; repeated SubscribedCodec subscribed_codecs = 3; }
 message LeaveRequest { bool can_reconnect = 1; int32 reason = 2; int32 action = 3; RegionSettings regions = 4; }
 message RegionSettings { repeated RegionInfo regions = 1; }
 message RegionInfo { string region = 1; string url = 2; int64 distance = 3; }
@@ -46,7 +49,9 @@ message SignalRequest {
   oneof message { SessionDescription offer = 1; SessionDescription answer = 2; TrickleRequest trickle = 3; AddTrackRequest add_track = 4; MuteTrackRequest mute = 5; UpdateSubscription subscription = 6; UpdateTrackSettings track_setting = 7; LeaveRequest leave = 8; SubscriptionPermission subscription_permission = 11; SyncState sync_state = 12; UpdateParticipantMetadata update_metadata = 15; int64 ping = 14; Ping ping_req = 16; }
 }
 message SignalResponse {
-  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; SubscriptionPermissionUpdate subscription_permission_update = 15; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; ReconnectResponse reconnect = 19; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; RequestResponse request_response = 22; RoomMovedResponse room_moved = 24; }
+  // Wire field 14 is the server's aggregate publisher demand, not a viewer's
+  // local subscription setting. Keep it in the same oneof as other responses.
+  oneof message { JoinResponse join = 1; SessionDescription answer = 2; SessionDescription offer = 3; TrickleRequest trickle = 4; ParticipantUpdate update = 5; TrackPublishedResponse track_published = 6; LeaveRequest leave = 8; MuteTrackRequest mute = 9; SpeakersChanged speakers_changed = 10; RoomUpdate room_update = 11; ConnectionQualityUpdate connection_quality = 12; SubscribedQualityUpdate subscribed_quality_update = 14; SubscriptionPermissionUpdate subscription_permission_update = 15; string refresh_token = 16; TrackUnpublishedResponse track_unpublished = 17; int64 pong = 18; ReconnectResponse reconnect = 19; Pong pong_resp = 20; SubscriptionResponse subscription_response = 21; RequestResponse request_response = 22; RoomMovedResponse room_moved = 24; }
 }
 message UserPacket { string participant_sid = 1; bytes payload = 2; optional string topic = 4; string participant_identity = 5; repeated string destination_identities = 6; bytes nonce = 11; }
 message DataPacket { int32 kind = 1; oneof value { UserPacket user = 2; ActiveSpeakerUpdate speaker = 3; SipDTMF sip_dtmf = 6; Transcription transcription = 7; RpcRequest rpc_request = 10; RpcAck rpc_ack = 11; RpcResponse rpc_response = 12; } string participant_identity = 4; repeated string destination_identities = 5; }
