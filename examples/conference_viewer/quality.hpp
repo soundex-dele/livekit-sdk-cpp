@@ -12,6 +12,7 @@ struct StreamQuality {
   // Send FPS uses framesSent. Receive FPS comes from graph ingress because
   // WebRTC's framesReceived depends on the bypassed decoded-frame callback.
   std::optional<double> bytes, kbps, frames, fps, lost, jitter_ms;
+  std::optional<double> retransmit_bytes, retransmit_kbps, fec_bytes, fec_kbps;
 };
 struct PeerQuality {
   double timestamp_us = 0;
@@ -25,6 +26,7 @@ struct QualitySnapshot {
   std::array<PeerQuality, 2> peers;
   std::map<std::string, int> participants;
   enum class Stage { capture, encode, send, receive, decode };
+  enum class Bitrate { rtp, retransmit, fec };
   struct NodeQuality {
     std::string name, track_id;
     Stage stage;
@@ -37,6 +39,7 @@ struct QualitySnapshot {
   std::map<std::string, std::string> local_tracks;
   std::array<std::map<std::string, std::string>, 2> remote_tracks;
   std::optional<double> fps(Stage stage, const std::string& track_id = {}) const;
+  std::optional<double> bitrate(Bitrate kind, const std::string& track_id, bool sending) const;
   std::string track_id(const StreamQuality& stream, size_t peer) const;
   void update(const livekit::sdk::Json& event);
   void update_graph(const livekit::sdk::Json& event);

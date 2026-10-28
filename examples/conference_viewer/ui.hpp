@@ -9,9 +9,10 @@ class View {
  public:
   std::array<char, 1024> url{};
   std::array<char, 256> room{};
-  std::array<char, 16384> token{};
+  std::array<char, 256> username{};
   bool audio = true, tone = false;
   bool show_quality = false;
+  bool pause_unused_video = false;
   int video_count = 0;
   std::string remove_video_sid;
   std::string error;

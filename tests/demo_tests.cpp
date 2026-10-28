@@ -1,5 +1,6 @@
 #define SDL_MAIN_HANDLED
 #include "ui.hpp"
+#include "connection.hpp"
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
@@ -16,10 +17,53 @@ static demo::sdk::Json quality_report(int target, double time, double bytes) {
     {{"id", "unused-pair"}, {"type", "candidate-pair"}, {"currentRoundTripTime", 9.0}},
     {{"id", "rtp"}, {"type", target == 0 ? "outbound-rtp" : "inbound-rtp"},
      {"ssrc", 1234}, {"kind", "video"}, {target == 0 ? "bytesSent" : "bytesReceived", bytes},
+     {target == 0 ? "retransmittedBytesSent" : "retransmittedBytesReceived", bytes / 10},
+     {"fecBytesReceived", bytes / 50},
      {"framesPerSecond", 99}, {target == 0 ? "framesSent" : "framesReceived", time / 1e6 * (target == 0 ? 28 : 27)},
      {"packetsLost", 4}, {"jitter", .003}, {"mediaSourceId", "src"}, {"trackIdentifier", "TR_two"}},
     {{"id", "src"}, {"type", "media-source"}, {"trackIdentifier", "video-1"}}
   })}};
+}
+static void test_repair_rates() {
+  demo::QualitySnapshot q;
+  for (int target : {0, 1}) {
+    q.update(quality_report(target, 1000000, 1000));
+    check(!q.peers[target].streams.at("rtp").retransmit_kbps && !q.peers[target].streams.at("rtp").fec_kbps,
+          "Repair rates require two samples");
+    q.update(quality_report(target, 2000000, 101000));
+    const auto& stream = q.peers[target].streams.at("rtp");
+    check(stream.retransmit_kbps == 80, "Send/receive retransmit payload rate");
+    check(target == 0 ? !stream.fec_kbps : stream.fec_kbps == 16, "Only receive FEC bytes are supported");
+  }
+  q.update(quality_report(1, 3000000, 101000));
+  check(q.peers[1].streams.at("rtp").retransmit_kbps == 0 && q.peers[1].streams.at("rtp").fec_kbps == 0,
+        "Measured zero repair rate must remain available");
+  auto row = quality_report(1, 4000000, 201000);
+  row["stats"][3]["retransmittedBytesReceived"] = 1;
+  row["stats"][3]["fecBytesReceived"] = 1;
+  q.update(row);
+  check(!q.peers[1].streams.at("rtp").retransmit_kbps && !q.peers[1].streams.at("rtp").fec_kbps &&
+        q.peers[1].streams.at("rtp").kbps == 800, "Repair counter resets do not invalidate RTP rate");
+  row = quality_report(1, 5000000, 301000);
+  row["stats"][3].erase("retransmittedBytesReceived"); row["stats"][3].erase("fecBytesReceived");
+  q.update(row);
+  check(!q.peers[1].streams.at("rtp").retransmit_kbps && !q.peers[1].streams.at("rtp").fec_kbps,
+        "Absent repair counters must not appear as zero");
+  q.update(quality_report(1, 6000000, 401000));
+  check(!q.peers[1].streams.at("rtp").fec_kbps, "Restored counter needs a new baseline");
+  q.update(quality_report(1, 10000000, 501000));
+  check(!q.peers[1].streams.at("rtp").retransmit_kbps && !q.peers[1].streams.at("rtp").fec_kbps,
+        "Long gap invalidates repair rates");
+  row = quality_report(1, 11000000, 601000); row["stats"][3]["ssrc"] = 5678;
+  q.update(row);
+  check(!q.peers[1].streams.at("rtp").retransmit_kbps && !q.peers[1].streams.at("rtp").fec_kbps,
+        "New SSRC cannot inherit repair rates");
+  row = quality_report(1, 12000000, 701000); row["stats"][3]["ssrc"] = 5678;
+  row["stats"][3]["fecBytesReceived"] = "invalid";
+  q.update(row);
+  check(q.peers[1].streams.at("rtp").retransmit_kbps == 80 && !q.peers[1].streams.at("rtp").fec_kbps,
+        "Malformed FEC counter does not hide valid retransmit rate");
+  check(q.peers[0].streams.at("rtp").retransmit_kbps == 80, "Connections retain independent repair baselines");
 }
 static demo::QualitySnapshot test_quality() {
   demo::QualitySnapshot q;
@@ -138,6 +182,34 @@ static demo::QualitySnapshot test_quality() {
   check(q.peers[1].timestamp_us == 11000000, "Malformed stats ignored");
   return fixture;
 }
+static void test_track_bitrates(demo::QualitySnapshot q) {
+  using Rate = demo::QualitySnapshot::Bitrate;
+  check(q.bitrate(Rate::rtp, "TR_local1", true) == 400 && q.bitrate(Rate::retransmit, "TR_local1", true) == 40,
+        "Local media source must map to its Track SID");
+  check(q.bitrate(Rate::rtp, "TR_two", false) == 800 && q.bitrate(Rate::fec, "TR_two", false) == 16,
+        "Remote track bitrate mapping");
+  check(!q.bitrate(Rate::rtp, "TR_unknown", false) && !q.bitrate(Rate::rtp, "TR_two", true) &&
+        !q.bitrate(Rate::rtp, "", false), "Unknown track or wrong direction must not borrow a total");
+  auto other = q.peers[1].streams.at("rtp");
+  other.id = "second"; other.ssrc = "5678"; other.track_id = "TR_other";
+  other.kbps = 200; other.retransmit_kbps = 5; other.fec_kbps.reset();
+  q.peers[1].streams.emplace(other.id, other);
+  check(q.bitrate(Rate::rtp, "TR_two", false) == 800 && q.bitrate(Rate::rtp, "TR_other", false) == 200 &&
+        q.bitrate(Rate::fec, "TR_two", false) == 16 && !q.bitrate(Rate::fec, "TR_other", false),
+        "Different tracks must retain distinct rates and availability");
+  q.remote_tracks[1]["5678"] = "TR_two";
+  check(q.bitrate(Rate::rtp, "TR_two", false) == 1000 && q.bitrate(Rate::retransmit, "TR_two", false) == 85 &&
+        !q.bitrate(Rate::fec, "TR_two", false) && !q.bitrate(Rate::rtp, "TR_other", false),
+        "SSRC mapping takes precedence and incomplete layer totals remain unavailable");
+  q.peers[1].streams.at("second").kbps.reset();
+  check(!q.bitrate(Rate::rtp, "TR_two", false) && q.bitrate(Rate::rtp, "TR_local1", true) == 400,
+        "A new layer invalidates only its own track total");
+  q.peers[1].streams.erase("second");
+  check(q.bitrate(Rate::rtp, "TR_two", false) == 800, "Removed layer must not linger");
+  q.peers[1].updated -= std::chrono::seconds(4);
+  check(!q.bitrate(Rate::rtp, "TR_two", false) && !q.bitrate(Rate::retransmit, "TR_two", false) &&
+        !q.bitrate(Rate::fec, "TR_two", false), "Stale per-track bitrates must be hidden");
+}
 static std::shared_ptr<demo::sdk::VideoFrame> pixels(const std::string& id, int w = 321, int h = 181) {
   auto f = std::make_shared<demo::sdk::VideoFrame>(); f->track_id = id; f->width = w; f->height = h;
   f->stride_y = w + 7; f->stride_u = (w + 1) / 2 + 9; f->stride_v = (w + 1) / 2 + 11;
@@ -145,7 +217,9 @@ static std::shared_ptr<demo::sdk::VideoFrame> pixels(const std::string& id, int 
 }
 int main(int argc, char** argv) {
   try {
+    test_repair_rates();
     const auto quality_fixture = test_quality();
+    test_track_bitrates(quality_fixture);
     SDL_SetMainReady(); check(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL init");
     auto* window = SDL_CreateWindow("Render test", 0, 0, 1100, 720, SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE);
     check(window, "window"); auto* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE); check(renderer, "renderer");
@@ -174,8 +248,23 @@ int main(int argc, char** argv) {
       check(demo::tiles(state).size() == 3, "roster tile count");
       state.frames["TR_two"] = pixels("TR_two");
       demo::View view;
+      bool missing_username = false;
+      try { view.options(); } catch (const std::invalid_argument&) { missing_username = true; }
+      check(missing_username, "Blank username must be rejected");
+      std::snprintf(view.username.data(), view.username.size(), " alice ");
       view.video_count = 3; view.tone = true;
       auto publishing = view.options();
+      const auto first_dot = publishing.token.find('.'), last_dot = publishing.token.rfind('.');
+      const auto claims = demo::sdk::Json::parse(demo::sdk::base64_decode(
+        publishing.token.substr(first_dot + 1, last_dot - first_dot - 1)));
+      check(claims.at("sub") == "alice" && claims.at("name") == "alice" &&
+        claims.at("video").at("room") == "demo" && claims.at("video").at("roomJoin") == true &&
+        claims.at("video").at("canPublish") == true && claims.at("video").at("canSubscribe") == true,
+        "Username must produce a room-scoped publish/subscribe token");
+      bool whitespace_rejected = false;
+      try { demo::username_options(view.url.data(), " \t", "alice"); }
+      catch (const std::invalid_argument&) { whitespace_rejected = true; }
+      check(whitespace_rejected, "Whitespace room must be rejected");
       check(publishing.media.size() == 4 && publishing.media[0].video && publishing.media[2].video && !publishing.media[3].video, "Multiple videos and independent tone");
       view.video_count = -1; check(view.options().media.size() == 1, "Negative video count");
       view.video_count = 99; check(view.options().media.size() == demo::max_test_videos + 1, "Video count limit");
@@ -184,10 +273,19 @@ int main(int argc, char** argv) {
       alice.tracks[0].name = "Test video 1"; alice.tracks.push_back(extra);
       local.tracks = alice.tracks; local.tracks[0].sid = "TR_local1"; local.tracks[1].sid = "TR_local2";
       state.update(local, {alice, bob, guest}); state.frames[extra.sid] = pixels(extra.sid);
+      state.pause_unused_video = true;
+      state.video_demand = {{"TR_local1", true}, {"TR_local2", false}, {"removed", true}};
+      state.update(local, {alice, bob, guest});
+      check(!state.video_demand.contains("removed") && state.video_demand.size() == 2, "Removed demand state retained");
       check(demo::tiles(state).size() == 4 && demo::tiles(state)[0].label == "Alice / Test video 1" && demo::tiles(state)[1].label == "Alice / Test video 2", "Same participant video labels");
+      float quality_scroll = -1;
       auto render = [&](demo::Snapshot snapshot) {
         ImGui_ImplSDLRenderer2_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
-        view.draw(renderer, snapshot); ImGui::Render(); SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer);
+        view.draw(renderer, snapshot);
+        if (view.show_quality && quality_scroll >= 0) {
+          ImGui::Begin("Quality dashboard"); ImGui::SetScrollY(quality_scroll); ImGui::End();
+        }
+        ImGui::Render(); SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer);
         demo::render_draw_data(renderer);
       };
       render(state); render(state);
@@ -233,6 +331,11 @@ int main(int argc, char** argv) {
       state.changing_video = true; render(state); state.changing_video = false;
       state.update(local, {bob, guest}); check(!state.frames.contains("TR_one"), "departed pixels retained"); render(state);
       state.quality = quality_fixture;
+      auto second_sender = state.quality.peers[0].streams.at("rtp");
+      second_sender.id = "rtp-local2"; second_sender.ssrc = "4321"; second_sender.track_id = "video-2";
+      second_sender.kbps = 160; second_sender.retransmit_kbps = 8; second_sender.fps = 15;
+      state.quality.local_tracks["video-2"] = "TR_local2";
+      state.quality.peers[0].streams.emplace(second_sender.id, second_sender);
       auto refresh_quality = [&] {
         state.quality.graph_sample.updated = std::chrono::steady_clock::now();
         for (auto& peer : state.quality.peers) peer.updated = std::chrono::steady_clock::now();
@@ -250,15 +353,25 @@ int main(int argc, char** argv) {
         check(SDL_SaveBMP(surface, path.string().c_str()) == 0, "save dashboard QA"); SDL_FreeSurface(surface);
       };
       save_dashboard("quality.bmp", 1100, 720);
+      quality_scroll = 430; render(state); render(state);
+      save_dashboard("quality-media.bmp", 1100, 720);
+      quality_scroll = 0; render(state); render(state);
+      quality_scroll = -1;
       ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, true); render(state);
       check(!view.show_quality, "Escape closes quality dashboard");
       ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, false); render(state);
       view.show_quality = true;
       SDL_SetWindowSize(window, 640, 480); refresh_quality(); render(state);
       render(state); save_dashboard("quality-small.bmp", 640, 480);
+      quality_scroll = 450; render(state); render(state);
+      save_dashboard("quality-media-small.bmp", 640, 480);
+      quality_scroll = -1;
       state.quality.peers[1].updated -= std::chrono::seconds(4); render(state);
       state.quality = {}; render(state); // waiting for statistics
-      render({}); // idle view and texture teardown
+      view.show_quality = false;
+      SDL_SetWindowSize(window, 1100, 720);
+      render({}); render({}); // idle view and texture teardown
+      save_dashboard("join.bmp", 1100, 720);
     }
     ImGui_ImplSDLRenderer2_Shutdown(); ImGui_ImplSDL2_Shutdown(); ImGui::DestroyContext();
     SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit();

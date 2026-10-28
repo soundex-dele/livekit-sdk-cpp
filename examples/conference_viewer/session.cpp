@@ -24,6 +24,10 @@ void Snapshot::update(sdk::ParticipantInfo local, const std::vector<sdk::Partici
   // precedes metadata is replaced by the next decoded frame once subscribed.
   std::erase_if(frames, [&](const auto& item) { return !current.contains(item.first); });
   std::erase_if(quality.participants, [&](const auto& item) { return !participants.contains(item.first); });
+  std::set<std::string> local_tracks;
+  if (auto it = participants.find(local_sid); it != participants.end())
+    for (const auto& track : it->second.tracks) local_tracks.insert(track.sid);
+  std::erase_if(video_demand, [&](const auto& item) { return !local_tracks.contains(item.first); });
 }
 std::vector<Tile> tiles(const Snapshot& s) {
   std::vector<Tile> result;
@@ -58,13 +62,22 @@ Session::Session() : room_([this] {
   return callbacks;
 }()) {}
 Session::~Session() { stop(); if (worker_.joinable()) worker_.join(); }
-void Session::start(sdk::RoomOptions options) {
+void Session::start(sdk::RoomOptions options, bool pause_unused_video) {
   if (std::count_if(options.media.begin(), options.media.end(), [](const auto& m) { return m.video; }) > max_test_videos)
     throw std::invalid_argument("Demo supports up to 8 test videos");
   { std::lock_guard lock(mutex_); if (!data_.finished) throw std::logic_error("Session already active"); }
   if (worker_.joinable()) worker_.join();
   { std::lock_guard lock(mutex_); data_ = {}; video_command_.reset(); data_.state = State::Connecting; data_.finished = false; data_.room = options.room; }
   options.video_playout = false;
+  { std::lock_guard lock(mutex_); data_.pause_unused_video = pause_unused_video; }
+  auto upstream_log = std::move(options.log_sink);
+  options.log_sink = [this, upstream_log = std::move(upstream_log)](const sdk::Json& event) {
+    if (event.value("event", "") == "source-demand" && event.contains("sid") && event.contains("enabled")) {
+      std::lock_guard lock(mutex_);
+      if (data_.state != State::Disconnecting) data_.video_demand[event.at("sid").get<std::string>()] = event.at("enabled").get<bool>();
+    }
+    if (upstream_log) upstream_log(event);
+  };
   options.stats_interval_ms = 1000;
   options.video_frame_handler = [this](const sdk::VideoFrame& frame) {
     auto owned = std::make_shared<sdk::VideoFrame>(frame);
@@ -72,7 +85,7 @@ void Session::start(sdk::RoomOptions options) {
     if (data_.state != State::Disconnecting) { data_.frames[frame.track_id] = std::move(owned); ++data_.received_frames; }
   };
   try {
-    worker_ = std::jthread([this, options = std::move(options)](std::stop_token stop) mutable {
+    worker_ = std::jthread([this, options = std::move(options), pause_unused_video](std::stop_token stop) mutable {
       std::string error;
       auto redact = [&](std::string message) {
         if (!options.token.empty()) for (size_t pos; (pos = message.find(options.token)) != std::string::npos;) message.replace(pos, options.token.size(), "[redacted]");
@@ -83,7 +96,8 @@ void Session::start(sdk::RoomOptions options) {
         auto media = std::move(options.media); options.media.clear();
         room_.join_with_token(options.url, options.token, options, stop);
         int video_number = 0;
-        auto publish = [&](const sdk::MediaSpec& spec) {
+        auto publish = [&](sdk::MediaSpec spec) {
+          if (spec.video && spec.demo && pause_unused_video) spec.dynacast = true;
           const auto name = spec.video ? "Test video " + std::to_string(++video_number) : "Test tone";
           room_.local_participant().publish_track(spec, {name}).get();
         };
@@ -125,6 +139,7 @@ void Session::start(sdk::RoomOptions options) {
       data_.error = std::move(error); data_.finished = true;
       data_.frames.clear(); data_.participants.clear(); data_.local_sid.clear();
       data_.quality = {};
+      data_.video_demand.clear(); data_.pause_unused_video = false;
       data_.changing_video = false; data_.video_error.clear(); video_command_.reset();
     });
   } catch (...) { std::lock_guard lock(mutex_); data_.finished = true; data_.state = State::Error; throw; }

@@ -16,6 +16,8 @@ struct Snapshot {
   bool finished = true;
   std::string error, room, local_sid;
   bool changing_video = false;
+  bool pause_unused_video = false;
+  std::map<std::string, bool> video_demand;
   std::string video_error;
   std::map<std::string, sdk::ParticipantInfo> participants;
   std::map<std::string, std::shared_ptr<const sdk::VideoFrame>> frames;
@@ -32,7 +34,7 @@ class Session {
  public:
   Session();
   ~Session();
-  void start(sdk::RoomOptions options);
+  void start(sdk::RoomOptions options, bool pause_unused_video = false);
   void stop();
   // Queue one operation for the supervisor; never wait on the UI thread.
   bool add_video();

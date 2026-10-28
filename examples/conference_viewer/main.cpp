@@ -75,7 +75,7 @@ int main() {
         if (action == demo::Action::AddVideo && !closing) session.add_video();
         if (action == demo::Action::RemoveVideo && !closing) session.remove_video(view.remove_video_sid);
         if (action == demo::Action::Join && !closing) {
-          try { session.start(view.options()); }
+          try { session.start(view.options(), view.pause_unused_video); }
           catch (const std::exception& e) { view.error = e.what(); }
         }
         ImGui::Render(); SDL_SetRenderDrawColor(renderer, 14, 17, 23, 255); SDL_RenderClear(renderer);

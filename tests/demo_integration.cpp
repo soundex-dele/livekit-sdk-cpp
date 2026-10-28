@@ -56,14 +56,17 @@ int main(int argc, char** argv) {
     until([&] {
       const auto s = viewer.snapshot();
       for (const auto& [id, stream] : s.quality.peers[1].streams)
-        if (!stream.sending && stream.kbps && *stream.kbps > 0 && stream.jitter_ms && stream.lost) return true;
+        if (!stream.sending && stream.kind == "video" && stream.kbps && *stream.kbps > 0 && stream.jitter_ms && stream.lost &&
+            (stream.retransmit_bytes ? stream.retransmit_kbps && *stream.retransmit_kbps >= 0 : !stream.retransmit_kbps) &&
+            !stream.fec_bytes && !stream.fec_kbps) return true;
       return false;
-    }, "Dashboard receive statistics missing");
+    }, "Dashboard receive/retransmit statistics missing or unsupported FEC shown as zero");
     using Stage = demo::QualitySnapshot::Stage;
     until([&] {
       const auto q = viewer.snapshot().quality;
       for (const auto& sid : {first_video.sid(), second_video.sid()})
-        if (q.fps(Stage::receive, sid).value_or(0) <= 0 || q.fps(Stage::decode, sid).value_or(0) <= 0) return false;
+        if (q.fps(Stage::receive, sid).value_or(0) <= 0 || q.fps(Stage::decode, sid).value_or(0) <= 0 ||
+            q.bitrate(demo::QualitySnapshot::Bitrate::rtp, sid, false).value_or(0) <= 0) return false;
       return true;
     }, "Dashboard per-track receive/decode FPS missing");
     first_video.set_muted(true).get();
@@ -93,13 +96,16 @@ int main(int argc, char** argv) {
     until([&] {
       const auto s = viewer.snapshot();
       for (const auto& [id, stream] : s.quality.peers[0].streams)
-        if (stream.sending && stream.kbps && *stream.kbps > 0) return true;
+        if (stream.sending && stream.kind == "video" && stream.kbps && *stream.kbps > 0 &&
+            stream.retransmit_kbps && *stream.retransmit_kbps >= 0 && !stream.fec_kbps) return true;
       return false;
     }, "Dashboard send statistics missing after rejoin");
     until([&] {
       const auto q = viewer.snapshot().quality;
       for (const auto& track : local_videos()) for (auto stage : {Stage::capture, Stage::encode, Stage::send})
-        if (q.fps(stage, track.sid).value_or(0) <= 0) return false;
+        if (q.fps(stage, track.sid).value_or(0) <= 0 ||
+            q.bitrate(demo::QualitySnapshot::Bitrate::rtp, track.sid, true).value_or(0) <= 0 ||
+            !q.bitrate(demo::QualitySnapshot::Bitrate::retransmit, track.sid, true)) return false;
       if (q.fps(Stage::receive, first_video.sid()).value_or(0) <= 0 || q.fps(Stage::decode, first_video.sid()).value_or(0) <= 0) return false;
       return true;
     }, "Dashboard per-track video FPS stages missing after rejoin");

@@ -82,6 +82,10 @@ void QualitySnapshot::update(const Json& event) {
     if (auto ssrc = number(row, "ssrc"); ssrc && *ssrc >= 0 && *ssrc <= 4294967295.0)
       stream.ssrc = std::to_string(static_cast<uint32_t>(*ssrc));
     stream.bytes = number(row, stream.sending ? "bytesSent" : "bytesReceived");
+    stream.retransmit_bytes = number(row, stream.sending ? "retransmittedBytesSent" : "retransmittedBytesReceived");
+    // Native outbound stats do not expose FEC bytes. Do not infer them from
+    // packet counts or from the difference between total and media bytes.
+    if (!stream.sending) stream.fec_bytes = number(row, "fecBytesReceived");
     stream.track_id = text(row, "trackIdentifier");
     if (stream.sending) {
       auto source = media_sources.find(text(row, "mediaSourceId"));
@@ -98,6 +102,8 @@ void QualitySnapshot::update(const Json& event) {
         old->second.ssrc == stream.ssrc && old->second.sending == stream.sending && old->second.kind == stream.kind &&
         old->second.track_id == stream.track_id) {
       if (auto bytes = rate(stream.bytes, old->second.bytes, seconds)) stream.kbps = *bytes * 8 / 1000;
+      if (auto bytes = rate(stream.retransmit_bytes, old->second.retransmit_bytes, seconds)) stream.retransmit_kbps = *bytes * 8 / 1000;
+      if (auto bytes = rate(stream.fec_bytes, old->second.fec_bytes, seconds)) stream.fec_kbps = *bytes * 8 / 1000;
       stream.fps = rate(stream.frames, old->second.frames, seconds);
     }
     next.streams.emplace(id, std::move(stream));
@@ -149,6 +155,20 @@ std::string QualitySnapshot::track_id(const StreamQuality& stream, size_t peer) 
   }
   auto mapped = remote_tracks[peer].find(stream.ssrc);
   return mapped == remote_tracks[peer].end() ? stream.track_id : mapped->second;
+}
+std::optional<double> QualitySnapshot::bitrate(Bitrate kind, const std::string& track, bool sending) const {
+  if (track.empty()) return {};
+  std::optional<double> total;
+  for (size_t p = 0; p < peers.size(); ++p) for (const auto& [id, stream] : peers[p].streams) {
+    if (stream.sending != sending || track_id(stream, p) != track) continue;
+    if (peers[p].stale() || (sending && stream.track_id != track && graph_sample.stale())) return {};
+    const auto value = kind == Bitrate::rtp ? stream.kbps :
+      kind == Bitrate::retransmit ? stream.retransmit_kbps : stream.fec_kbps;
+    // A new simulcast layer or missing counter invalidates only this track's total.
+    if (!value) return {};
+    total = total.value_or(0) + *value;
+  }
+  return total;
 }
 std::optional<double> QualitySnapshot::fps(Stage stage, const std::string& track) const {
   std::optional<double> total;

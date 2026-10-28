@@ -16,11 +16,18 @@ p.add_argument('--server', required=True)
 args = p.parse_args()
 root = Path('out/sdk-integration').resolve() / time.strftime('%Y%m%d-%H%M%S')
 root.mkdir(parents=True)
-port, rtc, udp = [free_port() for _ in range(3)]
+port, rtc = free_port(), free_port()
+while rtc == port:
+    rtc = free_port()
+# A free TCP port may be excluded for UDP on Windows. This fixture only uses
+# loopback, so probe UDP and keep the Go listener on that same interface.
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+    probe.bind(('127.0.0.1', 0))
+    udp = probe.getsockname()[1]
 env = dict(os.environ, LIVEKIT_URL=f'http://127.0.0.1:{port}', LIVEKIT_API_KEY='sdktest',
            LIVEKIT_API_SECRET='sdk-integration-test-secret-32-characters', LIVEKIT_TOKEN='')
 config = root / 'server.yaml'
-config.write_text(f'port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n  tcp_port: {rtc}\n  udp_port: {udp}\n  use_external_ip: false\n  node_ip: 127.0.0.1\n  enable_loopback_candidate: true\nkeys:\n  sdktest: {env["LIVEKIT_API_SECRET"]}\nlogging:\n  level: warn\n')
+config.write_text(f'port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n  tcp_port: {rtc}\n  udp_port: {udp}\n  use_external_ip: false\n  node_ip: 127.0.0.1\n  ips:\n    includes: [127.0.0.1/32]\n  enable_loopback_candidate: true\nkeys:\n  sdktest: {env["LIVEKIT_API_SECRET"]}\nlogging:\n  level: warn\n')
 flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 with open(root / 'server.log', 'w') as log:
     server = subprocess.Popen([args.server, '--config', str(config)], stdout=log, stderr=log, creationflags=flags)
