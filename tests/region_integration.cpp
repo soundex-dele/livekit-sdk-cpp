@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     options.token = token;
     options.regions.trusted_endpoints = {server};
     options.reconnect.enabled = false;
-    auto join = [&](transport::RoomSession& room, const std::string& url,
+    auto join = [&](transport::RoomEngine& room, const std::string& url,
                     transport::RoomOptions value) {
       value.url = url;
       return room.join(std::move(value));

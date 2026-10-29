@@ -139,7 +139,9 @@ class LiveKitTransport final : public RoomTransport {
     budget_ = std::move(budget);
   }
 
-  void start(const RoomOptions& options) override {
+  void start(const RoomOptions& options, Epoch initial_epoch) override {
+    epoch_ = initial_epoch;
+    detached_epoch_ = initial_epoch;
     if (worker_.joinable())
       throw std::logic_error("LiveKit transport is already started");
     if (options.single_peer_connection)
@@ -1374,7 +1376,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
 }  // namespace livekit::sdk::rtc::detail
 
 namespace livekit::sdk::rtc {
-std::unique_ptr<RoomSession> create_livekit_room() {
-  return std::make_unique<RoomSession>(std::make_unique<detail::LiveKitTransport>());
+std::unique_ptr<RoomEngine> create_livekit_room() {
+  return std::make_unique<RoomEngine>([] { return std::make_unique<detail::LiveKitTransport>(); });
 }
 }  // namespace livekit::sdk::rtc

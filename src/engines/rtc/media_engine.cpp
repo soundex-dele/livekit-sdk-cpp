@@ -1,4 +1,5 @@
-#include "livekit/rtc/media_engine.hpp"
+#include "engines/rtc/media_engine.hpp"
+#include "engines/rtc/rtc_engine_impl.hpp"
 #include <atomic>
 #include <algorithm>
 #include "livekit/rtc/input_node.hpp"
@@ -356,17 +357,15 @@ void MediaTrack::throw_if_failed() const {
   state_->check();
 }
 
-RtcMediaEngine::RtcMediaEngine(std::unique_ptr<RtcEngine> engine, AudioOutputOptions options)
-    : output_(std::make_shared<AudioOutputSession>(options)), engine_(std::move(engine)) {
-  if (!engine_)
-    throw std::invalid_argument("Media engine requires an encoded engine");
-}
+RtcMediaEngine::RtcMediaEngine(RtcPipelineEngine& engine, AudioOutputOptions options)
+    : output_(std::make_shared<AudioOutputSession>(options)), engine_(&engine) {}
 
-RtcMediaEngine::~RtcMediaEngine() {
-  try {
-    close().get();
-  } catch (...) {
+void RtcEngine::enable_media(AudioOutputOptions options) {
+  impl_->require_owner();
+  if (impl_->media || impl_->room->snapshot().state != ConnectionState::disconnected) {
+    throw std::logic_error("Enable RTC media once, before joining");
   }
+  impl_->media = std::make_unique<RtcMediaEngine>(*impl_->pipelines, options);
 }
 
 MediaOperation RtcMediaEngine::operation(std::future<TrackId> future,
@@ -395,29 +394,6 @@ MediaOperation RtcMediaEngine::operation(std::future<TrackId> future,
 
 void RtcMediaEngine::finish_pending() {
   std::erase_if(pending_, [](auto& finish) { return finish(); });
-}
-
-void RtcMediaEngine::poll(size_t frames) {
-  engine_->poll(frames);
-  finish_pending();
-}
-
-std::future<void> RtcMediaEngine::unpublish(const TrackId& id) {
-  auto result = engine_->unpublish(id);
-  finish_pending();
-  return result;
-}
-
-std::future<void> RtcMediaEngine::unsubscribe(const TrackId& id) {
-  auto result = engine_->unsubscribe(id);
-  finish_pending();
-  return result;
-}
-
-std::future<void> RtcMediaEngine::close() {
-  auto result = engine_->close();
-  finish_pending();
-  return result;
 }
 
 MediaOperation RtcMediaEngine::publish_media(MediaPublishSpec spec) {
@@ -533,22 +509,6 @@ MediaOperation RtcMediaEngine::subscribe_media(MediaSubscribeSpec spec) {
     return graph;
   });
   return operation(std::move(ready), std::move(state));
-}
-
-MediaOperation RtcMediaEngine::publish_video(MediaPublishSpec spec) {
-  if (spec.track.kind != MediaKind::video)
-    throw std::invalid_argument("Expected video publication");
-  return publish_media(std::move(spec));
-}
-
-MediaOperation RtcMediaEngine::publish_audio(MediaPublishSpec spec) {
-  if (spec.track.kind != MediaKind::audio)
-    throw std::invalid_argument("Expected audio publication");
-  return publish_media(std::move(spec));
-}
-
-std::unique_ptr<RtcMediaEngine> create_livekit_media_engine(AudioOutputOptions options) {
-  return std::make_unique<RtcMediaEngine>(create_livekit_engine(), options);
 }
 
 std::shared_ptr<SharedMediaInput> RtcMediaEngine::create_shared_input(TrackDescriptor format,

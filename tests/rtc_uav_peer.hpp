@@ -342,7 +342,7 @@ struct Peer {
     engine_->poll();
     if (auto failure = engine_->next_failure())
       throw std::runtime_error(failure->message);
-    while (auto event = engine_->room().next_event(0ms)) {
+    while (auto event = engine_->next_event(0ms)) {
       if (event->kind == transport::RoomEventKind::closed ||
           event->kind == transport::RoomEventKind::failed)
         throw std::runtime_error(event->message);

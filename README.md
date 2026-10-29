@@ -1,18 +1,20 @@
 # livekit-sdk-cpp
 
-C++20 LiveKit 收发 SDK。RoomSession 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 为每条轨道创建独立流水线，多路音视频共享一个房间连接。
+C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 
-普通媒体会话使用可选的 RtcMediaEngine：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
+普通媒体会话通过 RtcEngine 装配可选的内部 RtcMediaEngine：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
 
 旧 Room、Participant、TrackPublication、VideoFrameStream、AudioFrameStream API 和 LiveKit::SDK 目标已移除，没有兼容层。调用方与测试入口已迁移，支持边界与验证记录见 [实施清单](docs/rtc-backend-refactor.md)。
+
+旧公开 RtcMediaEngine / RoomSession 已移除，统一入口与退房重入契约见 [RTC 引擎 API](docs/rtc-media-engine.md)。
 
 ## 入口
 
 | 使用方式 | 公共头文件 | 链接目标 |
 | --- | --- | --- |
-| 配置采集、编解码、预览、播放、录制与共享采集 | livekit/rtc/media_engine.hpp | LiveKit::RTCMediaEngine |
+| 配置采集、编解码、预览、播放、录制与共享采集 | livekit/rtc/engine.hpp | LiveKit::RTCMediaEngine |
 | 只入会、收发编码帧 | livekit/rtc/livekit.hpp | LiveKit::RTCLiveKit |
-| Engine 管理每轨 GraphEngine | livekit/rtc/engine.hpp | LiveKit::RTCEngine |
+| 统一入口：编码传输与高级 GraphEngine 扩展 | livekit/rtc/engine.hpp | LiveKit::RTCEngine |
 | 自行组合发布/订阅节点 | livekit/rtc/publish_node.hpp、subscribe_node.hpp | LiveKit::RTCNodes |
 | 上层 VP8/H264/H265/Opus 编解码 | livekit/rtc/video_nodes.hpp、audio_nodes.hpp | LiveKit::RTCMedia |
 | 应用供帧、文件、设备输入图 | livekit/rtc/input_node.hpp | LiveKit::RTCInputs |
@@ -25,7 +27,7 @@ C++20 LiveKit 收发 SDK。RoomSession 负责入会、信令、已编码媒体�
 普通 Session 的入口、共享源示例及所有权规则见 [媒体引擎 API](docs/rtc-media-engine.md)。
 
     输入 → 编码节点 → 发布节点 ─┐
-    输入 → 编码节点 → 发布节点 ─┼─ 共享 RoomSession / LiveKit 连接
+    输入 → 编码节点 → 发布节点 ─┼─ 共享 RoomEngine / LiveKit 连接
     显示 ← 解码节点 ← 订阅节点 ─┤
     录制 ← 编码帧   ← 订阅节点 ─┘
 
@@ -35,14 +37,14 @@ RtcEngine 的控制和 poll() 由同一个主管线程调用；采集、编解�
 
 ## RTC 后端目录
 
-公共房间控制器为 `rtc::RoomSession`，头文件为 `livekit/rtc/room_session.hpp`。
-`RtcEngine` 持有会话，`RoomSession` 通过内部 `RoomTransport` 接口使用具体适配器。
-`create_livekit_room()` 返回 `std::unique_ptr<RoomSession>`。
+公共房间控制器为 `rtc::RoomEngine`，头文件为 `livekit/rtc/room_engine.hpp`。
+`RtcEngine` 持有会话，`RoomEngine` 通过内部 `RoomTransport` 接口使用具体适配器。
+`create_livekit_room()` 返回 `std::unique_ptr<RoomEngine>`。
 
 ```text
 src/backends/
 ├── rtc/
-│   ├── room_session.cpp       # 房间生命周期、轨道、事件和操作队列
+│   ├── room_engine.cpp       # 房间生命周期、轨道、事件和操作队列
 │   ├── room_transport.hpp     # 内部适配接口
 │   ├── endpoint.cpp
 │   ├── queue_budget.hpp

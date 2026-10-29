@@ -1,5 +1,5 @@
 #include "session.hpp"
-#include <livekit/rtc/media_engine.hpp>
+#include <livekit/rtc/engine.hpp>
 #include <algorithm>
 
 namespace demo {
@@ -94,7 +94,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
       };
       try {
         std::map<TrackId, std::shared_ptr<Track>> tracks;
-        auto engine = engine::create_livekit_media_engine();
+        auto engine = engine::create_livekit_engine({});
         const auto report = [&](const Json& event) {
           {
             std::lock_guard lock(mutex_);
@@ -190,7 +190,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
         };
         auto next_stats = SteadyClock::now();
         while (!stop.stop_requested()) {
-          while (auto event = engine->room().next_event(0ms)) {
+          while (auto event = engine->next_event(0ms)) {
             if (event->kind == RoomEventKind::remote_track_added && event->descriptor)
               subscribe(*event->descriptor);
             else if (event->kind == RoomEventKind::track_removed) {

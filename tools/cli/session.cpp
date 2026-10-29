@@ -1,5 +1,5 @@
 #include "session.hpp"
-#include "livekit/rtc/media_engine.hpp"
+#include "livekit/rtc/engine.hpp"
 #include "media_nodes/render/video_playout.hpp"
 #include "backends/webrtc/native_peer.hpp"
 #include "api/video/i420_buffer.h"
@@ -124,7 +124,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
   std::map<TrackId, std::shared_ptr<Track>> tracks;
   auto display =
       options.video_playout ? std::make_shared<lk::VideoPlayout>(display_events) : nullptr;
-  auto engine = engine::create_livekit_media_engine();  // Destroy before consumers/display.
+  auto engine = engine::create_livekit_engine({});  // Destroy before consumers/display.
   RoomOptions room;
   room.url = options.url;
   room.token = options.token;
@@ -227,7 +227,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
     while (!stop.stop_requested() &&
            (!options.duration ||
             SteadyClock::now() - start < std::chrono::seconds(options.duration))) {
-      while (auto event = engine->room().next_event(0ms)) {
+      while (auto event = engine->next_event(0ms)) {
         if (event->kind == RoomEventKind::remote_track_added && event->descriptor)
           subscribe(*event->descriptor);
         else if (event->kind == RoomEventKind::track_removed) {

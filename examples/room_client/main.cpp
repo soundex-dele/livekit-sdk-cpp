@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
     const auto end = rtc::SteadyClock::now() + duration;
     uint64_t timestamp = 0;
     while (rtc::SteadyClock::now() < end) {
-      while (auto event = engine->room().next_event(0ms)) {
+      while (auto event = engine->next_event(0ms)) {
         if (event->kind == rtc::RoomEventKind::failed)
           throw std::runtime_error(event->message);
         if (!publishing && event->kind == rtc::RoomEventKind::remote_track_added) {

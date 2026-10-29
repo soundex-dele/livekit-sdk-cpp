@@ -33,7 +33,7 @@ struct DataEvent {
 };
 
 // Session services share the room's transport and lifetime. This handle can be
-// retained after RoomSession destruction; active operations are then rejected.
+// retained after RoomEngine destruction; active operations are then rejected.
 // Network callbacks only enqueue data. RPC/stream handlers run on bounded
 // service executors, never on the native transport/signaling thread.
 class RoomServices {

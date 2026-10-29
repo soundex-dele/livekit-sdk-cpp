@@ -1,4 +1,4 @@
-#include <livekit/rtc/media_engine.hpp>
+#include <livekit/rtc/engine.hpp>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
@@ -12,7 +12,7 @@ int main() {
     if (!url || !token)
       throw std::runtime_error("Set LIVEKIT_URL and a room-join LIVEKIT_TOKEN");
     std::atomic<size_t> received{0};
-    auto engine = engine::create_livekit_media_engine();
+    auto engine = engine::create_livekit_engine({});
     RoomOptions options;
     options.url = url;
     options.token = token;
@@ -20,7 +20,7 @@ int main() {
     std::vector<std::future<TrackId>> pending;
     const auto deadline = SteadyClock::now() + 30s;
     while (received < 50 && SteadyClock::now() < deadline) {
-      if (auto event = engine->room().next_event(10ms);
+      if (auto event = engine->next_event(10ms);
           event && event->kind == RoomEventKind::remote_track_added &&
           event->descriptor->kind == MediaKind::video) {
         auto descriptor = *event->descriptor;

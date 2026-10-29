@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/rtc/room_session.hpp"
+#include "livekit/rtc/room_engine.hpp"
 #include "livekit/rtc/events.hpp"
 #include "core/graph_node.h"
 

@@ -1,42 +1,54 @@
 #pragma once
+#include "livekit/rtc/room_engine.hpp"
+#include "livekit/rtc/media_config.hpp"
 #include "livekit/rtc/stream_pipeline.hpp"
-#include <functional>
-#include <deque>
-#include <thread>
+#include <memory>
+#include <optional>
+#include <string>
 
 namespace livekit::sdk::rtc::engine {
-
-// Scene-engine building block. One RoomSession is shared by all track graphs.
-// The scene controller calls poll() to complete graph creation and fairly drive
-// receive/feedback nodes. No per-track worker and no user media work runs on the
-// backend's signaling/transport thread. Control methods are owner-thread only;
-// write() may be called by media producers. Consumers must not reenter graph
-// lifecycle methods from inside synchronous GraphEngine delivery.
-class RtcEngine {
+// Single-room SDK facade. Control, poll and destruction use the creating thread.
+// Media callbacks must be bounded and cannot reenter lifecycle operations.
+// Futures for graph/media creation require poll(); join/leave use the room worker.
+class RtcEngine final {
  public:
-  explicit RtcEngine(std::unique_ptr<detail::RoomTransport>);
-  explicit RtcEngine(std::unique_ptr<RoomSession>);
+  explicit RtcEngine(RoomEngine::TransportFactory);
+  explicit RtcEngine(std::unique_ptr<RoomEngine>);
   ~RtcEngine();
   RtcEngine(const RtcEngine&) = delete;
   RtcEngine& operator=(const RtcEngine&) = delete;
 
+  // Links LiveKit::RTCMediaEngine. Call before join; repeated installation is rejected.
+  void enable_media(AudioOutputOptions = {});
+  bool media_enabled() const;
   std::future<void> join(RoomOptions);
+  // Quiesces graphs before leaving. Await completion before joining again.
+  std::future<void> leave();
+  // Terminal and idempotent. Rejects subsequent control operations.
+  std::future<void> close();
+  void poll(size_t receive_frames_per_track = 4);
+
+  MediaOperation publish_media(MediaPublishSpec);
+  MediaOperation publish_video(MediaPublishSpec);
+  MediaOperation publish_audio(MediaPublishSpec);
+  MediaOperation subscribe_media(MediaSubscribeSpec);
+  std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput);
+
+  // Explicit advanced encoded/graph API. All tracks share the same room registry.
   std::future<TrackId> publish(TrackDescriptor,
                                std::shared_ptr<graphflow::core::GraphNode> feedback_sink = {});
   std::future<TrackId> subscribe(TrackDescriptor,
                                  std::shared_ptr<graphflow::core::GraphNode> consumer);
-  // Factories run on poll() only after endpoint confirmation. They create
-  // capture/codec/recording/playout nodes in the endpoint's own GraphEngine.
   std::future<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
   std::future<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
   std::future<void> unpublish(const TrackId&);
   std::future<void> unsubscribe(const TrackId&);
-  std::future<void> set_muted(const TrackId&, bool muted, ControlOptions = {});
+  std::future<void> set_muted(const TrackId&, bool, ControlOptions = {});
   std::future<void> set_receive_demand(const TrackId&, ReceiveDemand, ControlOptions = {});
+  // Producer threads may write; closed/absent publications return WriteStatus::closed.
   WriteStatus write(const TrackId&, EncodedFrame);
   TrackSnapshot publication(const TrackId&) const;
   SenderFeedback feedback(const TrackId&) const;
-  void poll(size_t receive_frames_per_track = 4);
 
   struct GraphFailure {
     TrackId id;
@@ -45,35 +57,20 @@ class RtcEngine {
   };
 
   std::optional<GraphFailure> next_failure();
-  std::future<void> close();
 
-  RoomSession& room() {
-    return *room_;
-  }
+  // Borrowed view valid until engine destruction. No room/track teardown escape hatch.
+  const RoomView& room() const;
+  // Single-consumer room event queue. Internal modules observe endpoints, not this queue.
+  std::optional<RoomEvent> next_event(std::chrono::milliseconds timeout = {},
+                                      std::stop_token stop = {});
 
  private:
-  void require_owner() const;
-  void remove_graph(const TrackId&, bool publication);
-  void cancel_pending(const TrackId&, bool publication);
-  void failed_graph(const TrackId&, bool publication, std::string message);
-
-  struct Pending {
-    TrackId id;
-    bool publication;
-    std::function<bool()> poll;
-    std::function<void(std::exception_ptr)> cancel;
-  };
-
-  std::unique_ptr<RoomSession> room_;
-  const std::thread::id owner_ = std::this_thread::get_id();
-  mutable std::mutex mutex_;
-  std::map<TrackId, std::shared_ptr<PublishPipeline>> publications_;
-  std::map<TrackId, std::shared_ptr<SubscribePipeline>> subscriptions_;
-  std::vector<Pending> pending_;
-  std::deque<GraphFailure> failures_;
-  bool closed_ = false;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
-// Available when the native LiveKit backend is built.
+// Encoded-only factory links LiveKit::RTCEngine; overload with audio options
+// installs media support and links LiveKit::RTCMediaEngine.
 std::unique_ptr<RtcEngine> create_livekit_engine();
+std::unique_ptr<RtcEngine> create_livekit_engine(AudioOutputOptions);
 }  // namespace livekit::sdk::rtc::engine

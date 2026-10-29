@@ -1,4 +1,4 @@
-#include "livekit/rtc/room_session.hpp"
+#include "livekit/rtc/room_engine.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include <algorithm>
 #include <condition_variable>
@@ -92,7 +92,7 @@ class FakeTransport : public RoomTransport {
  public:
   explicit FakeTransport(std::shared_ptr<Harness> harness) : h(std::move(harness)) {}
 
-  void start(const RoomOptions& options) override {
+  void start(const RoomOptions& options, Epoch) override {
     std::lock_guard lock(h->mutex);
     h->owner = std::this_thread::get_id();
     ++h->starts;
@@ -191,7 +191,7 @@ RoomOptions options(size_t budget = 4096) {
 
 void permission_controls() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   auto opts = options();
   opts.subscription_permissions = SubscriptionPermissions{false, {{"viewer", false, {"camera"}}}};
   get(room.join(opts));
@@ -282,7 +282,7 @@ void permission_controls() {
 
 void statistics_events() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   auto opts = options();
   opts.max_events = 2;
   opts.stats_interval = 200ms;
@@ -328,7 +328,7 @@ void statistics_events() {
   get(room.leave());
   auto bad = options();
   bad.stats_interval = 199ms;
-  RoomSession invalid(std::make_unique<FakeTransport>(std::make_shared<Harness>()));
+  RoomEngine invalid([] { return std::make_unique<FakeTransport>(std::make_shared<Harness>()); });
   bool rejected = false;
   try {
     get(invalid.join(bad));
@@ -340,7 +340,7 @@ void statistics_events() {
 
 void receive_demand_controls() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   auto descriptor = video("receive");
   descriptor.receive_demand.disabled = true;
@@ -479,7 +479,7 @@ void receive_demand_controls() {
 
 void publication_sources() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   for (auto source :
        {PublicationSource::unknown, PublicationSource::camera, PublicationSource::microphone,
@@ -553,7 +553,7 @@ void mute_contract() {
           "Native rates overrode local mute gate");
   }
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   auto descriptor = video("muted");
   descriptor.muted = true;
@@ -636,7 +636,7 @@ void mute_contract() {
 
 void mute_event_overflow() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   auto opts = options();
   opts.max_events = 1;
   get(room.join(opts));
@@ -662,7 +662,7 @@ void mute_event_overflow() {
 void participant_controls() {
   using livekit::sdk::ErrorCode;
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   auto opts = options();
   opts.signal_protocol = 15;
   get(room.join(opts));
@@ -758,7 +758,7 @@ void participant_controls() {
 
 void session_lifetime() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   auto opts = options();
   opts.max_events = 4;
   get(room.join(opts));
@@ -898,7 +898,7 @@ void feedback_admission() {
 
 void multi_stream_and_recovery() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   auto a = get(room.publish(video("camera-a")));
   auto b = get(room.publish(video("camera-b")));
@@ -955,7 +955,7 @@ void multi_stream_and_recovery() {
 
 void receive_and_lifetime() {
   auto h = std::make_shared<Harness>();
-  auto room = std::make_unique<RoomSession>(std::make_unique<FakeTransport>(h));
+  auto room = std::make_unique<RoomEngine>([h] { return std::make_unique<FakeTransport>(h); });
   get(room->join(options()));
   auto a = get(room->subscribe(video("remote-a")));
   auto b = get(room->subscribe(video("remote-b")));
@@ -998,7 +998,7 @@ void receive_and_lifetime() {
 
 void timeout_and_reused_identity() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   auto opts = options();
   opts.operation_timeout = 50ms;
   get(room.join(opts));
@@ -1038,7 +1038,7 @@ void timeout_and_reused_identity() {
 
 void cancel_pending_and_isolate_failure() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   {
     std::lock_guard lock(h->mutex);
@@ -1116,7 +1116,7 @@ class FeedbackConsumer : public graphflow::core::GraphNode {
 
 void pipeline_contract() {
   auto h = std::make_shared<Harness>();
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   auto a = get(room.publish(video("a")));
   auto b = get(room.publish(video("b")));
@@ -1181,7 +1181,7 @@ void pipeline_contract() {
 
 void engine_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine engine(std::make_unique<FakeTransport>(h));
+  engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
   get(engine.join(options()));
   auto first = engine.publish(video("first"));
   auto second = engine.publish(video("second"));
@@ -1233,7 +1233,7 @@ void engine_contract() {
       "Server revoke did not close publication graph");
   check(!engine.next_failure(), "Normal server removal became a graph processing failure");
   bool removal_observed = false;
-  while (auto event = engine.room().next_event(0ms))
+  while (auto event = engine.next_event(0ms))
     if (event->kind == RoomEventKind::track_removed && event->track_id == "second")
       removal_observed = event->descriptor && event->descriptor->id == "second";
   check(removal_observed, "Publication removal notification missing its identity");
@@ -1269,7 +1269,7 @@ class GraphRelay : public graphflow::core::GraphNode {
 
 void composed_graph_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine engine(std::make_unique<FakeTransport>(h));
+  engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
   get(engine.join(options()));
   int activations = 0, quiescences = 0, polls = 0;
   bool teardown_while_running = false;
@@ -1370,10 +1370,107 @@ void composed_graph_contract() {
   get(engine.close());
 }
 #endif
+// A new adapter/epoch prevents retained endpoints and delayed notifications from
+// changing a later join that reuses the same application track id.
+void room_reuse_contract() {
+  auto h = std::make_shared<Harness>();
+  int adapters = 0;
+  RoomEngine room([&] {
+    ++adapters;
+    return std::make_unique<FakeTransport>(h);
+  });
+  get(room.join(options()));
+  auto old_track = get(room.publish(video("camera")));
+  BindingToken old_binding;
+  {
+    std::lock_guard lock(h->mutex);
+    old_binding = h->published.back();
+  }
+  const auto old_epoch = room.snapshot().epoch;
+  get(room.leave());
+  get(room.join(options()));
+  check(adapters == 2 && room.snapshot().epoch > old_epoch,
+        "Rejoin reused an adapter or connection epoch");
+  auto current = get(room.publish(video("camera")));
+  get(old_track->close());
+  h->push({TransportEventKind::removed, old_binding});
+  check(current->try_write(frame(current->snapshot().epoch, 1)) == WriteStatus::accepted,
+        "Old endpoint closed the new publication");
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return !h->sent.empty();
+      },
+      "Rejoined publication did not send");
+  check(current->snapshot().state == TrackState::ready, "Stale event removed current endpoint");
+  get(room.leave());
+}
+
+#ifdef LIVEKIT_TEST_RTC_NODES
+template <class T>
+concept CanLeave = requires(T& value) { value.leave(); };
+template <class T>
+concept CanPublish = requires(T& value) { value.publish(TrackDescriptor{}); };
+static_assert(!CanLeave<RoomView> && !CanPublish<RoomView>);
+
+void facade_lifecycle_contract() {
+  auto h = std::make_shared<Harness>();
+  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  check(!rtc.media_enabled(), "Encoded facade unexpectedly installed media");
+  bool unsupported = false;
+  try {
+    rtc.publish_media({});
+  } catch (const livekit::sdk::SDKError& error) {
+    unsupported = error.code() == livekit::sdk::ErrorCode::unsupported;
+  }
+  check(unsupported, "Missing media module was not reported");
+  get(rtc.join(options()));
+  auto pending = rtc.publish(video("pending"));
+  get(rtc.leave());
+  bool cancelled = false;
+  try {
+    get(std::move(pending));
+  } catch (const std::exception&) {
+    cancelled = true;
+  }
+  check(cancelled, "Leave did not settle pending graph creation");
+  get(rtc.join(options()));
+  auto active = rtc.publish(video("pending"));
+  eventually(
+      [&] {
+        rtc.poll();
+        return active.wait_for(0ms) == std::future_status::ready;
+      },
+      "Facade failed to publish after rejoin");
+  check(active.get() == "pending", "Rejoined graph has wrong identity");
+  bool wrong_thread = false;
+  std::thread other([&] {
+    try {
+      rtc.leave();
+    } catch (const std::logic_error&) {
+      wrong_thread = true;
+    }
+  });
+  other.join();
+  check(wrong_thread, "Facade allowed lifecycle control on another thread");
+  get(rtc.close());
+  get(rtc.close());
+  check(rtc.write("pending", frame(2, 1)) == WriteStatus::closed,
+        "Terminal facade still accepts frames");
+  bool closed = false;
+  try {
+    rtc.join(options());
+  } catch (const livekit::sdk::SDKError& error) {
+    closed = error.code() == livekit::sdk::ErrorCode::session_closed;
+  }
+  check(closed, "Terminal close allowed another join");
+}
+#endif
+
 void typed_join_failure() {
   auto h = std::make_shared<Harness>();
   h->connect = false;
-  RoomSession room(std::make_unique<FakeTransport>(h));
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
   RoomOptions options;
   options.url = "ws://test";
   options.token = "test";
@@ -1407,11 +1504,13 @@ void typed_join_failure() {
 int main() {
   try {
 #ifdef LIVEKIT_TEST_RTC_NODES
+    facade_lifecycle_contract();
     pipeline_contract();
     engine_contract();
     composed_graph_contract();
     std::cout << "RTC graph pipeline contracts passed\n";
 #else
+    room_reuse_contract();
     typed_join_failure();
     statistics_events();
     permission_controls();

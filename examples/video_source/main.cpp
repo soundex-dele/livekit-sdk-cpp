@@ -1,4 +1,4 @@
-#include <livekit/rtc/media_engine.hpp>
+#include <livekit/rtc/engine.hpp>
 #include <algorithm>
 #include <iostream>
 #include <thread>
@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto engine = engine::create_livekit_media_engine();
+    auto engine = engine::create_livekit_engine({});
     RoomOptions options;
     options.url = argv[1];
     options.token = argv[2];

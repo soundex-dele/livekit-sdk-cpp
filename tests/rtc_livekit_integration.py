@@ -1,4 +1,4 @@
-"""Exercise encoded RoomSession against an isolated, explicitly supplied SFU."""
+"""Exercise encoded RoomEngine against an isolated, explicitly supplied SFU."""
 import argparse
 import base64
 import hashlib

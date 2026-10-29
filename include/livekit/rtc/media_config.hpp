@@ -1,11 +1,12 @@
 #pragma once
-#include "livekit/rtc/engine.hpp"
 #include "livekit/rtc/media_types.hpp"
 #include "livekit/video_source.hpp"
 #include "livekit/microphone.hpp"
 #include "livekit/encoded_media.hpp"
 #include "livekit/rtc/audio_output.hpp"
 #include <filesystem>
+#include <functional>
+#include <future>
 
 namespace livekit::sdk::rtc::engine {
 // Configuration and application-owned sources, never graph nodes. A microphone
@@ -125,66 +126,4 @@ struct MediaOperation {
   std::shared_ptr<MediaTrack> track;
 };
 
-// Optional layer above the encoded RtcEngine. All control/poll calls use the
-// same owner thread. The engine owns graph construction and shutdown barriers.
-class RtcMediaEngine final {
- public:
-  explicit RtcMediaEngine(std::unique_ptr<RtcEngine>, AudioOutputOptions = {});
-  ~RtcMediaEngine();
-  MediaOperation publish_media(MediaPublishSpec);
-  MediaOperation subscribe_media(MediaSubscribeSpec);
-  MediaOperation publish_video(MediaPublishSpec);
-  MediaOperation publish_audio(MediaPublishSpec);
-  std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor raw_format, MediaInput);
-
-  std::future<void> join(RoomOptions value) {
-    return engine_->join(std::move(value));
-  }
-
-  std::future<void> unpublish(const TrackId& id);
-  std::future<void> unsubscribe(const TrackId& id);
-
-  std::future<void> set_muted(const TrackId& id, bool value, ControlOptions options = {}) {
-    return engine_->set_muted(id, value, options);
-  }
-
-  std::future<void> set_receive_demand(const TrackId& id, ReceiveDemand value,
-                                       ControlOptions options = {}) {
-    return engine_->set_receive_demand(id, value, options);
-  }
-
-  void poll(size_t frames = 4);
-
-  auto next_failure() {
-    return engine_->next_failure();
-  }
-
-  std::future<void> close();
-
-  RoomSession& room() {
-    return engine_->room();
-  }
-
-  TrackSnapshot publication(const TrackId& id) const {
-    return engine_->publication(id);
-  }
-
-  SenderFeedback feedback(const TrackId& id) const {
-    return engine_->feedback(id);
-  }
-
-  // Advanced custom graphs remain available explicitly on the encoded engine.
-  RtcEngine& encoded_engine() {
-    return *engine_;
-  }
-
- private:
-  MediaOperation operation(std::future<TrackId>, std::shared_ptr<MediaTrack::State>);
-  void finish_pending();
-  std::shared_ptr<AudioOutputSession> output_;
-  std::unique_ptr<RtcEngine> engine_;
-  std::vector<std::function<bool()>> pending_;
-};
-
-std::unique_ptr<RtcMediaEngine> create_livekit_media_engine(AudioOutputOptions = {});
 }  // namespace livekit::sdk::rtc::engine

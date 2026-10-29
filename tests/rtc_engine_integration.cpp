@@ -80,7 +80,7 @@ int main() {
     const auto discovered_by = SteadyClock::now() + 10s;
     while (subscribing.size() < 4) {
       check(SteadyClock::now() < discovered_by, "Engine remote discovery timed out");
-      auto event = rx->room().next_event(100ms);
+      auto event = rx->next_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 4; ++i)
@@ -129,10 +129,47 @@ int main() {
     await(*tx, tx->unpublish("graph-0"));
     await(*tx, tx->unpublish("graph-2"));
     run({1, 3});
+    // Reuse the same facade with fresh native transport and service state.
+    const auto previous_epoch = tx->room().snapshot().epoch;
+    auto old_services = tx->room().services();
+    tx->leave().get();
+    rx->leave().get();
+    options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
+    await(*tx, tx->join(options));
+    options.token = std::getenv("LIVEKIT_SUBSCRIBE_TOKEN");
+    await(*rx, rx->join(options));
+    check(tx->room().snapshot().epoch > previous_epoch, "Native rejoin reused its epoch");
+    check(old_services != tx->room().services(), "Native rejoin reused closed room services");
+    bool old_service_closed = false;
+    try {
+      old_services->send_data({1}).get();
+    } catch (const std::exception&) {
+      old_service_closed = true;
+    }
+    check(old_service_closed, "Old room services affected the new join");
+    tx->room().services()->send_data({2}).get();
+    await(*tx, tx->publish(descriptors[3]));
+    const auto rejoined_by = SteadyClock::now() + 10s;
+    bool subscribed_again = false;
+    while (!subscribed_again) {
+      check(SteadyClock::now() < rejoined_by, "Rejoined remote discovery timed out");
+      auto event = rx->next_event(100ms);
+      if (!event || event->kind != RoomEventKind::remote_track_added ||
+          event->descriptor->name != descriptors[3].name) {
+        continue;
+      }
+      sinks[3] = std::make_shared<Consumer>(payloads[3]);
+      auto descriptor = *event->descriptor;
+      descriptor.id = descriptors[3].id;
+      await(*rx, rx->subscribe(descriptor, sinks[3]));
+      subscribed_again = true;
+    }
+    run({3});
     // close() quiesces graph delivery immediately; its future only awaits backend.
     tx->close().get();
     rx->close().get();
-    std::cout << "{\"engineMultiGraph\":true,\"encodedMedia\":true,\"independentClose\":true}\n";
+    std::cout << "{\"engineMultiGraph\":true,\"encodedMedia\":true,\"independentClose\":true,"
+                 "\"leaveRejoin\":true,\"serviceIsolation\":true}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

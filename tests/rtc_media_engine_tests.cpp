@@ -1,4 +1,4 @@
-#include "livekit/rtc/media_engine.hpp"
+#include "livekit/rtc/engine.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include <algorithm>
 #include <atomic>
@@ -37,7 +37,7 @@ class Transport final : public RoomTransport {
  public:
   explicit Transport(std::shared_ptr<Wire> wire) : w(std::move(wire)) {}
 
-  void start(const RoomOptions&) override {
+  void start(const RoomOptions&, Epoch) override {
     ++w->starts;
     w->emit({TransportEventKind::connected});
   }
@@ -112,7 +112,7 @@ class Transport final : public RoomTransport {
 };
 
 template <class F>
-void until(RtcMediaEngine& engine, F done) {
+void until(RtcEngine& engine, F done) {
   const auto deadline = SteadyClock::now() + 5s;
   while (!done()) {
     check(SteadyClock::now() < deadline, "Media engine operation timed out");
@@ -122,7 +122,7 @@ void until(RtcMediaEngine& engine, F done) {
 }
 
 template <class T>
-auto await(RtcMediaEngine& engine, std::future<T>& operation) {
+auto await(RtcEngine& engine, std::future<T>& operation) {
   until(engine, [&] { return operation.wait_for(0ms) == std::future_status::ready; });
   return operation.get();
 }
@@ -137,9 +137,9 @@ MediaPublishSpec video(std::string id) {
   return spec;
 }
 
-std::unique_ptr<RtcMediaEngine> make_engine(std::shared_ptr<Wire> wire) {
-  auto result = std::make_unique<RtcMediaEngine>(
-      std::make_unique<RtcEngine>(std::make_unique<Transport>(wire)));
+std::unique_ptr<RtcEngine> make_engine(std::shared_ptr<Wire> wire) {
+  auto result = std::make_unique<RtcEngine>([wire] { return std::make_unique<Transport>(wire); });
+  result->enable_media();
   RoomOptions options;
   options.url = "ws://test";
   options.token = "test";
@@ -281,7 +281,7 @@ void shared_capture() {
   });
   check(shared->snapshot().consumers == 2 && shared->snapshot().running,
         "Shared capture was not activated once for two consumers");
-  engine->unpublish(a.track.id).get();
+  engine->leave().get();
   check(shared->snapshot().consumers == 1 && shared->snapshot().running,
         "One publication stopped shared capture");
   const auto previous = second.track->snapshot().frames;
@@ -289,6 +289,11 @@ void shared_capture() {
   other->unpublish(b.track.id).get();
   check(!shared->snapshot().running && shared->snapshot().consumers == 0,
         "Last publication leaked capture");
+  RoomOptions room;
+  room.url = "ws://test";
+  room.token = "test";
+  auto joining = engine->join(room);
+  await(*engine, joining);
   auto replacement = engine->publish_video(a);
   await(*engine, replacement.ready);
   until(*engine, [&] { return replacement.track->snapshot().frames >= 2; });
@@ -357,12 +362,51 @@ void shared_audio() {
   check(!source->stats().attached && !source->stats().closed,
         "Shared audio closed or leaked external source");
 }
+void media_leave_and_rejoin() {
+  auto wire = std::make_shared<Wire>();
+  auto rtc = make_engine(wire);
+  auto spec = video("reusable");
+  std::atomic<int> callbacks = 0;
+  spec.preview.video = [&](const auto&) { ++callbacks; };
+  auto active = rtc->publish_video(spec);
+  await(*rtc, active.ready);
+  until(*rtc, [&] { return callbacks >= 2; });
+  wire->acknowledge = false;
+  auto pending = rtc->publish_video(video("pending"));
+  rtc->leave().get();
+  const auto stopped = callbacks.load();
+  bool cancelled = false;
+  try {
+    pending.ready.get();
+  } catch (const std::exception&) {
+    cancelled = true;
+  }
+  check(cancelled, "Leave failed to settle media operation");
+  check(active.track->snapshot().transport.state == TrackState::closed,
+        "Leave retained active media endpoint");
+  wire->acknowledge = true;
+  RoomOptions room;
+  room.url = "ws://test";
+  room.token = "test";
+  auto joining = rtc->join(room);
+  await(*rtc, joining);
+  check(callbacks == stopped, "Media callback escaped leave barrier");
+  auto resumed = rtc->publish_video(spec);
+  await(*rtc, resumed.ready);
+  until(*rtc, [&] { return callbacks >= stopped + 2; });
+  check(resumed.track->snapshot().transport.epoch > active.track->snapshot().transport.epoch,
+        "Rejoined media reused the old epoch");
+  rtc->close().get();
+  rtc->close().get();
+}
+
 }  // namespace
 
 int main() {
   try {
     std::cout << "multi_track" << std::endl;
     multi_track();
+    media_leave_and_rejoin();
     std::cout << "cancelled_and_failed_sources" << std::endl;
     cancelled_and_failed_sources();
     std::cout << "raw_audio_and_encoded" << std::endl;

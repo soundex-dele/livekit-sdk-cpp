@@ -3,13 +3,21 @@
 #include "livekit/rtc/types.hpp"
 #include "livekit/rtc/room_services.hpp"
 #include <future>
+#include <functional>
 #include <stop_token>
+#include <memory>
+#include <optional>
+#include <utility>
 
 namespace livekit::sdk::rtc {
+namespace engine {
+class RtcEngine;
+}
+
 namespace detail {
 class RoomTransport;
 struct Endpoint;
-struct RoomSessionState;
+struct RoomEngineState;
 }  // namespace detail
 
 struct ControlOptions {
@@ -30,10 +38,10 @@ class PublishedTrack {
   std::future<void> close();
 
  private:
-  friend class RoomSession;
-  PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomSessionState>);
+  friend class RoomEngine;
+  PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
   std::shared_ptr<detail::Endpoint> endpoint_;
-  std::weak_ptr<detail::RoomSessionState> session_;
+  std::weak_ptr<detail::RoomEngineState> session_;
 };
 
 class SubscribedTrack {
@@ -49,21 +57,23 @@ class SubscribedTrack {
   std::future<void> close();
 
  private:
-  friend class RoomSession;
-  SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomSessionState>);
+  friend class RoomEngine;
+  SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
   std::shared_ptr<detail::Endpoint> endpoint_;
-  std::weak_ptr<detail::RoomSessionState> session_;
+  std::weak_ptr<detail::RoomEngineState> session_;
 };
 
 // Transport-only room session. The private adapter is injected so the same state
 // machine can be tested without network, devices or codecs. The native factory
 // provides this adapter; callers do not implement GraphEngine or WebRTC objects.
-class RoomSession {
+class RoomEngine {
  public:
-  explicit RoomSession(std::unique_ptr<detail::RoomTransport> transport);
-  ~RoomSession();
-  RoomSession(const RoomSession&) = delete;
-  RoomSession& operator=(const RoomSession&) = delete;
+  // Factory must return a fresh adapter. It is retained and called again after leave.
+  using TransportFactory = std::function<std::unique_ptr<detail::RoomTransport>()>;
+  explicit RoomEngine(TransportFactory);
+  ~RoomEngine();
+  RoomEngine(const RoomEngine&) = delete;
+  RoomEngine& operator=(const RoomEngine&) = delete;
 
   std::future<void> join(RoomOptions options);
   std::future<std::shared_ptr<PublishedTrack>> publish(TrackDescriptor descriptor);
@@ -87,7 +97,37 @@ class RoomSession {
   std::optional<RoomEvent> next_event(std::chrono::milliseconds timeout, std::stop_token stop = {});
 
  private:
-  std::shared_ptr<detail::RoomSessionState> state_;
+  std::shared_ptr<detail::RoomEngineState> state_;
 };
 
+// Restricted borrowed facade. Lifecycle/track mutation goes through RtcEngine.
+// Snapshot/services are safe to read across threads. Room control is queued on the
+// room controller; retained service handles from a departed room stay closed.
+class RoomView {
+ public:
+  RoomSnapshot snapshot() const {
+    return room_->snapshot();
+  }
+
+  std::shared_ptr<RoomServices> services() const {
+    return room_->services();
+  }
+
+  std::future<void> update_local_participant(ParticipantUpdate update,
+                                             ControlOptions options = {}) const {
+    return room_->update_local_participant(std::move(update), options);
+  }
+
+  std::future<void> set_subscription_permissions(SubscriptionPermissions policy,
+                                                 ControlOptions options = {}) const {
+    return room_->set_subscription_permissions(std::move(policy), options);
+  }
+
+ private:
+  friend class engine::RtcEngine;
+
+  explicit RoomView(RoomEngine* room) : room_(room) {}
+
+  RoomEngine* room_;
+};
 }  // namespace livekit::sdk::rtc

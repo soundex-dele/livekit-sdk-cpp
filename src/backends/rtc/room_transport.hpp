@@ -93,11 +93,11 @@ struct SubscriptionPermissionsRequest {
 };
 enum class SendResult { sent, would_block, dropped };
 
-// All methods execute on the RoomSession controller, never on a graph thread.
+// All methods execute on the RoomEngine controller, never on a graph thread.
 // start/publish/subscribe enqueue work and must not wait for a server response.
 // poll collects native callbacks and drives signaling. Native threads never
 // enter application code. Connection recovery is adapter-owned; restoring the
-// desired publication/subscription registry is exclusively RoomSessionState-owned.
+// desired publication/subscription registry is exclusively RoomEngineState-owned.
 class RoomTransport {
  public:
   virtual ~RoomTransport() = default;
@@ -108,7 +108,7 @@ class RoomTransport {
 
   virtual void set_queue_budget(std::shared_ptr<QueueBudget>) {}
 
-  virtual void start(const RoomOptions&) = 0;
+  virtual void start(const RoomOptions&, Epoch initial_epoch) = 0;
   virtual std::vector<TransportEvent> poll(std::chrono::milliseconds wait, std::stop_token) = 0;
   virtual void publish(const BindingToken&, const TrackDescriptor&) = 0;
   virtual void subscribe(const BindingToken&, const TrackDescriptor&,

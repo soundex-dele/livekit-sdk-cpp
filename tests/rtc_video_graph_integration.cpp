@@ -113,7 +113,7 @@ int main() {
     const auto discovery_deadline = SteadyClock::now() + 10s;
     while (!verify[0] || !verify[1]) {
       check(SteadyClock::now() < discovery_deadline, "Video graph discovery timed out");
-      auto event = rx->room().next_event(100ms);
+      auto event = rx->next_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 2; ++i)

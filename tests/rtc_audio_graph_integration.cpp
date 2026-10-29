@@ -146,7 +146,7 @@ int main() {
     const auto deadline = SteadyClock::now() + 10s;
     while (!outputs[0] || !outputs[1]) {
       check(SteadyClock::now() < deadline, "Audio graph discovery timed out");
-      auto event = rx->room().next_event(100ms);
+      auto event = rx->next_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 2; ++i)

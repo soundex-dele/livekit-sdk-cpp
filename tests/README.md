@@ -1,13 +1,13 @@
 # RTC regression entry points
 
-The current API is `RoomSession` plus separate publish/subscribe nodes and
+The current API is `RoomEngine` plus separate publish/subscribe nodes and
 per-track `RtcEngine` graphs. Tests never require desktop automation.
 
 | Coverage | Current entry point |
 | --- | --- |
 | Configuration-driven media graphs, real VP8/Opus loopback, borrowed-source cancellation/failure, cross-room shared capture and shared PCM | `rtc_media_engine_tests.cpp` |
-| Backend lifetime, quotas, cancellation, epochs, permissions | `room_session_tests.cpp` |
-| Graph construction, independent removal, producer shutdown | `room_session_tests.cpp` (`LIVEKIT_TEST_RTC_NODES`) |
+| Backend lifetime, quotas, cancellation, epochs, permissions | `room_engine_tests.cpp` |
+| Graph construction, independent removal, producer shutdown | `room_engine_tests.cpp` (`LIVEKIT_TEST_RTC_NODES`) |
 | Encoded four-track SFU transport, mute, demand, permissions, E2EE | `rtc_livekit_integration.py` + `livekit_rtc_livekit_integration` |
 | Per-track engine routing | Same runner + `livekit_rtc_engine_integration` |
 | Actual upper-layer audio/video codecs | Same runner + `livekit_rtc_audio_graph_integration` / `livekit_rtc_video_graph_integration` |

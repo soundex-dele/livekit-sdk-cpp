@@ -2,7 +2,7 @@
 
 此目录预留给后续 mediasoup 适配，目前没有可编译实现或构建目标。
 
-适配器应实现上一级的 `RoomTransport` 接口，由公共 `RoomSession` 管理房间生命周期、
+适配器应实现上一级的 `RoomTransport` 接口，由公共 `RoomEngine` 管理房间生命周期、
 轨道、事件与队列；可复用的 WebRTC 能力位于 `backends/webrtc/`。
 
 mediasoup 不规定应用层房间与信令协议，接入时需确定服务端房间、鉴权、成员发现及

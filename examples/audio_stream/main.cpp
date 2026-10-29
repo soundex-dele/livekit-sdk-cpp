@@ -1,4 +1,4 @@
-#include <livekit/rtc/media_engine.hpp>
+#include <livekit/rtc/engine.hpp>
 #include <atomic>
 #include <cstdlib>
 #include <deque>
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     if (!url || !token)
       throw std::runtime_error("Set LIVEKIT_URL and a room-join LIVEKIT_TOKEN");
     ApplicationQueue queue;  // Outlives the engine and its decoder workers.
-    auto engine = engine::create_livekit_media_engine();
+    auto engine = engine::create_livekit_engine({});
     RoomOptions options;
     options.url = url;
     options.token = token;
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
     size_t blocks = 0;
     const auto deadline = SteadyClock::now() + 30s;
     while (blocks < 100 && SteadyClock::now() < deadline) {
-      if (auto event = engine->room().next_event(10ms);
+      if (auto event = engine->next_event(10ms);
           event && event->kind == RoomEventKind::remote_track_added && event->descriptor &&
           event->descriptor->kind == MediaKind::audio) {
         const auto descriptor = *event->descriptor;

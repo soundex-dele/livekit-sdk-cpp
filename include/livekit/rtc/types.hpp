@@ -85,7 +85,7 @@ struct ReceiveDemand {
 };
 
 struct TrackDescriptor {
-  TrackId id;  // Stable within this RoomSession, never a server SID.
+  TrackId id;  // Stable within this RoomEngine, never a server SID.
   std::string name;
   std::string source_id;
   std::string stream_group;
