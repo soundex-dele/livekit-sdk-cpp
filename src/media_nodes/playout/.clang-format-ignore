@@ -1,0 +1,3 @@
+# This directory contains first-party source, not build output.
+# Override ancestor ignore rules: clang-format 20.1.8 on Windows can match
+# playout/ against **/out/** and emit no output even when given stdin.
