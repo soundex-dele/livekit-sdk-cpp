@@ -2,8 +2,9 @@
 #include "scenarios/remote_control/text.hpp"
 #include <map>
 #include <stdexcept>
+
 namespace livekit::sdk::detail {
-std::optional<int> mac_key_code(const std::string &code) {
+std::optional<int> mac_key_code(const std::string& code) {
   static const std::map<std::string, int> keys = {{"KeyA", 0},
                                                   {"KeyS", 1},
                                                   {"KeyD", 2},
@@ -109,14 +110,16 @@ std::optional<int> mac_key_code(const std::string &code) {
     return {};
   return it->second;
 }
+
 class MacInput final : public ControlInputSink {
   std::shared_ptr<MacInputApi> api_;
   std::set<std::string> held_;
   std::set<int> buttons_;
   std::u16string pending_text_;
+
   uint64_t flags() const {
     uint64_t f = 0;
-    for (const auto &k : held_) {
+    for (const auto& k : held_) {
       if (k.starts_with("Shift"))
         f |= 1ULL << 17;
       else if (k.starts_with("Control"))
@@ -129,10 +132,14 @@ class MacInput final : public ControlInputSink {
     return f;
   }
 
-public:
+ public:
   explicit MacInput(std::shared_ptr<MacInputApi> a) : api_(std::move(a)) {}
-  bool supports_text() const noexcept override { return true; }
-  bool apply(const ControlInput &in) noexcept override {
+
+  bool supports_text() const noexcept override {
+    return true;
+  }
+
+  bool apply(const ControlInput& in) noexcept override {
     try {
       if (in.type == "text_release" && pending_text_.empty())
         return true;
@@ -200,8 +207,7 @@ public:
         return true;
       }
       const auto g = api_->display();
-      if (g.width < 2 || g.height < 2 || g.logical_width <= 0 ||
-          g.logical_height <= 0)
+      if (g.width < 2 || g.height < 2 || g.logical_width <= 0 || g.logical_height <= 0)
         return false;
       if (in.positioned) {
         e.x = g.x + double(in.x) * g.logical_width / g.width;
@@ -230,10 +236,10 @@ public:
     }
   }
 };
-std::shared_ptr<ControlInputSink>
-mac_input_with_api(std::shared_ptr<MacInputApi> a) {
+
+std::shared_ptr<ControlInputSink> mac_input_with_api(std::shared_ptr<MacInputApi> a) {
   if (!a)
     throw std::invalid_argument("Mac input API required");
   return std::make_shared<MacInput>(std::move(a));
 }
-} // namespace livekit::sdk::detail
+}  // namespace livekit::sdk::detail

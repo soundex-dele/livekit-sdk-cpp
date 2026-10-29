@@ -6,9 +6,14 @@
 #include <stop_token>
 
 namespace livekit::sdk::rtc {
-namespace detail { class RoomTransport; struct Endpoint; struct BackendState; }
+namespace detail {
+class RoomTransport;
+struct Endpoint;
+struct BackendState;
+}  // namespace detail
+
 struct ControlOptions {
-  std::chrono::milliseconds timeout{0}; // Zero uses RoomOptions::operation_timeout.
+  std::chrono::milliseconds timeout{0};  // Zero uses RoomOptions::operation_timeout.
   std::stop_token stop;
 };
 
@@ -23,6 +28,7 @@ class PublishedTrack {
   std::future<void> set_muted(bool muted, ControlOptions = {});
   // Completes after local transport detachment; it does not disconnect the room.
   std::future<void> close();
+
  private:
   friend class RoomBackend;
   PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::BackendState>);
@@ -41,6 +47,7 @@ class SubscribedTrack {
   // signaling submission; in-flight media can still arrive. Full replacement.
   std::future<void> set_demand(ReceiveDemand, ControlOptions = {});
   std::future<void> close();
+
  private:
   friend class RoomBackend;
   SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::BackendState>);
@@ -78,8 +85,9 @@ class RoomBackend {
   RoomSnapshot snapshot() const;
   std::shared_ptr<RoomServices> services() const;
   std::optional<RoomEvent> next_event(std::chrono::milliseconds timeout, std::stop_token stop = {});
+
  private:
   std::shared_ptr<detail::BackendState> state_;
 };
 
-} // namespace livekit::sdk::rtc
+}  // namespace livekit::sdk::rtc

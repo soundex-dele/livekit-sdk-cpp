@@ -17,11 +17,20 @@ struct Endpoint {
   ~Endpoint();
   const TrackDescriptor descriptor;
   const bool publication;
-  struct Item { EncodedFrame frame; uint64_t serial; SteadyClock::time_point queued; };
+
+  struct Item {
+    EncodedFrame frame;
+    uint64_t serial;
+    SteadyClock::time_point queued;
+  };
 
   TrackSnapshot snapshot() const;
   SenderFeedback feedback() const;
-  std::shared_ptr<QueueBudget> queue_budget() const { return budget_; }
+
+  std::shared_ptr<QueueBudget> queue_budget() const {
+    return budget_;
+  }
+
   BindingToken binding() const;
   bool matches(const BindingToken&) const;
   void rebind(Epoch);
@@ -53,4 +62,4 @@ struct Endpoint {
   std::optional<SteadyClock::time_point> mute_boundary_;
 };
 
-} // namespace livekit::sdk::rtc::detail
+}  // namespace livekit::sdk::rtc::detail

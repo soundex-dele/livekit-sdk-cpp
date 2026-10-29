@@ -18,14 +18,18 @@ struct TrackGraphSpec {
   std::function<void()> activate;
   std::function<void()> quiesce;
   std::function<void()> poll;
-  template<class Event> static graphflow::engine::NodeConnection connect(
+
+  template <class Event>
+  static graphflow::engine::NodeConnection connect(
       const std::shared_ptr<graphflow::core::GraphNode>& from,
       const std::shared_ptr<graphflow::core::GraphNode>& to) {
     return {from->getName(), to->getName(), graphflow::core::detail::prettyName<Event>(), {}};
   }
 };
+
 using PublishGraphFactory = std::function<TrackGraphSpec(std::shared_ptr<nodes::RtcPublishNode>)>;
-using SubscribeGraphFactory = std::function<TrackGraphSpec(std::shared_ptr<nodes::RtcSubscribeNode>)>;
+using SubscribeGraphFactory =
+    std::function<TrackGraphSpec(std::shared_ptr<nodes::RtcSubscribeNode>)>;
 
 // Engine-owned topology for one logical track. Lifecycle and polling use one
 // owner sequence; write() is safe from producers during lifecycle transitions.
@@ -41,7 +45,11 @@ class PublishPipeline {
   WriteStatus write(EncodedFrame);
   void poll_feedback();
   std::future<void> close();
-  const nodes::RtcPublishNode& node() const { return *sink_; }
+
+  const nodes::RtcPublishNode& node() const {
+    return *sink_;
+  }
+
  private:
   class Input;
   std::mutex mutex_;
@@ -56,13 +64,18 @@ class SubscribePipeline {
  public:
   // The consumer receives EncodedFrameEvent. Decoding/recording belong in that
   // consumer's engine graph, never inside the RTC backend or source node.
-  SubscribePipeline(std::shared_ptr<SubscribedTrack>, std::shared_ptr<graphflow::core::GraphNode> consumer);
+  SubscribePipeline(std::shared_ptr<SubscribedTrack>,
+                    std::shared_ptr<graphflow::core::GraphNode> consumer);
   SubscribePipeline(std::shared_ptr<SubscribedTrack>, SubscribeGraphFactory);
   ~SubscribePipeline();
   void start();
   size_t poll(size_t max_frames = 4);
   std::future<void> close();
-  const nodes::RtcSubscribeNode& node() const { return *source_; }
+
+  const nodes::RtcSubscribeNode& node() const {
+    return *source_;
+  }
+
  private:
   std::mutex mutex_;
   std::shared_ptr<nodes::RtcSubscribeNode> source_;
@@ -70,4 +83,4 @@ class SubscribePipeline {
   graphflow::engine::GraphEngine graph_{1};
   bool running_ = false, closed_ = false;
 };
-} // namespace livekit::sdk::rtc::engine
+}  // namespace livekit::sdk::rtc::engine

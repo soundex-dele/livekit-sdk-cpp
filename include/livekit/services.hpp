@@ -1,5 +1,6 @@
 #pragma once
 #include "livekit/api_client.hpp"
+
 namespace livekit::sdk {
 class EgressClient : public ServiceClient {
  public:
@@ -15,6 +16,7 @@ class EgressClient : public ServiceClient {
   Json list_egress(const Json& request, const RequestOptions& options = {}) const;
   Json stop_egress(const Json& request, const RequestOptions& options = {}) const;
 };
+
 class IngressClient : public ServiceClient {
  public:
   using ServiceClient::ServiceClient;
@@ -23,6 +25,7 @@ class IngressClient : public ServiceClient {
   Json list_ingress(const Json& request, const RequestOptions& options = {}) const;
   Json delete_ingress(const Json& request, const RequestOptions& options = {}) const;
 };
+
 class SIPClient : public ServiceClient {
  public:
   using ServiceClient::ServiceClient;
@@ -41,15 +44,18 @@ class SIPClient : public ServiceClient {
   Json create_sip_participant(const Json& request, const RequestOptions& options = {}) const;
   Json transfer_sip_participant(const Json& request, const RequestOptions& options = {}) const;
 };
+
 class AgentDispatchClient : public ServiceClient {
  public:
   // Returns JSON null when no matching dispatch exists (Go GetDispatch semantics).
-  Json get_dispatch(const std::string& id, const std::string& room, const RequestOptions& options = {}) const;
+  Json get_dispatch(const std::string& id, const std::string& room,
+                    const RequestOptions& options = {}) const;
   using ServiceClient::ServiceClient;
   Json create_dispatch(const Json& request, const RequestOptions& options = {}) const;
   Json delete_dispatch(const Json& request, const RequestOptions& options = {}) const;
   Json list_dispatch(const Json& request, const RequestOptions& options = {}) const;
 };
+
 class ConnectorClient : public ServiceClient {
  public:
   using ServiceClient::ServiceClient;
@@ -59,4 +65,4 @@ class ConnectorClient : public ServiceClient {
   Json connect_whats_app_call(const Json& request, const RequestOptions& options = {}) const;
   Json disconnect_whats_app_call(const Json& request, const RequestOptions& options = {}) const;
 };
-}
+}  // namespace livekit::sdk

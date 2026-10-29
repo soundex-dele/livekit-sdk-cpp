@@ -22,6 +22,7 @@ class EncodedAudioSender : public webrtc::FrameTransformerInterface {
   void RegisterTransformedFrameCallback(
       webrtc::scoped_refptr<webrtc::TransformedFrameCallback> callback) override;
   void UnregisterTransformedFrameCallback() override;
+
   // PCM-derived frames are deliberately not forwarded. This backend accepts
   // externally encoded access units only.
   void Transform(std::unique_ptr<webrtc::TransformableFrameInterface>) override {}
@@ -39,4 +40,4 @@ class EncodedAudioSender : public webrtc::FrameTransformerInterface {
   bool configured_ = false, closed_ = false;
 };
 
-} // namespace livekit::sdk::rtc::detail
+}  // namespace livekit::sdk::rtc::detail

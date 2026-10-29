@@ -13,4 +13,4 @@ struct OperationOptions {
   // currently reject this option; publish_track already waits for publication.
   bool wait_for_ack = false;
 };
-}
+}  // namespace livekit::sdk

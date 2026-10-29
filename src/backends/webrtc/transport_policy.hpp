@@ -10,16 +10,19 @@ inline void apply_media_transport(webrtc::PeerConnectionInterface::RTCConfigurat
   if (disable_turn || transport != MediaTransport::automatic)
     config.port_allocator_config.flags |= webrtc::PORTALLOCATOR_DISABLE_RELAY;
   switch (transport) {
-    case MediaTransport::automatic: break;
+    case MediaTransport::automatic:
+      break;
     case MediaTransport::udp_only:
       config.tcp_candidate_policy = PC::kTcpCandidatePolicyDisabled;
       config.port_allocator_config.flags |= webrtc::PORTALLOCATOR_DISABLE_TCP;
       break;
     case MediaTransport::tcp_only:
       config.tcp_candidate_policy = PC::kTcpCandidatePolicyEnabled;
-      config.port_allocator_config.flags |= webrtc::PORTALLOCATOR_DISABLE_UDP | webrtc::PORTALLOCATOR_DISABLE_STUN;
+      config.port_allocator_config.flags |=
+          webrtc::PORTALLOCATOR_DISABLE_UDP | webrtc::PORTALLOCATOR_DISABLE_STUN;
       break;
-    default: throw std::invalid_argument("Invalid media_transport");
+    default:
+      throw std::invalid_argument("Invalid media_transport");
   }
 }
-}
+}  // namespace livekit::sdk::detail

@@ -20,8 +20,12 @@ class EncodedVideoSender : public webrtc::VideoTrackSource {
   void set_muted(bool);
   void set_demand(bool enabled);
   void close();
+
  protected:
-  webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override { return &broadcaster_; }
+  webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
+    return &broadcaster_;
+  }
+
  private:
   std::shared_ptr<VideoSenderState> state_;
   webrtc::VideoBroadcaster broadcaster_;
@@ -30,4 +34,4 @@ class EncodedVideoSender : public webrtc::VideoTrackSource {
 std::unique_ptr<webrtc::VideoEncoderFactory> create_transport_video_encoder_factory();
 std::unique_ptr<webrtc::VideoDecoderFactory> create_transport_video_decoder_factory(
     std::shared_ptr<CodecBoundaryCounters> counters);
-} // namespace livekit::sdk::rtc::detail
+}  // namespace livekit::sdk::rtc::detail

@@ -15,7 +15,9 @@
 
 namespace livekit::sdk::rtc {
 
-namespace detail { struct QueueBudget; }
+namespace detail {
+struct QueueBudget;
+}
 
 using TrackId = std::string;
 using Epoch = uint64_t;
@@ -31,10 +33,18 @@ enum class ConnectionState { disconnected, connecting, connected, reconnecting, 
 class EncodedBuffer {
  public:
   EncodedBuffer() = default;
+
   explicit EncodedBuffer(std::vector<uint8_t> bytes)
       : bytes_(std::make_shared<const std::vector<uint8_t>>(std::move(bytes))) {}
-  std::span<const uint8_t> bytes() const { return bytes_ ? std::span<const uint8_t>(*bytes_) : std::span<const uint8_t>{}; }
-  size_t size() const { return bytes_ ? bytes_->size() : 0; }
+
+  std::span<const uint8_t> bytes() const {
+    return bytes_ ? std::span<const uint8_t>(*bytes_) : std::span<const uint8_t>{};
+  }
+
+  size_t size() const {
+    return bytes_ ? bytes_->size() : 0;
+  }
+
  private:
   friend struct detail::QueueBudget;
   std::shared_ptr<const std::vector<uint8_t>> bytes_;
@@ -65,16 +75,17 @@ struct EncodingDescriptor {
 };
 
 enum class ReceiveQuality { low = 0, medium = 1, high = 2 };
+
 struct ReceiveDemand {
   bool disabled = false;
-  ReceiveQuality quality = ReceiveQuality::high; // Used when dimensions are zero.
-  uint32_t width = 0, height = 0, fps = 0; // Dimensions are either both zero or both positive.
-  uint32_t priority = 0; // Zero: server default; 1 is highest priority.
+  ReceiveQuality quality = ReceiveQuality::high;  // Used when dimensions are zero.
+  uint32_t width = 0, height = 0, fps = 0;  // Dimensions are either both zero or both positive.
+  uint32_t priority = 0;                    // Zero: server default; 1 is highest priority.
   bool operator==(const ReceiveDemand&) const = default;
 };
 
 struct TrackDescriptor {
-  TrackId id;                  // Stable within this RoomBackend, never a server SID.
+  TrackId id;  // Stable within this RoomBackend, never a server SID.
   std::string name;
   std::string source_id;
   std::string stream_group;
@@ -85,28 +96,37 @@ struct TrackDescriptor {
   CodecFormat format;
   QueueLimits queue;
   std::vector<EncodingDescriptor> encodings{{"", 2000000, true}};
-  uint32_t priority = 1;        // Relative scheduling weight, bounded by validation.
-  bool muted = false;          // Initial publication intent; not a subscription filter.
-  bool follow_subscriber_demand = false; // Single-layer video: honor server aggregate ON/OFF.
+  uint32_t priority = 1;                  // Relative scheduling weight, bounded by validation.
+  bool muted = false;                     // Initial publication intent; not a subscription filter.
+  bool follow_subscriber_demand = false;  // Single-layer video: honor server aggregate ON/OFF.
   // Signaled publication role, independent of producer identity (source_id).
   // Unknown remains unknown on the wire; camera/microphone are not inferred.
   PublicationSource source = PublicationSource::unknown;
-  ReceiveDemand receive_demand; // Initial subscription request; ignored for publications.
+  ReceiveDemand receive_demand;  // Initial subscription request; ignored for publications.
 };
 
 struct EncodedFrame {
   EncodedBuffer buffer;
   std::string encoding_id;
-  uint64_t timestamp = 0;       // Unwrapped ticks in TrackDescriptor::format.clock_rate.
+  uint64_t timestamp = 0;  // Unwrapped ticks in TrackDescriptor::format.clock_rate.
   std::chrono::microseconds duration{0};
   std::optional<SteadyClock::time_point> captured;
-  Epoch epoch = 0;              // Required: use the endpoint's current binding epoch.
+  Epoch epoch = 0;  // Required: use the endpoint's current binding epoch.
   uint64_t config_revision = 1;
   bool keyframe = false;
 };
 
-enum class WriteStatus { accepted, backpressure, keyframe_required, stale_epoch, not_ready, closed, invalid_frame };
+enum class WriteStatus {
+  accepted,
+  backpressure,
+  keyframe_required,
+  stale_epoch,
+  not_ready,
+  closed,
+  invalid_frame
+};
 enum class ReadStatus { frame, timeout, cancelled, suspended, closed, failed };
+
 struct ReadResult {
   ReadStatus status = ReadStatus::timeout;
   std::optional<EncodedFrame> frame;
@@ -118,11 +138,12 @@ struct EncodingFeedback {
   bool keyframe_required = false;
   uint64_t keyframe_requests = 0;
 };
+
 struct SenderFeedback {
   Epoch epoch = 0;
   uint64_t revision = 0;
   std::map<std::string, EncodingFeedback> encodings;
-  uint64_t media_generation = 0; // Changes at local mute boundaries, even between polls.
+  uint64_t media_generation = 0;  // Changes at local mute boundaries, even between polls.
 };
 
 struct TrackSnapshot {
@@ -135,19 +156,21 @@ struct TrackSnapshot {
   size_t outstanding_frames = 0, outstanding_bytes = 0;
   uint64_t accepted = 0, consumed = 0, dropped = 0;
   std::string error;
-  bool muted = false;          // Current local publication gate, preserved on rejoin.
-  ReceiveDemand receive_demand; // Last locally submitted demand, not a server acknowledgement.
+  bool muted = false;            // Current local publication gate, preserved on rejoin.
+  ReceiveDemand receive_demand;  // Last locally submitted demand, not a server acknowledgement.
 };
 
 struct ParticipantTrackPermission {
   std::string participant_identity;
   bool all_tracks = false;
-  std::vector<TrackId> track_ids; // Stable local publication IDs, including future publications.
+  std::vector<TrackId> track_ids;  // Stable local publication IDs, including future publications.
 };
+
 struct SubscriptionPermissions {
   bool all_participants = true;
   std::vector<ParticipantTrackPermission> participants;
 };
+
 struct SubscriptionPermissionChange {
   std::string participant_sid, track_sid;
   bool allowed = false;
@@ -160,15 +183,17 @@ struct RoomOptions : SignalingOptions {
   size_t max_tracks = 128;
   size_t max_events = 4096;
   std::chrono::milliseconds operation_timeout{30000};
-  std::chrono::milliseconds stats_interval{0}; // Disabled, or 200..60000 ms.
+  std::chrono::milliseconds stats_interval{0};  // Disabled, or 200..60000 ms.
 };
+
 struct TransportStatistics {
-  int target = 0; // 0 publisher, 1 subscriber.
+  int target = 0;  // 0 publisher, 1 subscriber.
   int64_t timestamp_us = 0;
   // JSON array of native W3C media/transport records. No candidate addresses,
   // certificates or credentials; absent native fields are not synthesized.
   std::string json;
-  std::map<std::string, std::string> publication_tracks; // Native track identifier -> current server SID.
+  std::map<std::string, std::string>
+      publication_tracks;  // Native track identifier -> current server SID.
 };
 
 struct RoomSnapshot {
@@ -183,7 +208,23 @@ struct RoomSnapshot {
   std::shared_ptr<const SessionInfo> session;
 };
 
-enum class RoomEventKind { connected, reconnecting, closed, failed, remote_track_added, remote_track_removed, track_ready, track_removed, track_failed, encryption_state_changed, session_changed, track_mute_changed, subscription_permission_changed, statistics };
+enum class RoomEventKind {
+  connected,
+  reconnecting,
+  closed,
+  failed,
+  remote_track_added,
+  remote_track_removed,
+  track_ready,
+  track_removed,
+  track_failed,
+  encryption_state_changed,
+  session_changed,
+  track_mute_changed,
+  subscription_permission_changed,
+  statistics
+};
+
 struct RoomEvent {
   RoomEventKind kind;
   TrackId track_id;
@@ -195,4 +236,4 @@ struct RoomEvent {
   std::shared_ptr<const TransportStatistics> statistics;
 };
 
-} // namespace livekit::sdk::rtc
+}  // namespace livekit::sdk::rtc

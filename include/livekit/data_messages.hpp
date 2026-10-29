@@ -9,7 +9,11 @@ struct DataReceiveParams {
   bool reliable = false;
 };
 
-struct DtmfDigit { uint32_t code = 0; std::string digit; };
+struct DtmfDigit {
+  uint32_t code = 0;
+  std::string digit;
+};
+
 struct TranscriptionSegment {
   std::string id, text;
   // Raw protocol time values, preserved without conversion or clock inference.
@@ -17,9 +21,10 @@ struct TranscriptionSegment {
   bool final = false;
   std::string language;
 };
+
 struct Transcription {
   // The subject may differ from the authenticated data sender.
   std::string participant_identity, track_id;
   std::vector<TranscriptionSegment> segments;
 };
-}
+}  // namespace livekit::sdk

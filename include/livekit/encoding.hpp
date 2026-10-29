@@ -9,4 +9,4 @@ std::string base64url(std::string_view value);
 std::string base64_decode(std::string_view value);
 std::string percent_encode(std::string_view value);
 std::string endpoint(std::string url, bool websocket);
-}
+}  // namespace livekit::sdk

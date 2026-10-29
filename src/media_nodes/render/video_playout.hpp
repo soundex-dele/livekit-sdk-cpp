@@ -18,8 +18,9 @@ class VideoPlayout {
   void submit(const std::string& id, const webrtc::VideoFrame& frame);
   // False means the user closed a video window or pressed Escape.
   bool poll();
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-}
+}  // namespace lk

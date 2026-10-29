@@ -22,4 +22,4 @@ struct SignalingOptions {
   std::chrono::milliseconds token_timeout{10000};
   RegionOptions regions;
 };
-} // namespace livekit::sdk::rtc
+}  // namespace livekit::sdk::rtc

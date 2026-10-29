@@ -10,6 +10,7 @@ struct MicrophoneBlock {
   size_t channels = 1;
   std::chrono::steady_clock::time_point captured;
 };
+
 class MicrophoneDriver {
  public:
   using Callback = std::function<void(const MicrophoneBlock&)>;
@@ -19,10 +20,13 @@ class MicrophoneDriver {
   virtual void start(const MicrophoneOptions&, Callback) = 0;
   virtual void stop() noexcept = 0;
 };
+
 std::unique_ptr<MicrophoneDriver> create_native_microphone_driver();
+
 struct MicrophoneFactory {
-  static std::shared_ptr<MicrophoneSession> create(MicrophoneOptions options, std::unique_ptr<MicrophoneDriver> driver) {
-    return std::shared_ptr<MicrophoneSession>(new MicrophoneSession(options,std::move(driver)));
+  static std::shared_ptr<MicrophoneSession> create(MicrophoneOptions options,
+                                                   std::unique_ptr<MicrophoneDriver> driver) {
+    return std::shared_ptr<MicrophoneSession>(new MicrophoneSession(options, std::move(driver)));
   }
 };
-}
+}  // namespace livekit::sdk::detail

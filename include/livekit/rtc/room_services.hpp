@@ -6,15 +6,26 @@
 #include <variant>
 
 namespace livekit::sdk::rtc {
-namespace detail { struct RoomServiceState; }
+namespace detail {
+struct RoomServiceState;
+}
+
 struct DataSendOptions {
   bool reliable = true;
   std::string topic;
   std::vector<std::string> destinations;
   OperationOptions operation;
 };
-struct ReceivedData { std::string topic; std::vector<uint8_t> bytes; };
-struct DataServiceError { std::string message; };
+
+struct ReceivedData {
+  std::string topic;
+  std::vector<uint8_t> bytes;
+};
+
+struct DataServiceError {
+  std::string message;
+};
+
 struct DataEvent {
   std::string sender_identity;
   bool reliable = true;
@@ -40,14 +51,20 @@ class RoomServices {
   void unregister_stream(bool text, const std::string& topic);
   std::shared_ptr<StreamWriter> open_stream(bool text, StreamOptions = {});
   std::future<StreamInfo> send_text(std::string, StreamOptions = {}, OperationOptions = {});
-  std::future<StreamInfo> send_file(std::filesystem::path, StreamOptions = {}, OperationOptions = {});
+  std::future<StreamInfo> send_file(std::filesystem::path, StreamOptions = {},
+                                    OperationOptions = {});
 
-  std::future<LocalDataTrack> publish_data_track(std::string name, DataTrackOptions = {}, OperationOptions = {});
+  std::future<LocalDataTrack> publish_data_track(std::string name, DataTrackOptions = {},
+                                                 OperationOptions = {});
   std::vector<LocalDataTrack> local_data_tracks() const;
   std::vector<RemoteDataTrack> remote_data_tracks() const;
+
  private:
   friend struct detail::RoomServiceState;
-  explicit RoomServices(std::shared_ptr<detail::RoomServiceState> state) : state_(std::move(state)) {}
+
+  explicit RoomServices(std::shared_ptr<detail::RoomServiceState> state)
+      : state_(std::move(state)) {}
+
   std::shared_ptr<detail::RoomServiceState> state_;
 };
-} // namespace livekit::sdk::rtc
+}  // namespace livekit::sdk::rtc

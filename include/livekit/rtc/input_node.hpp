@@ -21,6 +21,7 @@ struct MediaInputOptions {
   std::shared_ptr<MicrophoneSession> microphone;
   std::shared_ptr<EncodedMediaSource> encoded_source;
 };
+
 // Engine-level source. No Room/PeerConnection, RTC encoder or renderer is owned
 // here. File/URL input uses an external FFmpeg decoder above the RTC backend.
 // Raw sources emit VideoFrameEvent/AudioFrameEvent; encoded sources emit
@@ -30,16 +31,18 @@ class MediaInputNode final : public graphflow::core::GraphNode {
  public:
   MediaInputNode(std::string name, TrackDescriptor, MediaInputOptions);
   ~MediaInputNode() override;
-  void activate(); // TrackGraphSpec::activate, after downstream graph start.
-  void quiesce(); // TrackGraphSpec::quiesce, before downstream graph stop.
+  void activate();  // TrackGraphSpec::activate, after downstream graph start.
+  void quiesce();   // TrackGraphSpec::quiesce, before downstream graph stop.
   MediaInputSnapshot snapshot() const;
   void throw_if_failed() const;
+
  protected:
   bool doInit() override;
   bool doStart() override;
   void doStop() override;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-} // namespace livekit::sdk::rtc::nodes
+}  // namespace livekit::sdk::rtc::nodes

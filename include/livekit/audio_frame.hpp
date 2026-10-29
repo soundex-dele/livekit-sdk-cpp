@@ -10,6 +10,7 @@
 
 namespace livekit::sdk {
 enum class AudioSampleFormat { pcm16, float32 };
+
 // One decoded remote track, interleaved channels. Exactly one sample vector is
 // populated, according to format. This is before application mixing/playout.
 struct AudioFrame {
@@ -27,8 +28,10 @@ struct AudioFrame {
   // Native WebRTC capture estimate, when available, on the WebRTC TimeMillis
   // clock. Not UTC, a C++ steady_clock epoch, or actual audio playout time.
   std::optional<int64_t> capture_timestamp_ms;
+
   std::chrono::microseconds duration() const {
-    return std::chrono::microseconds(sample_rate > 0 ? samples_per_channel * 1000000ull / sample_rate : 0);
+    return std::chrono::microseconds(
+        sample_rate > 0 ? samples_per_channel * 1000000ull / sample_rate : 0);
   }
 };
-}
+}  // namespace livekit::sdk

@@ -5,7 +5,7 @@
 namespace livekit::sdk::studio_detail {
 // Each dispatch composites one layer into an opaque program canvas. Buffers
 // use shared storage so the same path works on Intel and Apple Silicon.
-static NSString *const shader = @R"(
+static NSString* const shader = @R"(
 #include <metal_stdlib>
 using namespace metal;
 struct Settings { float4 transform, crop, key, params, canvas; };
@@ -31,6 +31,7 @@ kernel void composite(device uchar4* dst [[buffer(0)]],
  dst[p.y*w+p.x]=uchar4(uchar3(clamp((c.rgb*c.a+previous*(1-c.a))*255.,0.,255.)),255);
 }
 )";
+
 struct Compositor::Impl {
   int w, h;
   bool software;
@@ -38,6 +39,7 @@ struct Compositor::Impl {
   id<MTLCommandQueue> queue;
   id<MTLComputePipelineState> pipeline;
   id<MTLBuffer> output;
+
   Impl(int width, int height, bool soft) : w(width), h(height), software(soft) {
     if (software)
       return;
@@ -47,7 +49,7 @@ struct Compositor::Impl {
         software = true;
         return;
       }
-      NSError *error = nil;
+      NSError* error = nil;
       id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
       if (!library)
         throw std::runtime_error("Metal shader: " +
@@ -61,18 +63,19 @@ struct Compositor::Impl {
         throw std::runtime_error("无法初始化 Metal 合成器");
     }
   }
-  StudioImage render(const Layers &layers) {
+
+  StudioImage render(const Layers& layers) {
     if (software)
       return studio_composite_cpu(w, h, layers);
     @autoreleasepool {
-      auto *pixels = static_cast<uint8_t *>(output.contents);
+      auto* pixels = static_cast<uint8_t*>(output.contents);
       std::memset(pixels, 0, size_t(w) * h * 4);
       for (size_t i = 3; i < size_t(w) * h * 4; i += 4)
         pixels[i] = 255;
       id<MTLCommandBuffer> command = [queue commandBuffer];
       if (!command)
         throw std::runtime_error("Metal command allocation failed");
-      for (const auto &[s, img] : layers) {
+      for (const auto& [s, img] : layers) {
         if (!s.visible || !img || img->width < 1 || img->height < 1 || s.transform.width <= 0 ||
             s.transform.height <= 0)
           continue;
@@ -81,8 +84,8 @@ struct Compositor::Impl {
                                                   options:MTLResourceStorageModeShared];
         if (!source)
           throw std::runtime_error("Metal source allocation failed");
-        const auto &t = s.transform;
-        const auto &k = s.chroma;
+        const auto& t = s.transform;
+        const auto& k = s.chroma;
         float values[]{
             t.x,          t.y,          t.width,           t.height,
             t.crop_left,  t.crop_top,   t.crop_right,      t.crop_bottom,
@@ -108,7 +111,12 @@ struct Compositor::Impl {
     }
   }
 };
+
 Compositor::Compositor(int w, int h, bool soft) : impl_(std::make_unique<Impl>(w, h, soft)) {}
+
 Compositor::~Compositor() = default;
-StudioImage Compositor::render(const Layers &layers) { return impl_->render(layers); }
-} // namespace livekit::sdk::studio_detail
+
+StudioImage Compositor::render(const Layers& layers) {
+  return impl_->render(layers);
+}
+}  // namespace livekit::sdk::studio_detail

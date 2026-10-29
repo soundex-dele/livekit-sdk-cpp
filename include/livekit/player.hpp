@@ -9,17 +9,20 @@
 
 namespace livekit::sdk {
 enum class PlayerState { closed, ready, playing, paused, ended, failed };
+
 struct PlayerMediaInfo {
-  int64_t duration_us = 0; // 0 when unavailable
+  int64_t duration_us = 0;  // 0 when unavailable
   bool has_video = false, has_audio = false;
   int width = 0, height = 0;
   int audio_sample_rate = 48000, audio_channels = 2;
 };
+
 struct PlayerOptions {
   size_t video_queue_frames = 8, audio_queue_frames = 64;
-  size_t queue_bytes = 128 * 1024 * 1024; // per branch
+  size_t queue_bytes = 128 * 1024 * 1024;  // per branch
   std::chrono::milliseconds io_timeout{10000};
 };
+
 struct PlayerSnapshot {
   PlayerState state = PlayerState::closed;
   PlayerMediaInfo media;
@@ -28,6 +31,7 @@ struct PlayerSnapshot {
   size_t queued_video = 0, queued_audio = 0;
   std::string error;
 };
+
 class PlayerError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -49,9 +53,9 @@ class Player {
   // Paused seek asynchronously prepares one target video frame for poll_video;
   // the clock remains frozen and poll_audio stays empty until play().
   std::future<void> seek(std::chrono::microseconds position);
-  std::future<void> stop(); // rewind to zero, retain the source, transition to ready
-  std::future<void> close(); // idempotent; may open again after completion
-  void cancel_pending_io(); // interrupted open/read/seek reports an error
+  std::future<void> stop();   // rewind to zero, retain the source, transition to ready
+  std::future<void> close();  // idempotent; may open again after completion
+  void cancel_pending_io();   // interrupted open/read/seek reports an error
   PlayerSnapshot snapshot() const;
   // Pull output on the application/device thread; no user code runs on the
   // control worker. Poll both existing streams until ended. Queues use backpressure.
@@ -60,8 +64,9 @@ class Player {
   // Discard externally retained frames whose generation differs from snapshot().
   std::optional<media::VideoFrame> poll_video();
   std::optional<media::AudioFrame> poll_audio();
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
-}
+}  // namespace livekit::sdk

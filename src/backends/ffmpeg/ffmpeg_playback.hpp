@@ -19,54 +19,80 @@ void check_ffmpeg_abi();
 // edge. The demuxer owns AVIO and receives bytes in its subscription callback.
 struct FileIORequest : graphflow::core::EventT<FileIORequest> {
   enum Kind { begin, read, seek } kind = begin;
+
   int size = 0, whence = 0;
   int64_t offset = 0, result = 0;
   bool handled = false;
   std::exception_ptr error;
 };
+
 struct SeekableBytes : MediaEvent<SeekableBytes> {
   std::shared_ptr<const std::vector<uint8_t>> bytes;
 };
+
 struct EncodedPacket {
   std::shared_ptr<const AVPacket> packet;
   bool eos = false;
 };
+
 struct StreamFormat {
   std::shared_ptr<const AVCodecParameters> parameters;
   AVRational time_base{1, 1000000};
   int stream_index = -1;
   int64_t origin = 0, video_duration = 40000;
 };
+
 struct VideoPacket : MediaEvent<VideoPacket> {
   std::shared_ptr<const AVPacket> packet;
-  std::shared_ptr<const StreamFormat> format; // preparation event, before packets
+  std::shared_ptr<const StreamFormat> format;  // preparation event, before packets
 };
+
 struct AudioPacket : MediaEvent<AudioPacket> {
   std::shared_ptr<const AVPacket> packet;
   std::shared_ptr<const StreamFormat> format;
 };
+
 // AVFrame references own the underlying FFmpeg buffers across event dispatch,
 // backpressure and subsequent decoder receives.
 struct DecodedFrame {
   std::shared_ptr<const AVFrame> frame;
   int64_t timestamp_us = 0, duration_us = 0;
 };
-struct DecodedVideo : MediaEvent<DecodedVideo> { DecodedFrame frame; };
-struct DecodedAudio : MediaEvent<DecodedAudio> { DecodedFrame frame; };
+
+struct DecodedVideo : MediaEvent<DecodedVideo> {
+  DecodedFrame frame;
+};
+
+struct DecodedAudio : MediaEvent<DecodedAudio> {
+  DecodedFrame frame;
+};
 
 class FileSourceNode final : public MediaNode {
  public:
-  FileSourceNode(graphflow::core::EventBus* bus, std::atomic<bool>& cancel, std::chrono::milliseconds timeout);
+  FileSourceNode(graphflow::core::EventBus* bus, std::atomic<bool>& cancel,
+                 std::chrono::milliseconds timeout);
   ~FileSourceNode() override;
-  void configure(std::string path) { path_ = std::move(path); }
-  const std::string& path() const { return path_; }
+
+  void configure(std::string path) {
+    path_ = std::move(path);
+  }
+
+  const std::string& path() const {
+    return path_;
+  }
+
   void begin_io();
   void check_cancelled() const;
   static int interrupt(void* self);
+
  protected:
   bool doInit() override;
   void doRelease() override;
-  void on_reset(int64_t) override { finished_ = true; }
+
+  void on_reset(int64_t) override {
+    finished_ = true;
+  }
+
  private:
   void handle_io(FileIORequest& request);
   std::atomic<bool>& cancel_;
@@ -79,20 +105,34 @@ class FileSourceNode final : public MediaNode {
 
 class DemuxerNode final : public MediaNode {
  public:
-  DemuxerNode(graphflow::core::EventBus* bus, std::atomic<bool>& cancel, std::chrono::milliseconds timeout);
+  DemuxerNode(graphflow::core::EventBus* bus, std::atomic<bool>& cancel,
+              std::chrono::milliseconds timeout);
   ~DemuxerNode() override;
-  const PlayerMediaInfo& info() const { return info_; }
+
+  const PlayerMediaInfo& info() const {
+    return info_;
+  }
+
   AVStream* stream(bool video) const;
-  int64_t origin() const { return origin_; }
-  int64_t video_duration() const { return video_duration_; }
-  const AVPacket* read(); // nullptr = container EOF
+
+  int64_t origin() const {
+    return origin_;
+  }
+
+  int64_t video_duration() const {
+    return video_duration_;
+  }
+
+  const AVPacket* read();  // nullptr = container EOF
   void seek(int64_t position, int64_t preroll);
   bool pump() override;
   void prepare() override;
+
  protected:
   bool doInit() override;
   void doRelease() override;
   void on_reset(int64_t position) override;
+
  private:
   void open_input();
   int64_t request_io(FileIORequest request);
@@ -120,19 +160,29 @@ class DemuxerNode final : public MediaNode {
 class DecoderNode : public MediaNode {
  public:
   ~DecoderNode() override;
-  bool enabled() const { return codec_ != nullptr; }
+
+  bool enabled() const {
+    return codec_ != nullptr;
+  }
+
   int stream_index() const;
-  int reorder_depth() const { return codec_ ? codec_->has_b_frames : 0; }
+
+  int reorder_depth() const {
+    return codec_ ? codec_->has_b_frames : 0;
+  }
+
   void send(const AVPacket* packet);
   void drain();
   std::optional<DecodedFrame> receive();
   void flush(int64_t position);
   bool pump() override;
+
  protected:
   DecoderNode(const char* name, graphflow::core::EventBus* bus, bool video);
   bool doInit() override;
   void doRelease() override;
   void on_reset(int64_t position) override;
+
  private:
   std::optional<EncodedPacket> input_;
   std::optional<DecodedFrame> pending_;
@@ -144,50 +194,63 @@ class DecoderNode : public MediaNode {
   AVFrame* frame_ = nullptr;
   int64_t next_time_ = 0;
 };
+
 class VideoDecoderNode final : public DecoderNode {
  public:
-  explicit VideoDecoderNode(graphflow::core::EventBus* bus) : DecoderNode("video.decoder", bus, true) {}
+  explicit VideoDecoderNode(graphflow::core::EventBus* bus)
+      : DecoderNode("video.decoder", bus, true) {}
 };
+
 class AudioDecoderNode final : public DecoderNode {
  public:
-  explicit AudioDecoderNode(graphflow::core::EventBus* bus) : DecoderNode("audio.decoder", bus, false) {}
+  explicit AudioDecoderNode(graphflow::core::EventBus* bus)
+      : DecoderNode("audio.decoder", bus, false) {}
 };
+
 class VideoConverterNode final : public MediaNode {
  public:
   explicit VideoConverterNode(graphflow::core::EventBus* bus) : MediaNode("video.rgba", bus) {}
+
   ~VideoConverterNode() override;
   std::optional<media::VideoFrame> convert(const DecodedFrame& input);
   void flush(int64_t position);
   bool pump() override;
+
  protected:
   bool doInit() override;
   void doRelease() override;
   void on_reset(int64_t position) override;
+
  private:
   std::optional<DecodedVideo> input_;
   std::optional<RGBA8> pending_;
   SwsContext* scaler_ = nullptr;
   int64_t discard_before_ = 0;
 };
+
 class AudioResamplerNode final : public MediaNode {
  public:
   explicit AudioResamplerNode(graphflow::core::EventBus* bus) : MediaNode("audio.resampler", bus) {}
+
   ~AudioResamplerNode() override;
   std::optional<media::AudioFrame> convert(const DecodedFrame& input);
   std::optional<media::AudioFrame> drain();
   void flush(int64_t position);
   bool pump() override;
+
  protected:
   bool doInit() override;
   void doRelease() override;
   void on_reset(int64_t position) override;
+
  private:
   std::optional<DecodedAudio> input_;
   std::optional<StereoFloat48k> pending_;
-  std::optional<media::AudioFrame> emit(std::shared_ptr<std::vector<float>> data, int samples, int64_t pts);
+  std::optional<media::AudioFrame> emit(std::shared_ptr<std::vector<float>> data, int samples,
+                                        int64_t pts);
   SwrContext* resampler_ = nullptr;
   AVChannelLayout layout_{};
   int rate_ = 0, format_ = -1;
   int64_t next_time_ = 0, discard_before_ = 0;
 };
-}
+}  // namespace livekit::sdk::detail

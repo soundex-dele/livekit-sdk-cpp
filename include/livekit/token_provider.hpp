@@ -6,6 +6,7 @@
 
 namespace livekit::sdk {
 enum class TokenRequestReason { initial, authentication_failed };
+
 struct TokenRequest {
   std::string url;
   TokenRequestReason reason = TokenRequestReason::initial;
@@ -13,10 +14,12 @@ struct TokenRequest {
   std::stop_token stop;
 };
 enum class TokenFailure { none, unavailable, denied };
+
 struct TokenResult {
   std::string token;
   TokenFailure failure = TokenFailure::none;
 };
+
 using TokenCompletion = std::function<void(TokenResult)>;
 // Start an asynchronous operation and return promptly. Completion may run on
 // any thread, including inline. The SDK accepts only the first completion and
@@ -25,4 +28,4 @@ using TokenCompletion = std::function<void(TokenResult)>;
 // Never block this startup callback: arbitrary application code cannot be
 // forcibly interrupted by the SDK. SDK-owned threads are not created for it.
 using TokenProvider = std::function<void(TokenRequest, TokenCompletion)>;
-}
+}  // namespace livekit::sdk

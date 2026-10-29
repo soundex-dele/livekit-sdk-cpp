@@ -12,11 +12,13 @@ struct NativeDescription {
   webrtc::SdpType type;
   std::string sdp;
 };
+
 struct NativeIceCandidate {
   std::string mid;
   int mline_index = 0;
   std::string sdp;
 };
+
 struct NativeRemoteTrack {
   std::string sid;
   std::string mid;
@@ -24,10 +26,12 @@ struct NativeRemoteTrack {
   webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver;
   webrtc::scoped_refptr<EncodedReceiver> output;
 };
+
 struct NativeTrackEvent {
   bool added;
   std::string sid;
 };
+
 struct NativeDataMessage {
   std::string label;
   std::vector<uint8_t> bytes;
@@ -49,7 +53,7 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   std::future<NativeDescription> create_local(bool offer, bool ice_restart = false);
   std::future<TransportStatistics> statistics();
   std::future<void> set_remote(NativeDescription description,
-                             std::map<std::string, std::string> mid_to_track = {});
+                               std::map<std::string, std::string> mid_to_track = {});
   // Call when offer/answer negotiation is stable to bind reused/preallocated receivers.
   void refresh_receivers();
   void add_ice(const NativeIceCandidate& candidate);
@@ -58,7 +62,8 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   std::map<std::string, NativeRemoteTrack> remote_tracks() const;
   void request_keyframe(const std::string& sid);
   void reset_receiver(const std::string& sid);
-  using ReceiverTransformFactory = std::function<EncodedReceiver::PayloadTransform(const std::string&, MediaKind)>;
+  using ReceiverTransformFactory =
+      std::function<EncodedReceiver::PayloadTransform(const std::string&, MediaKind)>;
   void set_receiver_transform(ReceiverTransformFactory);
   void create_data_channel(const std::string& label, bool reliable);
   bool data_ready(const std::string& label, size_t bytes = 16384);
@@ -70,6 +75,7 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   std::atomic<bool> connected{false}, gathered{false}, failed{false};
 
   void OnSignalingChange(webrtc::PeerConnectionInterface::SignalingState) override {}
+
   void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface>) override;
   void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState state) override;
   void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override;
@@ -97,4 +103,4 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   bool closed_ = false;
   void track_event(bool added, const std::string& sid);
 };
-} // namespace livekit::sdk::rtc::detail
+}  // namespace livekit::sdk::rtc::detail

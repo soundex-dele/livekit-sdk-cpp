@@ -6,6 +6,7 @@
 #endif
 #include <windows.h>
 #include <span>
+
 namespace livekit::sdk::detail {
 // Private native boundary: tests substitute this interface and never touch a desktop.
 class WindowsInputApi {
@@ -15,6 +16,7 @@ class WindowsInputApi {
   virtual ControlLayout virtual_layout() noexcept = 0;
   virtual unsigned send(std::span<const INPUT>) noexcept = 0;
 };
+
 std::shared_ptr<ControlInputSink> windows_input_with_api(std::shared_ptr<WindowsInputApi>);
-}
+}  // namespace livekit::sdk::detail
 #endif

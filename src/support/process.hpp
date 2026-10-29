@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+
 namespace lk {
 // Owns exactly one child and its stdout pipe. Arguments never pass through a shell.
 class Process {
@@ -16,9 +17,11 @@ class Process {
   int wait();
   void terminate();
   static std::string capture(const std::vector<std::string>& args);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
 std::wstring windows_quote(const std::wstring& arg);
-}
+}  // namespace lk

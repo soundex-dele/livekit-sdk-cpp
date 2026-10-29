@@ -15,4 +15,4 @@ class VideoDecodeTarget {
                      int64_t render_time_ms, const std::string& format) = 0;
   virtual void decoded(uint64_t generation, const webrtc::VideoFrame& frame) = 0;
 };
-}
+}  // namespace livekit::sdk::detail

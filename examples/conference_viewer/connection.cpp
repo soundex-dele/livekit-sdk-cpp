@@ -7,10 +7,12 @@ namespace demo {
 namespace {
 std::string trim(std::string value) {
   const auto first = value.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) return {};
+  if (first == std::string::npos)
+    return {};
   return value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
 }
-}
+}  // namespace
+
 SessionOptions username_options(std::string url, std::string room, std::string username) {
   SessionOptions options;
   options.connection.url = trim(std::move(url));
@@ -22,12 +24,20 @@ SessionOptions username_options(std::string url, std::string room, std::string u
   const char* secret = std::getenv("LIVEKIT_API_SECRET");
   const bool has_key = key && *key, has_secret = secret && *secret;
   if (has_key != has_secret)
-    throw std::invalid_argument("Set both LIVEKIT_API_KEY and LIVEKIT_API_SECRET, or unset both for local testing.");
-  options.connection.token = livekit::sdk::AccessToken(has_key ? key : "uav-test",
-      has_secret ? secret : "uav-local-test-secret-at-least-32-characters")
-    .set_identity(username).set_name(username).set_valid_for(3600)
-    .set_video_grant({{"roomJoin", true}, {"room", options.room},
-                     {"canPublish", true}, {"canSubscribe", true}}).to_jwt();
+    throw std::invalid_argument(
+        "Set both LIVEKIT_API_KEY and LIVEKIT_API_SECRET, or unset both for local testing.");
+  options.connection.token =
+      livekit::sdk::AccessToken(
+          has_key ? key : "uav-test",
+          has_secret ? secret : "uav-local-test-secret-at-least-32-characters")
+          .set_identity(username)
+          .set_name(username)
+          .set_valid_for(3600)
+          .set_video_grant({{"roomJoin", true},
+                            {"room", options.room},
+                            {"canPublish", true},
+                            {"canSubscribe", true}})
+          .to_jwt();
   return options;
 }
-}
+}  // namespace demo

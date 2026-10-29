@@ -13,6 +13,7 @@ struct VideoFrameEvent : graphflow::core::EventT<VideoFrameEvent> {
   Epoch epoch = 0;
   SteadyClock::time_point captured = SteadyClock::now();
 };
+
 // Optional engine media nodes, linked through LiveKit::RTCMedia. Each owns a
 // bounded worker and actual codec; neither creates a room or PeerConnection.
 // Encoder: VideoFrameEvent -> EncodedFrameEvent, SenderFeedbackEvent input.
@@ -27,12 +28,14 @@ class VideoCodecNode final : public graphflow::core::GraphNode {
   // Close admission and join worker before graph lifecycle stops downstream.
   // Idempotent; required as the owning TrackGraphSpec's quiesce hook.
   void quiesce();
+
  protected:
   bool doInit() override;
   bool doStart() override;
   void doStop() override;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-} // namespace livekit::sdk::rtc::nodes
+}  // namespace livekit::sdk::rtc::nodes

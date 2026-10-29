@@ -9,6 +9,7 @@ namespace livekit::sdk {
 class I420VideoSource;
 class PcmAudioSource;
 class EncodedMediaSource;
+
 // Owned I420 pixels, rotated upright. Chroma dimensions round up for odd sizes.
 struct VideoFrame {
   std::string track_id;
@@ -19,17 +20,19 @@ struct VideoFrame {
   // Input source generation or decoded room epoch, as assigned by its node.
   uint64_t stream_generation = 0;
 };
+
 using VideoFrameHandler = std::function<void(const VideoFrame&)>;
 enum class CaptureKind { input, camera, screen };
+
 struct MediaSpec {
   std::string input;
   std::string ffmpeg = "ffmpeg";
   bool video = true, demo = false, loop = false;
   int width = 640, height = 360, fps = 30;
   CaptureKind capture = CaptureKind::input;
-  int device_index = 0; // camera enumeration index
+  int device_index = 0;  // camera enumeration index
   bool local_preview = false;
-  std::string screen_id; // empty preserves legacy primary-display behavior
+  std::string screen_id;  // empty preserves legacy primary-display behavior
   // Application-fed live video. Mutually exclusive with input/demo/devices.
   std::shared_ptr<I420VideoSource> video_source;
   // Independent application PCM track; set video=false.
@@ -41,6 +44,7 @@ struct MediaSpec {
   bool dynacast = false;
   std::shared_ptr<EncodedMediaSource> encoded_source;
 };
+
 struct ScreenCaptureDevice {
   std::string id, name;
   // Physical pixel width/height. Origins use platform desktop coordinates
@@ -50,15 +54,23 @@ struct ScreenCaptureDevice {
   int rotation = 0, refresh_rate = 0;
   bool operator==(const ScreenCaptureDevice&) const = default;
 };
-struct CaptureSize { int width, height; };
+
+struct CaptureSize {
+  int width, height;
+};
+
 std::vector<ScreenCaptureDevice> screen_capture_devices();
 // Fit landscape into 1920x1080 or portrait into 1080x1920, without upscaling.
 CaptureSize screen_capture_size(int width, int height);
-struct VideoCaptureDevice { std::string name, id; };
+
+struct VideoCaptureDevice {
+  std::string name, id;
+};
+
 std::vector<VideoCaptureDevice> video_capture_devices();
 // probe_media also accepts camera://<index> and screen://primary without FFmpeg.
 // File/network inputs require external ffprobe and ffmpeg. Generated sources do not.
-std::vector<MediaSpec> probe_media(const std::string& input,
-    const std::string& ffmpeg = "ffmpeg", bool loop = false,
-    int width = 640, int height = 360, int fps = 30);
-}
+std::vector<MediaSpec> probe_media(const std::string& input, const std::string& ffmpeg = "ffmpeg",
+                                   bool loop = false, int width = 640, int height = 360,
+                                   int fps = 30);
+}  // namespace livekit::sdk

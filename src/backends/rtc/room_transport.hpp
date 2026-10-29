@@ -5,7 +5,10 @@
 #include <stop_token>
 #include <exception>
 
-namespace livekit::sdk::rtc { class RoomServices; }
+namespace livekit::sdk::rtc {
+class RoomServices;
+}
+
 namespace livekit::sdk::rtc::detail {
 
 // Echoed by every track event. An id alone cannot distinguish a cancelled
@@ -19,10 +22,25 @@ struct BindingToken {
 };
 
 enum class TransportEventKind {
-  connected, interrupted, terminal_error,
-  published, subscribed, removed, operation_failed,
-  frame, feedback, remote_track_added, remote_track_removed, encryption_state_changed, session_changed, control_completed, mute_changed, subscription_permission_changed, statistics
+  connected,
+  interrupted,
+  terminal_error,
+  published,
+  subscribed,
+  removed,
+  operation_failed,
+  frame,
+  feedback,
+  remote_track_added,
+  remote_track_removed,
+  encryption_state_changed,
+  session_changed,
+  control_completed,
+  mute_changed,
+  subscription_permission_changed,
+  statistics
 };
+
 struct TransportEvent {
   TransportEventKind kind;
   BindingToken binding;
@@ -41,6 +59,7 @@ struct TransportEvent {
   std::shared_ptr<const TransportStatistics> statistics;
   std::exception_ptr failure;
 };
+
 struct ParticipantUpdateRequest {
   uint32_t id = 0;
   Epoch epoch = 0;
@@ -48,6 +67,7 @@ struct ParticipantUpdateRequest {
   SteadyClock::time_point deadline;
   std::stop_token stop;
 };
+
 struct MuteRequest {
   uint32_t id = 0;
   BindingToken binding;
@@ -55,6 +75,7 @@ struct MuteRequest {
   SteadyClock::time_point deadline;
   std::stop_token stop;
 };
+
 struct ReceiveDemandRequest {
   uint32_t id = 0;
   BindingToken binding;
@@ -62,6 +83,7 @@ struct ReceiveDemandRequest {
   SteadyClock::time_point deadline;
   std::stop_token stop;
 };
+
 struct SubscriptionPermissionsRequest {
   uint32_t id = 0;
   Epoch epoch = 0;
@@ -79,28 +101,43 @@ enum class SendResult { sent, would_block, dropped };
 class RoomTransport {
  public:
   virtual ~RoomTransport() = default;
-  virtual std::shared_ptr<RoomServices> services() const { return {}; }
+
+  virtual std::shared_ptr<RoomServices> services() const {
+    return {};
+  }
+
   virtual void set_queue_budget(std::shared_ptr<QueueBudget>) {}
+
   virtual void start(const RoomOptions&) = 0;
   virtual std::vector<TransportEvent> poll(std::chrono::milliseconds wait, std::stop_token) = 0;
   virtual void publish(const BindingToken&, const TrackDescriptor&) = 0;
-  virtual void subscribe(const BindingToken&, const TrackDescriptor&, std::shared_ptr<QueueBudget>) = 0;
+  virtual void subscribe(const BindingToken&, const TrackDescriptor&,
+                         std::shared_ptr<QueueBudget>) = 0;
   virtual void remove(const BindingToken&, bool publication) = 0;
   virtual SendResult send(const BindingToken&, const EncodedFrame&) = 0;
   virtual void request_keyframe(const BindingToken&) = 0;
+
   virtual void update_participant(ParticipantUpdateRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported, "Transport does not support participant updates");
+    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
+                   "Transport does not support participant updates");
   }
+
   virtual void set_muted(MuteRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported, "Transport does not support publication mute");
+    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
+                   "Transport does not support publication mute");
   }
+
   virtual void set_receive_demand(ReceiveDemandRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported, "Transport does not support receive demand");
+    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
+                   "Transport does not support receive demand");
   }
+
   virtual void set_subscription_permissions(SubscriptionPermissionsRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported, "Transport does not support subscription permissions");
+    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
+                   "Transport does not support subscription permissions");
   }
+
   virtual void stop() noexcept = 0;
 };
 
-} // namespace livekit::sdk::rtc::detail
+}  // namespace livekit::sdk::rtc::detail

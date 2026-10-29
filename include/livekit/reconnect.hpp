@@ -6,7 +6,7 @@
 
 namespace livekit::sdk {
 struct RegionOptions {
-  bool discovery = true; // HTTPS /settings/regions, only for *.livekit.cloud
+  bool discovery = true;  // HTTPS /settings/regions, only for *.livekit.cloud
   bool allow_cloud_regions = true;
   // Exact endpoint URLs (including path). https/wss and http/ws are equivalent.
   // TLS downgrade is never permitted, even for an explicitly listed endpoint.
@@ -20,6 +20,7 @@ struct RegionOptions {
   // cloud policy). The trust list alone never causes connection attempts.
   std::vector<std::string> fallback_endpoints;
 };
+
 struct ReconnectOptions {
   bool enabled = true;
   size_t max_attempts = 6;
@@ -31,8 +32,9 @@ struct ReconnectOptions {
   size_t resume_attempts = 2;
 };
 enum class ReconnectMode { resume, rejoin };
+
 struct ReconnectInfo {
   ReconnectMode mode = ReconnectMode::resume;
   size_t attempt = 0;
 };
-}
+}  // namespace livekit::sdk

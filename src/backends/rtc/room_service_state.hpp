@@ -24,8 +24,11 @@ struct RoomServiceState : std::enable_shared_from_this<RoomServiceState> {
   std::optional<DataEvent> next_event(std::chrono::milliseconds, std::stop_token);
 
   livekit::sdk::detail::RpcSession rpc;
-  std::shared_ptr<livekit::sdk::detail::StreamSession> streams = std::make_shared<livekit::sdk::detail::StreamSession>();
-  std::shared_ptr<livekit::sdk::detail::DataTrackSession> tracks = std::make_shared<livekit::sdk::detail::DataTrackSession>();
+  std::shared_ptr<livekit::sdk::detail::StreamSession> streams =
+      std::make_shared<livekit::sdk::detail::StreamSession>();
+  std::shared_ptr<livekit::sdk::detail::DataTrackSession> tracks =
+      std::make_shared<livekit::sdk::detail::DataTrackSession>();
+
  private:
   struct Pending {
     livekit::DataPacket packet;
@@ -34,6 +37,7 @@ struct RoomServiceState : std::enable_shared_from_this<RoomServiceState> {
     std::chrono::steady_clock::time_point deadline;
     std::stop_token stop;
   };
+
   std::mutex mutex;
   std::condition_variable_any changed;
   bool active = false, closed = false;
@@ -47,4 +51,4 @@ struct RoomServiceState : std::enable_shared_from_this<RoomServiceState> {
   void emit(DataEvent);
   bool send_packet(const livekit::DataPacket&, const Send&);
 };
-} // namespace livekit::sdk::rtc::detail
+}  // namespace livekit::sdk::rtc::detail

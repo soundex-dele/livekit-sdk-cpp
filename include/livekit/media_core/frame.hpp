@@ -14,6 +14,7 @@ struct VideoFrame {
   // Packed RGBA8, top to bottom; conversion is explicit in the FFmpeg node.
   std::shared_ptr<const std::vector<uint8_t>> rgba;
 };
+
 struct AudioFrame {
   int sample_rate = 48000, channels = 2, samples = 0;
   int64_t timestamp_us = 0, duration_us = 0;
@@ -21,5 +22,6 @@ struct AudioFrame {
   // Interleaved float32 stereo, FL/FR.
   std::shared_ptr<const std::vector<float>> pcm;
 };
+
 using Frame = std::variant<VideoFrame, AudioFrame>;
-}
+}  // namespace livekit::sdk::media

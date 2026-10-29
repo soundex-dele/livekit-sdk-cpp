@@ -5,6 +5,7 @@
 
 namespace demo {
 enum class Action { None, Join, Leave, AddVideo, RemoveVideo };
+
 class View {
  public:
   std::array<char, 1024> url{};
@@ -19,14 +20,18 @@ class View {
   View();
   Action draw(SDL_Renderer* renderer, const Snapshot& snapshot);
   SessionOptions options() const;
+
  private:
   void draw_quality(const Snapshot& snapshot);
+
   struct Cached {
     VideoTexture texture;
     std::shared_ptr<const sdk::VideoFrame> last;
   };
+
   std::map<std::string, Cached> textures_;
 };
+
 void apply_style(float scale, float pixel_density = 1.0f);
 void render_draw_data(SDL_Renderer* renderer);
-}
+}  // namespace demo

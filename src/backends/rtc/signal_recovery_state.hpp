@@ -13,4 +13,4 @@ struct SignalRecoveryState {
   RecoveryBudget::Clock::time_point session_deadline = RecoveryBudget::Clock::time_point::max();
   RecoveryBudget::Clock::time_point initial_deadline = RecoveryBudget::Clock::time_point::max();
 };
-}
+}  // namespace livekit::sdk::detail

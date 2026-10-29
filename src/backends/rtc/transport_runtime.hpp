@@ -18,6 +18,7 @@ class TransportRuntime {
   std::unique_ptr<webrtc::Thread> network, worker, signaling;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
   std::shared_ptr<CodecBoundaryCounters> codec_counters = std::make_shared<CodecBoundaryCounters>();
+
  private:
 #ifdef _WIN32
   webrtc::WinsockInitializer winsock_;
@@ -25,4 +26,4 @@ class TransportRuntime {
   bool ssl_ = false;
   void cleanup();
 };
-} // namespace livekit::sdk::rtc::detail
+}  // namespace livekit::sdk::rtc::detail

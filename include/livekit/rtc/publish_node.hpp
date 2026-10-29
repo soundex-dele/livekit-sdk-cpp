@@ -10,15 +10,29 @@ namespace livekit::sdk::rtc::nodes {
 class RtcPublishNode final : public graphflow::core::GraphNode {
  public:
   RtcPublishNode(std::string name, std::shared_ptr<PublishedTrack> track);
-  void poll_feedback(); // Engine control sequence; never a native RTC callback.
-  WriteStatus last_write() const { return last_write_.load(); }
-  std::shared_ptr<PublishedTrack> track() const { return track_; }
-  uint64_t accepted() const { return accepted_.load(); }
-  uint64_t rejected() const { return rejected_.load(); }
+  void poll_feedback();  // Engine control sequence; never a native RTC callback.
+
+  WriteStatus last_write() const {
+    return last_write_.load();
+  }
+
+  std::shared_ptr<PublishedTrack> track() const {
+    return track_;
+  }
+
+  uint64_t accepted() const {
+    return accepted_.load();
+  }
+
+  uint64_t rejected() const {
+    return rejected_.load();
+  }
+
  protected:
   bool doInit() override;
   bool doStart() override;
   void doStop() override;
+
  private:
   std::shared_ptr<PublishedTrack> track_;
   std::atomic<bool> active_{false};
@@ -27,4 +41,4 @@ class RtcPublishNode final : public graphflow::core::GraphNode {
   uint64_t feedback_revision_ = UINT64_MAX;
   Epoch feedback_epoch_ = 0;
 };
-} // namespace livekit::sdk::rtc::nodes
+}  // namespace livekit::sdk::rtc::nodes

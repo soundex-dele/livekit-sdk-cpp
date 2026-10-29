@@ -7,8 +7,9 @@
 
 namespace livekit::sdk {
 std::string make_token(const std::string& key, const std::string& secret,
-                       const std::string& identity, const Json& grants,
-                       int ttl_seconds = 3600, const std::string& name = "");
+                       const std::string& identity, const Json& grants, int ttl_seconds = 3600,
+                       const std::string& name = "");
+
 // Go auth.AccessToken equivalent. Grants are protobuf-JSON objects.
 class AccessToken {
  public:
@@ -23,9 +24,10 @@ class AccessToken {
   AccessToken& set_sip_grant(Json grant);
   AccessToken& set_agent_grant(Json grant);
   std::string to_jwt() const;
+
  private:
   std::string key_, secret_;
   Json claims_ = Json::object();
   int ttl_ = 3600;
 };
-}
+}  // namespace livekit::sdk

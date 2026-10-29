@@ -12,20 +12,24 @@ namespace {
 class SctpFactory : public webrtc::SctpTransportFactoryInterface {
  public:
   explicit SctpFactory(webrtc::Thread* network) : network_(network) {}
+
   std::unique_ptr<webrtc::SctpTransportInternal> CreateSctpTransport(
       const webrtc::Environment& env, webrtc::DtlsTransportInternal* dtls) override {
     return std::make_unique<webrtc::DcSctpTransport>(env, network_, dtls);
   }
+
  private:
   webrtc::Thread* network_;
 };
-} // namespace
+}  // namespace
 
 TransportRuntime::TransportRuntime() {
 #ifdef _WIN32
-  if (winsock_.error()) throw std::runtime_error("Winsock initialization failed");
+  if (winsock_.error())
+    throw std::runtime_error("Winsock initialization failed");
 #endif
-  if (!webrtc::InitializeSSL()) throw std::runtime_error("WebRTC SSL initialization failed");
+  if (!webrtc::InitializeSSL())
+    throw std::runtime_error("WebRTC SSL initialization failed");
   ssl_ = true;
   try {
     network = webrtc::Thread::CreateWithSocketServer();
@@ -43,7 +47,8 @@ TransportRuntime::TransportRuntime() {
       return webrtc::AudioDeviceModule::Create(webrtc::AudioDeviceModule::kDummyAudio,
                                                deps.task_queue_factory.get());
     });
-    if (!deps.adm) throw std::runtime_error("Cannot create transport audio module");
+    if (!deps.adm)
+      throw std::runtime_error("Cannot create transport audio module");
     install_transport_audio_codecs(deps, codec_counters);
     deps.video_encoder_factory = create_transport_video_encoder_factory();
     deps.video_decoder_factory = create_transport_video_decoder_factory(codec_counters);
@@ -51,7 +56,8 @@ TransportRuntime::TransportRuntime() {
     // built-in audio processing or codec factories.
     webrtc::EnableMedia(deps);
     factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
-    if (!factory) throw std::runtime_error("Cannot create native transport factory");
+    if (!factory)
+      throw std::runtime_error("Cannot create native transport factory");
     webrtc::PeerConnectionFactoryInterface::Options options;
     options.network_ignore_mask = 0;
     factory->SetOptions(options);
@@ -60,12 +66,23 @@ TransportRuntime::TransportRuntime() {
     throw;
   }
 }
-TransportRuntime::~TransportRuntime() { cleanup(); }
-void TransportRuntime::cleanup() {
-  if (factory) signaling->BlockingCall([&] { factory = nullptr; });
-  if (signaling) signaling->Stop();
-  if (worker) worker->Stop();
-  if (network) network->Stop();
-  if (ssl_) { webrtc::CleanupSSL(); ssl_ = false; }
+
+TransportRuntime::~TransportRuntime() {
+  cleanup();
 }
-} // namespace livekit::sdk::rtc::detail
+
+void TransportRuntime::cleanup() {
+  if (factory)
+    signaling->BlockingCall([&] { factory = nullptr; });
+  if (signaling)
+    signaling->Stop();
+  if (worker)
+    worker->Stop();
+  if (network)
+    network->Stop();
+  if (ssl_) {
+    webrtc::CleanupSSL();
+    ssl_ = false;
+  }
+}
+}  // namespace livekit::sdk::rtc::detail
