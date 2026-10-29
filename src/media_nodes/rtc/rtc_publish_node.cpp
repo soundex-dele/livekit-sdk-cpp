@@ -30,21 +30,73 @@ bool RtcPublishNode::doStart() {
   return true;
 }
 
-void RtcPublishNode::doStop() {
-  active_ = false;
-  // Closing a track is asynchronous. Engine teardown awaits its own endpoint
-  // close barrier; GraphEngine lifecycle methods never wait on native signaling.
-  track_->close();
+RtcPublishNode::~RtcPublishNode() {
+  quiesce();
+  release();
 }
 
-void RtcPublishNode::poll_feedback() {
-  if (!active_)
+void RtcPublishNode::activate() {
+  if (!active_) {
+    throw std::logic_error("Activate requires a started RTC sink");
+  }
+  if (worker_.joinable()) {
     return;
-  auto feedback = track_->feedback();
-  if (feedback.epoch == feedback_epoch_ && feedback.revision == feedback_revision_)
-    return;
-  feedback_epoch_ = feedback.epoch;
-  feedback_revision_ = feedback.revision;
-  publish(SenderFeedbackEvent(std::move(feedback)));
+  }
+  std::promise<void> initial;
+  auto ready = initial.get_future();
+  worker_ = std::jthread([this, initial = std::move(initial)](std::stop_token stop) mutable {
+    bool initialized = false;
+    try {
+      Epoch epoch = 0;
+      uint64_t revision = UINT64_MAX;
+      while (!stop.stop_requested()) {
+        auto feedback = track_->wait_feedback(epoch, revision, stop);
+        if (!feedback) {
+          if (!initialized) {
+            throw std::runtime_error("RTC publication closed before initial feedback");
+          }
+          break;
+        }
+        epoch = feedback->epoch;
+        revision = feedback->revision;
+        publish(SenderFeedbackEvent(std::move(*feedback)));
+        if (!initialized) {
+          initial.set_value();
+          initialized = true;
+        }
+      }
+    } catch (...) {
+      const auto failure = std::current_exception();
+      {
+        std::lock_guard lock(failure_mutex_);
+        failure_ = failure;
+      }
+      if (!initialized) {
+        initial.set_exception(failure);
+      }
+    }
+  });
+  ready.get();
+}
+
+void RtcPublishNode::quiesce() {
+  active_ = false;
+  worker_.request_stop();
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+}
+
+void RtcPublishNode::throw_if_failed() const {
+  std::lock_guard lock(failure_mutex_);
+  if (failure_) {
+    std::rethrow_exception(failure_);
+  }
+}
+
+void RtcPublishNode::doStop() {
+  quiesce();
+  // Local graph stop never waits for native signaling.
+  track_->close();
 }
 }  // namespace livekit::sdk::rtc::nodes

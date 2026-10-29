@@ -134,6 +134,85 @@ void roundtrip(uint16_t channels, uint32_t rate, bool floating) {
   }
 }
 
+void jitter_loss_and_reordering() {
+  auto source = std::make_shared<Input>();
+  auto packets = std::make_shared<Output>();
+  auto descriptor = rtc_audio_test::descriptor("jitter");
+  auto encoder = std::make_shared<nodes::AudioCodecNode>("encoder", descriptor, true);
+  graphflow::engine::GraphEngine encoding{1};
+  check(encoding.loadFromNodes({packets, encoder, source},
+                               {G::connect<nodes::AudioFrameEvent>(source, encoder),
+                                G::connect<nodes::SenderFeedbackEvent>(source, encoder),
+                                G::connect<nodes::EncodedFrameEvent>(encoder, packets)}) &&
+            encoding.init() && encoding.start(),
+        "Jitter fixture encoder failed");
+  source->feedback(1);
+  for (int packet = 0; packet < 16; ++packet) {
+    source->raw(rtc_audio_test::tone(1, packet * 960, 48000, 1, false));
+    source->raw(rtc_audio_test::tone(1, packet * 960 + 480, 48000, 1, false));
+    eventually(
+        [&] {
+          std::lock_guard lock(packets->mutex);
+          return packets->packets.size() == size_t(packet + 1);
+        },
+        "Opus fixture failed to produce a packet");
+  }
+  encoder->quiesce();
+  encoding.stop();
+  encoding.release();
+  auto input = std::make_shared<Input>();
+  auto output = std::make_shared<Output>();
+  AudioCodecOptions options;
+  options.jitter_buffer = true;
+  auto decoder =
+      std::make_shared<nodes::AudioCodecNode>("jitter.decoder", descriptor, false, options);
+  graphflow::engine::GraphEngine graph{1};
+  check(graph.loadFromNodes({output, decoder, input},
+                            {G::connect<nodes::EncodedFrameEvent>(input, decoder),
+                             G::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
+            graph.init() && graph.start(),
+        "Jitter graph failed");
+  const auto send = [&](int i, Epoch epoch = 1) {
+    auto packet = packets->packets.at(size_t(i));
+    packet.epoch = epoch;
+    packet.sequence_number = uint16_t(65530 + i);
+    packet.sender_capture_time_us = 1000000 + i * 20000;
+    input->encoded(std::move(packet));
+  };
+  send(0);
+  send(2);
+  send(1);  // Packet reordering plus sequence-number wrap.
+  for (int i = 3; i < 16; ++i) {
+    if (i < 5 || i > 8) {
+      send(i);  // Four genuinely missing Opus packets.
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  eventually([&] { return decoder->snapshot().concealed_samples > 0; },
+             "Packet loss did not invoke PLC");
+  {
+    std::lock_guard lock(output->mutex);
+    check(output->frames.size() >= 10, "Jitter decoder did not produce paced audio");
+    for (const auto& frame : output->frames) {
+      check(frame.pcm->samples_per_channel() == 480 && frame.pcm->sample_rate == 48000,
+            "NetEq output is not a 10ms 48kHz block");
+    }
+  }
+  send(0, 2);
+  send(1, 2);
+  eventually(
+      [&] {
+        std::lock_guard lock(output->mutex);
+        return std::any_of(output->frames.begin(), output->frames.end(),
+                           [](const auto& f) { return f.epoch == 2; });
+      },
+      "Jitter decoder did not reset after rejoin");
+  decoder->quiesce();
+  graph.stop();
+  graph.release();
+  decoder->throw_if_failed();
+}
+
 void overload_and_epoch() {
   auto in = std::make_shared<Input>();
   auto out = std::make_shared<Output>();
@@ -275,6 +354,7 @@ int main() {
     roundtrip(1, 44100, true);
     roundtrip(2, 48000, false);
     overload_and_epoch();
+    jitter_loss_and_reordering();
     decode_gaps();
     std::cout << "Audio graph codec contracts passed\n";
     return 0;

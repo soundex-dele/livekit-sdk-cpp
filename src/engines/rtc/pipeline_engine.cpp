@@ -50,7 +50,8 @@ std::future<TrackId> RtcPipelineEngine::publish(
 }
 
 std::future<TrackId> RtcPipelineEngine::publish_graph(TrackDescriptor descriptor,
-                                                      PublishGraphFactory factory) {
+                                                      PublishGraphFactory factory,
+                                                      FailureCleanup cleanup) {
   require_owner();
   if (!factory)
     throw std::invalid_argument("RTC engine requires a publication graph factory");
@@ -82,7 +83,12 @@ std::future<TrackId> RtcPipelineEngine::publish_graph(TrackDescriptor descriptor
                         }
                         return true;
                       },
-                      [promise](auto failure) { promise->set_exception(failure); }});
+                      [promise, cleanup = std::move(cleanup)](auto failure) {
+                        if (cleanup) {
+                          cleanup(failure);
+                        }
+                        promise->set_exception(failure);
+                      }});
   return result;
 }
 
@@ -99,7 +105,8 @@ std::future<TrackId> RtcPipelineEngine::subscribe(
 }
 
 std::future<TrackId> RtcPipelineEngine::subscribe_graph(TrackDescriptor descriptor,
-                                                        SubscribeGraphFactory factory) {
+                                                        SubscribeGraphFactory factory,
+                                                        FailureCleanup cleanup) {
   require_owner();
   if (!factory)
     throw std::invalid_argument("RTC engine requires a subscription graph factory");
@@ -131,7 +138,12 @@ std::future<TrackId> RtcPipelineEngine::subscribe_graph(TrackDescriptor descript
                         }
                         return true;
                       },
-                      [promise](auto failure) { promise->set_exception(failure); }});
+                      [promise, cleanup = std::move(cleanup)](auto failure) {
+                        if (cleanup) {
+                          cleanup(failure);
+                        }
+                        promise->set_exception(failure);
+                      }});
   return result;
 }
 
@@ -187,19 +199,14 @@ void RtcPipelineEngine::cancel_pending(const TrackId& id, bool publication) {
 
 void RtcPipelineEngine::failed_graph(const TrackId& id, bool publication, std::string message) {
   remove_graph(id, publication);
-  if (failures_.size() >= 256)
-    failures_.pop_front();
-  failures_.push_back({id, publication, std::move(message)});
+  if (failure_handler_) {
+    failure_handler_({id, publication, std::move(message)});
+  }
 }
 
-std::optional<RtcPipelineEngine::GraphFailure> RtcPipelineEngine::next_failure() {
-  if (std::this_thread::get_id() != owner_)
-    throw std::logic_error("RTC failures require the owner thread");
-  if (failures_.empty())
-    return {};
-  auto failure = std::move(failures_.front());
-  failures_.pop_front();
-  return failure;
+void RtcPipelineEngine::set_failure_handler(std::function<void(GraphFailure)> handler) {
+  require_owner();
+  failure_handler_ = std::move(handler);
 }
 
 WriteStatus RtcPipelineEngine::write(const TrackId& id, EncodedFrame frame) {
@@ -230,12 +237,12 @@ SenderFeedback RtcPipelineEngine::feedback(const TrackId& id) const {
   return it->second->node().track()->feedback();
 }
 
-void RtcPipelineEngine::poll(size_t receive_frames_per_track) {
+void RtcPipelineEngine::complete_operations() {
   require_owner();
   for (auto it = pending_.begin(); it != pending_.end();) {
     bool completed = false;
     try {
-      completed = it->poll();
+      completed = it->complete();
     } catch (...) {
       it->cancel(std::current_exception());
       completed = true;
@@ -245,6 +252,10 @@ void RtcPipelineEngine::poll(size_t receive_frames_per_track) {
     else
       ++it;
   }
+}
+
+void RtcPipelineEngine::check_health() {
+  require_owner();
   std::vector<std::pair<TrackId, std::shared_ptr<PublishPipeline>>> publications;
   std::vector<std::pair<TrackId, std::shared_ptr<SubscribePipeline>>> subscriptions;
   {
@@ -260,7 +271,7 @@ void RtcPipelineEngine::poll(size_t receive_frames_per_track) {
       else if (status.state == TrackState::failed)
         failed_graph(id, true, status.error);
       else
-        graph->poll_feedback();
+        graph->check();
     } catch (const std::exception& e) {
       failed_graph(id, true, e.what());
     } catch (...) {
@@ -275,7 +286,7 @@ void RtcPipelineEngine::poll(size_t receive_frames_per_track) {
       else if (status.state == TrackState::failed)
         failed_graph(id, false, status.error);
       else
-        graph->poll(receive_frames_per_track);
+        graph->check();
     } catch (const std::exception& e) {
       failed_graph(id, false, e.what());
     } catch (...) {
@@ -301,6 +312,5 @@ void RtcPipelineEngine::clear() {
     graph->close();
   for (auto& [id, graph] : subscriptions)
     graph->close();
-  failures_.clear();
 }
 }  // namespace livekit::sdk::rtc::engine

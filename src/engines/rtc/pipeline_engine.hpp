@@ -12,9 +12,9 @@
 namespace livekit::sdk::rtc::engine {
 
 // Scene-engine building block. One RoomEngine is shared by all track graphs.
-// The scene controller calls poll() to complete graph creation and fairly drive
-// receive/feedback nodes. No per-track worker and no user media work runs on the
-// backend's signaling/transport thread. Control methods are owner-thread only;
+// The engine task queue handles completion notifications and health checks.
+// Source/feedback nodes dispatch on their own event-driven workers; no media
+// delivery runs on the controller or backend transport thread. Control methods are owner-thread only;
 // write() may be called by media producers. Consumers must not reenter graph
 // lifecycle methods from inside synchronous GraphEngine delivery.
 class RtcPipelineEngine {
@@ -28,16 +28,20 @@ class RtcPipelineEngine {
                                std::shared_ptr<graphflow::core::GraphNode> feedback_sink = {});
   std::future<TrackId> subscribe(TrackDescriptor,
                                  std::shared_ptr<graphflow::core::GraphNode> consumer);
-  // Factories run on poll() only after endpoint confirmation. They create
+  // Factories run on the engine task queue after endpoint confirmation. They create
   // capture/codec/recording/playout nodes in the endpoint's own GraphEngine.
-  std::future<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
-  std::future<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  // Internal failure cleanup runs before the operation's future becomes ready,
+  // including cancellation and teardown. It must not throw or reenter this engine.
+  using FailureCleanup = std::function<void(std::exception_ptr)>;
+  std::future<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory, FailureCleanup = {});
+  std::future<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory, FailureCleanup = {});
   std::future<void> unpublish(const TrackId&);
   std::future<void> unsubscribe(const TrackId&);
   WriteStatus write(const TrackId&, EncodedFrame);
   TrackSnapshot publication(const TrackId&) const;
   SenderFeedback feedback(const TrackId&) const;
-  void poll(size_t receive_frames_per_track = 4);
+  void complete_operations();  // Invoked by backend completion notifications.
+  void check_health();
 
   struct GraphFailure {
     TrackId id;
@@ -45,7 +49,7 @@ class RtcPipelineEngine {
     std::string message;
   };
 
-  std::optional<GraphFailure> next_failure();
+  void set_failure_handler(std::function<void(GraphFailure)> handler);
   void clear();
 
  private:
@@ -57,7 +61,7 @@ class RtcPipelineEngine {
   struct Pending {
     TrackId id;
     bool publication;
-    std::function<bool()> poll;
+    std::function<bool()> complete;
     std::function<void(std::exception_ptr)> cancel;
   };
 
@@ -67,7 +71,7 @@ class RtcPipelineEngine {
   std::map<TrackId, std::shared_ptr<PublishPipeline>> publications_;
   std::map<TrackId, std::shared_ptr<SubscribePipeline>> subscriptions_;
   std::vector<Pending> pending_;
-  std::deque<GraphFailure> failures_;
+  std::function<void(GraphFailure)> failure_handler_;
 };
 
 }  // namespace livekit::sdk::rtc::engine

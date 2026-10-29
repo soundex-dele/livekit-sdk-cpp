@@ -1,9 +1,11 @@
 #pragma once
+#include "livekit/media_core/frame_view.hpp"
+#include "livekit/rtc/audio_processing.hpp"
 #include "livekit/rtc/media_types.hpp"
 #include "livekit/video_source.hpp"
 #include "livekit/microphone.hpp"
 #include "livekit/encoded_media.hpp"
-#include "livekit/rtc/audio_output.hpp"
+#include "livekit/rtc/audio_output_options.hpp"
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -19,6 +21,9 @@ struct MediaInput {
   int device_index = 0;
   std::string screen_id;
   uint32_t fps = 30;
+  // Microphone inputs default to APM; application/file inputs opt in explicitly.
+  std::optional<AudioProcessingOptions> audio_processing;
+  std::shared_ptr<AudioRenderReference> echo_reference;
   std::shared_ptr<I420VideoSource> video_source;
   std::shared_ptr<PcmAudioSource> audio_source;
   std::shared_ptr<EncodedMediaSource> encoded_source;
@@ -30,6 +35,7 @@ struct VideoSample {
   uint64_t timestamp = 0;
   Epoch epoch = 0;
   SteadyClock::time_point captured;
+  std::optional<SteadyClock::time_point> presentation_time;
 };
 
 struct AudioSample {
@@ -38,15 +44,19 @@ struct AudioSample {
   Epoch epoch = 0;
   SteadyClock::time_point captured;
   bool discontinuity = false;
+  std::optional<SteadyClock::time_point> presentation_time;
 };
 
 struct MediaOutput {
-  // Runs on the input/codec worker. Must be bounded and nonblocking; never
-  // reenter engine lifecycle from these callbacks. Retained samples own data.
+  // Runs on this output's bounded dispatcher. Slow callbacks drop only this
+  // branch's backlog. Never wait for engine lifecycle operations from callbacks:
+  // shutdown waits for the in-flight callback. Retained samples own their data.
   std::function<void(const VideoSample&)> video;
   std::function<void(const AudioSample&)> audio;
+  std::function<void(const media::FrameView&)> frame;
   bool playout = false;
   std::filesystem::path recording;
+  QueueLimits queue{4, 32 * 1024 * 1024, std::chrono::milliseconds(250)};
 };
 
 struct SharedInputSnapshot {
@@ -82,10 +92,16 @@ struct MediaPublishSpec {
 };
 
 struct MediaSubscribeSpec {
+  bool synchronize = true;
+  std::chrono::milliseconds presentation_delay{80};
   TrackDescriptor track;
   MediaOutput output;
   VideoCodecOptions video;
-  AudioCodecOptions audio;
+  AudioCodecOptions audio = [] {
+    AudioCodecOptions options;
+    options.jitter_buffer = true;
+    return options;
+  }();
 };
 
 struct MediaNodeSnapshot {

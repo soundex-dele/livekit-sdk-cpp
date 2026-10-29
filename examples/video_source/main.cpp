@@ -1,3 +1,5 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/engine.hpp>
 #include <algorithm>
 #include <iostream>
@@ -12,7 +14,8 @@ int main(int argc, char** argv) {
   }
   try {
     auto engine = engine::create_livekit_engine({});
-    RoomOptions options;
+    livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
+    LiveKitRoomOptions options;
     options.url = argv[1];
     options.token = argv[2];
     engine->join(options).get();
@@ -27,14 +30,12 @@ int main(int argc, char** argv) {
     auto operation = engine->publish_video(std::move(config));
     auto publication = std::move(operation.ready);
     while (publication.wait_for(0ms) != std::future_status::ready) {
-      engine->poll();
       std::this_thread::sleep_for(1ms);
     }
     const auto id = publication.get();
     const auto end = SteadyClock::now() + 10s;
     while (SteadyClock::now() < end) {
-      engine->poll();
-      if (auto failure = engine->next_failure())
+      if (auto failure = engine_events.take_failure())
         throw std::runtime_error(failure->message);
       std::this_thread::sleep_for(10ms);
     }

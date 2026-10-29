@@ -4,6 +4,7 @@
 #include "livekit/error.hpp"
 #include <stop_token>
 #include <exception>
+#include <future>
 
 namespace livekit::sdk::rtc {
 class RoomServices;
@@ -102,6 +103,10 @@ class RoomTransport {
  public:
   virtual ~RoomTransport() = default;
 
+  virtual BackendCapabilities capabilities() const {
+    return {};
+  }
+
   virtual std::shared_ptr<RoomServices> services() const {
     return {};
   }
@@ -113,7 +118,9 @@ class RoomTransport {
   virtual void publish(const BindingToken&, const TrackDescriptor&) = 0;
   virtual void subscribe(const BindingToken&, const TrackDescriptor&,
                          std::shared_ptr<QueueBudget>) = 0;
-  virtual void remove(const BindingToken&, bool publication) = 0;
+  // Completion fences native detachment, not a server ACK. Do not wait on the
+  // controller: other tracks and control requests must continue to progress.
+  virtual std::future<void> remove(const BindingToken&, bool publication) = 0;
   virtual SendResult send(const BindingToken&, const EncodedFrame&) = 0;
   virtual void request_keyframe(const BindingToken&) = 0;
 

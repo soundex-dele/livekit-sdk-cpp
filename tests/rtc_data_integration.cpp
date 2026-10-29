@@ -1,4 +1,5 @@
 #include "livekit/rtc/livekit.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include "livekit/error.hpp"
 #include <cstdlib>
 #include <iostream>
@@ -56,7 +57,7 @@ int main() {
         stream_data->set_exception(std::current_exception());
       }
     });
-    RoomOptions options;
+    LiveKitRoomOptions options;
     options.url = env("LIVEKIT_URL");
     options.reconnect.enabled = false;
     if (encrypted) {

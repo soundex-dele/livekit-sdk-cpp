@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/rtc/signaling_options.hpp"
+#include "livekit/rtc/backend_options.hpp"
 #include "livekit/rtc/session_info.hpp"
 #include "livekit/encryption.hpp"
 
@@ -114,6 +114,11 @@ struct EncodedFrame {
   Epoch epoch = 0;  // Required: use the endpoint's current binding epoch.
   uint64_t config_revision = 1;
   bool keyframe = false;
+  // Optional native receive metadata. Audio sequence numbers preserve loss and
+  // reordering information across the encoded boundary; capture time is a sender
+  // clock value, never interpreted as a local steady_clock timestamp.
+  std::optional<uint16_t> sequence_number;
+  std::optional<int64_t> sender_capture_time_us;
 };
 
 enum class WriteStatus {
@@ -176,14 +181,17 @@ struct SubscriptionPermissionChange {
   bool allowed = false;
 };
 
-struct RoomOptions : SignalingOptions {
-  EncryptionOptions encryption;
+struct RoomSettings {
   std::optional<SubscriptionPermissions> subscription_permissions;
   size_t max_queued_bytes = 64 * 1024 * 1024;
   size_t max_tracks = 128;
   size_t max_events = 4096;
   std::chrono::milliseconds operation_timeout{30000};
   std::chrono::milliseconds stats_interval{0};  // Disabled, or 200..60000 ms.
+};
+
+struct RoomOptions : RoomSettings {
+  std::shared_ptr<const BackendOptions> backend;
 };
 
 struct TransportStatistics {
@@ -197,6 +205,7 @@ struct TransportStatistics {
 };
 
 struct RoomSnapshot {
+  BackendCapabilities capabilities;
   ConnectionState state = ConnectionState::disconnected;
   Epoch epoch = 0;
   size_t queued_bytes = 0;

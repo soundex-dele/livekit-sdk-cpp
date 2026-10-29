@@ -1,3 +1,4 @@
+#include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/engine.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include <algorithm>
@@ -64,10 +65,13 @@ class Transport final : public RoomTransport {
     w->emit({TransportEventKind::subscribed, binding, d.remote_sid});
   }
 
-  void remove(const BindingToken& binding, bool) override {
+  std::future<void> remove(const BindingToken& binding, bool) override {
     std::lock_guard lock(w->mutex);
     std::erase_if(w->subscribers, [&](const auto& item) { return item.second == binding; });
     std::erase_if(w->publishers, [&](const auto& item) { return item.second == binding; });
+    std::promise<void> done;
+    done.set_value();
+    return done.get_future();
   }
 
   SendResult send(const BindingToken& binding, const EncodedFrame& frame) override {
@@ -116,7 +120,7 @@ void until(RtcEngine& engine, F done) {
   const auto deadline = SteadyClock::now() + 5s;
   while (!done()) {
     check(SteadyClock::now() < deadline, "Media engine operation timed out");
-    engine.poll();
+
     std::this_thread::sleep_for(1ms);
   }
 }
@@ -140,7 +144,7 @@ MediaPublishSpec video(std::string id) {
 std::unique_ptr<RtcEngine> make_engine(std::shared_ptr<Wire> wire) {
   auto result = std::make_unique<RtcEngine>([wire] { return std::make_unique<Transport>(wire); });
   result->enable_media();
-  RoomOptions options;
+  LiveKitRoomOptions options;
   options.url = "ws://test";
   options.token = "test";
   auto joined = result->join(options);
@@ -204,6 +208,30 @@ void cancelled_and_failed_sources() {
         "Cancelled publication leaked or closed application source");
   check(pending.track->snapshot().transport.state == TrackState::failed,
         "Cancelled operation still appears pending");
+  spec.track.id = "backend-rejected";
+  auto rejected = engine->publish_video(spec);
+  BindingToken rejected_binding;
+  until(*engine, [&] {
+    std::lock_guard lock(wire->mutex);
+    auto found = wire->publishers.find(spec.track.id);
+    if (found == wire->publishers.end()) {
+      return false;
+    }
+    rejected_binding = found->second;
+    return true;
+  });
+  TransportEvent failure{TransportEventKind::operation_failed, rejected_binding};
+  failure.error = "publication rejected";
+  wire->emit(std::move(failure));
+  bool backend_failed = false;
+  try {
+    await(*engine, rejected.ready);
+  } catch (...) {
+    backend_failed = true;
+  }
+  check(backend_failed && !source->stats().attached && !source->stats().closed &&
+            rejected.track->snapshot().transport.state == TrackState::failed,
+        "Backend failure became ready before media cleanup");
   wire->acknowledge = true;
   spec.track.id = "bad-codec";
   spec.video.max_frames = 0;
@@ -289,7 +317,7 @@ void shared_capture() {
   other->unpublish(b.track.id).get();
   check(!shared->snapshot().running && shared->snapshot().consumers == 0,
         "Last publication leaked capture");
-  RoomOptions room;
+  LiveKitRoomOptions room;
   room.url = "ws://test";
   room.token = "test";
   auto joining = engine->join(room);
@@ -342,9 +370,9 @@ void shared_audio() {
   auto invalid = a;
   invalid.track.id = "bad-shared";
   invalid.audio.max_frames = 0;
-  auto bad = engine->publish_audio(invalid);
   bool failed = false;
   try {
+    auto bad = engine->publish_audio(invalid);
     await(*engine, bad.ready);
   } catch (...) {
     failed = true;
@@ -385,7 +413,7 @@ void media_leave_and_rejoin() {
   check(active.track->snapshot().transport.state == TrackState::closed,
         "Leave retained active media endpoint");
   wire->acknowledge = true;
-  RoomOptions room;
+  LiveKitRoomOptions room;
   room.url = "ws://test";
   room.token = "test";
   auto joining = rtc->join(room);

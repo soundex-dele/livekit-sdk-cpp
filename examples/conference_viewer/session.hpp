@@ -1,3 +1,4 @@
+#include "livekit/rtc/livekit.hpp"
 #pragma once
 #include <livekit/rtc/types.hpp>
 #include <livekit/media.hpp>
@@ -14,7 +15,7 @@ namespace sdk = livekit::sdk;
 namespace rtc = sdk::rtc;
 
 struct SessionOptions {
-  rtc::RoomOptions connection;
+  rtc::LiveKitRoomOptions connection;
   std::string room;
   std::vector<sdk::MediaSpec> media;
   bool audio_playout = false;

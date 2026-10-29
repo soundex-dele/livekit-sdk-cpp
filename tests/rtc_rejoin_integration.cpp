@@ -1,3 +1,5 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/livekit.hpp>
 #include <livekit/auth.hpp>
 #include "rtc_video_fixtures.hpp"
@@ -35,7 +37,8 @@ int main(int argc, char** argv) {
           {{"roomJoin", true}, {"room", "rejoin"}, {"canPublish", true}, {"canSubscribe", true}});
     };
     auto tx = create_livekit_room(), rx = create_livekit_room();
-    RoomOptions options;
+    livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
+    LiveKitRoomOptions options;
     options.url = argv[1];
     options.token = token("observer");
     options.reconnect.enabled = false;
@@ -78,7 +81,7 @@ int main(int argc, char** argv) {
     auto muted = tx->publish(audio).get();
     std::vector<std::shared_ptr<SubscribedTrack>> subscriptions(2);
     auto discover = [&] {
-      while (auto event = rx->next_event(0ms)) {
+      while (auto event = rx_events.take_event(0ms)) {
         if (event->kind != RoomEventKind::remote_track_added)
           continue;
         for (int i = 0; i < 2; ++i)

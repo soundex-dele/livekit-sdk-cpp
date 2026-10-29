@@ -294,7 +294,7 @@ CLI 已迁移到新 engine，详细记录见下节；以下剩余项不再包含
 
 - RtcEngine 组合 RoomEngine、内部 RtcPipelineEngine 和可选 RtcMediaEngine；媒体模块不再持有顶层引擎。
 - RoomSession 更名并演进为 RoomEngine；公开媒体引擎头与旧工厂移除，应用、CLI、示例迁移到统一工厂。
-- room() 返回受控 RoomView，房间事件由 next_event() 单一消费；轨道关闭与退房经过顶层屏障。
+- room() 返回受控 RoomView，房间事件由 set_callbacks() 在串行通知队列回调；轨道关闭与退房经过顶层屏障。
 - leave 支持随后重新 join，使用新传输适配器及递增 epoch；close 永久终止引擎。
 - 保留纯编码构建，媒体模块显式装配；内部每轨流水线继续使用 GraphEngine。
 

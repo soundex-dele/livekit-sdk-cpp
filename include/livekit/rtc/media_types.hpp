@@ -36,12 +36,16 @@ struct AudioCodecOptions {
   size_t max_frames = 25, max_bytes = 256 * 1024;
   std::chrono::milliseconds max_age{250};
   uint32_t packet_duration_ms = 20;  // Encode: 10, 20, 40 or 60.
+  bool jitter_buffer = false;        // Receive: NetEq pacing, adaptive jitter and PLC.
+  std::chrono::milliseconds jitter_min_delay{20}, jitter_max_delay{200};
   uint32_t bitrate_bps = 64000;      // Encode: 6000..510000.
 };
 
 struct AudioCodecSnapshot {
   uint64_t admitted = 0, completed = 0, dropped = 0, discontinuities = 0, invalid_packets = 0;
   size_t queued_frames = 0, queued_bytes = 0;
+  uint64_t concealed_samples = 0, accelerated_samples = 0, decelerated_samples = 0;
+  uint64_t jitter_buffer_ms = 0;
   std::string error;
 };
 

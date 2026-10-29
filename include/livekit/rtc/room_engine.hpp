@@ -30,6 +30,10 @@ class PublishedTrack {
   const TrackDescriptor& descriptor() const;
   TrackSnapshot snapshot() const;
   SenderFeedback feedback() const;
+  // Wait for a new epoch/revision without polling. Null on stop or terminal
+  // endpoint state. Multiple observers may independently retain their cursors.
+  std::optional<SenderFeedback> wait_feedback(Epoch previous_epoch, uint64_t previous_revision,
+                                              std::stop_token stop = {}) const;
   WriteStatus try_write(EncodedFrame frame);
   // Local gate plus signaling submission, not a server ACK. Already transmitted
   // packets cannot be retracted. Muting does not unpublish the track.
@@ -49,6 +53,9 @@ class SubscribedTrack {
   const TrackDescriptor& descriptor() const;
   TrackSnapshot snapshot() const;
   ReadResult read(std::chrono::milliseconds timeout, std::stop_token stop = {});
+  // Single-reader blocking receive. Remains asleep across suspension/rebind;
+  // returns on media, cancellation, failure or close. No timeout polling.
+  ReadResult wait_frame(std::stop_token stop = {});
   // Sends a rate-limited PLI independently of incoming media arrival.
   std::future<void> request_keyframe();
   // SFU forwarding demand, not a local decoder/device gate. Success means
@@ -94,9 +101,19 @@ class RoomEngine {
   std::future<void> leave();
   RoomSnapshot snapshot() const;
   std::shared_ptr<RoomServices> services() const;
-  std::optional<RoomEvent> next_event(std::chrono::milliseconds timeout, std::stop_token stop = {});
+  // Events run serially on the notification task queue, never the transport
+  // worker. Register before join. Replacement/removal fences previous callbacks.
+  // Callbacks may issue control requests, but must not destroy the engine or throw.
+  // Serialize registration calls; event references are borrowed for the call.
+  // Return promptly. A thrown exception disables the handler and fails the room.
+  void set_event_handler(std::function<void(const RoomEvent&)>);
 
  private:
+  friend class engine::RtcEngine;
+  // Internal completion notification. Called on the backend thread; only enqueue
+  // control work here, never execute graph/application code synchronously.
+  void set_completion_wakeup(std::function<void()>);
+  void post_notification(std::function<void()>);
   std::shared_ptr<detail::RoomEngineState> state_;
 };
 

@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include "backends/rtc/queue_budget.hpp"
 #include <atomic>
+#include "system_wrappers/include/clock.h"
 
 namespace livekit::sdk::rtc::detail {
 
@@ -73,9 +74,18 @@ SendResult EncodedAudioSender::send(const EncodedFrame& frame) {
   }
   const auto bytes = frame.buffer.bytes();
   const auto deadline = QueueBudget::admitted(frame.buffer) + budget_->limits.max_age;
+  std::optional<uint64_t> capture_ms;
+  if (frame.captured) {
+    const auto age =
+        std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - *frame.captured);
+    const auto capture_us = webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds() - age.count();
+    if (capture_us > 0) {
+      capture_ms = uint64_t(capture_us / 1000);
+    }
+  }
   auto native = webrtc::CreateSenderAudioFrame(
       {bytes.data(), bytes.size()}, payload_type_, uint32_t(frame.timestamp), ssrc_, "audio/opus",
-      std::nullopt, std::nullopt,
+      capture_ms, std::nullopt,
       [reservation, room_reservation = QueueBudget::ownership(frame.buffer)] {},
       [budget = budget_, deadline, generation = budget_->generation.load()] {
         return !budget->closed.load() && !budget->muted.load() &&

@@ -10,14 +10,14 @@ namespace livekit::sdk::rtc::engine {
 // Additional nodes in the same per-track GraphEngine as its RTC endpoint.
 // Nodes must be fresh. Connections may refer to the supplied RTC node. Start
 // production in activate, after every node has started; quiesce must not throw
-// and must join all producers before returning. poll runs on the engine owner thread and must be
+// and must join all producers before returning. check_health runs on the engine task queue and must be
 // bounded. Codec/device work belongs in bounded workers owned by these nodes.
 struct TrackGraphSpec {
   std::vector<std::shared_ptr<graphflow::core::GraphNode>> nodes;
   std::vector<graphflow::engine::NodeConnection> connections;
   std::function<void()> activate;
   std::function<void()> quiesce;
-  std::function<void()> poll;
+  std::function<void()> check_health;
 
   template <class Event>
   static graphflow::engine::NodeConnection connect(
@@ -31,7 +31,7 @@ using PublishGraphFactory = std::function<TrackGraphSpec(std::shared_ptr<nodes::
 using SubscribeGraphFactory =
     std::function<TrackGraphSpec(std::shared_ptr<nodes::RtcSubscribeNode>)>;
 
-// Engine-owned topology for one logical track. Lifecycle and polling use one
+// Engine-owned topology for one logical track. Lifecycle and health checks use one
 // owner sequence; write() is safe from producers during lifecycle transitions.
 // Nodes hold endpoint leases, never a RoomEngine.
 // To add/remove a stream, create/close this graph without rebuilding other graphs.
@@ -43,7 +43,7 @@ class PublishPipeline {
   ~PublishPipeline();
   void start();
   WriteStatus write(EncodedFrame);
-  void poll_feedback();
+  void check();
   std::future<void> close();
 
   const nodes::RtcPublishNode& node() const {
@@ -69,7 +69,7 @@ class SubscribePipeline {
   SubscribePipeline(std::shared_ptr<SubscribedTrack>, SubscribeGraphFactory);
   ~SubscribePipeline();
   void start();
-  size_t poll(size_t max_frames = 4);
+  void check();
   std::future<void> close();
 
   const nodes::RtcSubscribeNode& node() const {

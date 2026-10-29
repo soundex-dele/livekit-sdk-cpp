@@ -1,4 +1,5 @@
 #include "media_nodes/playout/audio_output_driver.hpp"
+#include "livekit/rtc/audio_processing.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -66,6 +67,17 @@ struct AudioOutputSession::Impl {
     if (output.size() != 960) {
       return;
     }
+
+    struct ReferenceWrite {
+      AudioRenderReference* reference;
+      std::span<int16_t> output;
+
+      ~ReferenceWrite() {
+        if (reference) {
+          reference->write(output);
+        }
+      }
+    } reference{options.echo_reference.get(), output};
     const auto begin = cursor.fetch_add(480), end = begin + 480;
     std::unique_lock lock(mutex, std::try_to_lock);
     if (!lock) {
@@ -221,7 +233,7 @@ bool AudioOutputTrack::write(const nodes::AudioFrameEvent& event) {
       packet.stereo[i * 2 + c] = pcm.samples[i * pcm.channels + (pcm.channels == 1 ? 0 : c)];
     }
   }
-  std::lock_guard lock(device.mutex);
+  std::unique_lock lock(device.mutex);
   const auto now = SteadyClock::now();
   if (s.stats.closed || !device.stats.error.empty() || event.epoch < s.stats.epoch ||
       event.captured < s.boundary || event.captured > now + 1s ||
@@ -247,7 +259,8 @@ bool AudioOutputTrack::write(const nodes::AudioFrameEvent& event) {
     s.base_timestamp = event.timestamp;
     s.base_play = cursor + std::min(uint64_t(device.options.buffer.count()) * 48, maximum - frames);
   };
-  if (!s.base_timestamp) {
+  const bool first_packet = !s.base_timestamp;
+  if (first_packet) {
     anchor();
   }
   auto delta = event.timestamp - *s.base_timestamp;
@@ -261,6 +274,19 @@ bool AudioOutputTrack::write(const nodes::AudioFrameEvent& event) {
     delta = 0;
   }
   packet.at = s.base_play + delta;
+  if (first_packet && event.presentation_time) {
+    const auto ahead_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(*event.presentation_time - now)
+            .count();
+    if (ahead_us > device.options.max_latency.count() * 1000) {
+      ++s.stats.dropped;
+      return false;
+    }
+    const auto offset = ahead_us * 48 / 1000;
+    packet.at = offset < 0 ? (uint64_t(-offset) > cursor ? 0 : cursor - uint64_t(-offset))
+                           : cursor + uint64_t(offset);
+    s.base_play = packet.at;
+  }
   if (packet.end() > cursor + maximum) {
     s.reset();
     anchor();
@@ -273,7 +299,13 @@ bool AudioOutputTrack::write(const nodes::AudioFrameEvent& event) {
   s.last_end = event.timestamp + frames;
   s.stats.queued_samples += frames;
   ++s.stats.admitted;
+  const auto scheduled =
+      now + std::chrono::microseconds((int64_t(packet.at) - int64_t(cursor)) * 1000000 / 48000);
   s.queue.push_back(std::move(packet));
+  lock.unlock();
+  if (event.sender_capture_time_us && event.presentation_clock) {
+    event.presentation_clock->observe_audio(*event.sender_capture_time_us, scheduled, event.epoch);
+  }
   return true;
 }
 

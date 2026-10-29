@@ -7,7 +7,7 @@ CLI 已使用新的 `rtc::RoomEngine` 和 `rtc::engine::RtcEngine`，不再包�
 订阅连接；`stats` 保留 libwebrtc 原生 W3C 字段，包括帧数、编码器质量限制
 原因、码率、RTT、丢包、NACK/PLI 和候选连接对统计。未定义字段不会伪造为零。
 不输出 candidate 地址或 certificate 记录；采集为异步，每条连接最多一个
-未完成请求。统计通过 `rtc::RoomOptions::stats_interval` 启用，再用 `RoomEngine::next_event()` 读取 `RoomEventKind::statistics`。报告带连接 epoch；每个目标最多保留一条待读报告，控制事件优先。CLI 在自身控制线程串行输出 JSON。
+未完成请求。统计通过 `rtc::RoomOptions::stats_interval` 启用，再用 `RoomEngine::set_event_handler()` 接收 `RoomEventKind::statistics`。报告带连接 epoch；每个目标最多保留一条待读报告，控制事件优先。CLI 在自身控制线程串行输出 JSON。
 
 原生 W3C 指标描述传输 PeerConnection；实际编解码位于上层，使用 `media-graph-stats` 的节点计数查看其准入、完成、丢弃和错误。该事件的 `edges` 来自运行中 GraphEngine 节点的真实连接。带宽估计、探测参数和 RTP/RTCP 算法由 libwebrtc 决定，设备不放进传输 PeerConnection。
 

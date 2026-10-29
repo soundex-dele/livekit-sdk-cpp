@@ -1,5 +1,6 @@
 #pragma once
 #include "livekit/rtc/audio_nodes.hpp"
+#include "livekit/rtc/audio_output_options.hpp"
 
 namespace livekit::sdk::rtc {
 namespace detail {
@@ -10,12 +11,6 @@ struct AudioOutputFactory;
 namespace nodes {
 class AudioOutputNode;
 }
-
-struct AudioOutputOptions {
-  std::optional<uint16_t> device_index;
-  size_t max_tracks = 32;
-  std::chrono::milliseconds buffer{40}, max_latency{250};
-};
 
 struct AudioOutputSnapshot {
   size_t tracks = 0;

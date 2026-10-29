@@ -1,3 +1,5 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include "session.hpp"
 #include "livekit/rtc/engine.hpp"
 #include "media_nodes/render/video_playout.hpp"
@@ -125,7 +127,8 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
   auto display =
       options.video_playout ? std::make_shared<lk::VideoPlayout>(display_events) : nullptr;
   auto engine = engine::create_livekit_engine({});  // Destroy before consumers/display.
-  RoomOptions room;
+  livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
+  LiveKitRoomOptions room;
   room.url = options.url;
   room.token = options.token;
   room.connect_timeout = options.connect_timeout;
@@ -138,7 +141,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
       engine->close().get();
       return;
     }
-    engine->poll();
+
     std::this_thread::sleep_for(5ms);
   }
   joining.get();
@@ -227,7 +230,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
     while (!stop.stop_requested() &&
            (!options.duration ||
             SteadyClock::now() - start < std::chrono::seconds(options.duration))) {
-      while (auto event = engine->next_event(0ms)) {
+      while (auto event = engine_events.take_event(0ms)) {
         if (event->kind == RoomEventKind::remote_track_added && event->descriptor)
           subscribe(*event->descriptor);
         else if (event->kind == RoomEventKind::track_removed) {
@@ -263,8 +266,8 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
                   {"timestampUs", event->statistics->timestamp_us},
                   {"stats", Json::parse(event->statistics->json)}});
       }
-      engine->poll();
-      while (auto failure = engine->next_failure()) {
+
+      while (auto failure = engine_events.take_failure()) {
         auto it = tracks.find(failure->id);
         if (it != tracks.end() && it->second->closing)
           continue;

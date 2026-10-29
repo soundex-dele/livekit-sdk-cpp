@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/rtc/audio_processing.hpp"
 #include "livekit/rtc/media_types.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
 #include "livekit/rtc/video_nodes.hpp"
@@ -6,6 +7,10 @@
 #include "livekit/microphone.hpp"
 #include "livekit/video_source.hpp"
 #include "livekit/encoded_media.hpp"
+
+namespace livekit::sdk::rtc::detail {
+class RawFrameQueue;
+}
 
 namespace livekit::sdk::rtc::nodes {
 struct MediaInputOptions {
@@ -16,10 +21,15 @@ struct MediaInputOptions {
   int device_index = 0;
   std::string screen_id;
   uint32_t fps = 30;
+  // Microphone inputs default to APM; application/file inputs opt in explicitly.
+  std::optional<AudioProcessingOptions> audio_processing;
+  std::shared_ptr<AudioRenderReference> echo_reference;
   std::shared_ptr<I420VideoSource> video_source;
   std::shared_ptr<PcmAudioSource> audio_source;
   std::shared_ptr<MicrophoneSession> microphone;
   std::shared_ptr<EncodedMediaSource> encoded_source;
+  // Engine-internal shared capture branch; no copy of the immutable payload.
+  std::shared_ptr<detail::RawFrameQueue> shared_frames;
 };
 
 // Engine-level source. No Room/PeerConnection, RTC encoder or renderer is owned

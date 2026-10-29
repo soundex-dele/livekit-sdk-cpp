@@ -1,3 +1,5 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/engine.hpp>
 #include <atomic>
 #include <cstdlib>
@@ -58,7 +60,8 @@ int main(int argc, char** argv) {
       throw std::runtime_error("Set LIVEKIT_URL and a room-join LIVEKIT_TOKEN");
     ApplicationQueue queue;  // Outlives the engine and its decoder workers.
     auto engine = engine::create_livekit_engine({});
-    RoomOptions options;
+    livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
+    LiveKitRoomOptions options;
     options.url = url;
     options.token = token;
     engine->join(options).get();
@@ -67,7 +70,7 @@ int main(int argc, char** argv) {
     size_t blocks = 0;
     const auto deadline = SteadyClock::now() + 30s;
     while (blocks < 100 && SteadyClock::now() < deadline) {
-      if (auto event = engine->next_event(10ms);
+      if (auto event = engine_events.take_event(10ms);
           event && event->kind == RoomEventKind::remote_track_added && event->descriptor &&
           event->descriptor->kind == MediaKind::audio) {
         const auto descriptor = *event->descriptor;
@@ -80,7 +83,7 @@ int main(int argc, char** argv) {
         auto operation = engine->subscribe_media(std::move(config));
         pending.push_back(std::move(operation.ready));
       }
-      engine->poll();
+
       for (auto it = pending.begin(); it != pending.end();) {
         if (it->wait_for(0ms) == std::future_status::ready) {
           it->get();
@@ -88,7 +91,7 @@ int main(int argc, char** argv) {
         } else
           ++it;
       }
-      if (auto failure = engine->next_failure())
+      if (auto failure = engine_events.take_failure())
         throw std::runtime_error(failure->message);
       // Slow application work happens here, outside decoder/native callbacks.
       // A playout consumer must also track epoch, timestamp gaps and discontinuity;

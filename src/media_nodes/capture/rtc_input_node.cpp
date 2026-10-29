@@ -1,4 +1,6 @@
 #include "livekit/rtc/input_node.hpp"
+#include "media_graph/raw_frame_queue.hpp"
+#include "media_nodes/capture/audio_processor.hpp"
 #include "media_nodes/capture/audio_source.hpp"
 #include "media_nodes/capture/video_source.hpp"
 #include "media_nodes/capture/encoded_source.hpp"
@@ -80,6 +82,8 @@ struct MediaInputNode::Impl {
   std::unique_ptr<livekit::sdk::detail::I420SourceReader> video;
   std::unique_ptr<livekit::sdk::detail::PcmSourceReader> audio;
   std::unique_ptr<livekit::sdk::detail::EncodedSourceReader> encoded;
+  std::unique_ptr<detail::AudioProcessor> audio_processor;
+  std::optional<uint64_t> audio_generation;  // Input worker only.
 
   struct Token {
     Epoch epoch;
@@ -92,7 +96,7 @@ struct MediaInputNode::Impl {
     const int inputs = int(options.generated) + int(!options.input.empty()) +
                        int(options.capture != CaptureKind::input) +
                        int(bool(options.video_source)) + int(bool(options.audio_source)) +
-                       int(bool(options.encoded_source));
+                       int(bool(options.encoded_source)) + int(bool(options.shared_frames));
     if (inputs != 1 || !options.fps || options.fps > 240 || options.ffmpeg.empty() ||
         descriptor.encodings.size() != 1 ||
         (descriptor.kind != MediaKind::video && descriptor.kind != MediaKind::audio) ||
@@ -108,6 +112,13 @@ struct MediaInputNode::Impl {
         (options.loop && options.input.empty()))
       throw std::invalid_argument("Invalid media input configuration");
     codec_name(descriptor.format.codec);
+    if (options.audio_processing && options.audio_processing->enabled) {
+      if (is_video || options.encoded_source || options.shared_frames) {
+        throw std::invalid_argument("APM belongs on the raw capture before shared fanout");
+      }
+      audio_processor = std::make_unique<detail::AudioProcessor>(*options.audio_processing,
+                                                                 options.echo_reference);
+    }
     if (descriptor.follow_subscriber_demand && (!is_video || !options.input.empty()))
       throw std::invalid_argument("Subscriber demand requires a live video source");
     if (options.video_source) {
@@ -133,6 +144,9 @@ struct MediaInputNode::Impl {
   }
 
   void start_readers() {
+    if (options.shared_frames) {
+      options.shared_frames->start();
+    }
     if (video)
       video->start();
     if (audio)
@@ -142,6 +156,9 @@ struct MediaInputNode::Impl {
   }
 
   void stop_readers() {
+    if (options.shared_frames) {
+      options.shared_frames->stop();
+    }
     if (video)
       video->stop();
     if (audio)
@@ -197,7 +214,8 @@ struct MediaInputNode::Impl {
 
   Token source_token(uint64_t source_generation) const {
     std::lock_guard lock(mutex);
-    const auto current = options.video_source   ? options.video_source->stats().generation
+    const auto current = options.shared_frames  ? options.shared_frames->generation()
+                         : options.video_source ? options.video_source->stats().generation
                          : options.audio_source ? options.audio_source->stats().generation
                                                 : options.encoded_source->stats().generation;
     return source_generation == current ? Token{feedback.epoch, generation} : Token{0, 0};
@@ -276,6 +294,38 @@ struct MediaInputNode::Impl {
     pixels(std::move(out), captured, binding);
   }
 
+  void emit_audio(AudioFrameEvent& event, Token binding) {
+    event.discontinuity = !audio_generation || *audio_generation != binding.generation;
+    audio_generation = binding.generation;
+    if (audio_processor) {
+      audio_processor->process(event);
+    }
+    owner.publish(event);
+  }
+
+  void shared(std::stop_token cancel) {
+    while (!stop && !cancel.stop_requested()) {
+      if (!wait_enabled(cancel)) {
+        break;
+      }
+      auto sample = options.shared_frames->read(cancel);
+      if (!sample) {
+        continue;
+      }
+      const auto binding = source_token(sample->generation);
+      if (auto pixels_value = std::get_if<std::shared_ptr<const VideoFrame>>(&sample->payload)) {
+        pixels(*pixels_value, sample->captured, binding);
+      } else if (admit(binding, sample->captured)) {
+        AudioFrameEvent event;
+        event.pcm = std::get<std::shared_ptr<const PcmAudioFrame>>(std::move(sample->payload));
+        event.captured = sample->captured;
+        event.epoch = binding.epoch;
+        event.timestamp = sample->timestamp;
+        emit_audio(event, binding);
+      }
+    }
+  }
+
   void application(std::stop_token cancel) {
     auto next = SteadyClock::now();
     std::optional<SteadyClock::time_point> audio_origin;
@@ -303,7 +353,7 @@ struct MediaInputNode::Impl {
         }
         if (!pace(cancel, input->captured))
           break;
-        pixels(std::make_shared<const VideoFrame>(input->frame), input->captured,
+        pixels(std::shared_ptr<const VideoFrame>(input, &input->frame), input->captured,
                source_token(input->frame.stream_generation));
         next = SteadyClock::now() + std::chrono::microseconds(1000000 / options.fps);
       } else if (audio) {
@@ -333,7 +383,7 @@ struct MediaInputNode::Impl {
           event.epoch = binding.epoch;
           event.captured = input->captured;
           event.timestamp = audio_base + uint64_t((input->captured - *audio_origin) / 10ms) * 480;
-          owner.publish(event);
+          emit_audio(event, binding);
         }
         next += 10ms;
       } else {
@@ -472,7 +522,7 @@ struct MediaInputNode::Impl {
                   std::chrono::duration_cast<std::chrono::milliseconds>(captured - first).count() /
                   10) *
                   480;
-          owner.publish(event);
+          emit_audio(event, binding);
         }
       }
       ++sequence;
@@ -496,9 +546,11 @@ struct MediaInputNode::Impl {
       if (!stop && !cancel.stop_requested()) {
         if (options.microphone)
           options.microphone->start();
-        if (video || audio || encoded)
+        if (options.shared_frames) {
+          shared(cancel);
+        } else if (video || audio || encoded) {
           application(cancel);
-        else if (options.capture != CaptureKind::input) {
+        } else if (options.capture != CaptureKind::input) {
           MediaSpec spec;
           spec.capture = options.capture;
           spec.device_index = options.device_index;
@@ -518,8 +570,9 @@ struct MediaInputNode::Impl {
             if (!capture_stop)
               throw std::runtime_error("Capture device stopped unexpectedly");
           }
-        } else
+        } else {
           generated_or_file(cancel);
+        }
       }
     } catch (const std::exception& e) {
       std::lock_guard lock(mutex);

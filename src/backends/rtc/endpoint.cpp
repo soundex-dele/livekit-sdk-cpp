@@ -119,6 +119,20 @@ SenderFeedback Endpoint::feedback() const {
   return feedback_;
 }
 
+std::optional<SenderFeedback> Endpoint::wait_feedback(Epoch epoch, uint64_t revision,
+                                                      std::stop_token stop) {
+  std::unique_lock lock(mutex_);
+  changed_.wait(lock, stop, [&] {
+    return stats_.state == TrackState::closed || stats_.state == TrackState::failed ||
+           feedback_.epoch != epoch || feedback_.revision != revision;
+  });
+  if (stop.stop_requested() || stats_.state == TrackState::closed ||
+      stats_.state == TrackState::failed) {
+    return {};
+  }
+  return feedback_;
+}
+
 BindingToken Endpoint::binding() const {
   std::lock_guard lock(mutex_);
   return binding_;
@@ -143,6 +157,7 @@ void Endpoint::require_keyframe_locked() {
     ++encoding.keyframe_requests;
   }
   ++feedback_.revision;
+  changed_.notify_all();
 }
 
 void Endpoint::require_keyframe() {
@@ -220,8 +235,10 @@ WriteStatus Endpoint::write(EncodedFrame frame) {
        !(bytes[2] == 1 || (bytes[2] == 0 && bytes[3] == 1))))
     return WriteStatus::invalid_frame;
   auto& last_timestamp = last_timestamp_.at(frame.encoding_id);
-  if (last_timestamp && frame.timestamp <= *last_timestamp)
+  if ((publication || descriptor.kind == MediaKind::video) && last_timestamp &&
+      frame.timestamp <= *last_timestamp) {
     return WriteStatus::invalid_frame;
+  }
   if (!encoding->second.active)
     return WriteStatus::not_ready;
   expire_locked();
@@ -260,6 +277,26 @@ ReadResult Endpoint::read(std::chrono::milliseconds timeout, std::stop_token sto
   std::unique_lock lock(mutex_);
   changed_.wait_for(lock, stop, timeout,
                     [&] { return stats_.state != TrackState::ready || !queue_.empty(); });
+  return read_locked(stop);
+}
+
+ReadResult Endpoint::wait_frame(std::stop_token stop) {
+  std::unique_lock lock(mutex_);
+  for (;;) {
+    changed_.wait(lock, stop, [&] {
+      return stats_.state == TrackState::closed || stats_.state == TrackState::failed ||
+             (stats_.state == TrackState::ready && !queue_.empty());
+    });
+    auto result = read_locked(stop);
+    if (result.status != ReadStatus::timeout) {
+      return result;
+    }
+    // Expiration can remove an entire encoded dependency chain. Wait for the
+    // next admissible frame instead of spinning on an empty queue.
+  }
+}
+
+ReadResult Endpoint::read_locked(std::stop_token stop) {
   if (stop.stop_requested())
     return {ReadStatus::cancelled, {}};
   if (stats_.state == TrackState::closed)
@@ -336,6 +373,7 @@ void Endpoint::update_feedback(const SenderFeedback& feedback) {
   }
   transport_feedback_ = feedback;
   ++feedback_.revision;
+  changed_.notify_all();
 }
 
 void Endpoint::set_muted(bool muted) {

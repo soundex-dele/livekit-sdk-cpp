@@ -1,5 +1,7 @@
 # livekit-sdk-cpp
 
+当前分层、帧契约与迁移说明见 [架构说明](docs/architecture.md)。最新的 [源节点分发与任务队列设计](docs/source-driven-runtime.md) 已移除 RtcEngine/pipeline 的 poll 接口。
+
 C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 
 普通媒体会话通过 RtcEngine 装配可选的内部 RtcMediaEngine：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
@@ -14,7 +16,8 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 | --- | --- | --- |
 | 配置采集、编解码、预览、播放、录制与共享采集 | livekit/rtc/engine.hpp | LiveKit::RTCMediaEngine |
 | 只入会、收发编码帧 | livekit/rtc/livekit.hpp | LiveKit::RTCLiveKit |
-| 统一入口：编码传输与高级 GraphEngine 扩展 | livekit/rtc/engine.hpp | LiveKit::RTCEngine |
+| 统一入口：编码传输与高级 GraphEngine 扩展 | livekit/rtc/engine.hpp、graph_api.hpp | LiveKit::RTCEngine |
+| 自动驱动普通媒体会话 | livekit/rtc/executor.hpp | LiveKit::RTCMediaEngine |
 | 自行组合发布/订阅节点 | livekit/rtc/publish_node.hpp、subscribe_node.hpp | LiveKit::RTCNodes |
 | 上层 VP8/H264/H265/Opus 编解码 | livekit/rtc/video_nodes.hpp、audio_nodes.hpp | LiveKit::RTCMedia |
 | 应用供帧、文件、设备输入图 | livekit/rtc/input_node.hpp | LiveKit::RTCInputs |
@@ -33,7 +36,7 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 轨道以稳定本地 TrackId 路由，服务端 SID 是当前会话绑定。每轨拥有独立队列、预算、反馈和关闭屏障。停止一条轨道不退出房间。已有编码帧可直接写入 PublishedTrack；SubscribedTrack::read() 返回拥有数据的完整编码帧。
 
-RtcEngine 的控制和 poll() 由同一个主管线程调用；采集、编解码及设备输出放在各自有界工作线程。RoomServices 在同一 backend 上提供可靠/不可靠数据、RPC、文本/字节流、DataTrack、DTMF、转写及加密。UI 使用不可变快照。
+RtcEngine 通过内置 utoolkit/task_queue 自动处理控制与建图，不再提供 poll()/next_event()/next_failure()，房间事件和图错误通过 set_callbacks() 通知；源节点在自己的线程上等待并分发媒体与反馈；采集、编解码及设备输出放在各自有界工作线程。RoomServices 在同一 backend 上提供可靠/不可靠数据、RPC、文本/字节流、DataTrack、DTMF、转写及加密。UI 使用不可变快照。
 
 ## RTC 后端目录
 
@@ -60,9 +63,9 @@ src/backends/
 LiveKit 数据消息、RPC、流、加密及重连策略实现在 `rtc/livekit/`；依赖 LiveKit
 参与者与协议类型的帧加密适配器也属于此目录。WebRTC 底层实现不包含 LiveKit 协议头文件。
 
-此次调整保留现有运行行为。`RoomOptions` 仍继承现有 `SignalingOptions`，
-`RoomServices` 的具体实现仍使用 LiveKit 数据协议；接入其他后端时需拆分专属连接配置
-并明确可选服务能力，目录拆分不代表已经支持 mediasoup。
+`RoomOptions` 仅包含通用房间设置与不可变后端配置。LiveKit 调用方使用
+`LiveKitRoomOptions`，房间快照通过 `BackendCapabilities` 报告可选服务能力。
+`mediasoup/` 尚无实现。
 
 ## 构建
 
@@ -104,6 +107,6 @@ LiveKit 数据消息、RPC、流、加密及重连策略实现在 `rtc/livekit/`
 
 支持多条独立音视频轨、VP8/Opus 编码传输及可选 H264/H265 上层 codec、完整重新入会、逐轨静音/订阅需求/发布权限和会话服务。
 
-单 PC、信令 resume/无缝房间迁移、simulcast/SVC、AEC/APM、接收端抖动缓冲/PLC 和跨轨音画同步尚未完整实现。多流不等同于同一轨道多编码层。具体已验证范围与限制以 [实施记录](docs/rtc-backend-refactor.md) 为准。
+单 PC、信令 resume/无缝房间迁移、simulcast/SVC 尚未实现。媒体模块新增 APM、NetEq 抖动缓冲/PLC 和基于发送端采集时间的音画同步；缺少共同发送端时钟的轨道不宣称同步。本轮 Windows 自动化验证与限制见 [重构记录](docs/architecture-refactor-20261029.md)；尚未完成真实设备人工验收。多流不等同于同一轨道多编码层。具体已验证范围与限制以 [实施记录](docs/rtc-backend-refactor.md) 为准。
 
 历史接口文档和旧验收记录中的 Room API 示例不能用于当前版本。

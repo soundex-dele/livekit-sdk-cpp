@@ -1,3 +1,4 @@
+#include "rtc_event_mailbox.hpp"
 #include "session.hpp"
 #include <livekit/rtc/engine.hpp>
 #include <algorithm>
@@ -95,6 +96,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
       try {
         std::map<TrackId, std::shared_ptr<Track>> tracks;
         auto engine = engine::create_livekit_engine({});
+        livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
         const auto report = [&](const Json& event) {
           {
             std::lock_guard lock(mutex_);
@@ -109,7 +111,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
           while (future.wait_for(0ms) != std::future_status::ready) {
             if (stop.stop_requested())
               throw std::runtime_error("Session cancelled");
-            engine->poll();
+
             std::this_thread::sleep_for(5ms);
           }
           return future.get();
@@ -190,7 +192,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
         };
         auto next_stats = SteadyClock::now();
         while (!stop.stop_requested()) {
-          while (auto event = engine->next_event(0ms)) {
+          while (auto event = engine_events.take_event(0ms)) {
             if (event->kind == RoomEventKind::remote_track_added && event->descriptor)
               subscribe(*event->descriptor);
             else if (event->kind == RoomEventKind::track_removed) {
@@ -235,8 +237,8 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
                                            ? "Disconnected by server. Join again to reconnect."
                                            : event->message);
           }
-          engine->poll();
-          while (auto failure = engine->next_failure()) {
+
+          while (auto failure = engine_events.take_failure()) {
             auto it = tracks.find(failure->id);
             if (it != tracks.end())
               throw std::runtime_error("Track " + failure->id + ": " + failure->message);

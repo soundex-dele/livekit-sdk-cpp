@@ -2,15 +2,22 @@
 #include "livekit/rtc/room_engine.hpp"
 #include "livekit/rtc/events.hpp"
 #include "core/graph_node.h"
+#include <mutex>
+#include <thread>
 
 namespace livekit::sdk::rtc::nodes {
 
-// One subscription source. The engine fairly polls all sources on its media
-// scheduling sequence. No per-track thread, decoding or direct network callback.
+// One subscription source with its own blocking receive worker. The endpoint
+// wakes this worker; graph delivery never runs on the control/network thread.
+// Lifecycle uses the graph owner. Consumers must not synchronously close the
+// graph from a delivery callback. Quiesce the source before its downstream nodes.
 class RtcSubscribeNode final : public graphflow::core::GraphNode {
  public:
   RtcSubscribeNode(std::string name, std::shared_ptr<SubscribedTrack> track);
-  size_t poll(size_t max_frames = 4);
+  ~RtcSubscribeNode() override;
+  void activate();  // After all graph nodes and downstream producers are ready.
+  void quiesce();
+  void throw_if_failed() const;
 
   std::shared_ptr<SubscribedTrack> track() const {
     return track_;
@@ -28,6 +35,9 @@ class RtcSubscribeNode final : public graphflow::core::GraphNode {
  private:
   std::shared_ptr<SubscribedTrack> track_;
   std::atomic<bool> active_{false};
-  uint64_t delivered_ = 0;
+  std::atomic<uint64_t> delivered_{0};
+  mutable std::mutex failure_mutex_;
+  std::exception_ptr failure_;
+  std::jthread worker_;
 };
 }  // namespace livekit::sdk::rtc::nodes

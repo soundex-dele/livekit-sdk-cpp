@@ -1,0 +1,24 @@
+#pragma once
+#include "livekit/rtc/engine.hpp"
+#include "livekit/rtc/stream_pipeline.hpp"
+
+namespace livekit::sdk::rtc::engine {
+// Explicit opt-in to GraphFlow types. Borrowed access shares the engine's track
+// registry and serial task-queue contract; it must not outlive the engine.
+class RtcGraphApi final {
+ public:
+  std::future<TrackId> publish(TrackDescriptor,
+                               std::shared_ptr<graphflow::core::GraphNode> feedback_sink = {});
+  std::future<TrackId> subscribe(TrackDescriptor,
+                                 std::shared_ptr<graphflow::core::GraphNode> consumer);
+  std::future<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
+  std::future<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+
+ private:
+  friend class RtcEngine;
+
+  explicit RtcGraphApi(RtcEngine& engine) : engine_(&engine) {}
+
+  RtcEngine* engine_;
+};
+}  // namespace livekit::sdk::rtc::engine

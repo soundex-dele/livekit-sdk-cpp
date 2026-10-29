@@ -13,6 +13,8 @@ struct ReceivedAccessUnit {
   uint32_t width = 0, height = 0;
   bool keyframe = false;
   std::string mime_type;
+  std::optional<uint16_t> sequence_number;
+  std::optional<int64_t> sender_capture_time_us;
 };
 
 // Terminal receive boundary: owns complete depacketized access units and never

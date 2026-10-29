@@ -228,6 +228,19 @@ std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_res
     completion->reject(std::make_exception_ptr(std::runtime_error("Native peer is closed")));
     return future;
   }
+  for (const auto& transceiver : pc->GetTransceivers()) {
+    auto extensions = transceiver->GetHeaderExtensionsToNegotiate();
+    for (auto& extension : extensions) {
+      if (extension.uri == webrtc::RtpExtension::kAbsoluteCaptureTimeUri) {
+        extension.direction = webrtc::RtpTransceiverDirection::kSendRecv;
+      }
+    }
+    const auto error = transceiver->SetHeaderExtensionsToNegotiate(extensions);
+    if (!error.ok()) {
+      completion->reject(failure(error));
+      return future;
+    }
+  }
   auto observer = webrtc::make_ref_counted<CreateLocal>(pc, completion);
   PC::RTCOfferAnswerOptions options;
   options.ice_restart = ice_restart;

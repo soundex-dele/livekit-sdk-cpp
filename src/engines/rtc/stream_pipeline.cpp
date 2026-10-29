@@ -82,7 +82,7 @@ void PublishPipeline::start() {
     if (!graph_.start())
       throw std::runtime_error("RTC publication graph start failed");
     // Deliver current epoch/bitrate before producers can emit their first frame.
-    sink_->poll_feedback();
+    sink_->activate();
     if (extension_.activate)
       extension_.activate();
     std::lock_guard lock(mutex_);
@@ -92,6 +92,7 @@ void PublishPipeline::start() {
       std::lock_guard lock(mutex_);
       closed_ = true;
     }
+    sink_->quiesce();
     quiesce(extension_);
     graph_.stop();
     sink_->track()->close();
@@ -108,15 +109,16 @@ WriteStatus PublishPipeline::write(EncodedFrame frame) {
   return input_->push(std::move(frame));
 }
 
-void PublishPipeline::poll_feedback() {
+void PublishPipeline::check() {
   {
     std::lock_guard lock(mutex_);
     if (!running_)
       return;
   }
-  sink_->poll_feedback();
-  if (extension_.poll)
-    extension_.poll();
+  sink_->throw_if_failed();
+  if (extension_.check_health) {
+    extension_.check_health();
+  }
 }
 
 std::future<void> PublishPipeline::close() {
@@ -132,6 +134,7 @@ std::future<void> PublishPipeline::close() {
   // A producer can be completing write() while quiesce joins its thread.
   // Admission is closed above; never hold the ingress mutex during that join.
   if (stop) {
+    sink_->quiesce();
     quiesce(extension_);
     graph_.stop();
   }
@@ -168,19 +171,31 @@ SubscribePipeline::~SubscribePipeline() {
 }
 
 void SubscribePipeline::start() {
-  std::lock_guard lock(mutex_);
-  if (closed_)
-    throw std::logic_error("Closed RTC pipeline cannot restart");
-  if (running_)
-    return;
+  {
+    std::lock_guard lock(mutex_);
+    if (closed_) {
+      throw std::logic_error("Closed RTC pipeline cannot restart");
+    }
+    if (running_) {
+      return;
+    }
+  }
   try {
-    if (!graph_.start())
+    if (!graph_.start()) {
       throw std::runtime_error("RTC subscription graph start failed");
-    if (extension_.activate)
+    }
+    if (extension_.activate) {
       extension_.activate();
+    }
+    source_->activate();
+    std::lock_guard lock(mutex_);
     running_ = true;
   } catch (...) {
-    closed_ = true;
+    {
+      std::lock_guard lock(mutex_);
+      closed_ = true;
+    }
+    source_->quiesce();
     quiesce(extension_);
     graph_.stop();
     source_->track()->close();
@@ -188,21 +203,33 @@ void SubscribePipeline::start() {
   }
 }
 
-size_t SubscribePipeline::poll(size_t max_frames) {
-  std::lock_guard lock(mutex_);
-  if (!running_)
-    return 0;
-  const auto count = source_->poll(max_frames);
-  if (extension_.poll)
-    extension_.poll();
-  return count;
+void SubscribePipeline::check() {
+  {
+    std::lock_guard lock(mutex_);
+    if (!running_) {
+      return;
+    }
+  }
+  source_->throw_if_failed();
+  if (extension_.check_health) {
+    extension_.check_health();
+  }
 }
 
 std::future<void> SubscribePipeline::close() {
-  std::lock_guard lock(mutex_);
-  if (!closed_) {
-    running_ = false;
-    closed_ = true;
+  bool stop = false;
+  {
+    std::lock_guard lock(mutex_);
+    if (!closed_) {
+      running_ = false;
+      closed_ = true;
+      stop = true;
+    }
+  }
+  if (stop) {
+    // Stop and join ingress before any downstream quiescence or graph teardown.
+    // No pipeline lock may be held across an in-flight consumer callback.
+    source_->quiesce();
     quiesce(extension_);
     graph_.stop();
   }

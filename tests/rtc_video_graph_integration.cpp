@@ -1,4 +1,6 @@
-#include "livekit/rtc/engine.hpp"
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
+#include "livekit/rtc/graph_api.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include <atomic>
@@ -20,7 +22,7 @@ auto await(engine::RtcEngine& engine, std::future<T> future) {
   const auto deadline = SteadyClock::now() + 15s;
   while (future.wait_for(0ms) != std::future_status::ready) {
     check(SteadyClock::now() < deadline, "Media graph operation timed out");
-    engine.poll();
+
     std::this_thread::sleep_for(1ms);
   }
   return future.get();
@@ -59,7 +61,9 @@ int main() {
     const auto kind = std::getenv("LIVEKIT_MEDIA_ENCRYPTION");
     const bool encrypted = kind && std::string(kind) == "1";
     auto tx = engine::create_livekit_engine(), rx = engine::create_livekit_engine();
-    RoomOptions opts;
+    livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
+    livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
+    LiveKitRoomOptions opts;
     opts.url = std::getenv("LIVEKIT_URL");
     opts.reconnect.enabled = false;
     if (encrypted) {
@@ -82,7 +86,7 @@ int main() {
       d.format.codec = encrypted ? Codec::h264 : Codec::vp8;
       d.format.width = 64;
       d.format.height = 48;
-      await(*tx, tx->publish_graph(d, [&, i, d](auto sink) {
+      await(*tx, tx->graph().publish_graph(d, [&, i, d](auto sink) {
         livekit::sdk::I420SourceOptions source_options;
         source_options.width = 64;
         source_options.height = 48;
@@ -103,7 +107,7 @@ int main() {
           input->quiesce();
           node->quiesce();
         };
-        graph.poll = [input = inputs[i], node = encoders[i]] {
+        graph.check_health = [input = inputs[i], node = encoders[i]] {
           input->throw_if_failed();
           node->throw_if_failed();
         };
@@ -113,14 +117,14 @@ int main() {
     const auto discovery_deadline = SteadyClock::now() + 10s;
     while (!verify[0] || !verify[1]) {
       check(SteadyClock::now() < discovery_deadline, "Video graph discovery timed out");
-      auto event = rx->next_event(100ms);
+      auto event = rx_events.take_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 2; ++i)
         if (event->descriptor->name == "video-" + std::to_string(i) && !verify[i]) {
           auto d = *event->descriptor;
           d.id = "receive-" + std::to_string(i);
-          await(*rx, rx->subscribe_graph(d, [&, i, d](auto source) {
+          await(*rx, rx->graph().subscribe_graph(d, [&, i, d](auto source) {
             decoders[i] = std::make_shared<nodes::VideoCodecNode>("video.decoder", d, false);
             verify[i] = std::make_shared<Verify>(i ? 180 : 60);
             engine::TrackGraphSpec graph;
@@ -130,7 +134,7 @@ int main() {
                 engine::TrackGraphSpec::connect<nodes::VideoFrameEvent>(decoders[i], verify[i]),
                 engine::TrackGraphSpec::connect<nodes::KeyframeRequestEvent>(decoders[i], source)};
             graph.quiesce = [node = decoders[i]] { node->quiesce(); };
-            graph.poll = [node = decoders[i]] { node->throw_if_failed(); };
+            graph.check_health = [node = decoders[i]] { node->throw_if_failed(); };
             return graph;
           }));
         }
@@ -153,18 +157,17 @@ int main() {
           check(sources[i]->write(frame) == livekit::sdk::VideoWriteStatus::accepted,
                 "Application source rejected live pixels");
         }
-        tx->poll();
-        rx->poll();
-        if (auto fail = tx->next_failure())
+
+        if (auto fail = tx_events.take_failure())
           throw std::runtime_error(fail->message);
-        if (auto fail = rx->next_failure())
+        if (auto fail = rx_events.take_failure())
           throw std::runtime_error(fail->message);
         std::this_thread::sleep_for(33ms);
       }
     };
     run(0);
     await(*tx, tx->set_muted("video-0", true));
-    tx->poll();
+
     const auto muted_admissions = encoders[0]->snapshot().admitted;
     run(0);  // Keep producing both sources; only the other graph may encode.
     check(encoders[0]->snapshot().admitted == muted_admissions,

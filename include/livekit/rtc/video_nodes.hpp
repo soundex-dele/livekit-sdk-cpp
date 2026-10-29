@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/media_core/frame_view.hpp"
 #include "livekit/rtc/media_types.hpp"
 #include "livekit/rtc/events.hpp"
 #include "livekit/media.hpp"
@@ -7,11 +8,11 @@
 namespace livekit::sdk::rtc::nodes {
 // Immutable upright I420 pixels. Timestamp uses the track's 90 kHz clock;
 // epoch is captured when input is admitted, never retagged after reconnect.
-struct VideoFrameEvent : graphflow::core::EventT<VideoFrameEvent> {
+struct VideoFrameEvent : graphflow::core::EventT<VideoFrameEvent>, media::FrameTiming {
+  VideoFrameEvent() {
+    clock_rate = 90000;
+  }
   std::shared_ptr<const livekit::sdk::VideoFrame> pixels;
-  uint64_t timestamp = 0;
-  Epoch epoch = 0;
-  SteadyClock::time_point captured = SteadyClock::now();
 };
 
 // Optional engine media nodes, linked through LiveKit::RTCMedia. Each owns a

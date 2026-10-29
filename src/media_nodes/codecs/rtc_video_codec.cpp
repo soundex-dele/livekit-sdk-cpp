@@ -61,6 +61,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     Epoch epoch;
     uint64_t timestamp, generation;
     SteadyClock::time_point captured;
+    std::optional<int64_t> sender_capture_time_us;
   };
 
   struct Job {
@@ -239,7 +240,9 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
 
   void encoded(const EncodedFrame& frame) {
     if (frame.buffer.size())
-      enqueue({frame, {frame.epoch, frame.timestamp, 0, SteadyClock::now()}, frame.buffer.size()},
+      enqueue({frame,
+               {frame.epoch, frame.timestamp, 0, SteadyClock::now(), frame.sender_capture_time_us},
+               frame.buffer.size()},
               frame.keyframe);
   }
 
@@ -495,6 +498,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
         output.timestamp = timing->timestamp;
         output.epoch = timing->epoch;
         output.captured = timing->captured;
+        output.sender_capture_time_us = timing->sender_capture_time_us;
         owner.publish(output);
       }
     } catch (const std::exception& e) {

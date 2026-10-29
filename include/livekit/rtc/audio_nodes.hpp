@@ -1,25 +1,28 @@
 #pragma once
+#include "livekit/media_core/frame_view.hpp"
 #include "livekit/rtc/media_types.hpp"
 #include "livekit/rtc/events.hpp"
 #include "core/graph_node.h"
 
 namespace livekit::sdk::rtc::nodes {
-struct AudioFrameEvent : graphflow::core::EventT<AudioFrameEvent> {
+struct AudioFrameEvent : graphflow::core::EventT<AudioFrameEvent>, media::FrameTiming {
+  AudioFrameEvent() {
+    clock_rate = 48000;
+  }
   std::shared_ptr<const PcmAudioFrame> pcm;
-  uint64_t timestamp = 0;  // 48 kHz track clock, independent of input sample rate.
-  Epoch epoch = 0;
-  SteadyClock::time_point captured = SteadyClock::now();
-  // A gap/epoch/format boundary. Consumers must preserve the timestamp gap;
-  // this codec node does not silently fill, compress or pace the timeline.
+  // A gap/epoch/format boundary. Bare decoding preserves gaps; NetEq mode
+  // conceals loss and produces a paced output clock.
   bool discontinuity = false;
 };
 
 // Optional engine codec, never a Room/PeerConnection owner. Encoder input is
 // exactly 10 ms PCM16 or float32 at 8..96 kHz (rate divisible by 100), mono or
 // stereo matching the descriptor. Resampling and actual Opus encoding run on
-// its bounded worker. Decoder output is owned PCM16, 48 kHz, 2.5..120 ms.
+// its bounded worker. Decoder output is owned PCM16, 48 kHz: 10 ms in NetEq
+// mode, or 2.5..120 ms in bare decoding mode.
 // Connect SenderFeedbackEvent to the encoder. Downstream callbacks run on the
-// codec worker and must be nonblocking; playout/reordering belong above it.
+// codec worker and must be nonblocking. NetEq handles receive reordering;
+// device playout remains a separate node.
 class AudioCodecNode final : public graphflow::core::GraphNode {
  public:
   AudioCodecNode(std::string name, TrackDescriptor, bool encode, AudioCodecOptions = {});

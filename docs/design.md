@@ -1,3 +1,5 @@
+> 当前实现已演进，统一架构入口为 [architecture.md](architecture.md)。下文保留历史设计背景。
+
 > 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
 
 # livekit-sdk-cpp 仓库设计

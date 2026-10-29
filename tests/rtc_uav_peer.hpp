@@ -1,4 +1,7 @@
+#include "livekit/rtc/graph_api.hpp"
+#include "livekit/rtc/livekit.hpp"
 #pragma once
+#include "rtc_event_mailbox.hpp"
 #include <livekit/rtc/input_node.hpp>
 #include <livekit/rtc/engine.hpp>
 #include <condition_variable>
@@ -33,7 +36,8 @@ struct Peer {
           bool announced = false;
           try {
             engine_ = transport::engine::create_livekit_engine();
-            transport::RoomOptions options;
+            engine_events_.attach(*engine_);
+            transport::LiveKitRoomOptions options;
             options.url = url;
             options.token = token(identity);
             options.media_transport = test_transport;
@@ -159,7 +163,7 @@ struct Peer {
       input.video_source = spec.video_source;
       input.audio_source = spec.audio_source;
       input.fps = spec.fps;
-      await(engine_->publish_graph(d, [d, input](auto sink) {
+      await(engine_->graph().publish_graph(d, [d, input](auto sink) {
         auto source = std::make_shared<transport::nodes::MediaInputNode>("input", d, input);
         const auto build = [&]<class Codec, class Event>(std::shared_ptr<Codec> codec) {
           TrackGraph graph;
@@ -174,7 +178,7 @@ struct Peer {
             source->quiesce();
             codec->quiesce();
           };
-          graph.poll = [source, codec] {
+          graph.check_health = [source, codec] {
             source->throw_if_failed();
             codec->throw_if_failed();
           };
@@ -278,7 +282,7 @@ struct Peer {
     while (future.wait_for(0ms) != std::future_status::ready) {
       require(!stopping_.load() && Clock::now() < deadline,
               "Test operation cancelled or timed out");
-      engine_->poll();
+
       std::this_thread::sleep_for(1ms);
     }
     return future.get();
@@ -311,7 +315,7 @@ struct Peer {
   }
 
   void subscribe(const transport::TrackDescriptor& d) {
-    pending_[d.id] = engine_->subscribe_graph(d, [this, d](auto source) {
+    pending_[d.id] = engine_->graph().subscribe_graph(d, [this, d](auto source) {
       auto output = std::make_shared<Observe>(*this, d.remote_sid);
       const auto build = [&]<class Codec, class Event>(std::shared_ptr<Codec> codec) {
         TrackGraph graph;
@@ -323,7 +327,7 @@ struct Peer {
           graph.connections.push_back(
               TrackGraph::connect<transport::nodes::KeyframeRequestEvent>(codec, source));
         graph.quiesce = [codec] { codec->quiesce(); };
-        graph.poll = [codec] { codec->throw_if_failed(); };
+        graph.check_health = [codec] { codec->throw_if_failed(); };
         return graph;
       };
       if (d.kind == transport::MediaKind::video)
@@ -339,10 +343,9 @@ struct Peer {
   }
 
   void tick() {
-    engine_->poll();
-    if (auto failure = engine_->next_failure())
+    if (auto failure = engine_events_.take_failure())
       throw std::runtime_error(failure->message);
-    while (auto event = engine_->next_event(0ms)) {
+    while (auto event = engine_events_.take_event(0ms)) {
       if (event->kind == transport::RoomEventKind::closed ||
           event->kind == transport::RoomEventKind::failed)
         throw std::runtime_error(event->message);
@@ -408,6 +411,7 @@ struct Peer {
   std::map<std::string, TestTrack> outgoing_;
   std::map<std::string, std::future<transport::TrackId>> pending_;
   std::unique_ptr<transport::engine::RtcEngine> engine_;
+  livekit::sdk::app_support::RtcEventMailbox engine_events_;
   std::exception_ptr failure_;
   bool finished_ = false;
   uint64_t sequence_ = 0;

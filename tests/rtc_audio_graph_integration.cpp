@@ -1,4 +1,6 @@
-#include "livekit/rtc/engine.hpp"
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
+#include "livekit/rtc/graph_api.hpp"
 #include "rtc_audio_fixtures.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include <array>
@@ -21,7 +23,7 @@ auto await(engine::RtcEngine& engine, std::future<T> future) {
   const auto deadline = SteadyClock::now() + 15s;
   while (future.wait_for(0ms) != std::future_status::ready) {
     check(SteadyClock::now() < deadline, "Audio graph operation timed out");
-    engine.poll();
+
     std::this_thread::sleep_for(1ms);
   }
   return future.get();
@@ -107,7 +109,9 @@ int main() {
     const auto encrypted_env = std::getenv("LIVEKIT_MEDIA_ENCRYPTION");
     const bool encrypted = encrypted_env && std::string(encrypted_env) == "1";
     auto tx = engine::create_livekit_engine(), rx = engine::create_livekit_engine();
-    RoomOptions options;
+    livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
+    livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
+    LiveKitRoomOptions options;
     options.url = std::getenv("LIVEKIT_URL");
     options.reconnect.enabled = false;
     if (encrypted) {
@@ -130,7 +134,7 @@ int main() {
     using G = engine::TrackGraphSpec;
     for (int i = 0; i < 2; ++i) {
       const auto d = rtc_audio_test::descriptor("audio-" + std::to_string(i), i + 1);
-      await(*tx, tx->publish_graph(d, [&, i, d](auto sink) {
+      await(*tx, tx->graph().publish_graph(d, [&, i, d](auto sink) {
         sources[i] = std::make_shared<Source>();
         encoders[i] = std::make_shared<nodes::AudioCodecNode>("opus.encoder", d, true);
         G graph;
@@ -139,21 +143,21 @@ int main() {
                              G::connect<nodes::EncodedFrameEvent>(encoders[i], sink),
                              G::connect<nodes::SenderFeedbackEvent>(sink, encoders[i])};
         graph.quiesce = [node = encoders[i]] { node->quiesce(); };
-        graph.poll = [node = encoders[i]] { node->throw_if_failed(); };
+        graph.check_health = [node = encoders[i]] { node->throw_if_failed(); };
         return graph;
       }));
     }
     const auto deadline = SteadyClock::now() + 10s;
     while (!outputs[0] || !outputs[1]) {
       check(SteadyClock::now() < deadline, "Audio graph discovery timed out");
-      auto event = rx->next_event(100ms);
+      auto event = rx_events.take_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 2; ++i)
         if (event->descriptor->name == "audio-" + std::to_string(i) && !outputs[i]) {
           auto d = *event->descriptor;
           d.id = "receive-" + std::to_string(i);
-          await(*rx, rx->subscribe_graph(d, [&, i, d](auto source) {
+          await(*rx, rx->graph().subscribe_graph(d, [&, i, d](auto source) {
             decoders[i] = std::make_shared<nodes::AudioCodecNode>("opus.decoder", d, false);
             outputs[i] = std::make_shared<Verify>(i);
             speakers[i] = std::make_shared<nodes::AudioOutputNode>("device.output", d.id, playout);
@@ -166,7 +170,7 @@ int main() {
               node->quiesce();
               output->quiesce();
             };
-            graph.poll = [node = decoders[i], output = speakers[i]] {
+            graph.check_health = [node = decoders[i], output = speakers[i]] {
               node->throw_if_failed();
               output->throw_if_failed();
             };
@@ -187,11 +191,10 @@ int main() {
                                                 timestamp, i ? 48000 : 44100, i + 1, !i,
                                                 i ? 880 : 440));
         timestamp += 480;
-        tx->poll();
-        rx->poll();
-        if (auto failure = tx->next_failure())
+
+        if (auto failure = tx_events.take_failure())
           throw std::runtime_error(failure->message);
-        if (auto failure = rx->next_failure())
+        if (auto failure = rx_events.take_failure())
           throw std::runtime_error(failure->message);
         const auto block = device->pull();
         rendered.samples.insert(rendered.samples.end(), block.begin(), block.end());

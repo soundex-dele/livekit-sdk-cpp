@@ -1,3 +1,5 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 // Headless C++ clients for the Go SFU requirement assessment. No capture devices.
 #include <livekit/livekit.hpp>
 #include "rtc_base/logging.h"
@@ -414,7 +416,8 @@ static void dynacast_case(const std::string& url, const std::string& codec,
 
 static void transport_reject_case(const std::string& url, Json& report) {
   auto room = transport::create_livekit_room();
-  transport::RoomOptions options;
+  livekit::sdk::app_support::RtcEventMailbox room_events(*room);
+  transport::LiveKitRoomOptions options;
   options.url = url;
   options.token = token("drone");
   options.media_transport = test_transport;
@@ -425,7 +428,7 @@ static void transport_reject_case(const std::string& url, Json& report) {
   const auto start = Clock::now();
   auto joining = room->join(options);
   while (joining.wait_for(0ms) != std::future_status::ready) {
-    if (auto event = room->next_event(10ms)) {
+    if (auto event = room_events.take_event(10ms)) {
       joined |= event->kind == transport::RoomEventKind::session_changed;
       connected |= event->kind == transport::RoomEventKind::connected;
     }

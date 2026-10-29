@@ -1,3 +1,5 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/livekit.hpp>
 #include <livekit/auth.hpp>
 #include "backends/rtc/livekit/signal_socket.hpp"
@@ -22,12 +24,12 @@ int main(int argc, char** argv) {
     const auto token = sdk::make_token(
         "region-test", "region-integration-secret-32-characters", "region-client",
         {{"roomJoin", true}, {"room", "regions"}, {"canPublish", true}, {"canSubscribe", true}});
-    transport::RoomOptions options;
+    transport::LiveKitRoomOptions options;
     options.token = token;
     options.regions.trusted_endpoints = {server};
     options.reconnect.enabled = false;
     auto join = [&](transport::RoomEngine& room, const std::string& url,
-                    transport::RoomOptions value) {
+                    transport::LiveKitRoomOptions value) {
       value.url = url;
       return room.join(std::move(value));
     };
@@ -38,6 +40,7 @@ int main(int argc, char** argv) {
     video.format.height = 48;
     {
       auto room = transport::create_livekit_room();
+      livekit::sdk::app_support::RtcEventMailbox room_events(*room);
       join(*room, fixture + "/allowed", options).get();
       const auto session = room->snapshot().session;
       check(
@@ -49,6 +52,7 @@ int main(int argc, char** argv) {
     }
     for (const auto& path : {"/unavailable", "/silent", "/media-stall"}) {
       auto room = transport::create_livekit_room();
+      livekit::sdk::app_support::RtcEventMailbox room_events(*room);
       auto initial = options;
       initial.connect_timeout = 10;
       initial.regions.endpoint_timeout = 250ms;
@@ -57,7 +61,7 @@ int main(int argc, char** argv) {
       int connected = 0, interrupted = 0;
       const auto notification_deadline = Clock::now() + 2s;
       while (Clock::now() < notification_deadline) {
-        auto event = room->next_event(connected ? 0ms : 50ms);
+        auto event = room_events.take_event(connected ? 0ms : 50ms);
         if (!event) {
           if (connected)
             break;

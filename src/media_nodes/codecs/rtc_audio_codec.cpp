@@ -3,6 +3,9 @@
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/environment/environment_factory.h"
+#include "api/neteq/default_neteq_factory.h"
+#include "api/audio/audio_frame.h"
+#include "system_wrappers/include/clock.h"
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
@@ -53,8 +56,12 @@ struct AudioCodecNode::Impl {
         options.max_age > std::chrono::seconds(5) ||
         (options.packet_duration_ms != 10 && options.packet_duration_ms != 20 &&
          options.packet_duration_ms != 40 && options.packet_duration_ms != 60) ||
-        options.bitrate_bps < 6000 || options.bitrate_bps > 510000)
+        options.bitrate_bps < 6000 || options.bitrate_bps > 510000 ||
+        options.jitter_min_delay.count() < 0 ||
+        options.jitter_max_delay < options.jitter_min_delay ||
+        (options.jitter_buffer && options.jitter_max_delay > options.max_age)) {
       throw std::invalid_argument("Invalid audio codec node configuration");
+    }
   }
 
   void discard_locked() {
@@ -120,8 +127,9 @@ struct AudioCodecNode::Impl {
     if ((encode && job.timing.captured < input_boundary) ||
         job.timing.captured > now + std::chrono::seconds(1) ||
         now - job.timing.captured > options.max_age ||
-        (last_timestamp && (job.timing.timestamp <= *last_timestamp ||
-                            (encode && job.timing.timestamp - *last_timestamp < 480)))) {
+        ((encode || !options.jitter_buffer) && last_timestamp &&
+         (job.timing.timestamp <= *last_timestamp ||
+          (encode && job.timing.timestamp - *last_timestamp < 480)))) {
       ++stats.dropped;
       return;
     }
@@ -192,9 +200,186 @@ struct AudioCodecNode::Impl {
     ++stats.dropped;
   }
 
+  void decode_realtime(std::stop_token stop, std::promise<void>& started, bool& ready) {
+    using namespace std::chrono_literals;
+    const auto env = webrtc::CreateEnvironment();
+    auto factory = webrtc::CreateBuiltinAudioDecoderFactory();
+    webrtc::DefaultNetEqFactory neteq_factory;
+    webrtc::NetEq::Config config;
+    config.sample_rate_hz = 48000;
+    config.max_packets_in_buffer = options.max_frames;
+    config.min_delay_ms = int(options.jitter_min_delay.count());
+    config.max_delay_ms = int(options.jitter_max_delay.count());
+    config.enable_muted_state = true;
+    config.enable_fast_accelerate = true;
+    auto parameters = descriptor.format.fmtp;
+    parameters["stereo"] = descriptor.format.channels == 2 ? "1" : "0";
+    const webrtc::SdpAudioFormat format("opus", 48000, 2, parameters);
+    std::unique_ptr<webrtc::NetEq> neteq;
+    Timing binding{};
+    uint16_t sequence = 0;
+    uint64_t reference_timestamp = 0, output_timestamp = 0;
+    auto next = SteadyClock::now(), last_packet = next;
+    bool playing = false, boundary = true;
+    std::optional<std::pair<uint64_t, int64_t>> sender_anchor;
+
+    struct Reservation {
+      uint64_t timestamp;
+      size_t bytes;
+    };
+
+    std::deque<Reservation> reservations;
+    size_t retained_bytes = 0;
+    const auto reset = [&](const Timing& timing) {
+      neteq = neteq_factory.Create(env, config, factory);
+      if (!neteq || !neteq->RegisterPayloadType(111, format)) {
+        throw std::runtime_error("Unable to create Opus jitter decoder");
+      }
+      binding = timing;
+      reference_timestamp = output_timestamp = timing.timestamp;
+      reservations.clear();
+      sender_anchor.reset();
+      retained_bytes = 0;
+      next = SteadyClock::now() + options.jitter_min_delay;
+      playing = true;
+      boundary = true;
+      discontinuity();
+    };
+    started.set_value();
+    ready = true;
+    while (!stop.stop_requested()) {
+      std::deque<Job> incoming;
+      {
+        std::unique_lock lock(mutex);
+        if (playing) {
+          changed.wait_until(lock, stop, next, [&] { return !active || !jobs.empty(); });
+        } else {
+          changed.wait(lock, stop, [&] { return !active || !jobs.empty(); });
+        }
+        if (!active || stop.stop_requested()) {
+          break;
+        }
+        incoming.swap(jobs);
+        stats.queued_frames = stats.queued_bytes = 0;
+        if (binding.epoch != epoch || binding.generation != generation) {
+          playing = false;
+          neteq.reset();
+        }
+      }
+      for (auto& job : incoming) {
+        if (SteadyClock::now() - job.timing.captured > options.max_age) {
+          continue;
+        }
+        {
+          std::lock_guard lock(mutex);
+          if (job.timing.epoch != epoch || job.timing.generation != generation) {
+            continue;
+          }
+        }
+        if (!playing) {
+          reset(job.timing);
+        }
+        const auto& packet = std::get<EncodedFrame>(job.frame);
+        if (packet.buffer.size() > options.max_bytes ||
+            retained_bytes > options.max_bytes - packet.buffer.size() ||
+            reservations.size() >= options.max_frames) {
+          // Flush NetEq's internal copies too; clearing the ingress queue alone
+          // would not enforce the configured receive memory budget.
+          reset(job.timing);
+        }
+        webrtc::RTPHeader header;
+        header.payloadType = 111;
+        header.timestamp = uint32_t(packet.timestamp);
+        header.sequenceNumber = packet.sequence_number.value_or(sequence++);
+        header.ssrc = 1;
+        const auto data = packet.buffer.bytes();
+        if (neteq->InsertPacket(header, {data.data(), data.size()},
+                                webrtc::Timestamp::Micros(env.clock().TimeInMicroseconds())) != 0) {
+          invalid_packet();
+          continue;
+        }
+        reservations.push_back({packet.timestamp, packet.buffer.size()});
+        retained_bytes += packet.buffer.size();
+        if (packet.sender_capture_time_us) {
+          sender_anchor = std::pair{packet.timestamp, *packet.sender_capture_time_us};
+        }
+        last_packet = SteadyClock::now();
+      }
+      if (!playing || SteadyClock::now() < next) {
+        continue;
+      }
+      if (SteadyClock::now() - next > options.max_age ||
+          SteadyClock::now() - last_packet > options.max_age) {
+        playing = false;
+        neteq.reset();
+        reservations.clear();
+        retained_bytes = 0;
+        continue;
+      }
+      webrtc::AudioFrame decoded;
+      bool muted = false;
+      if (neteq->GetAudio(&decoded, &muted) != webrtc::NetEq::kOK) {
+        invalid_packet();
+        next += 10ms;
+        continue;
+      }
+      const auto delta = int32_t(decoded.timestamp_ - uint32_t(reference_timestamp));
+      const auto timestamp = delta < 0 && uint64_t(-int64_t(delta)) > reference_timestamp
+                                 ? reference_timestamp
+                                 : uint64_t(int64_t(reference_timestamp) + delta);
+      reference_timestamp = timestamp;
+      for (auto it = reservations.begin(); it != reservations.end();) {
+        if (it->timestamp <= timestamp) {
+          retained_bytes -= it->bytes;
+          it = reservations.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      auto pcm = std::make_shared<PcmAudioFrame>();
+      pcm->channels = uint16_t(decoded.num_channels_);
+      pcm->sample_rate = uint32_t(decoded.sample_rate_hz_);
+      const auto size = decoded.samples_per_channel_ * decoded.num_channels_;
+      if (muted) {
+        pcm->samples.resize(size);
+      } else {
+        pcm->samples.assign(decoded.data(), decoded.data() + size);
+      }
+      Timing timing{binding.epoch, timestamp, binding.generation, SteadyClock::now()};
+      if (output_allowed(timing)) {
+        AudioFrameEvent output;
+        output.pcm = std::move(pcm);
+        output.timestamp = output_timestamp;
+        output.epoch = timing.epoch;
+        output.captured = timing.captured;
+        output.discontinuity = std::exchange(boundary, false);
+        if (sender_anchor) {
+          const auto distance = int64_t(timestamp) - int64_t(sender_anchor->first);
+          output.sender_capture_time_us = sender_anchor->second + distance * 1000000 / 48000;
+        }
+        owner.publish(output);
+      }
+      const auto metrics = neteq->GetLifetimeStatistics();
+      const auto state = neteq->GetOperationsAndState();
+      {
+        std::lock_guard lock(mutex);
+        stats.concealed_samples = metrics.concealed_samples;
+        stats.accelerated_samples = metrics.removed_samples_for_acceleration;
+        stats.decelerated_samples = metrics.inserted_samples_for_deceleration;
+        stats.jitter_buffer_ms = state.current_buffer_size_ms;
+      }
+      output_timestamp += 480;
+      next += 10ms;
+    }
+  }
+
   void run(std::stop_token stop, std::promise<void> started) {
     bool ready = false;
     try {
+      if (!encode && options.jitter_buffer) {
+        decode_realtime(stop, started, ready);
+        return;
+      }
       // Keep the environment and factories alive until codec destruction.
       const auto env = webrtc::CreateEnvironment();
       auto encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
@@ -359,6 +544,7 @@ struct AudioCodecNode::Impl {
             output.epoch = timing.epoch;
             output.captured = timing.captured;
             output.discontinuity = boundary;
+            output.sender_capture_time_us = frame.sender_capture_time_us;
             owner.publish(output);
           }
         }

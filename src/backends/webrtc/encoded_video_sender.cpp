@@ -383,7 +383,11 @@ SendResult EncodedVideoSender::send(const EncodedFrame& frame) {
       return SendResult::would_block;
     // The native capture clock orders triggers; the explicit encoded RTP
     // timestamp preserves the external media clock without millisecond loss.
-    capture_us = std::max(webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds(),
+    const auto age_us = frame.captured ? std::chrono::duration_cast<std::chrono::microseconds>(
+                                             SteadyClock::now() - *frame.captured)
+                                             .count()
+                                       : 0;
+    capture_us = std::max(webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds() - age_us,
                           state_->last_capture_us + 1000);
     state_->last_capture_us = capture_us;
     state_->last_timestamp = frame.timestamp;

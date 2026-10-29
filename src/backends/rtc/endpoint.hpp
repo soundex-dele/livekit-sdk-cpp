@@ -26,6 +26,7 @@ struct Endpoint {
 
   TrackSnapshot snapshot() const;
   SenderFeedback feedback() const;
+  std::optional<SenderFeedback> wait_feedback(Epoch, uint64_t, std::stop_token);
 
   std::shared_ptr<QueueBudget> queue_budget() const {
     return budget_;
@@ -38,6 +39,7 @@ struct Endpoint {
   void finish(TrackState, std::string error = {});
   WriteStatus write(EncodedFrame);
   ReadResult read(std::chrono::milliseconds, std::stop_token);
+  ReadResult wait_frame(std::stop_token);
   std::optional<Item> front();
   void consumed(uint64_t serial, bool dropped = false);
   void update_feedback(const SenderFeedback&);
@@ -46,6 +48,7 @@ struct Endpoint {
   void require_keyframe();
 
  private:
+  ReadResult read_locked(std::stop_token);
   void clear_locked();
   void require_keyframe_locked();
   void expire_locked();

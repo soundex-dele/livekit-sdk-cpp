@@ -1,4 +1,6 @@
-#include "livekit/rtc/engine.hpp"
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
+#include "livekit/rtc/graph_api.hpp"
 #include "rtc_video_fixtures.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -18,7 +20,7 @@ auto await(engine::RtcEngine& engine, std::future<T> future) {
   const auto deadline = SteadyClock::now() + 15s;
   while (future.wait_for(0ms) != std::future_status::ready) {
     check(SteadyClock::now() < deadline, "Engine operation timed out");
-    engine.poll();
+
     std::this_thread::sleep_for(1ms);
   }
   return future.get();
@@ -29,7 +31,7 @@ class Consumer : public graphflow::core::GraphNode {
   explicit Consumer(std::vector<uint8_t> expected)
       : GraphNode("verify", nullptr), expected_(std::move(expected)) {}
 
-  int frames = 0;
+  std::atomic<int> frames{0};
 
  protected:
   bool doInit() override {
@@ -49,7 +51,9 @@ class Consumer : public graphflow::core::GraphNode {
 int main() {
   try {
     auto tx = engine::create_livekit_engine(), rx = engine::create_livekit_engine();
-    RoomOptions options;
+    livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
+    livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
+    LiveKitRoomOptions options;
     options.url = std::getenv("LIVEKIT_URL");
     options.reconnect.enabled = false;
     options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
@@ -80,7 +84,7 @@ int main() {
     const auto discovered_by = SteadyClock::now() + 10s;
     while (subscribing.size() < 4) {
       check(SteadyClock::now() < discovered_by, "Engine remote discovery timed out");
-      auto event = rx->next_event(100ms);
+      auto event = rx_events.take_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 4; ++i)
@@ -88,7 +92,7 @@ int main() {
           sinks[i] = std::make_shared<Consumer>(payloads[i]);
           auto d = *event->descriptor;
           d.id = descriptors[i].id;
-          subscribing.push_back(rx->subscribe(d, sinks[i]));
+          subscribing.push_back(rx->graph().subscribe(d, sinks[i]));
         }
     }
     for (auto& future : subscribing)
@@ -112,11 +116,11 @@ int main() {
           check(status == WriteStatus::accepted || status == WriteStatus::backpressure,
                 "Graph rejected media");
         }
-        tx->poll();
-        rx->poll();
-        if (auto failure = tx->next_failure())
+        // Graph setup has completed. Media and feedback must progress while
+        // both control threads deliberately stop polling.
+        if (auto failure = tx_events.take_failure())
           throw std::runtime_error(failure->message);
-        if (auto failure = rx->next_failure())
+        if (auto failure = rx_events.take_failure())
           throw std::runtime_error(failure->message);
         if (std::all_of(active.begin(), active.end(), [&](int i) { return sinks[i]->frames >= 3; }))
           return;
@@ -153,7 +157,7 @@ int main() {
     bool subscribed_again = false;
     while (!subscribed_again) {
       check(SteadyClock::now() < rejoined_by, "Rejoined remote discovery timed out");
-      auto event = rx->next_event(100ms);
+      auto event = rx_events.take_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added ||
           event->descriptor->name != descriptors[3].name) {
         continue;
@@ -161,7 +165,7 @@ int main() {
       sinks[3] = std::make_shared<Consumer>(payloads[3]);
       auto descriptor = *event->descriptor;
       descriptor.id = descriptors[3].id;
-      await(*rx, rx->subscribe(descriptor, sinks[3]));
+      await(*rx, rx->graph().subscribe(descriptor, sinks[3]));
       subscribed_again = true;
     }
     run({3});
@@ -169,7 +173,7 @@ int main() {
     tx->close().get();
     rx->close().get();
     std::cout << "{\"engineMultiGraph\":true,\"encodedMedia\":true,\"independentClose\":true,"
-                 "\"leaveRejoin\":true,\"serviceIsolation\":true}\n";
+                 "\"leaveRejoin\":true,\"serviceIsolation\":true,\"noMediaPoll\":true}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -1,5 +1,6 @@
 #include "livekit/rtc/livekit.hpp"
 #include "backends/rtc/room_transport.hpp"
+#include "backends/rtc/bounded_events.hpp"
 #include "backends/webrtc/native_peer.hpp"
 #include "backends/webrtc/encoded_audio_sender.hpp"
 #include "backends/webrtc/encoded_video_sender.hpp"
@@ -100,6 +101,7 @@ struct Subscription {
   // Timestamp and dependency state belongs exclusively to poll().
   std::optional<uint32_t> last_timestamp;
   uint64_t timestamp = 0;
+  std::optional<std::pair<uint64_t, int64_t>> sender_clock;
   bool waiting_for_keyframe = true;
 };
 
@@ -139,7 +141,30 @@ class LiveKitTransport final : public RoomTransport {
     budget_ = std::move(budget);
   }
 
-  void start(const RoomOptions& options, Epoch initial_epoch) override {
+  BackendCapabilities capabilities() const override {
+    BackendCapabilities result;
+    result.backend = "livekit";
+    result.participant_update_ack = options_.signal_protocol >= 15;
+    result.subscription_permissions = true;
+    result.receive_demand = true;
+    result.room_services = true;
+    result.media_encryption = true;
+    result.full_rejoin = true;
+    return result;
+  }
+
+  void start(const RoomOptions& common, Epoch initial_epoch) override {
+    const auto* connection = dynamic_cast<const LiveKitConnectionOptions*>(common.backend.get());
+    if (!connection) {
+      throw std::invalid_argument("LiveKit transport requires LiveKitRoomOptions");
+    }
+    LiveKitRoomOptions options;
+    static_cast<RoomSettings&>(options) = common;
+    static_cast<SignalingOptions&>(options) = connection->signaling;
+    options.encryption = connection->encryption;
+    if (options.url.empty() || (options.token.empty() && !options.token_provider)) {
+      throw std::invalid_argument("LiveKit requires a URL and token or token provider");
+    }
     epoch_ = initial_epoch;
     detached_epoch_ = initial_epoch;
     if (worker_.joinable())
@@ -184,18 +209,21 @@ class LiveKitTransport final : public RoomTransport {
     post(std::move(command));
   }
 
-  void remove(const BindingToken& binding, bool publication) override {
+  std::future<void> remove(const BindingToken& binding, bool publication) override {
     // The old peer has already been detached before interrupted is emitted.
     // Do not wait for the next network connection to close an offline track.
-    if (binding.epoch < detached_epoch_.load())
-      return;
-    // The session worker serializes creation and detachment. Waiting for its
-    // acknowledgement also fences publications still queued or being created.
+    auto completion = std::make_shared<std::promise<void>>();
+    auto detached = completion->get_future();
+    if (binding.epoch < detached_epoch_.load()) {
+      completion->set_value();
+      return detached;
+    }
+    // The worker's acknowledgement fences queued creation and detachment without
+    // blocking the room controller while native peer operations finish.
     Command command{Command::remove, binding, {}};
-    command.completion = std::make_shared<std::promise<void>>();
-    auto detached = command.completion->get_future();
+    command.completion = std::move(completion);
     post(std::move(command));
-    detached.get();
+    return detached;
   }
 
   SendResult send(const BindingToken& binding, const EncodedFrame& frame) override {
@@ -273,19 +301,29 @@ class LiveKitTransport final : public RoomTransport {
       if (video && receiver->receiver->take_keyframe_request())
         request_keyframe(receiver->binding);
       for (auto& unit : receiver->receiver->poll()) {
+        uint64_t timestamp = unit.timestamp;
         if (receiver->last_timestamp) {
           const auto delta = int32_t(unit.timestamp - *receiver->last_timestamp);
-          if (delta <= 0) {
-            if (video) {
-              receiver->waiting_for_keyframe = true;
-              request_keyframe(receiver->binding);
-            }
+          if (delta <= 0 && video) {
+            receiver->waiting_for_keyframe = true;
+            request_keyframe(receiver->binding);
             continue;
           }
-          receiver->timestamp += uint32_t(delta);
-        } else
-          receiver->timestamp = unit.timestamp;
-        receiver->last_timestamp = unit.timestamp;
+          if (delta < 0 && uint64_t(-int64_t(delta)) > receiver->timestamp) {
+            continue;
+          }
+          timestamp = delta < 0 ? receiver->timestamp - uint64_t(-int64_t(delta))
+                                : receiver->timestamp + uint32_t(delta);
+          // Keep the unwrap reference at the newest timestamp. Audio reordering
+          // is resolved by the upper-layer jitter buffer, not discarded here.
+          if (delta > 0) {
+            receiver->timestamp = timestamp;
+            receiver->last_timestamp = unit.timestamp;
+          }
+        } else {
+          receiver->timestamp = timestamp;
+          receiver->last_timestamp = unit.timestamp;
+        }
         if (video && receiver->waiting_for_keyframe && !unit.keyframe)
           continue;
         if (unit.keyframe)
@@ -294,7 +332,19 @@ class LiveKitTransport final : public RoomTransport {
         frame.buffer = std::move(unit.buffer);
         frame.encoding_id = receiver->descriptor.encodings.front().id;
         frame.epoch = receiver->binding.epoch;
-        frame.timestamp = receiver->timestamp;
+        frame.timestamp = timestamp;
+        frame.sequence_number = unit.sequence_number;
+        if (unit.sender_capture_time_us) {
+          receiver->sender_clock = std::pair{timestamp, *unit.sender_capture_time_us};
+        }
+        if (receiver->sender_clock) {
+          const auto distance = int64_t(timestamp) - int64_t(receiver->sender_clock->first);
+          // Extrapolate infrequent absolute-capture extensions in this track's
+          // negotiated clock, without guessing a relationship between RTP origins.
+          frame.sender_capture_time_us =
+              receiver->sender_clock->second +
+              distance * 1000000 / receiver->descriptor.format.clock_rate;
+        }
         frame.keyframe = unit.keyframe;
         if (!video) {
           frame.duration = opus_duration(frame.buffer.bytes());
@@ -329,7 +379,7 @@ class LiveKitTransport final : public RoomTransport {
 
  private:
   std::shared_ptr<RoomServiceState> services_ = std::make_shared<RoomServiceState>();
-  RoomOptions options_;
+  LiveKitRoomOptions options_;
   std::optional<SubscriptionPermissions>
       permissions_;  // Session-worker intent, retained across full rejoin.
   std::shared_ptr<QueueBudget> budget_;
@@ -361,35 +411,27 @@ class LiveKitTransport final : public RoomTransport {
   }
 
   void emit_locked(TransportEvent value) {
-    if (value.kind == TransportEventKind::statistics) {
-      for (auto& queued : events_)
-        if (queued.kind == TransportEventKind::statistics &&
-            queued.statistics->target == value.statistics->target) {
-          queued = std::move(value);
-          return;
-        }
-      if (events_.size() >= options_.max_events)
-        return;
-    } else if (events_.size() >= options_.max_events) {
-      const auto stale = std::find_if(events_.begin(), events_.end(), [](const auto& queued) {
-        return queued.kind == TransportEventKind::statistics;
-      });
-      if (stale != events_.end())
-        events_.erase(stale);
-    }
-    if (value.kind == TransportEventKind::session_changed && !events_.empty() &&
-        events_.back().kind == value.kind && events_.back().binding.epoch == value.binding.epoch) {
-      events_.back() = std::move(value);
-      changed_.notify_all();
+    const auto result =
+        enqueue_event(events_, std::move(value), options_.max_events,
+                      TransportEventKind::statistics, [](auto& queued, auto& incoming) {
+                        // Transport state updates carry snapshots; only replace adjacent ones.
+                        if (incoming.kind == TransportEventKind::session_changed &&
+                            !queued.empty() && queued.back().kind == incoming.kind &&
+                            queued.back().binding.epoch == incoming.binding.epoch) {
+                          queued.back() = std::move(incoming);
+                          return true;
+                        }
+                        return false;
+                      });
+    if (result == EventAdmission::dropped) {
       return;
     }
-    if (events_.size() >= options_.max_events) {
+    if (result == EventAdmission::overflow) {
       events_.clear();
       events_.push_back(
           event(TransportEventKind::terminal_error, {}, "RTC native event queue exhausted"));
       worker_.request_stop();
-    } else
-      events_.push_back(std::move(value));
+    }
     changed_.notify_all();
   }
 

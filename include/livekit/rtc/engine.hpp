@@ -1,15 +1,18 @@
 #pragma once
 #include "livekit/rtc/room_engine.hpp"
 #include "livekit/rtc/media_config.hpp"
-#include "livekit/rtc/stream_pipeline.hpp"
 #include <memory>
 #include <optional>
 #include <string>
 
 namespace livekit::sdk::rtc::engine {
-// Single-room SDK facade. Control, poll and destruction use the creating thread.
-// Media callbacks must be bounded and cannot reenter lifecycle operations.
-// Futures for graph/media creation require poll(); join/leave use the room worker.
+class RtcGraphApi;
+
+// Single-room facade with an owned serial task queue. Control methods marshal
+// to that queue and may be called from application threads. Futures progress
+// automatically. Media/feedback source nodes dispatch on their own workers.
+// Never wait for lifecycle operations from media callbacks or graph hooks.
+// Destruction requires callers to have stopped using this facade.
 class RtcEngine final {
  public:
   explicit RtcEngine(RoomEngine::TransportFactory);
@@ -26,7 +29,6 @@ class RtcEngine final {
   std::future<void> leave();
   // Terminal and idempotent. Rejects subsequent control operations.
   std::future<void> close();
-  void poll(size_t receive_frames_per_track = 4);
 
   MediaOperation publish_media(MediaPublishSpec);
   MediaOperation publish_video(MediaPublishSpec);
@@ -34,13 +36,9 @@ class RtcEngine final {
   MediaOperation subscribe_media(MediaSubscribeSpec);
   std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput);
 
-  // Explicit advanced encoded/graph API. All tracks share the same room registry.
-  std::future<TrackId> publish(TrackDescriptor,
-                               std::shared_ptr<graphflow::core::GraphNode> feedback_sink = {});
-  std::future<TrackId> subscribe(TrackDescriptor,
-                                 std::shared_ptr<graphflow::core::GraphNode> consumer);
-  std::future<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
-  std::future<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  // Encoded publication. Advanced graph composition requires graph_api.hpp.
+  std::future<TrackId> publish(TrackDescriptor);
+  RtcGraphApi graph();
   std::future<void> unpublish(const TrackId&);
   std::future<void> unsubscribe(const TrackId&);
   std::future<void> set_muted(const TrackId&, bool, ControlOptions = {});
@@ -56,15 +54,23 @@ class RtcEngine final {
     std::string message;
   };
 
-  std::optional<GraphFailure> next_failure();
+  struct Callbacks {
+    std::function<void(const RoomEvent&)> on_event;
+    std::function<void(const GraphFailure&)> on_failure;
+  };
+
+  // Serial notification task queue, separate from control and media workers.
+  // Register before join. Replacing/clearing callbacks fences old invocations.
+  // Control calls are permitted; destruction from a callback is not permitted.
+  // Serialize registration calls. Callback arguments are borrowed for the call.
+  // Callbacks must return promptly; throwing disables them and fails the room.
+  void set_callbacks(Callbacks);
 
   // Borrowed view valid until engine destruction. No room/track teardown escape hatch.
   const RoomView& room() const;
-  // Single-consumer room event queue. Internal modules observe endpoints, not this queue.
-  std::optional<RoomEvent> next_event(std::chrono::milliseconds timeout = {},
-                                      std::stop_token stop = {});
 
  private:
+  friend class RtcGraphApi;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

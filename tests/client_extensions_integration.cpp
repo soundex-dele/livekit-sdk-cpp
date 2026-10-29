@@ -1,3 +1,5 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/livekit.hpp>
 #include <livekit/json.hpp>
 #include <livekit/error.hpp>
@@ -85,6 +87,7 @@ int main(int argc, char** argv) {
     }
     const bool media_mode = mode == "encoded" || mode == "media-e2ee";
     auto room = create_livekit_room();
+    livekit::sdk::app_support::RtcEventMailbox room_events(*room);
     auto services = room->services();
     auto text = std::make_shared<std::promise<std::string>>();
     auto binary = std::make_shared<std::promise<std::vector<uint8_t>>>();
@@ -110,7 +113,7 @@ int main(int argc, char** argv) {
         }
       }
     });
-    RoomOptions options;
+    LiveKitRoomOptions options;
     options.url = argv[1];
     options.signal_protocol = 17;
     options.reconnect.enabled = false;
@@ -192,7 +195,7 @@ int main(int argc, char** argv) {
       std::shared_ptr<SubscribedTrack> receiver;
       const auto deadline = SteadyClock::now() + 20s;
       while (!receiver && SteadyClock::now() < deadline) {
-        auto event = room->next_event(100ms);
+        auto event = room_events.take_event(100ms);
         if (event && event->kind == RoomEventKind::remote_track_added &&
             event->descriptor->name == "go-encoded-echo")
           receiver = await(room->subscribe(*event->descriptor));

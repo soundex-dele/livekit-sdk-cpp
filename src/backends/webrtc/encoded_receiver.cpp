@@ -98,6 +98,16 @@ void EncodedReceiver::receive(std::unique_ptr<webrtc::TransformableFrameInterfac
   } else
     unit.buffer = EncodedBuffer(std::vector<uint8_t>(data.begin(), data.end()));
   unit.timestamp = frame->GetTimestamp();
+  if (auto capture = frame->CaptureTime(); capture && capture->IsFinite()) {
+    unit.sender_capture_time_us = capture->us();
+    if (auto offset = frame->SenderCaptureTimeOffset(); offset && offset->IsFinite()) {
+      *unit.sender_capture_time_us += offset->us();
+    }
+  }
+  if (kind_ == MediaKind::audio) {
+    unit.sequence_number =
+        static_cast<webrtc::TransformableAudioFrameInterface*>(frame.get())->SequenceNumber();
+  }
   unit.ssrc = frame->GetSsrc();
   unit.mime_type = frame->GetMimeType();
   if (video) {

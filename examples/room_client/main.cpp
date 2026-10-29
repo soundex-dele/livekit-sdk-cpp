@@ -1,3 +1,6 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/graph_api.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/engine.hpp>
 #include <cstdlib>
 #include <iostream>
@@ -10,7 +13,6 @@ namespace {
 template <class T>
 auto complete(rtc::engine::RtcEngine& engine, std::future<T> future) {
   while (future.wait_for(0ms) != std::future_status::ready) {
-    engine.poll();
     std::this_thread::sleep_for(2ms);
   }
   return future.get();
@@ -21,7 +23,7 @@ class EncodedConsumer : public graphflow::core::GraphNode {
   explicit EncodedConsumer(std::string id)
       : GraphNode("encoded-consumer", nullptr), id_(std::move(id)) {}
 
-  size_t frames = 0, bytes = 0;
+  std::atomic<size_t> frames{0}, bytes{0};
 
  protected:
   bool doInit() override {
@@ -49,7 +51,8 @@ int main(int argc, char** argv) {
   }
   try {
     auto engine = rtc::engine::create_livekit_engine();
-    rtc::RoomOptions options;
+    livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
+    rtc::LiveKitRoomOptions options;
     options.url = argv[1];
     if (const auto token = std::getenv("LIVEKIT_TOKEN"))
       options.token = token;
@@ -72,12 +75,12 @@ int main(int argc, char** argv) {
     const auto end = rtc::SteadyClock::now() + duration;
     uint64_t timestamp = 0;
     while (rtc::SteadyClock::now() < end) {
-      while (auto event = engine->next_event(0ms)) {
+      while (auto event = engine_events.take_event(0ms)) {
         if (event->kind == rtc::RoomEventKind::failed)
           throw std::runtime_error(event->message);
         if (!publishing && event->kind == rtc::RoomEventKind::remote_track_added) {
           auto sink = std::make_shared<EncodedConsumer>(event->descriptor->name);
-          subscriptions.push_back(engine->subscribe(*event->descriptor, sink));
+          subscriptions.push_back(engine->graph().subscribe(*event->descriptor, sink));
           consumers.push_back(std::move(sink));
         }
       }
@@ -101,8 +104,8 @@ int main(int argc, char** argv) {
           throw std::runtime_error("Publication rejected encoded media");
       }
       timestamp += 960;
-      engine->poll();
-      while (auto failure = engine->next_failure())
+
+      while (auto failure = engine_events.take_failure())
         std::cerr << failure->id << ": " << failure->message << '\n';
       std::this_thread::sleep_for(20ms);
     }

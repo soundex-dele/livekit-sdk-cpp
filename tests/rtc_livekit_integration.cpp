@@ -1,9 +1,12 @@
+#include "rtc_event_mailbox.hpp"
+#include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/error.hpp"
 #include "rtc_video_fixtures.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <source_location>
 #include <thread>
 
 using namespace livekit::sdk::rtc;
@@ -88,7 +91,8 @@ std::vector<uint8_t> payload(int index) {
 
 void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
               const std::vector<std::shared_ptr<SubscribedTrack>>& rx,
-              const std::vector<int>& indices, uint64_t& sequence, bool resubscribed = false) {
+              const std::vector<int>& indices, uint64_t& sequence, bool resubscribed = false,
+              std::source_location caller = std::source_location::current()) {
   std::vector<int> received(indices.size());
   const auto deadline = SteadyClock::now() + 10s;
   while (SteadyClock::now() < deadline) {
@@ -148,6 +152,7 @@ void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
       return;
     std::this_thread::sleep_for(20ms);
   }
+  std::cerr << "Transmit timed out at integration line " << caller.line() << '\n';
   for (size_t n = 0; n < indices.size(); ++n)
     std::cerr << "track " << indices[n] << " received " << received[n] << '\n';
   throw std::runtime_error("Encoded media did not cross SFU");
@@ -188,7 +193,9 @@ void verify_receive_pause(const std::vector<std::shared_ptr<PublishedTrack>>& tx
 int main() {
   try {
     auto publisher = create_livekit_room(), subscriber = create_livekit_room();
-    RoomOptions options;
+    livekit::sdk::app_support::RtcEventMailbox subscriber_events(*subscriber);
+    livekit::sdk::app_support::RtcEventMailbox publisher_events(*publisher);
+    LiveKitRoomOptions options;
     options.url = env("LIVEKIT_URL");
     options.reconnect.enabled = false;
     options.signal_protocol = 15;
@@ -264,7 +271,7 @@ int main() {
     size_t discovered = 0;
     const auto deadline = SteadyClock::now() + 10s;
     while (discovered != 4 && SteadyClock::now() < deadline) {
-      auto event = subscriber->next_event(100ms);
+      auto event = subscriber_events.take_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 4; ++i)
@@ -314,7 +321,7 @@ int main() {
                       .muted;
         },
         "Unmute did not reach remote roster");
-    while (auto notification = publisher->next_event(0ms))
+    while (auto notification = publisher_events.take_event(0ms))
       check(notification->kind != RoomEventKind::remote_track_added,
             "Local publication appeared as remote discovery");
     remote[3].receive_demand.disabled = true;
@@ -327,7 +334,7 @@ int main() {
     auto permission_change = [&](bool allowed) {
       const auto deadline = SteadyClock::now() + 5s;
       while (SteadyClock::now() < deadline) {
-        const auto event = subscriber->next_event(100ms);
+        const auto event = subscriber_events.take_event(100ms);
         if (event && event->permission && event->permission->track_sid == remote[3].remote_sid &&
             event->permission->allowed == allowed) {
           check(event->permission->participant_sid == publisher_sid,
@@ -363,7 +370,7 @@ int main() {
         std::this_thread::sleep_for(20ms);
       }
       bool rejected = false;
-      while (auto notification = subscriber->next_event(0ms))
+      while (auto notification = subscriber_events.take_event(0ms))
         if (notification->encryption && !notification->encryption->ok)
           rejected = true;
       check(rejected, "Media authentication failure was not observable");

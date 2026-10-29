@@ -1,7 +1,9 @@
 #include "livekit/rtc/engine.hpp"
+#include "livekit/rtc/graph_api.hpp"
 #include "engines/rtc/rtc_engine_impl.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include "livekit/error.hpp"
+#include "utoolkit/task_queue/task_queue.h"
 
 namespace livekit::sdk::rtc::engine {
 RtcEngine::RtcEngine(RoomEngine::TransportFactory factory)
@@ -17,22 +19,109 @@ RtcEngine::Impl::Impl(std::unique_ptr<RoomEngine> value)
   if (!room) {
     throw std::invalid_argument("RTC engine requires a room engine");
   }
-  pipelines = std::make_unique<RtcPipelineEngine>(*room);
+  control = vi::TaskQueue::create("rtc.engine.control");
+  call([this] { pipelines = std::make_unique<RtcPipelineEngine>(*room); });
+  room->set_completion_wakeup([this] { completion_ready(); });
+  call([this] { schedule_health(); });
 }
 
 RtcEngine::Impl::~Impl() {
-  // Clear graphs while media callbacks and the room still exist. Room destruction
-  // supplies the final transport barrier even if a shutdown operation fails.
+  // Unregister waits for an in-flight notifier, then the queue fence drains
+  // already posted notifications before destroying their referenced modules.
+  call([this] {
+    if (callback_active) {
+      *callback_active = false;
+    }
+    pipelines->set_failure_handler({});
+  });
+  room->set_event_handler({});
+  room->set_completion_wakeup({});
   try {
-    clear_tracks();
+    call([this] {
+      stopping = true;
+      clear_tracks();
+      media.reset();
+      pipelines.reset();
+    });
+  } catch (...) {
+  }
+  control.reset();
+  try {
     room->leave().get();
   } catch (...) {
   }
 }
 
+void RtcEngine::Impl::dispatch(std::function<void()> task) const {
+  if (control->isCurrent()) {
+    task();
+    return;
+  }
+  if (queued_commands.fetch_add(1) >= 1024) {
+    --queued_commands;
+    throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
+                   "RTC control task queue exhausted");
+  }
+  try {
+    control->postTask([this, task = std::move(task)] {
+      --queued_commands;
+      task();  // Always a packaged_task; exceptions become future failures.
+    });
+  } catch (...) {
+    --queued_commands;
+    throw;
+  }
+}
+
+void RtcEngine::Impl::fail_control(std::exception_ptr failure) {
+  control_failure = failure;
+  try {
+    clear_tracks();
+  } catch (...) {
+  }
+}
+
+void RtcEngine::Impl::completion_ready() {
+  if (completion_queued.exchange(true)) {
+    return;
+  }
+  control->postTask([this] {
+    completion_queued = false;
+    if (stopping || control_failure) {
+      return;
+    }
+    try {
+      pipelines->complete_operations();
+    } catch (...) {
+      fail_control(std::current_exception());
+    }
+  });
+}
+
+void RtcEngine::Impl::schedule_health() {
+  // Legacy/custom nodes report failures through bounded snapshot checks. This
+  // timer performs no receive, feedback, graph creation or media dispatch.
+  control->postDelayedTask(
+      [this] {
+        if (stopping || control_failure) {
+          return;
+        }
+        try {
+          pipelines->check_health();
+          schedule_health();
+        } catch (...) {
+          fail_control(std::current_exception());
+        }
+      },
+      20);
+}
+
 void RtcEngine::Impl::require_owner() const {
-  if (std::this_thread::get_id() != owner) {
-    throw std::logic_error("RTC control requires its owner thread");
+  if (!control->isCurrent()) {
+    throw std::logic_error("RTC control requires its task queue");
+  }
+  if (control_failure) {
+    std::rethrow_exception(control_failure);
   }
   if (closed) {
     throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
@@ -49,50 +138,44 @@ MediaModule& RtcEngine::Impl::require_media() const {
 
 void RtcEngine::Impl::clear_tracks() {
   pipelines->clear();
-  if (media) {
-    media->finish_pending();
-  }
 }
 
 bool RtcEngine::media_enabled() const {
-  impl_->require_owner();
-  return bool(impl_->media);
+  return impl_->call([&] {
+    impl_->require_owner();
+    return bool(impl_->media);
+  });
 }
 
 std::future<void> RtcEngine::join(RoomOptions options) {
-  impl_->require_owner();
-  const auto state = impl_->room->snapshot().state;
-  if (state == ConnectionState::failed || state == ConnectionState::closed) {
-    impl_->clear_tracks();
-  }
-  return impl_->room->join(std::move(options));
+  return impl_->call([&] {
+    impl_->require_owner();
+    const auto state = impl_->room->snapshot().state;
+    if (state == ConnectionState::failed || state == ConnectionState::closed) {
+      impl_->clear_tracks();
+    }
+    return impl_->room->join(std::move(options));
+  });
 }
 
 std::future<void> RtcEngine::leave() {
-  impl_->require_owner();
-  impl_->clear_tracks();
-  return impl_->room->leave();
+  return impl_->call([&] {
+    impl_->require_owner();
+    impl_->clear_tracks();
+    return impl_->room->leave();
+  });
 }
 
 std::future<void> RtcEngine::close() {
-  if (std::this_thread::get_id() != impl_->owner) {
-    throw std::logic_error("RTC close requires its owner thread");
-  }
-  impl_->closed = true;
-  impl_->clear_tracks();
-  return impl_->room->leave();
-}
-
-void RtcEngine::poll(size_t frames) {
-  impl_->require_owner();
-  impl_->pipelines->poll(frames);
-  if (impl_->media) {
-    impl_->media->finish_pending();
-  }
+  return impl_->call([&] {
+    impl_->closed = true;
+    impl_->clear_tracks();
+    return impl_->room->leave();
+  });
 }
 
 MediaOperation RtcEngine::publish_media(MediaPublishSpec spec) {
-  return impl_->require_media().publish_media(std::move(spec));
+  return impl_->call([&] { return impl_->require_media().publish_media(std::move(spec)); });
 }
 
 MediaOperation RtcEngine::publish_video(MediaPublishSpec spec) {
@@ -110,65 +193,89 @@ MediaOperation RtcEngine::publish_audio(MediaPublishSpec spec) {
 }
 
 MediaOperation RtcEngine::subscribe_media(MediaSubscribeSpec spec) {
-  return impl_->require_media().subscribe_media(std::move(spec));
+  return impl_->call([&] { return impl_->require_media().subscribe_media(std::move(spec)); });
 }
 
 std::shared_ptr<SharedMediaInput> RtcEngine::create_shared_input(TrackDescriptor format,
                                                                  MediaInput input) {
-  return impl_->require_media().create_shared_input(std::move(format), std::move(input));
+  return impl_->call([&] {
+    return impl_->require_media().create_shared_input(std::move(format), std::move(input));
+  });
 }
 
-std::future<TrackId> RtcEngine::publish(TrackDescriptor descriptor,
-                                        std::shared_ptr<graphflow::core::GraphNode> sink) {
-  impl_->require_owner();
-  return impl_->pipelines->publish(std::move(descriptor), std::move(sink));
+std::future<TrackId> RtcEngine::publish(TrackDescriptor descriptor) {
+  return impl_->call([&] {
+    impl_->require_owner();
+    return impl_->pipelines->publish(std::move(descriptor));
+  });
 }
 
-std::future<TrackId> RtcEngine::subscribe(TrackDescriptor descriptor,
-                                          std::shared_ptr<graphflow::core::GraphNode> consumer) {
-  impl_->require_owner();
-  return impl_->pipelines->subscribe(std::move(descriptor), std::move(consumer));
+RtcGraphApi RtcEngine::graph() {
+  impl_->call([&] { impl_->require_owner(); });
+  return RtcGraphApi(*this);
 }
 
-std::future<TrackId> RtcEngine::publish_graph(TrackDescriptor descriptor,
-                                              PublishGraphFactory factory) {
-  impl_->require_owner();
-  return impl_->pipelines->publish_graph(std::move(descriptor), std::move(factory));
+std::future<TrackId> RtcGraphApi::publish(TrackDescriptor descriptor,
+                                          std::shared_ptr<graphflow::core::GraphNode> sink) {
+  return engine_->impl_->call([&] {
+    engine_->impl_->require_owner();
+    return engine_->impl_->pipelines->publish(std::move(descriptor), std::move(sink));
+  });
 }
 
-std::future<TrackId> RtcEngine::subscribe_graph(TrackDescriptor descriptor,
-                                                SubscribeGraphFactory factory) {
-  impl_->require_owner();
-  return impl_->pipelines->subscribe_graph(std::move(descriptor), std::move(factory));
+std::future<TrackId> RtcGraphApi::subscribe(TrackDescriptor descriptor,
+                                            std::shared_ptr<graphflow::core::GraphNode> consumer) {
+  return engine_->impl_->call([&] {
+    engine_->impl_->require_owner();
+    return engine_->impl_->pipelines->subscribe(std::move(descriptor), std::move(consumer));
+  });
+}
+
+std::future<TrackId> RtcGraphApi::publish_graph(TrackDescriptor descriptor,
+                                                PublishGraphFactory factory) {
+  return engine_->impl_->call([&] {
+    engine_->impl_->require_owner();
+    return engine_->impl_->pipelines->publish_graph(std::move(descriptor), std::move(factory));
+  });
+}
+
+std::future<TrackId> RtcGraphApi::subscribe_graph(TrackDescriptor descriptor,
+                                                  SubscribeGraphFactory factory) {
+  return engine_->impl_->call([&] {
+    engine_->impl_->require_owner();
+    return engine_->impl_->pipelines->subscribe_graph(std::move(descriptor), std::move(factory));
+  });
 }
 
 std::future<void> RtcEngine::unpublish(const TrackId& id) {
-  impl_->require_owner();
-  auto result = impl_->pipelines->unpublish(id);
-  if (impl_->media) {
-    impl_->media->finish_pending();
-  }
-  return result;
+  return impl_->call([&] {
+    impl_->require_owner();
+    auto result = impl_->pipelines->unpublish(id);
+    return result;
+  });
 }
 
 std::future<void> RtcEngine::unsubscribe(const TrackId& id) {
-  impl_->require_owner();
-  auto result = impl_->pipelines->unsubscribe(id);
-  if (impl_->media) {
-    impl_->media->finish_pending();
-  }
-  return result;
+  return impl_->call([&] {
+    impl_->require_owner();
+    auto result = impl_->pipelines->unsubscribe(id);
+    return result;
+  });
 }
 
 std::future<void> RtcEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
-  impl_->require_owner();
-  return impl_->room->set_muted(id, muted, options);
+  return impl_->call([&] {
+    impl_->require_owner();
+    return impl_->room->set_muted(id, muted, options);
+  });
 }
 
 std::future<void> RtcEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                                 ControlOptions options) {
-  impl_->require_owner();
-  return impl_->room->set_receive_demand(id, demand, options);
+  return impl_->call([&] {
+    impl_->require_owner();
+    return impl_->room->set_receive_demand(id, demand, options);
+  });
 }
 
 WriteStatus RtcEngine::write(const TrackId& id, EncodedFrame frame) {
@@ -183,20 +290,48 @@ SenderFeedback RtcEngine::feedback(const TrackId& id) const {
   return impl_->pipelines->feedback(id);
 }
 
-std::optional<RtcEngine::GraphFailure> RtcEngine::next_failure() {
-  impl_->require_owner();
-  if (auto failure = impl_->pipelines->next_failure()) {
-    return GraphFailure{failure->id, failure->publication, std::move(failure->message)};
+void RtcEngine::set_callbacks(Callbacks callbacks) {
+  auto active = std::make_shared<std::atomic<bool>>(true);
+  impl_->call([&] {
+    if (impl_->callback_active) {
+      *impl_->callback_active = false;
+    }
+    impl_->callback_active = active;
+    impl_->pipelines->set_failure_handler(
+        [state = impl_.get(), active, handler = std::move(callbacks.on_failure)](auto failure) {
+          if (handler) {
+            state->room->post_notification([active, handler, failure = std::move(failure)] {
+              if (*active) {
+                try {
+                  handler(GraphFailure{failure.id, failure.publication, failure.message});
+                } catch (...) {
+                  *active = false;
+                  throw;
+                }
+              }
+            });
+          }
+        });
+  });
+  // Keep control available while fencing callbacks that may await control calls.
+  std::function<void(const RoomEvent&)> event;
+  if (callbacks.on_event) {
+    event = [active, handler = std::move(callbacks.on_event)](const RoomEvent& value) {
+      if (*active) {
+        try {
+          handler(value);
+        } catch (...) {
+          *active = false;
+          throw;
+        }
+      }
+    };
   }
-  return {};
+  impl_->room->set_event_handler(std::move(event));
 }
 
 const RoomView& RtcEngine::room() const {
   return impl_->room_view;
 }
 
-std::optional<RoomEvent> RtcEngine::next_event(std::chrono::milliseconds timeout,
-                                               std::stop_token stop) {
-  return impl_->room->next_event(timeout, stop);
-}
 }  // namespace livekit::sdk::rtc::engine
