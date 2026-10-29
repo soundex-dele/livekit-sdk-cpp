@@ -1,8 +1,8 @@
 #include <livekit/livekit.hpp>
 #include "rtc_services_contract.hpp"
-#include "backends/rtc/stream_session.hpp"
-#include "backends/rtc/data_track_session.hpp"
-#include "backends/rtc/encryption.hpp"
+#include "backends/rtc/livekit/stream_session.hpp"
+#include "backends/rtc/livekit/data_track_session.hpp"
+#include "backends/rtc/livekit/packet_encryption.hpp"
 #include "media_nodes/capture/encoded_source.hpp"
 #include "media_nodes/capture/audio_source.hpp"
 #include "media_nodes/capture/video_source.hpp"

@@ -1,6 +1,6 @@
 #pragma once
-#include "backends/rtc/encoded_receiver.hpp"
-#include "backends/rtc/transport_runtime.hpp"
+#include "backends/webrtc/encoded_receiver.hpp"
+#include "backends/webrtc/transport_runtime.hpp"
 #include "api/rtp_transceiver_interface.h"
 #include <deque>
 #include <future>

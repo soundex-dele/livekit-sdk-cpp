@@ -1,4 +1,4 @@
-#include "backends/rtc/encoded_receiver.hpp"
+#include "backends/webrtc/encoded_receiver.hpp"
 #include <stdexcept>
 #include "backends/rtc/queue_budget.hpp"
 #include <utility>

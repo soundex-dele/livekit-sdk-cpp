@@ -1,8 +1,8 @@
 #pragma once
-#include "backends/rtc/signal_socket.hpp"
+#include "backends/rtc/livekit/signal_socket.hpp"
 #include "backends/rtc/events.hpp"
 #include "livekit.pb.h"
-#include "backends/rtc/signal_recovery_state.hpp"
+#include "backends/rtc/livekit/signal_recovery_state.hpp"
 #include "livekit/rtc/signaling_options.hpp"
 #include <functional>
 

@@ -1,4 +1,4 @@
-#include "backends/rtc/stream_session.hpp"
+#include "backends/rtc/livekit/stream_session.hpp"
 #include "livekit/error.hpp"
 #include <algorithm>
 #include <array>

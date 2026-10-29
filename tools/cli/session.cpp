@@ -1,7 +1,7 @@
 #include "session.hpp"
 #include "livekit/rtc/media_engine.hpp"
 #include "media_nodes/render/video_playout.hpp"
-#include "backends/rtc/native_peer.hpp"
+#include "backends/webrtc/native_peer.hpp"
 #include "api/video/i420_buffer.h"
 #include <algorithm>
 #include <thread>

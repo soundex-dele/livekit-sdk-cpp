@@ -1,4 +1,4 @@
-#include "backends/rtc/encryption.hpp"
+#include "backends/rtc/livekit/packet_encryption.hpp"
 #include "livekit/error.hpp"
 #include <openssl/crypto.h>
 #include <openssl/evp.h>

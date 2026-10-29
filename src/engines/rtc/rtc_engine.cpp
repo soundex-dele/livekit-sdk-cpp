@@ -11,16 +11,16 @@ std::exception_ptr closed_error() {
 }  // namespace
 
 RtcEngine::RtcEngine(std::unique_ptr<detail::RoomTransport> transport)
-    : RtcEngine(std::make_unique<RoomBackend>(std::move(transport))) {}
+    : RtcEngine(std::make_unique<RoomSession>(std::move(transport))) {}
 
-RtcEngine::RtcEngine(std::unique_ptr<RoomBackend> room) : room_(std::move(room)) {
+RtcEngine::RtcEngine(std::unique_ptr<RoomSession> room) : room_(std::move(room)) {
   if (!room_)
     throw std::invalid_argument("RTC engine requires a room backend");
 }
 
 RtcEngine::~RtcEngine() {
   // Destruction, like all graph lifecycle operations, must follow producer
-  // quiescence. RoomBackend destruction supplies the final native barrier.
+  // quiescence. RoomSession destruction supplies the final native barrier.
   for (auto& pending : pending_)
     pending.cancel(closed_error());
   pending_.clear();

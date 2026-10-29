@@ -1,4 +1,4 @@
-#include "backends/rtc/signal_socket.hpp"
+#include "backends/rtc/livekit/signal_socket.hpp"
 #include "livekit/version.hpp"
 #include <ixwebsocket/IXHttpClient.h>
 #include <ixwebsocket/IXNetSystem.h>

@@ -1,10 +1,10 @@
 #include <livekit/livekit.hpp>
 #include "api_contract.hpp"
 #include "backends/rtc/events.hpp"
-#include "backends/rtc/reconnect_policy.hpp"
+#include "backends/rtc/livekit/reconnect_policy.hpp"
 #include "token_provider_contract.hpp"
 #include "region_policy_contract.hpp"
-#include "backends/rtc/client_configuration.hpp"
+#include "backends/rtc/livekit/client_configuration.hpp"
 #include "video_source_contract.hpp"
 #include "audio_source_contract.hpp"
 #include "data_messages_contract.hpp"

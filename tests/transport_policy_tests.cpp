@@ -1,5 +1,5 @@
 #include "backends/webrtc/transport_policy.hpp"
-#include "backends/rtc/client_configuration.hpp"
+#include "backends/rtc/livekit/client_configuration.hpp"
 #include <iostream>
 
 using namespace livekit::sdk;

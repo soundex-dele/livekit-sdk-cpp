@@ -1,4 +1,4 @@
-#include "livekit/rtc/room_backend.hpp"
+#include "livekit/rtc/room_session.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include <algorithm>
 #include <condition_variable>
@@ -191,7 +191,7 @@ RoomOptions options(size_t budget = 4096) {
 
 void permission_controls() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   auto opts = options();
   opts.subscription_permissions = SubscriptionPermissions{false, {{"viewer", false, {"camera"}}}};
   get(room.join(opts));
@@ -282,7 +282,7 @@ void permission_controls() {
 
 void statistics_events() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   auto opts = options();
   opts.max_events = 2;
   opts.stats_interval = 200ms;
@@ -328,7 +328,7 @@ void statistics_events() {
   get(room.leave());
   auto bad = options();
   bad.stats_interval = 199ms;
-  RoomBackend invalid(std::make_unique<FakeTransport>(std::make_shared<Harness>()));
+  RoomSession invalid(std::make_unique<FakeTransport>(std::make_shared<Harness>()));
   bool rejected = false;
   try {
     get(invalid.join(bad));
@@ -340,7 +340,7 @@ void statistics_events() {
 
 void receive_demand_controls() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   get(room.join(options()));
   auto descriptor = video("receive");
   descriptor.receive_demand.disabled = true;
@@ -479,7 +479,7 @@ void receive_demand_controls() {
 
 void publication_sources() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   get(room.join(options()));
   for (auto source :
        {PublicationSource::unknown, PublicationSource::camera, PublicationSource::microphone,
@@ -553,7 +553,7 @@ void mute_contract() {
           "Native rates overrode local mute gate");
   }
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   get(room.join(options()));
   auto descriptor = video("muted");
   descriptor.muted = true;
@@ -636,7 +636,7 @@ void mute_contract() {
 
 void mute_event_overflow() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   auto opts = options();
   opts.max_events = 1;
   get(room.join(opts));
@@ -662,7 +662,7 @@ void mute_event_overflow() {
 void participant_controls() {
   using livekit::sdk::ErrorCode;
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   auto opts = options();
   opts.signal_protocol = 15;
   get(room.join(opts));
@@ -758,7 +758,7 @@ void participant_controls() {
 
 void session_lifetime() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   auto opts = options();
   opts.max_events = 4;
   get(room.join(opts));
@@ -898,7 +898,7 @@ void feedback_admission() {
 
 void multi_stream_and_recovery() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   get(room.join(options()));
   auto a = get(room.publish(video("camera-a")));
   auto b = get(room.publish(video("camera-b")));
@@ -955,7 +955,7 @@ void multi_stream_and_recovery() {
 
 void receive_and_lifetime() {
   auto h = std::make_shared<Harness>();
-  auto room = std::make_unique<RoomBackend>(std::make_unique<FakeTransport>(h));
+  auto room = std::make_unique<RoomSession>(std::make_unique<FakeTransport>(h));
   get(room->join(options()));
   auto a = get(room->subscribe(video("remote-a")));
   auto b = get(room->subscribe(video("remote-b")));
@@ -998,7 +998,7 @@ void receive_and_lifetime() {
 
 void timeout_and_reused_identity() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   auto opts = options();
   opts.operation_timeout = 50ms;
   get(room.join(opts));
@@ -1038,7 +1038,7 @@ void timeout_and_reused_identity() {
 
 void cancel_pending_and_isolate_failure() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   get(room.join(options()));
   {
     std::lock_guard lock(h->mutex);
@@ -1116,7 +1116,7 @@ class FeedbackConsumer : public graphflow::core::GraphNode {
 
 void pipeline_contract() {
   auto h = std::make_shared<Harness>();
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   get(room.join(options()));
   auto a = get(room.publish(video("a")));
   auto b = get(room.publish(video("b")));
@@ -1373,7 +1373,7 @@ void composed_graph_contract() {
 void typed_join_failure() {
   auto h = std::make_shared<Harness>();
   h->connect = false;
-  RoomBackend room(std::make_unique<FakeTransport>(h));
+  RoomSession room(std::make_unique<FakeTransport>(h));
   RoomOptions options;
   options.url = "ws://test";
   options.token = "test";

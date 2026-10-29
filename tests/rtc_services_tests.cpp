@@ -1,6 +1,6 @@
 #include "rtc_services_contract.hpp"
 #include "rpc_contract.hpp"
-#include "backends/rtc/room_service_state.hpp"
+#include "backends/rtc/livekit/room_service_state.hpp"
 #include <iostream>
 
 namespace {

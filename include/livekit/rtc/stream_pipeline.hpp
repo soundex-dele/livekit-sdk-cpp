@@ -33,7 +33,7 @@ using SubscribeGraphFactory =
 
 // Engine-owned topology for one logical track. Lifecycle and polling use one
 // owner sequence; write() is safe from producers during lifecycle transitions.
-// Nodes hold endpoint leases, never a RoomBackend.
+// Nodes hold endpoint leases, never a RoomSession.
 // To add/remove a stream, create/close this graph without rebuilding other graphs.
 class PublishPipeline {
  public:

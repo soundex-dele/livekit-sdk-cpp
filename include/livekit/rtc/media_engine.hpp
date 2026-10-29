@@ -161,7 +161,7 @@ class RtcMediaEngine final {
 
   std::future<void> close();
 
-  RoomBackend& room() {
+  RoomSession& room() {
     return engine_->room();
   }
 

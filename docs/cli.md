@@ -1,13 +1,13 @@
 # GraphEngine-based LiveKit CLI
 
-CLI 已使用新的 `rtc::RoomBackend` 和 `rtc::engine::RtcEngine`，不再包含或链接旧 `Room` API。每条发布独立创建 `MediaInputNode → CodecNode → RtcPublishNode`，每条订阅创建 `RtcSubscribeNode → CodecNode → 输出/录制节点`，所有图共享同一个房间后端。房间管理和 Token 命令仍使用 ServerSDK。
+CLI 已使用新的 `rtc::RoomSession` 和 `rtc::engine::RtcEngine`，不再包含或链接旧 `Room` API。每条发布独立创建 `MediaInputNode → CodecNode → RtcPublishNode`，每条订阅创建 `RtcSubscribeNode → CodecNode → 输出/录制节点`，所有图共享同一个房间后端。房间管理和 Token 命令仍使用 ServerSDK。
 
 `room join/publish/subscribe --stats-interval-ms 500` 可输出 `rtc-stats` 事件。
 默认关闭；启用时范围为 200–60000 ms。`target=0` 是发布连接，`target=1` 是
 订阅连接；`stats` 保留 libwebrtc 原生 W3C 字段，包括帧数、编码器质量限制
 原因、码率、RTT、丢包、NACK/PLI 和候选连接对统计。未定义字段不会伪造为零。
 不输出 candidate 地址或 certificate 记录；采集为异步，每条连接最多一个
-未完成请求。统计通过 `rtc::RoomOptions::stats_interval` 启用，再用 `RoomBackend::next_event()` 读取 `RoomEventKind::statistics`。报告带连接 epoch；每个目标最多保留一条待读报告，控制事件优先。CLI 在自身控制线程串行输出 JSON。
+未完成请求。统计通过 `rtc::RoomOptions::stats_interval` 启用，再用 `RoomSession::next_event()` 读取 `RoomEventKind::statistics`。报告带连接 epoch；每个目标最多保留一条待读报告，控制事件优先。CLI 在自身控制线程串行输出 JSON。
 
 原生 W3C 指标描述传输 PeerConnection；实际编解码位于上层，使用 `media-graph-stats` 的节点计数查看其准入、完成、丢弃和错误。该事件的 `edges` 来自运行中 GraphEngine 节点的真实连接。带宽估计、探测参数和 RTP/RTCP 算法由 libwebrtc 决定，设备不放进传输 PeerConnection。
 

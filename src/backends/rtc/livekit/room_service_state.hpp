@@ -1,9 +1,9 @@
 #pragma once
 #include "livekit/rtc/room_services.hpp"
-#include "backends/rtc/rpc_session.hpp"
-#include "backends/rtc/stream_session.hpp"
-#include "backends/rtc/data_track_session.hpp"
-#include "backends/rtc/encryption.hpp"
+#include "backends/rtc/livekit/rpc_session.hpp"
+#include "backends/rtc/livekit/stream_session.hpp"
+#include "backends/rtc/livekit/data_track_session.hpp"
+#include "backends/rtc/livekit/packet_encryption.hpp"
 #include <condition_variable>
 #include <deque>
 

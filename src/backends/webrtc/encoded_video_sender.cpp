@@ -1,6 +1,6 @@
-#include "backends/rtc/encoded_video_sender.hpp"
+#include "backends/webrtc/encoded_video_sender.hpp"
 #include "backends/rtc/queue_budget.hpp"
-#include "backends/rtc/transport_codecs.hpp"
+#include "backends/webrtc/transport_codecs.hpp"
 #include "api/make_ref_counted.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"

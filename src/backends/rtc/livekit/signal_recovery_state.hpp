@@ -1,6 +1,6 @@
 #pragma once
-#include "backends/rtc/reconnect_policy.hpp"
-#include "backends/rtc/region_policy.hpp"
+#include "backends/rtc/livekit/reconnect_policy.hpp"
+#include "backends/rtc/livekit/region_policy.hpp"
 
 namespace livekit::sdk::detail {
 // Connection recovery survives native peer replacement. Media restart policy

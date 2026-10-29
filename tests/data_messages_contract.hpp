@@ -1,5 +1,5 @@
 #pragma once
-#include "backends/rtc/data_messages.hpp"
+#include "backends/rtc/livekit/data_message_wire.hpp"
 
 inline void data_messages_contract() {
   using namespace livekit::sdk;

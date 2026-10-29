@@ -1,15 +1,15 @@
 #include "livekit/rtc/livekit.hpp"
 #include "backends/rtc/room_transport.hpp"
-#include "backends/rtc/native_peer.hpp"
-#include "backends/rtc/encoded_audio_sender.hpp"
-#include "backends/rtc/encoded_video_sender.hpp"
-#include "backends/rtc/signal_session.hpp"
-#include "backends/rtc/room_service_state.hpp"
-#include "backends/rtc/session_roster.hpp"
-#include "backends/rtc/client_configuration.hpp"
-#include "backends/rtc/subscribed_quality.hpp"
-#include "backends/rtc/subscription_policy_wire.hpp"
-#include "backends/webrtc/frame_cryptor.hpp"
+#include "backends/webrtc/native_peer.hpp"
+#include "backends/webrtc/encoded_audio_sender.hpp"
+#include "backends/webrtc/encoded_video_sender.hpp"
+#include "backends/rtc/livekit/signal_session.hpp"
+#include "backends/rtc/livekit/room_service_state.hpp"
+#include "backends/rtc/livekit/session_roster.hpp"
+#include "backends/rtc/livekit/client_configuration.hpp"
+#include "backends/rtc/livekit/subscribed_quality.hpp"
+#include "backends/rtc/livekit/subscription_policy_wire.hpp"
+#include "backends/rtc/livekit/frame_cryptor.hpp"
 #include "backends/webrtc/transport_policy.hpp"
 #include "api/make_ref_counted.h"
 #include <algorithm>
@@ -1374,7 +1374,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
 }  // namespace livekit::sdk::rtc::detail
 
 namespace livekit::sdk::rtc {
-std::unique_ptr<RoomBackend> create_livekit_room() {
-  return std::make_unique<RoomBackend>(std::make_unique<detail::LiveKitTransport>());
+std::unique_ptr<RoomSession> create_livekit_room() {
+  return std::make_unique<RoomSession>(std::make_unique<detail::LiveKitTransport>());
 }
 }  // namespace livekit::sdk::rtc

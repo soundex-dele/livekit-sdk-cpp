@@ -1,5 +1,5 @@
 #pragma once
-#include "backends/rtc/region_policy.hpp"
+#include "backends/rtc/livekit/region_policy.hpp"
 
 inline void region_policy_contract() {
   using namespace livekit::sdk;

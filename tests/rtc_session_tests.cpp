@@ -1,6 +1,6 @@
-#include "backends/rtc/session_roster.hpp"
-#include "backends/rtc/subscription_policy_wire.hpp"
-#include "backends/rtc/subscribed_quality.hpp"
+#include "backends/rtc/livekit/session_roster.hpp"
+#include "backends/rtc/livekit/subscription_policy_wire.hpp"
+#include "backends/rtc/livekit/subscribed_quality.hpp"
 #include <iostream>
 #include <limits>
 

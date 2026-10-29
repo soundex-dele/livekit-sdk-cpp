@@ -9,7 +9,7 @@ namespace livekit::sdk::rtc {
 namespace detail {
 class RoomTransport;
 struct Endpoint;
-struct BackendState;
+struct RoomSessionState;
 }  // namespace detail
 
 struct ControlOptions {
@@ -30,10 +30,10 @@ class PublishedTrack {
   std::future<void> close();
 
  private:
-  friend class RoomBackend;
-  PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::BackendState>);
+  friend class RoomSession;
+  PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomSessionState>);
   std::shared_ptr<detail::Endpoint> endpoint_;
-  std::weak_ptr<detail::BackendState> backend_;
+  std::weak_ptr<detail::RoomSessionState> session_;
 };
 
 class SubscribedTrack {
@@ -49,21 +49,21 @@ class SubscribedTrack {
   std::future<void> close();
 
  private:
-  friend class RoomBackend;
-  SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::BackendState>);
+  friend class RoomSession;
+  SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomSessionState>);
   std::shared_ptr<detail::Endpoint> endpoint_;
-  std::weak_ptr<detail::BackendState> backend_;
+  std::weak_ptr<detail::RoomSessionState> session_;
 };
 
-// Transport-only room owner. The private adapter is injected so the same state
+// Transport-only room session. The private adapter is injected so the same state
 // machine can be tested without network, devices or codecs. The native factory
 // provides this adapter; callers do not implement GraphEngine or WebRTC objects.
-class RoomBackend {
+class RoomSession {
  public:
-  explicit RoomBackend(std::unique_ptr<detail::RoomTransport> transport);
-  ~RoomBackend();
-  RoomBackend(const RoomBackend&) = delete;
-  RoomBackend& operator=(const RoomBackend&) = delete;
+  explicit RoomSession(std::unique_ptr<detail::RoomTransport> transport);
+  ~RoomSession();
+  RoomSession(const RoomSession&) = delete;
+  RoomSession& operator=(const RoomSession&) = delete;
 
   std::future<void> join(RoomOptions options);
   std::future<std::shared_ptr<PublishedTrack>> publish(TrackDescriptor descriptor);
@@ -87,7 +87,7 @@ class RoomBackend {
   std::optional<RoomEvent> next_event(std::chrono::milliseconds timeout, std::stop_token stop = {});
 
  private:
-  std::shared_ptr<detail::BackendState> state_;
+  std::shared_ptr<detail::RoomSessionState> state_;
 };
 
 }  // namespace livekit::sdk::rtc

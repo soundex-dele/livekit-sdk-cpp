@@ -6,7 +6,7 @@
 
 namespace livekit::sdk::rtc::engine {
 
-// Scene-engine building block. One RoomBackend is shared by all track graphs.
+// Scene-engine building block. One RoomSession is shared by all track graphs.
 // The scene controller calls poll() to complete graph creation and fairly drive
 // receive/feedback nodes. No per-track worker and no user media work runs on the
 // backend's signaling/transport thread. Control methods are owner-thread only;
@@ -15,7 +15,7 @@ namespace livekit::sdk::rtc::engine {
 class RtcEngine {
  public:
   explicit RtcEngine(std::unique_ptr<detail::RoomTransport>);
-  explicit RtcEngine(std::unique_ptr<RoomBackend>);
+  explicit RtcEngine(std::unique_ptr<RoomSession>);
   ~RtcEngine();
   RtcEngine(const RtcEngine&) = delete;
   RtcEngine& operator=(const RtcEngine&) = delete;
@@ -47,7 +47,7 @@ class RtcEngine {
   std::optional<GraphFailure> next_failure();
   std::future<void> close();
 
-  RoomBackend& room() {
+  RoomSession& room() {
     return *room_;
   }
 
@@ -64,7 +64,7 @@ class RtcEngine {
     std::function<void(std::exception_ptr)> cancel;
   };
 
-  std::unique_ptr<RoomBackend> room_;
+  std::unique_ptr<RoomSession> room_;
   const std::thread::id owner_ = std::this_thread::get_id();
   mutable std::mutex mutex_;
   std::map<TrackId, std::shared_ptr<PublishPipeline>> publications_;

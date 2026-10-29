@@ -1,5 +1,5 @@
-#include "backends/rtc/rpc_session.hpp"
-#include "backends/rtc/data_messages.hpp"
+#include "backends/rtc/livekit/rpc_session.hpp"
+#include "backends/rtc/livekit/data_message_wire.hpp"
 #include "livekit/error.hpp"
 #include "support/compression.hpp"
 #include <algorithm>

@@ -1,5 +1,5 @@
-#include "backends/rtc/transport_runtime.hpp"
-#include "backends/rtc/encoded_video_sender.hpp"
+#include "backends/webrtc/transport_runtime.hpp"
+#include "backends/webrtc/encoded_video_sender.hpp"
 #include "api/enable_media.h"
 #include "api/audio/audio_device.h"
 #include "api/task_queue/default_task_queue_factory.h"

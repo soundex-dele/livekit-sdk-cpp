@@ -1,8 +1,8 @@
 # 配置式 RTC 媒体引擎
 
-普通媒体会话使用 `livekit/rtc/media_engine.hpp`，链接 `LiveKit::RTCMediaEngine`。Session 负责业务状态、发布/订阅配置和 UI 数据交接；`RtcMediaEngine` 创建采集、编解码、输出节点并组织 GraphEngine，`RtcEngine` 管理每轨传输图，`RoomBackend` 管理共享房间及信令、编码帧传输。
+普通媒体会话使用 `livekit/rtc/media_engine.hpp`，链接 `LiveKit::RTCMediaEngine`。Session 负责业务状态、发布/订阅配置和 UI 数据交接；`RtcMediaEngine` 创建采集、编解码、输出节点并组织 GraphEngine，`RtcEngine` 管理每轨传输图，`RoomSession` 管理共享房间及信令、编码帧传输。
 
-仅收发已有编码帧时，继续使用 [编码媒体 API](rtc-encoded-api.md) 的 RoomBackend 或 RtcEngine，无须链接媒体引擎。`LIVEKIT_BUILD_RTC_MEDIA=ON` 启用可选媒体引擎和媒体节点库，不改变纯传输层依赖。
+仅收发已有编码帧时，继续使用 [编码媒体 API](rtc-encoded-api.md) 的 RoomSession 或 RtcEngine，无须链接媒体引擎。`LIVEKIT_BUILD_RTC_MEDIA=ON` 启用可选媒体引擎和媒体节点库，不改变纯传输层依赖。
 
 ## 发布与订阅
 

@@ -1,5 +1,5 @@
-#include "backends/rtc/room_service_state.hpp"
-#include "backends/rtc/data_messages.hpp"
+#include "backends/rtc/livekit/room_service_state.hpp"
+#include "backends/rtc/livekit/data_message_wire.hpp"
 #include "livekit/error.hpp"
 #include <algorithm>
 

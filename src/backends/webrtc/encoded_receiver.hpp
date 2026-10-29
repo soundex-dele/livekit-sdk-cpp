@@ -16,7 +16,7 @@ struct ReceivedAccessUnit {
 };
 
 // Terminal receive boundary: owns complete depacketized access units and never
-// calls the native decoder callback. poll() transfers ownership to RoomBackend.
+// calls the native decoder callback. poll() transfers ownership to RoomSession.
 // Native callback work is bounded even while the controller is busy signaling.
 class EncodedReceiver : public webrtc::FrameTransformerInterface {
  public:

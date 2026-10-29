@@ -26,7 +26,7 @@ option(LIVEKIT_BUILD_EXAMPLES "Build public SDK examples" ${PROJECT_IS_TOP_LEVEL
 option(LIVEKIT_BUILD_TESTS "Build SDK and CLI tests" ${PROJECT_IS_TOP_LEVEL})
 add_library(livekit_rtc_backend STATIC
   src/backends/rtc/endpoint.cpp
-  src/backends/rtc/room_backend.cpp)
+  src/backends/rtc/room_session.cpp)
 add_library(LiveKit::RTCBackend ALIAS livekit_rtc_backend)
 find_package(Threads REQUIRED)
 target_compile_features(livekit_rtc_backend PUBLIC cxx_std_20)
@@ -34,7 +34,7 @@ target_link_libraries(livekit_rtc_backend PRIVATE Threads::Threads)
 target_include_directories(livekit_rtc_backend PUBLIC include "${CMAKE_CURRENT_BINARY_DIR}/public" PRIVATE src)
 if(LIVEKIT_BUILD_TESTS)
   enable_testing()
-  add_executable(livekit_rtc_backend_tests tests/rtc_backend_tests.cpp)
+  add_executable(livekit_rtc_backend_tests tests/room_session_tests.cpp)
   target_include_directories(livekit_rtc_backend_tests PRIVATE src)
   target_link_libraries(livekit_rtc_backend_tests PRIVATE LiveKit::RTCBackend)
   add_test(NAME rtc_backend COMMAND livekit_rtc_backend_tests)
@@ -72,7 +72,7 @@ if(LIVEKIT_BUILD_RTC_GRAPH_NODES)
   target_include_directories(livekit_rtc_pipelines PRIVATE src)
   target_link_libraries(livekit_rtc_pipelines PUBLIC livekit_rtc_nodes graphflow::engine)
   if(LIVEKIT_BUILD_TESTS)
-    add_executable(livekit_rtc_pipeline_tests tests/rtc_backend_tests.cpp)
+    add_executable(livekit_rtc_pipeline_tests tests/room_session_tests.cpp)
     target_include_directories(livekit_rtc_pipeline_tests PRIVATE src)
     target_compile_definitions(livekit_rtc_pipeline_tests PRIVATE LIVEKIT_TEST_RTC_NODES=1)
     target_link_libraries(livekit_rtc_pipeline_tests PRIVATE livekit_rtc_pipelines livekit_rtc_nodes graphflow::engine)
@@ -105,10 +105,10 @@ if(LIVEKIT_BUILD_RTC_NATIVE)
 endif()
 if(LIVEKIT_BUILD_RTC_NATIVE)
 add_library(livekit_rtc_native STATIC
-  src/backends/rtc/encoded_audio_sender.cpp src/backends/rtc/encoded_receiver.cpp
-  src/backends/rtc/encoded_video_sender.cpp
-  src/backends/rtc/native_peer.cpp
-  src/backends/rtc/transport_codecs.cpp src/backends/rtc/transport_runtime.cpp)
+  src/backends/webrtc/encoded_audio_sender.cpp src/backends/webrtc/encoded_receiver.cpp
+  src/backends/webrtc/encoded_video_sender.cpp
+  src/backends/webrtc/native_peer.cpp
+  src/backends/webrtc/transport_codecs.cpp src/backends/webrtc/transport_runtime.cpp)
 add_library(LiveKit::RTCNative ALIAS livekit_rtc_native)
 target_include_directories(livekit_rtc_native PRIVATE src)
 target_link_libraries(livekit_rtc_native PRIVATE LiveKit::RTCBackend WebRTC::webrtc)
@@ -161,8 +161,8 @@ else()
   set(_sdk_zlib ZLIB::ZLIB)
 endif()
 add_library(livekit_rtc_services STATIC
-  src/backends/rtc/room_services.cpp src/backends/rtc/rpc_session.cpp src/backends/rtc/stream_session.cpp
-  src/backends/rtc/data_track_session.cpp src/backends/rtc/encryption.cpp)
+  src/backends/rtc/livekit/room_services.cpp src/backends/rtc/livekit/rpc_session.cpp src/backends/rtc/livekit/stream_session.cpp
+  src/backends/rtc/livekit/data_track_session.cpp src/backends/rtc/livekit/encryption.cpp)
 add_library(LiveKit::RTCServices ALIAS livekit_rtc_services)
 target_include_directories(livekit_rtc_services PUBLIC include PRIVATE src)
 target_link_libraries(livekit_rtc_services PRIVATE livekit_protocol nlohmann_json::nlohmann_json ${_sdk_zlib} OpenSSL::Crypto Threads::Threads)
@@ -174,7 +174,7 @@ if(LIVEKIT_BUILD_TESTS)
   set_tests_properties(rtc_services PROPERTIES TIMEOUT 30)
 endif()
 
-add_library(livekit_rtc_signaling STATIC src/backends/rtc/signal_session.cpp src/backends/rtc/signal_socket.cpp)
+add_library(livekit_rtc_signaling STATIC src/backends/rtc/livekit/signal_session.cpp src/backends/rtc/livekit/signal_socket.cpp)
 add_library(LiveKit::RTCSignaling ALIAS livekit_rtc_signaling)
 target_include_directories(livekit_rtc_signaling PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/public" PUBLIC include)
 target_link_libraries(livekit_rtc_signaling PRIVATE livekit_wire livekit_protocol ixwebsocket nlohmann_json::nlohmann_json)
@@ -184,7 +184,7 @@ endif()
 
 endif()
 if(LIVEKIT_BUILD_RTC_NATIVE)
-  add_library(livekit_rtc_livekit STATIC src/backends/rtc/livekit_transport.cpp)
+  add_library(livekit_rtc_livekit STATIC src/backends/rtc/livekit/livekit_transport.cpp)
   add_library(LiveKit::RTCLiveKit ALIAS livekit_rtc_livekit)
   if(LIVEKIT_BUILD_RTC_GRAPH_NODES)
     target_sources(livekit_rtc_pipelines PRIVATE src/engines/rtc/livekit_engine.cpp)

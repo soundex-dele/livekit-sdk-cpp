@@ -1,4 +1,4 @@
-#include "livekit/rtc/room_backend.hpp"
+#include "livekit/rtc/room_session.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/subscription_policy.hpp"
 #include "livekit/error.hpp"
@@ -23,15 +23,15 @@ std::future<T> rejected(std::exception_ptr failure) {
 }
 }  // namespace
 
-struct BackendState {
-  explicit BackendState(std::unique_ptr<RoomTransport> adapter) : transport(std::move(adapter)) {
+struct RoomSessionState {
+  explicit RoomSessionState(std::unique_ptr<RoomTransport> adapter) : transport(std::move(adapter)) {
     if (!transport)
       throw std::invalid_argument("RTC room requires a transport");
     services = transport->services();
     worker = std::jthread([this](std::stop_token stop) { run(stop); });
   }
 
-  ~BackendState() {
+  ~RoomSessionState() {
     shutdown();
   }
 
@@ -696,8 +696,8 @@ struct BackendState {
 }  // namespace detail
 
 PublishedTrack::PublishedTrack(std::shared_ptr<detail::Endpoint> endpoint,
-                               std::weak_ptr<detail::BackendState> backend)
-    : endpoint_(std::move(endpoint)), backend_(std::move(backend)) {}
+                               std::weak_ptr<detail::RoomSessionState> session)
+    : endpoint_(std::move(endpoint)), session_(std::move(session)) {}
 
 const TrackDescriptor& PublishedTrack::descriptor() const {
   return endpoint_->descriptor;
@@ -716,20 +716,20 @@ WriteStatus PublishedTrack::try_write(EncodedFrame frame) {
 }
 
 std::future<void> PublishedTrack::set_muted(bool muted, ControlOptions options) {
-  if (auto backend = backend_.lock())
-    return backend->set_muted(endpoint_->descriptor.id, muted, options, endpoint_);
+  if (auto session = session_.lock())
+    return session->set_muted(endpoint_->descriptor.id, muted, options, endpoint_);
   return detail::rejected<void>(detail::error("RTC room destroyed"));
 }
 
 std::future<void> PublishedTrack::close() {
-  if (auto backend = backend_.lock())
-    return backend->close_track(endpoint_);
+  if (auto session = session_.lock())
+    return session->close_track(endpoint_);
   return detail::rejected<void>(detail::error("RTC room destroyed"));
 }
 
 SubscribedTrack::SubscribedTrack(std::shared_ptr<detail::Endpoint> endpoint,
-                                 std::weak_ptr<detail::BackendState> backend)
-    : endpoint_(std::move(endpoint)), backend_(std::move(backend)) {}
+                                 std::weak_ptr<detail::RoomSessionState> session)
+    : endpoint_(std::move(endpoint)), session_(std::move(session)) {}
 
 const TrackDescriptor& SubscribedTrack::descriptor() const {
   return endpoint_->descriptor;
@@ -744,44 +744,44 @@ ReadResult SubscribedTrack::read(std::chrono::milliseconds timeout, std::stop_to
 }
 
 std::future<void> SubscribedTrack::request_keyframe() {
-  if (auto backend = backend_.lock())
-    return backend->request_keyframe(endpoint_);
+  if (auto session = session_.lock())
+    return session->request_keyframe(endpoint_);
   return detail::rejected<void>(detail::error("RTC room destroyed"));
 }
 
 std::future<void> SubscribedTrack::set_demand(ReceiveDemand demand, ControlOptions options) {
-  if (auto backend = backend_.lock())
-    return backend->set_receive_demand(endpoint_->descriptor.id, demand, options, endpoint_);
+  if (auto session = session_.lock())
+    return session->set_receive_demand(endpoint_->descriptor.id, demand, options, endpoint_);
   return detail::rejected<void>(detail::error("RTC room destroyed"));
 }
 
 std::future<void> SubscribedTrack::close() {
-  if (auto backend = backend_.lock())
-    return backend->close_track(endpoint_);
+  if (auto session = session_.lock())
+    return session->close_track(endpoint_);
   return detail::rejected<void>(detail::error("RTC room destroyed"));
 }
 
-RoomBackend::RoomBackend(std::unique_ptr<detail::RoomTransport> transport)
-    : state_(std::make_shared<detail::BackendState>(std::move(transport))) {}
+RoomSession::RoomSession(std::unique_ptr<detail::RoomTransport> transport)
+    : state_(std::make_shared<detail::RoomSessionState>(std::move(transport))) {}
 
-RoomBackend::~RoomBackend() {
+RoomSession::~RoomSession() {
   state_->shutdown();
 }
 
-std::shared_ptr<RoomServices> RoomBackend::services() const {
+std::shared_ptr<RoomServices> RoomSession::services() const {
   if (!state_->services)
     throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
                    "This transport does not provide room services");
   return state_->services;
 }
 
-std::future<void> RoomBackend::join(RoomOptions options) {
+std::future<void> RoomSession::join(RoomOptions options) {
   auto promise = std::make_shared<std::promise<void>>();
   auto future = promise->get_future();
   auto* s = state_.get();
   s->post({[s, options = std::move(options), promise] {
              if (s->connection != ConnectionState::disconnected)
-               throw std::logic_error("RTC RoomBackend is single-session");
+               throw std::logic_error("RTC RoomSession is single-session");
              if (options.url.empty() || (options.token.empty() && !options.token_provider) ||
                  !options.max_queued_bytes || options.max_queued_bytes > 1024ull * 1024 * 1024 ||
                  !options.max_tracks || options.max_tracks > 1024 || !options.max_events ||
@@ -814,7 +814,7 @@ std::future<void> RoomBackend::join(RoomOptions options) {
   return future;
 }
 
-std::future<std::shared_ptr<PublishedTrack>> RoomBackend::publish(TrackDescriptor descriptor) {
+std::future<std::shared_ptr<PublishedTrack>> RoomSession::publish(TrackDescriptor descriptor) {
   auto promise = std::make_shared<std::promise<std::shared_ptr<PublishedTrack>>>();
   auto future = promise->get_future();
   auto* s = state_.get();
@@ -833,7 +833,7 @@ std::future<std::shared_ptr<PublishedTrack>> RoomBackend::publish(TrackDescripto
   return future;
 }
 
-std::future<std::shared_ptr<SubscribedTrack>> RoomBackend::subscribe(TrackDescriptor descriptor) {
+std::future<std::shared_ptr<SubscribedTrack>> RoomSession::subscribe(TrackDescriptor descriptor) {
   auto promise = std::make_shared<std::promise<std::shared_ptr<SubscribedTrack>>>();
   auto future = promise->get_future();
   auto* s = state_.get();
@@ -852,7 +852,7 @@ std::future<std::shared_ptr<SubscribedTrack>> RoomBackend::subscribe(TrackDescri
   return future;
 }
 
-std::future<void> RoomBackend::leave() {
+std::future<void> RoomSession::leave() {
   auto promise = std::make_shared<std::promise<void>>();
   auto future = promise->get_future();
   auto* s = state_.get();
@@ -865,24 +865,24 @@ std::future<void> RoomBackend::leave() {
   return future;
 }
 
-std::future<void> RoomBackend::unpublish(const TrackId& id) {
+std::future<void> RoomSession::unpublish(const TrackId& id) {
   return state_->close_id(id, true);
 }
 
-std::future<void> RoomBackend::unsubscribe(const TrackId& id) {
+std::future<void> RoomSession::unsubscribe(const TrackId& id) {
   return state_->close_id(id, false);
 }
 
-std::future<void> RoomBackend::set_muted(const TrackId& id, bool muted, ControlOptions options) {
+std::future<void> RoomSession::set_muted(const TrackId& id, bool muted, ControlOptions options) {
   return state_->set_muted(id, muted, options);
 }
 
-std::future<void> RoomBackend::set_receive_demand(const TrackId& id, ReceiveDemand demand,
+std::future<void> RoomSession::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                                   ControlOptions options) {
   return state_->set_receive_demand(id, demand, options);
 }
 
-std::future<void> RoomBackend::update_local_participant(ParticipantUpdate update,
+std::future<void> RoomSession::update_local_participant(ParticipantUpdate update,
                                                         ControlOptions options) {
   auto promise = std::make_shared<std::promise<void>>();
   auto future = promise->get_future();
@@ -925,7 +925,7 @@ std::future<void> RoomBackend::update_local_participant(ParticipantUpdate update
                                                   ErrorCode::resource_exhausted));
            const auto id = ++s->next_control;
            s->controls.emplace(
-               id, detail::BackendState::PendingControl{promise, s->epoch, deadline, options.stop});
+               id, detail::RoomSessionState::PendingControl{promise, s->epoch, deadline, options.stop});
            try {
              s->transport->update_participant(
                  {id, s->epoch, std::move(update), deadline, options.stop});
@@ -941,7 +941,7 @@ std::future<void> RoomBackend::update_local_participant(ParticipantUpdate update
   return future;
 }
 
-std::future<void> RoomBackend::set_subscription_permissions(SubscriptionPermissions policy,
+std::future<void> RoomSession::set_subscription_permissions(SubscriptionPermissions policy,
                                                             ControlOptions options) {
   auto promise = std::make_shared<std::promise<void>>();
   auto future = promise->get_future();
@@ -969,7 +969,7 @@ std::future<void> RoomBackend::set_subscription_permissions(SubscriptionPermissi
                  detail::error("RTC control capacity exhausted", ErrorCode::resource_exhausted));
            const auto id = ++s->next_control;
            s->controls.emplace(
-               id, detail::BackendState::PendingControl{promise, s->epoch, deadline, options.stop});
+               id, detail::RoomSessionState::PendingControl{promise, s->epoch, deadline, options.stop});
            try {
              s->transport->set_subscription_permissions(
                  {id, s->epoch, std::move(policy), deadline, options.stop});
@@ -985,12 +985,12 @@ std::future<void> RoomBackend::set_subscription_permissions(SubscriptionPermissi
   return future;
 }
 
-RoomSnapshot RoomBackend::snapshot() const {
+RoomSnapshot RoomSession::snapshot() const {
   std::lock_guard lock(state_->mutex);
   return state_->status;
 }
 
-std::optional<RoomEvent> RoomBackend::next_event(std::chrono::milliseconds timeout,
+std::optional<RoomEvent> RoomSession::next_event(std::chrono::milliseconds timeout,
                                                  std::stop_token stop) {
   if (timeout < std::chrono::milliseconds::zero())
     throw std::invalid_argument("Negative RTC event timeout");

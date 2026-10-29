@@ -5,7 +5,7 @@
 ## 目标边界
 
 - `backends/rtc` 拥有房间、信令、发布订阅、传输恢复及轨道端点。公共契约不含 WebRTC、GraphEngine、像素、设备或播放器类型。
-- `media_nodes/rtc` 的发布 sink 和订阅 source 分离；一条逻辑轨道对应一个节点，多节点共享 RoomBackend。停止节点不能退会。
+- `media_nodes/rtc` 的发布 sink 和订阅 source 分离；一条逻辑轨道对应一个节点，多节点共享 RoomSession。停止节点不能退会。
 - `engines/rtc` 创建 backend、节点和 GraphEngine 图，负责媒体源、编码器、录制与播放的组合策略。backend 不创建媒体图。
 - 多流采用稳定本地 TrackId；服务端 SID/SSRC 是可替换绑定。编码层不是独立房间。每轨有界队列，会话有总字节预算，慢轨道不会阻塞其他轨道。
 - 传输恢复由 backend 独占执行；engine 恢复媒体源。旧 epoch 数据、旧操作确认不能恢复已删除轨道。
@@ -31,7 +31,7 @@
 
 ### 当前已实现的部分
 
-- 新 `rtc::RoomBackend` 控制器、PublishedTrack/订阅端点、中立编码帧与格式描述；逐轨队列和会话总队列字节预算。底层事件用 `(id, epoch, incarnation, direction)` 区分旧绑定、重连及同名新轨道。
+- 新 `rtc::RoomSession` 控制器、PublishedTrack/订阅端点、中立编码帧与格式描述；逐轨队列和会话总队列字节预算。底层事件用 `(id, epoch, incarnation, direction)` 区分旧绑定、重连及同名新轨道。
 - 新 `RtcPublishNode` 与 `RtcSubscribeNode`；`PublishPipeline`、`SubscribePipeline` 使用真实 GraphEngine 边。新内部 `RtcEngine` 创建一个 backend 并管理多张轨道图，异步等待发布/订阅确认后创建图，独立移除轨道。
 - 控制线程之外不调用原生 adapter；新图采用同步媒体边与 engine 轮询，无每帧无限异步投递。下游媒体节点应使用各自有界处理队列。
 - SignalSession、SignalSocket、连接恢复/区域/Token 策略已从 engine/support 移至 `backends/rtc`。SignalingOptions 与 SignalRecoveryState 不再包含 MediaSpec；原生信令拆为 `LiveKit::RTCSignaling`，通用 wire 编码工具与 ServerSDK 分开。
@@ -66,7 +66,7 @@
 - 服务端为本机已有 `out/uav-sfu-go/livekit-server.exe`，版本输出 1.13.10；未将其称为官方发行包。测试使用独立端口、临时配置及无窗口进程。快速再订阅出现的确切 VP8 8×8 清屏帧已对照本机服务端源码确认，测试不跳过其他载荷差异。
 
 - 独立配置 `out/rtc-native-contracts` 已成功构建完整 LiveKit adapter，关闭旧 SDK、GraphEngine、ServerSDK 和 Player。backend/native 两项测试通过（2.32 秒），完整 SFU 测试通过：`out/rtc-livekit-integration/20261028-213305-r3i8lt6i/result.json`。
-- RPC、StreamSession、DataTrackSession、加密和数据消息编码工具已从 `engines/rtc` 移入 `backends/rtc`，拆为无媒体依赖的 `LiveKit::RTCServices`。原有消费者已更新引用；这些服务尚待接入新 RoomBackend 的公开接口及原生数据通道。
+- RPC、StreamSession、DataTrackSession、加密和数据消息编码工具已从 `engines/rtc` 移入 `backends/rtc`，拆为无媒体依赖的 `LiveKit::RTCServices`。原有消费者已更新引用；这些服务尚待接入新 RoomSession 的公开接口及原生数据通道。
 - 新独立 `rtc_services` 测试覆盖 RPC、分块/压缩流、DataTrack 和加密，已通过（9.08 秒），无需旧 SDK/ServerSDK/GraphEngine。测试重用抽出的契约，避免维护重复实现。
 - 生命周期修正后的后端/Engine SFU 最终复验通过：`20261028-213202-slvuwdwb`、`20261028-213202-gahp7vbk`，均位于仓库 `out/rtc-livekit-integration`。
 
@@ -101,7 +101,7 @@
 
 ### 成员信息控制
 
-- 新 `RoomBackend::update_local_participant` 更新自己的名称、元数据和属性，要求支持 ACK 的信令协议（15+），等待真实 `RequestResponse`。属性空值删除键，名称/元数据空值保持原值，不模拟协议不存在的清空语义。
+- 新 `RoomSession::update_local_participant` 更新自己的名称、元数据和属性，要求支持 ACK 的信令协议（15+），等待真实 `RequestResponse`。属性空值删除键，名称/元数据空值保持原值，不模拟协议不存在的清空语义。
 - 后端限制单次更新 64 KiB 和 128 个待确认请求；校验 UTF-8、超时和属性数量。控制操作使用未复用的请求 ID 与 epoch，迟到 ACK、取消、超时、关闭及重连不会错误地完成下一次操作。已派发但没有确认的操作以 `outcome_unknown` 结束，不自动重放。
 - 共享 UTF-8 检查抽到 `support/utf8.hpp`，中立 backend 无需依赖 protobuf/JSON。新增 FakeTransport 测试覆盖确认前 future 不完成、拒绝权限、过期、取消、重连、迟到确认、容量和关闭。
 - 指定本机 SFU 的实际测试验证服务端 ACK、本地/远端名称与元数据更新、属性删除及无权限客户端被拒绝，并继续完成四轨收发回归。明文报告：仓库 `out/rtc-livekit-integration/20261028-234657-uak68s3e/result.json`。
@@ -110,7 +110,7 @@
 
 ### 逐轨静音控制（2026-10-29）
 
-- `TrackDescriptor::muted` 支持初始静音发布；`PublishedTrack`、`RoomBackend` 和 `RtcEngine` 提供异步 `set_muted`。当前门控由 `TrackSnapshot::muted` 报告。端点保持稳定轨道身份及静音意图，重入时将当前意图写入新发布请求，旧句柄不能控制同名新轨道。
+- `TrackDescriptor::muted` 支持初始静音发布；`PublishedTrack`、`RoomSession` 和 `RtcEngine` 提供异步 `set_muted`。当前门控由 `TrackSnapshot::muted` 报告。端点保持稳定轨道身份及静音意图，重入时将当前意图写入新发布请求，旧句柄不能控制同名新轨道。
 - 静音清空端点队列并使原生音视频发送队列中的旧代次失效，快速静音/恢复不能复活这些载荷。视频恢复要求关键帧；其他轨道保持独立。已进入传输协议栈的包和重传不能撤回。
 - 音视频 codec 节点在活动状态或 `SenderFeedback::media_generation` 变化时清理旧输入/编码积累。该代次保证两次 engine 轮询间发生的完整静音/恢复仍可观察；带本地采集时间的旧编码帧在端点也会被过滤。
 - 静音成功 future 表示本地原生门控加信令提交，不宣称收到服务端 ACK。MuteTrackRequest 没有独立请求 ID。后端接收服务端 mute 命令时也更新原生门控和端点；这一分支有 FakeTransport 覆盖。
@@ -124,7 +124,7 @@
 ### 轨道来源与订阅需求（2026-10-29）
 
 - `TrackDescriptor::source` 使用 `PublicationSource` 显式区分摄像头、麦克风、屏幕和系统音频；unknown 保持 unknown，不再按媒体类型猜测。`source_id` 仍是来源身份，不代替轨道角色。发布时校验媒体类型，发现事件和成员快照保留服务端来源；重入保存发布意图。
-- `SubscribedTrack::set_demand`、`RoomBackend::set_receive_demand`、`RtcEngine::set_receive_demand` 设置独立订阅的 SFU 转发需求，包含暂停、目标尺寸/帧率、质量及优先级。初始需求放在 descriptor，当前最后成功提交值位于 snapshot，重入使用后者。
+- `SubscribedTrack::set_demand`、`RoomSession::set_receive_demand`、`RtcEngine::set_receive_demand` 设置独立订阅的 SFU 转发需求，包含暂停、目标尺寸/帧率、质量及优先级。初始需求放在 descriptor，当前最后成功提交值位于 snapshot，重入使用后者。
 - 需求更新 future 等待原生适配器提交信令；协议没有服务器 ACK。失败/未确定结果不替换恢复意图；迟到完成事件、旧句柄与新同名订阅隔离。该接口不暂停本地解码器或清除已在途媒体，服务端按可用编码层选择，不承诺转码到目标尺寸。
 - 无旧 SDK 配置的 backend/pipelines 两项测试通过（1.89 秒），包括来源校验、恢复、需求提交前等待、失败/取消、音频参数校验、旧代次完成和旧句柄隔离。
 - 实际指定 SFU 的四轨明文回归通过，验证四种来源、初始暂停、运行中暂停、持续生产时另一视频继续转发和恢复收发。报告：仓库 `out/rtc-livekit-integration/20261029-003717-_cu6_m1z/result.json`。
@@ -132,7 +132,7 @@
 
 ### 订阅权限迁移（2026-10-29）
 
-- 新 `RoomOptions::subscription_permissions` 与 `RoomBackend::set_subscription_permissions` 支持初始及动态发布方允许列表。协议没有 ACK，future 成功表示本地提交；原生循环保留策略意图跨重入恢复，派发后的未知结果不会自动撤销该意图。
+- 新 `RoomOptions::subscription_permissions` 与 `RoomSession::set_subscription_permissions` 支持初始及动态发布方允许列表。协议没有 ACK，future 成功表示本地提交；原生循环保留策略意图跨重入恢复，派发后的未知结果不会自动撤销该意图。
 - 配置以 participant identity 和稳定的本地 publication ID 表达；在发布确认/移除时重新映射服务端 SID，初始限制在媒体发布前提交。未发布、已移除或未列出的 ID 不扩大授权。
 - `subscription_permission_changed` 提供服务器的许可变化通知，包含发布者 SID 和轨道 SID；后端丢弃旧 epoch。等待绑定的订阅仍有操作超时，已经绑定的句柄保留，由服务器停止/恢复转发。
 - 独立 backend/pipelines/session 三项自动化通过（2.18 秒）；覆盖无效策略、提交前等待、取消/中断、权限通知 epoch 隔离以及未来/移除/重入后的 SID 映射。
@@ -261,7 +261,7 @@ CLI 已迁移到新 engine，详细记录见下节；以下剩余项不再包含
 
 ### 配置式媒体引擎与共享采集（2026-10-29，后续调整）
 
-- 新增可选 `LiveKit::RTCMediaEngine` 和 `rtc/media_engine.hpp`。Session 提交 MediaPublishSpec / MediaSubscribeSpec，读取 MediaTrack 快照和拥有数据的像素/PCM 回调；采集、编解码、预览、播放、录制节点及反馈连线由媒体引擎创建。RtcEngine 保留纯编码和高级图接口，RoomBackend 保留房间、信令及传输职责。
+- 新增可选 `LiveKit::RTCMediaEngine` 和 `rtc/media_engine.hpp`。Session 提交 MediaPublishSpec / MediaSubscribeSpec，读取 MediaTrack 快照和拥有数据的像素/PCM 回调；采集、编解码、预览、播放、录制节点及反馈连线由媒体引擎创建。RtcEngine 保留纯编码和高级图接口，RoomSession 保留房间、信令及传输职责。
 - 会议示例、会议产品、CLI、投屏、远控、Studio 及音视频公共示例迁移到配置式入口；常规 Session 不再创建 GraphNode。PCM、codec 配置及快照移至中立 media_types.hpp。room_client 保留高级图示例。
 - SharedMediaInput 用独立 GraphEngine 源图扇出到每路有界队列，可跨房间共享原始采集。第一路激活时开始，最后一路结束时停止；各发布独立编码、反馈和关闭。外部应用源只借用读者，取消、失败与关闭释放借用，不永久关闭源。共享输入要求相同视频尺寸/音频声道数，不支持文件/URL、编码源或逐分支缩放。
 - 新增真实 VP8/Opus 编解码回环、多流独立关闭、回调停止屏障、取消/启动失败后源复用、跨房间共享视频、共享 44.1 kHz 双声道 PCM 和失败分支隔离测试。首次模拟传输测试出现超时，补齐模拟关键帧反馈后连续五次通过（9.89 秒）；未把首次失败算作成功。
@@ -271,3 +271,20 @@ CLI 已迁移到新 engine，详细记录见下节；以下剩余项不再包含
 - 最终产品二进制的 C++ SFU 原生远控集成通过，覆盖双会话、实际视频、Unicode 文本、正常停止、控制进程退出与业务失联释放：out/rtc-media-engine-remote/evidence.json。
 - 最终 Studio fixture 的 C++ SFU + 无头 Chromium 集成通过，覆盖节目视频/音频、嘉宾解码及合成、双主播 PK、权限撤销、业务控制和录制完成：livekit-app/out/live-studio/integration-1793239942574/result.json。runner 新增 STUDIO_NATIVE_FIXTURE 路径选择，避免误用旧构建。
 - 当前接口和所有权规则见 [媒体引擎 API](rtc-media-engine.md)。未新增 AEC/APM、NetEq/PLC、跨轨音画同步或多编码层能力。以上均为自动化检查，没有物理设备人工验收，也未操作用户桌面。代码未提交。
+
+### RoomSession 命名与后端目录整理（2026-10-29）
+
+- 公共房间类型及头文件改为 `RoomSession` / `livekit/rtc/room_session.hpp`，内部状态改为 `RoomSessionState`；工厂、引擎、节点、测试和文档同步更新，不保留旧类型别名。CMake 模块目标与开关保持不变。
+- 公共控制器、端点、预算和适配接口留在 `src/backends/rtc/`；LiveKit 信令、传输适配、RPC、流、数据消息、加密及重连策略移到 `rtc/livekit/`。PeerConnection、编码帧收发和传输运行时移到 `backends/webrtc/`；依赖 LiveKit 协议的帧加密适配器移回 `rtc/livekit/`。
+- 内部消息和加密头分别命名为 `data_message_wire.hpp` 与 `packet_encryption.hpp`，避免 MSVC 沿包含栈搜索时遮蔽公共 `livekit/data_messages.hpp` / `livekit/encryption.hpp`。
+- `rtc/mediasoup/` 仅记录扩展边界，没有实现或构建目标。现有 `RoomOptions` 与 `RoomServices` 语义保持不变，后续接入需要拆分后端连接配置并明确可选服务能力。
+- 自动化验证：`out/rtc-backend-contracts` 编译及 2 项 CTest 通过；`out/rtc-native-contracts` 编译及 6 项 CTest 通过；`out/rtc-media-contracts` 中已重新编译的 `rtc_pipelines`、`rtc_inputs`、`rtc_input_ffmpeg`、`rtc_audio_nodes`、`rtc_video_nodes`、`sdk`、`client_extensions` 共 7 项定向测试通过。40 个移动文件的非包含内容核对、内部路径解析及 diff 空白检查通过。
+- 本次完整媒体构建未通过：当前提交中的 `src/media_nodes/playout/audio_output.cpp`、`native_audio_output.cpp`、`audio_output_driver.hpp`、`audio_output_transport.hpp` 均为空文件，造成音频输出测试编译失败及媒体引擎消费者链接失败。这 4 个文件未在本次修改；完整构建日志位于聚合仓库 `out/room-session-media-build.log`。以上历史全量通过记录不代表本次全量验证结果。
+- 未执行实际设备人工验收或操作用户桌面；未提交代码。
+
+### 音频播放构建阻塞修复（2026-10-29）
+
+- 确认格式化提交 `188df04` 清空了上节列出的 4 个音频播放文件；从前一提交 `5dd88ef` 恢复共享 PCM 混音、GraphEngine 输出节点、设备驱动及 ADM 回调适配，补齐直接使用的标准库头文件，并使用 clang-format 20.1.8 格式化。
+- 在隔离夹具中复现 `**/out/**` 对 `playout/` 的错误匹配：格式化进程成功退出但输出为空。新增 `src/media_nodes/playout/.clang-format-ignore` 覆盖父级忽略规则；验证 4 个源码实际参与格式化且输出非空，生成代码和 WebRTC 上游源码仍被排除。仓库代码规范补充了非空输出校验与禁止直接重定向回输入文件的要求。
+- 完整 `out/rtc-media-contracts` Release 构建成功，包含 CLI、会议示例、音视频示例及音频图集成目标；全部 22 项 CTest 通过（28.45 秒），包含共享音频输出、媒体引擎、编解码及无窗口渲染。上节记录的完整媒体构建阻塞已解除。
+- 日志位于聚合仓库 `out/audio-playout-repair-full-build.log` 和 `out/audio-playout-repair-ctest.log`。格式检查及 diff 空白检查通过；结果属于自动化验证，未进行实际设备人工验收，未操作用户桌面，也未提交代码。

@@ -1,4 +1,4 @@
-#include "backends/rtc/encoded_audio_sender.hpp"
+#include "backends/webrtc/encoded_audio_sender.hpp"
 #include "audio/channel_send_frame_transformer_delegate.h"
 #include <stdexcept>
 #include "backends/rtc/queue_budget.hpp"

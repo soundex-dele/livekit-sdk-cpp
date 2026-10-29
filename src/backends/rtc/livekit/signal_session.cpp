@@ -1,6 +1,6 @@
-#include "backends/rtc/signal_session.hpp"
-#include "backends/rtc/reconnect_policy.hpp"
-#include "backends/rtc/token_request.hpp"
+#include "backends/rtc/livekit/signal_session.hpp"
+#include "backends/rtc/livekit/reconnect_policy.hpp"
+#include "backends/rtc/livekit/token_request.hpp"
 #include <algorithm>
 #include <random>
 

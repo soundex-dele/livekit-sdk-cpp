@@ -1,6 +1,6 @@
 # livekit-sdk-cpp
 
-C++20 LiveKit 收发 SDK。RoomBackend 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 为每条轨道创建独立流水线，多路音视频共享一个房间连接。
+C++20 LiveKit 收发 SDK。RoomSession 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 为每条轨道创建独立流水线，多路音视频共享一个房间连接。
 
 普通媒体会话使用可选的 RtcMediaEngine：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
 
@@ -25,13 +25,42 @@ C++20 LiveKit 收发 SDK。RoomBackend 负责入会、信令、已编码媒体�
 普通 Session 的入口、共享源示例及所有权规则见 [媒体引擎 API](docs/rtc-media-engine.md)。
 
     输入 → 编码节点 → 发布节点 ─┐
-    输入 → 编码节点 → 发布节点 ─┼─ 共享 RoomBackend / LiveKit 连接
+    输入 → 编码节点 → 发布节点 ─┼─ 共享 RoomSession / LiveKit 连接
     显示 ← 解码节点 ← 订阅节点 ─┤
     录制 ← 编码帧   ← 订阅节点 ─┘
 
 轨道以稳定本地 TrackId 路由，服务端 SID 是当前会话绑定。每轨拥有独立队列、预算、反馈和关闭屏障。停止一条轨道不退出房间。已有编码帧可直接写入 PublishedTrack；SubscribedTrack::read() 返回拥有数据的完整编码帧。
 
 RtcEngine 的控制和 poll() 由同一个主管线程调用；采集、编解码及设备输出放在各自有界工作线程。RoomServices 在同一 backend 上提供可靠/不可靠数据、RPC、文本/字节流、DataTrack、DTMF、转写及加密。UI 使用不可变快照。
+
+## RTC 后端目录
+
+公共房间控制器为 `rtc::RoomSession`，头文件为 `livekit/rtc/room_session.hpp`。
+`RtcEngine` 持有会话，`RoomSession` 通过内部 `RoomTransport` 接口使用具体适配器。
+`create_livekit_room()` 返回 `std::unique_ptr<RoomSession>`。
+
+```text
+src/backends/
+├── rtc/
+│   ├── room_session.cpp       # 房间生命周期、轨道、事件和操作队列
+│   ├── room_transport.hpp     # 内部适配接口
+│   ├── endpoint.cpp
+│   ├── queue_budget.hpp
+│   ├── livekit/               # LiveKit 信令、传输适配与专属服务
+│   └── mediasoup/             # 扩展说明，尚无实现
+├── webrtc/                    # PeerConnection、编码帧收发和传输运行时
+├── ffmpeg/
+└── platform/
+```
+
+`RoomBackend` / `room_backend.hpp` 已改名，不提供旧名称别名；调用方需更新类型和包含路径。
+`LiveKit::RTCBackend` 仍是公共 RTC 后端模块的链接目标，其他 CMake 目标和构建开关保持不变。
+LiveKit 数据消息、RPC、流、加密及重连策略实现在 `rtc/livekit/`；依赖 LiveKit
+参与者与协议类型的帧加密适配器也属于此目录。WebRTC 底层实现不包含 LiveKit 协议头文件。
+
+此次调整保留现有运行行为。`RoomOptions` 仍继承现有 `SignalingOptions`，
+`RoomServices` 的具体实现仍使用 LiveKit 数据协议；接入其他后端时需拆分专属连接配置
+并明确可选服务能力，目录拆分不代表已经支持 mediasoup。
 
 ## 构建
 

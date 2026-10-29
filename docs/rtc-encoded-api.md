@@ -102,7 +102,7 @@ room->join(options).get();
 
 ### 修改自己的成员信息
 
-使用 `RoomBackend::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `RoomOptions::signal_protocol = 15` 或适配器支持的更高版本；future 只在服务端 ACK 后成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `SDKError`，错误码为 `permission_denied`。
+使用 `RoomSession::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `RoomOptions::signal_protocol = 15` 或适配器支持的更高版本；future 只在服务端 ACK 后成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `SDKError`，错误码为 `permission_denied`。
 
 ```cpp
 livekit::sdk::rtc::ParticipantUpdate update;
@@ -144,7 +144,7 @@ room->update_local_participant(std::move(update)).get();
 
 ### 轨道静音和恢复
 
-发布前可设置 `TrackDescriptor::muted`，通过 `AddTrackRequest.muted` 以静音状态发布。发布后使用 `PublishedTrack::set_muted(bool)`、`RoomBackend::set_muted(id, bool)` 或 `RtcEngine::set_muted(id, bool)`；它们支持 `ControlOptions`。静音保留轨道、订阅和其他轨道的发送，不等同于取消发布。当前状态读取 `TrackSnapshot::muted`，描述符保留初始配置。
+发布前可设置 `TrackDescriptor::muted`，通过 `AddTrackRequest.muted` 以静音状态发布。发布后使用 `PublishedTrack::set_muted(bool)`、`RoomSession::set_muted(id, bool)` 或 `RtcEngine::set_muted(id, bool)`；它们支持 `ControlOptions`。静音保留轨道、订阅和其他轨道的发送，不等同于取消发布。当前状态读取 `TrackSnapshot::muted`，描述符保留初始配置。
 
 静音立即关闭端点输入准入并清空待发帧，随后在原生发送器中使已排队的旧代次失效。`try_write()` 在静音期间返回 `not_ready`。恢复后，视频必须从关键帧开始；本地静音意图会作为新发布配置随完整重入恢复。已越过原生发送检查或进入网络协议栈的包、重传及 SFU 填充帧无法撤回，不能用“接收端完全没有 RTP”判断静音是否生效。
 

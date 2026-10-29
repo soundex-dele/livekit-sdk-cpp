@@ -1,5 +1,5 @@
 #pragma once
-#include "backends/rtc/subscribed_quality.hpp"
+#include "backends/rtc/livekit/subscribed_quality.hpp"
 #include <stdexcept>
 
 inline void subscribed_quality_contract() {
