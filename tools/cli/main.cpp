@@ -1,4 +1,5 @@
-#include "livekit/livekit.hpp"
+#include "livekit/api.hpp"
+#include "session.hpp"
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -66,7 +67,7 @@ int run(int argc, char** argv) {
   auto mute = room->add_subcommand("mute-track", "Mute a published track")->fallthrough(); mute->add_option("room", room_name)->required(); mute->add_option("--identity", identity)->required(); mute->add_option("--sid", track_sid)->required();
   bool unmute = false; mute->add_flag("--unmute", unmute);
   mute->callback([&] { output(service().mute_published_track(room_name, identity, track_sid, !unmute)); });
-  lk::RoomOptions options; std::vector<std::string> publish; std::string ffmpeg = "ffmpeg", record;
+  livekit::cli::SessionOptions options; std::vector<std::string> publish; std::string ffmpeg = "ffmpeg", record;
   bool demo = false, tone = false, loop = false, no_auto_subscribe = false;
   int width = 640, height = 360, fps = 30;
   for (const auto& command : {"join", "publish", "subscribe"}) {
@@ -86,7 +87,7 @@ int run(int argc, char** argv) {
     join->add_flag("--exit-after-publish", options.exit_after_publish, "Exit when all media inputs finish");
     join->add_option("--width", width)->check(CLI::Range(2, 3840)); join->add_option("--height", height)->check(CLI::Range(2, 2160));
     join->add_option("--fps", fps)->check(CLI::Range(1, 60));
-    join->add_option("--codec", options.codec, "Video codec")->check(CLI::IsMember({"vp8", "vp9", "h264", "av1"}));
+    join->add_option("--codec", options.codec, "Video codec")->check(CLI::IsMember({"vp8", "h264", "h265"}));
     join->add_option("--duration", options.duration, "Exit after N connected seconds (0: until Ctrl+C)")->check(CLI::NonNegativeNumber);
     join->add_option("--connect-timeout", options.connect_timeout)->check(CLI::PositiveNumber);
     join->add_option("--stats-interval-ms", options.stats_interval_ms, "Native RTC media/transport stats (0 disables; otherwise 200..60000 ms)")->check(CLI::Range(0, 60000));
@@ -107,7 +108,6 @@ int run(int argc, char** argv) {
       if (demo) options.media.push_back({"", ffmpeg, true, true, false, width, height, fps});
       if (tone) options.media.push_back({"", ffmpeg, false, true, false, width, height, fps});
       std::signal(SIGINT, signal_handler); std::signal(SIGTERM, signal_handler);
-      lk::Room session;
       std::stop_source session_stop;
       std::jthread cancellation([&](std::stop_token stop) {
         while (!stop.stop_requested()) {
@@ -115,12 +115,10 @@ int run(int argc, char** argv) {
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
       });
-      session.run(options, print_event, session_stop.get_token());
-      if (session.disconnect_reason() != 0 && session.disconnect_reason() != 1)
-        throw std::runtime_error("Server disconnected participant, reason=" + std::to_string(session.disconnect_reason()));
+      livekit::cli::run_session(options,print_event,session_stop.get_token());
     });
   }
-  auto doctor = app.add_subcommand("doctor", "Create a real native WebRTC peer and generate SDP"); doctor->callback([] { lk::webrtc_smoke(print_event); });
+  auto doctor = app.add_subcommand("doctor", "Create a transport-only native WebRTC peer and generate SDP"); doctor->callback([] { livekit::cli::doctor(print_event); });
   try { app.parse(argc, argv); }
   catch (const CLI::ParseError& e) { return app.exit(e); }
   catch (const std::exception& e) { std::cerr << "error: " << e.what() << '\n'; return 1; }

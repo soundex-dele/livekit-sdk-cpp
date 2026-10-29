@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # DTMF 与结构化转写
 
 `LocalParticipant::publish_dtmf` 和 `publish_transcription` 使用官方 `DataPacket.sip_dtmf` / `DataPacket.transcription`，固定 schema 的 descriptor 合约检查覆盖字段编号和类型。它们不使用自定义 topic，也不涉及 SIP/Agent 管理 API。

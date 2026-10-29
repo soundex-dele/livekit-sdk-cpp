@@ -1,5 +1,5 @@
 #pragma once
-#include <livekit/livekit.hpp>
+#include <livekit/json.hpp>
 #include <array>
 #include <chrono>
 #include <map>

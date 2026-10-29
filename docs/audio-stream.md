@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # 逐轨 PCM 读取
 
 `RoomOptions.audio_frame_stream` 输出已订阅远端轨道解码后的 PCM，不经过应用混音或音频设备播放。各块带 `track_id`，使用 `read_for(track_sid, timeout)` 可单独消费指定轨道；`read(timeout)` 按队列顺序消费任一轨道。多个读取线程竞争数据，不进行广播。

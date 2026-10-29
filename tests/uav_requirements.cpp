@@ -40,67 +40,7 @@ static std::string token(const std::string& identity) {
 }
 
 struct VideoObservation { uint64_t frames = 0; int width = 0, height = 0; double y = 0; };
-struct Peer {
-  // The worker is joined before any state used by callbacks is destroyed.
-  std::mutex mutex;
-  std::map<std::string, VideoObservation> video;
-  std::map<std::string, bool> demand;
-  std::atomic<uint64_t> video_bytes{0}, video_stats_rows{0}, stats_samples{0};
-  std::shared_ptr<AudioFrameStream> audio = std::make_shared<AudioFrameStream>(AudioStreamOptions{500});
-  Room room;
-  std::ofstream events;
-  std::exception_ptr failure;
-  std::atomic<bool> finished{false};
-  std::jthread worker;
-  Peer(const std::string& url, const std::string& identity, const std::string& codec,
-       const std::filesystem::path& directory) : events(directory / (identity + ".jsonl")) {
-    RoomOptions o; o.url = url; o.token = token(identity); o.codec = codec;
-    o.disable_turn = true; o.media_transport = test_transport; o.stats_interval_ms = 1000; o.audio_frame_stream = audio;
-    o.video_frame_handler = [this](const VideoFrame& f) {
-      std::lock_guard lock(mutex);
-      auto& v = video[f.track_id]; ++v.frames; v.width = f.width; v.height = f.height;
-      uint64_t sum = 0;
-      for (int y = 0; y < f.height; ++y)
-        for (int x = 0; x < f.width; ++x) sum += f.y.at(y * f.stride_y + x);
-      v.y = double(sum) / (f.width * f.height);
-    };
-    worker = std::jthread([this, o](std::stop_token stop) {
-      try {
-        room.run(o, [this](const Json& event) {
-          // Never retain SDP or access tokens in this evidence file.
-          const auto kind = event.value("event", "");
-          if (kind == "rtc-stats" || kind == "media-graph-stats" || kind == "source-demand" || kind == "transport") events << event.dump() << '\n';
-          if (kind == "source-demand") { std::lock_guard lock(mutex); demand[event.at("sid").get<std::string>()] = event.at("enabled").get<bool>(); }
-          if (kind == "rtc-stats" && event.value("target", -1) == 0) {
-            uint64_t bytes = 0, rows = 0;
-            for (const auto& row : event.at("stats"))
-              if (row.value("type", "") == "outbound-rtp" && row.value("kind", "") == "video") { bytes += row.value("bytesSent", uint64_t(0)); ++rows; }
-            video_bytes.store(bytes); video_stats_rows.store(rows); ++stats_samples;
-          }
-        }, stop);
-      } catch (...) { failure = std::current_exception(); }
-      finished.store(true);
-    });
-    until([&] { return finished.load() || room.connection_state() == ConnectionState::connected; }, "join timeout: " + identity);
-    if (finished.load()) { worker.join(); if (failure) std::rethrow_exception(failure); }
-  }
-  ~Peer() { worker.request_stop(); room.request_stop(); if (worker.joinable()) worker.join(); }
-  VideoObservation observation(const std::string& sid) {
-    std::lock_guard lock(mutex); return video[sid];
-  }
-  bool has_demand(const std::string& sid, bool enabled) {
-    std::lock_guard lock(mutex); const auto it = demand.find(sid); return it != demand.end() && it->second == enabled;
-  }
-  TrackPublication remote(const std::string& who, const std::string& sid) {
-    std::optional<TrackPublication> publication;
-    until([&] {
-      auto p = room.participant_by_identity(who); if (!p) return false;
-      for (const auto& t : p->track_publications()) if (t.sid() == sid) publication = t;
-      return publication.has_value();
-    }, "missing remote publication: " + sid);
-    return *publication;
-  }
-};
+#include "rtc_uav_peer.hpp"
 
 struct VideoInput {
   std::shared_ptr<I420VideoSource> source = std::make_shared<I420VideoSource>(I420SourceOptions{320, 180});
@@ -115,9 +55,9 @@ struct VideoInput {
     std::cerr << Json{{"video_source_accepted", s.accepted}, {"consumed", s.consumed}, {"dropped", s.dropped}, {"accepting", s.accepting}}.dump() << '\n';
     source->close();
   }
-  TrackPublication publish(Peer& p, const std::string& name, bool dynacast = false) {
+  TestTrack publish(Peer& p, const std::string& name, bool dynacast = false) {
     MediaSpec m; m.width = 320; m.height = 180; m.video_source = source; m.dynacast = dynacast;
-    return done(p.room.local_participant().publish_track(m, {name, "device-01", TrackSource::camera}));
+    return done(p.publish(m, name, transport::PublicationSource::camera));
   }
 };
 struct AudioInput {
@@ -141,10 +81,9 @@ struct AudioInput {
       {"silence", s.silence_samples}, {"skipped", s.skipped_samples}, {"dropped", s.dropped_samples}}.dump() << '\n';
     source->close();
   }
-  TrackPublication publish(Peer& p, const std::string& name) {
+  TestTrack publish(Peer& p, const std::string& name) {
     MediaSpec m; m.video = false; m.audio_source = source;
-    TrackPublishOptions o; o.name = name; o.source = TrackSource::microphone; o.disable_red = true;
-    return done(p.room.local_participant().publish_track(m, o));
+    return done(p.publish(m, name, transport::PublicationSource::microphone));
   }
 };
 struct Tone {
@@ -182,58 +121,58 @@ static void video_case(const std::string& url, const std::string& codec,
   auto t1 = first.publish(drone, "device-01/camera-front/epoch-1");
   auto t2 = second.publish(drone, "device-01/camera-rear/epoch-1");
   for (auto* viewer : {&a, &b}) {
-    verify_video(*viewer, t1.sid(), 80); verify_video(*viewer, t2.sid(), 160);
+    verify_video(*viewer, t1.sid, 80); verify_video(*viewer, t2.sid, 160);
     for (const auto& t : {t1, t2}) {
-      auto remote = viewer->remote("drone", t.sid());
-      until([&] { return !remote.info().mime_type.empty(); }, "missing negotiated MIME");
-      auto mime = remote.info().mime_type;
+      auto remote = viewer->remote("drone", t.sid);
+      until([&] { return !remote.mime_type.empty(); }, "missing negotiated MIME");
+      auto mime = remote.mime_type;
       std::transform(mime.begin(), mime.end(), mime.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       require(mime == "video/" + codec,
-              "negotiated codec differs from requested codec: " + remote.info().mime_type);
+              "negotiated codec differs from requested codec: " + remote.mime_type);
     }
   }
-  require(drone.room.local_participant().track_publications().size() == 2, "source duplicated per viewer");
+  require(drone.publications.load() == 2, "source duplicated per viewer");
   passed(report, "two_sources_two_viewers", {{"sources", 2}, {"subscriptions", 4}, {"codec", codec}, {"decoded_luma", {80, 160}}});
-  auto selected = a.remote("drone", t1.sid()); done(selected.set_subscribed(false));
-  until([&] { return !selected.info().subscribed; }, "unsubscribe not acknowledged");
+  auto selected = a.remote("drone", t1.sid); done(a.set_subscribed(selected.id, false));
+  until([&] { return !a.subscribed(selected.id); }, "unsubscribe not acknowledged");
   std::this_thread::sleep_for(500ms);
-  auto stopped = a.observation(t1.sid()).frames;
-  auto other = a.observation(t2.sid()).frames, independent = b.observation(t1.sid()).frames;
-  verify_video(a, t2.sid(), 160, other); verify_video(b, t1.sid(), 80, independent);
+  auto stopped = a.observation(t1.sid).frames;
+  auto other = a.observation(t2.sid).frames, independent = b.observation(t1.sid).frames;
+  verify_video(a, t2.sid, 160, other); verify_video(b, t1.sid, 80, independent);
   std::this_thread::sleep_for(700ms);
-  require(a.observation(t1.sid()).frames == stopped, "unsubscribed video still decoding");
-  done(selected.set_subscribed(true)); verify_video(a, t1.sid(), 80, stopped);
+  require(a.observation(t1.sid).frames == stopped, "unsubscribed video still decoding");
+  done(a.set_subscribed(selected.id, true)); verify_video(a, t1.sid, 80, stopped);
   passed(report, "independent_unsubscribe_resubscribe");
   // A stopped camera must not stop the second camera or another viewer.
-  done(drone.room.local_participant().unpublish_track(t1.sid()));
+  done(drone.unpublish(t1.id));
   until([&] { return !first.source->stats().attached; }, "source not released");
-  other = b.observation(t2.sid()).frames; verify_video(b, t2.sid(), 160, other);
+  other = b.observation(t2.sid).frames; verify_video(b, t2.sid, 160, other);
   std::this_thread::sleep_for(500ms);
-  stopped = a.observation(t1.sid()).frames;
+  stopped = a.observation(t1.sid).frames;
   std::this_thread::sleep_for(700ms);
-  require(a.observation(t1.sid()).frames == stopped, "old source still decoding");
+  require(a.observation(t1.sid).frames == stopped, "old source still decoding");
   passed(report, "unpublish_isolation");
   auto renewed = first.publish(drone, "device-01/camera-front/epoch-2");
-  require(renewed.sid() != t1.sid(), "republish reused server SID");
-  verify_video(a, renewed.sid(), 80); verify_video(b, renewed.sid(), 80);
-  passed(report, "republish_new_sid", {{"old_sid", t1.sid()}, {"new_sid", renewed.sid()}});
+  require(renewed.sid != t1.sid, "republish reused server SID");
+  verify_video(a, renewed.sid, 80); verify_video(b, renewed.sid, 80);
+  passed(report, "republish_new_sid", {{"old_sid", t1.sid}, {"new_sid", renewed.sid}});
 }
 static void audio_case(const std::string& url, const std::string& codec,
                        const std::filesystem::path& out, Json& report, bool mixed = false) {
   Peer drone(url, "drone", codec, out), a(url, "viewer-a", codec, out), b(url, "viewer-b", codec, out);
   std::unique_ptr<VideoInput> front, rear;
-  std::optional<TrackPublication> front_track, rear_track;
+  std::optional<TestTrack> front_track, rear_track;
   if (mixed) {
     front = std::make_unique<VideoInput>(80); rear = std::make_unique<VideoInput>(160);
     front_track = front->publish(drone, "mixed-front"); rear_track = rear->publish(drone, "mixed-rear");
     for (auto* viewer : {&a, &b}) {
-      verify_video(*viewer, front_track->sid(), 80); verify_video(*viewer, rear_track->sid(), 160);
+      verify_video(*viewer, front_track->sid, 80); verify_video(*viewer, rear_track->sid, 160);
     }
     passed(report, "two_sources_two_viewers", {{"codec", codec}, {"sources", 2}, {"subscriptions", 4}});
   }
   std::array<Peer*, 3> peers{&drone, &a, &b};
   AudioInput s0(440), s1(660), s2(880);
-  std::array<TrackPublication, 3> tracks{s0.publish(drone, "drone-440"), s1.publish(a, "a-660"), s2.publish(b, "b-880")};
+  std::array<TestTrack, 3> tracks{s0.publish(drone, "drone-440"), s1.publish(a, "a-660"), s2.publish(b, "b-880")};
   const std::array<int, 3> frequencies{440, 660, 880};
   std::array<std::map<std::string, Tone>, 3> tones;
   const auto deadline = Clock::now() + 18s;
@@ -241,8 +180,8 @@ static void audio_case(const std::string& url, const std::string& codec,
   while (!complete) {
     require(Clock::now() < deadline, "six directed audio links did not decode");
     for (size_t i = 0; i < peers.size(); ++i) {
-      auto r = peers[i]->audio->read(10ms); if (r.status != AudioReadStatus::frame) continue;
-      require(r.frame->track_id != tracks[i].sid(), "self audio unexpectedly subscribed");
+      auto r = peers[i]->read_audio(10ms); if (!r.frame) continue;
+      require(r.frame->track_id != tracks[i].sid, "self audio unexpectedly subscribed");
       auto& tone = tones[i][r.frame->track_id];
       // Ignore initial decoder silence, then count all decoded samples.
       if (!tone.count && std::none_of(r.frame->samples.begin(), r.frame->samples.end(), [](auto s) { return std::abs(int(s)) > 500; })) continue;
@@ -250,37 +189,37 @@ static void audio_case(const std::string& url, const std::string& codec,
     }
     complete = true;
     for (size_t i = 0; i < 3; ++i) for (size_t j = 0; j < 3; ++j)
-      if (i != j && tones[i][tracks[j].sid()].count < 48000) complete = false;
+      if (i != j && tones[i][tracks[j].sid].count < 48000) complete = false;
   }
   Json links = Json::array();
   for (size_t i = 0; i < 3; ++i) for (size_t j = 0; j < 3; ++j) if (i != j) {
-    const auto& t = tones[i][tracks[j].sid()];
+    const auto& t = tones[i][tracks[j].sid];
     std::ofstream pcm(out / ("audio-" + std::to_string(j) + "-to-" + std::to_string(i) + ".s16le"), std::ios::binary);
     pcm.write(reinterpret_cast<const char*>(t.pcm.data()), t.pcm.size() * sizeof(int16_t));
     std::cerr << Json{{"from", j}, {"to", i}, {"expected_hz", frequencies[j]}, {"decoded_hz", t.hz()},
       {"samples", t.count}, {"peak", t.peak}, {"sample_rate", t.rate}, {"discontinuities", t.discontinuities}}.dump() << '\n';
   }
   for (size_t i = 0; i < 3; ++i) for (size_t j = 0; j < 3; ++j) if (i != j) {
-    const auto& t = tones[i][tracks[j].sid()];
+    const auto& t = tones[i][tracks[j].sid];
     require(t.peak > 500 && std::abs(t.hz() - frequencies[j]) < frequencies[j] * .06, "wrong audio source/frequency");
     links.push_back({{"from", j}, {"to", i}, {"expected_hz", frequencies[j]}, {"decoded_hz", t.hz()}, {"samples", t.count}});
   }
   passed(report, "three_way_audio_six_links", links);
   // Leaving voice must preserve this member's video and remaining audio links.
-  VideoInput camera(80); auto video = camera.publish(b, "viewer-b-video"); verify_video(a, video.sid(), 80);
-  done(b.room.local_participant().unpublish_track(tracks[2].sid()));
+  VideoInput camera(80); auto video = camera.publish(b, "viewer-b-video"); verify_video(a, video.sid, 80);
+  done(b.unpublish(tracks[2].id));
   until([&] { return !s2.source->stats().attached; }, "leaving voice did not release PCM source");
-  require(b.room.connection_state() == ConnectionState::connected, "voice leave disconnected member");
-  auto before = a.observation(video.sid()).frames; verify_video(a, video.sid(), 80, before);
+  require(b.connected.load(), "voice leave disconnected member");
+  auto before = a.observation(video.sid).frames; verify_video(a, video.sid, 80, before);
   std::this_thread::sleep_for(500ms);
-  while (a.audio->read(0ms).status == AudioReadStatus::frame) {}
-  while (drone.audio->read(0ms).status == AudioReadStatus::frame) {}
+  while (a.read_audio(0ms).frame) {}
+  while (drone.read_audio(0ms).frame) {}
   std::array<int, 2> remaining{}; const auto end = Clock::now() + 1s;
   while (Clock::now() < end) {
     for (size_t i = 0; i < 2; ++i) {
-      auto r = peers[i]->audio->read(10ms);
-      if (r.status == AudioReadStatus::frame) {
-        require(r.frame->track_id != tracks[2].sid(), "removed audio still decoding"); ++remaining[i];
+      auto r = peers[i]->read_audio(10ms);
+      if (bool(r.frame)) {
+        require(r.frame->track_id != tracks[2].sid, "removed audio still decoding"); ++remaining[i];
       }
     }
   }
@@ -288,8 +227,8 @@ static void audio_case(const std::string& url, const std::string& codec,
   passed(report, "voice_leave_preserves_video_and_other_voice", {{"remaining_audio_blocks", remaining}});
   if (mixed) {
     for (auto* viewer : {&a, &b}) {
-      verify_video(*viewer, front_track->sid(), 80, viewer->observation(front_track->sid()).frames);
-      verify_video(*viewer, rear_track->sid(), 160, viewer->observation(rear_track->sid()).frames);
+      verify_video(*viewer, front_track->sid, 80, viewer->observation(front_track->sid).frames);
+      verify_video(*viewer, rear_track->sid, 160, viewer->observation(rear_track->sid).frames);
     }
     passed(report, "video_continues_after_concurrent_audio_and_voice_leave");
   }
@@ -300,7 +239,7 @@ static void dynacast_case(const std::string& url, const std::string& codec,
   Peer drone(url, "drone", codec, out);
   VideoInput source(80); auto track = source.publish(drone, "demand-camera", true);
   auto stopped = [&] {
-    until([&] { return drone.has_demand(track.sid(), false) && !source.source->stats().accepting; }, "no aggregate OFF at publisher");
+    until([&] { return drone.has_demand(track.sid, false) && !source.source->stats().accepting; }, "no aggregate OFF at publisher");
     const auto samples = drone.stats_samples.load();
     until([&] { return drone.stats_samples.load() >= samples + 2; }, "missing publisher stats after OFF");
     const auto consumed = source.source->stats().consumed, bytes = drone.video_bytes.load();
@@ -314,50 +253,48 @@ static void dynacast_case(const std::string& url, const std::string& codec,
   };
   auto initial = stopped();
   Peer a(url, "viewer-a", codec, out);
-  verify_video(a, track.sid(), 80);
+  verify_video(a, track.sid, 80);
   Peer b(url, "viewer-b", codec, out);
-  verify_video(b, track.sid(), 80);
-  auto ta = a.remote("drone", track.sid()), tb = b.remote("drone", track.sid());
-  done(ta.set_subscribed(false));
+  verify_video(b, track.sid, 80);
+  auto ta = a.remote("drone", track.sid), tb = b.remote("drone", track.sid);
+  done(a.set_subscribed(ta.id, false));
   // Outlast the server's default 5 s pause debounce. Otherwise a broken
   // per-viewer OFF decision could be hidden by immediately removing viewer B.
   std::this_thread::sleep_for(6s);
-  verify_video(b, track.sid(), 80, b.observation(track.sid()).frames);
+  verify_video(b, track.sid, 80, b.observation(track.sid).frames);
   require(source.source->stats().accepting, "one viewer leaving stopped shared source");
-  done(tb.set_subscribed(false));
+  done(b.set_subscribed(tb.id, false));
   auto empty = stopped();
-  const auto before = a.observation(track.sid()).frames;
-  done(ta.set_subscribed(true)); verify_video(a, track.sid(), 80, before);
-  until([&] { return drone.has_demand(track.sid(), true); }, "missing aggregate ON");
-  require(drone.room.local_participant().track_publications().size() == 1, "dynacast republished source instead of resuming");
+  const auto before = a.observation(track.sid).frames;
+  done(a.set_subscribed(ta.id, true)); verify_video(a, track.sid, 80, before);
+  until([&] { return drone.has_demand(track.sid, true); }, "missing aggregate ON");
+  require(drone.publications.load() == 1, "dynacast republished source instead of resuming");
   passed(report, "aggregate_demand_stops_source_and_rtp", {{"initial_zero_viewers", initial}, {"last_viewer_left", empty},
-    {"resumed_same_sid", track.sid()}, {"single_remaining_viewer_seconds", 6}, {"codec", codec}});
+    {"resumed_same_sid", track.sid}, {"single_remaining_viewer_seconds", 6}, {"codec", codec}});
 }
 
 static void transport_reject_case(const std::string& url, Json& report) {
-  Room room;
-  RoomOptions o; o.url = url; o.token = token("drone");
-  o.media_transport = test_transport; o.connect_timeout = 4; o.reconnect.enabled = false;
+  auto room = transport::create_livekit_room();
+  transport::RoomOptions options; options.url = url; options.token = token("drone");
+  options.media_transport = test_transport; options.connect_timeout = 4; options.reconnect.enabled = false;
   require(test_transport != MediaTransport::automatic, "negative test requires strict transport");
-  bool joined = false, connected = false;
-  const auto start = Clock::now();
-  try {
-    room.run(o, [&](const Json& event) {
-      if (event.value("event", "") == "joined") joined = true;
-      if (event.value("event", "") == "transport" && event.value("state", -1) ==
-          static_cast<int>(webrtc::PeerConnectionInterface::PeerConnectionState::kConnected)) {
-        connected = true; room.request_stop();
-      }
-    });
-  } catch (const SDKError& e) {
-    require(joined && !connected && e.domain() == ErrorDomain::transport &&
-      (e.code() == ErrorCode::timeout || e.code() == ErrorCode::connection_lost),
-      "failure was not an expected media transport rejection");
-    passed(report, "opposite_protocol_rejected", {{"signaling_joined", joined}, {"error", e.what()},
+  bool joined = false, connected = false; const auto start = Clock::now();
+  auto joining = room->join(options);
+  while (joining.wait_for(0ms) != std::future_status::ready) {
+    if (auto event = room->next_event(10ms)) {
+      joined |= event->kind == transport::RoomEventKind::session_changed;
+      connected |= event->kind == transport::RoomEventKind::connected;
+    }
+  }
+  try { joining.get(); }
+  catch (const SDKError& error) {
+    require(joined && !connected && (error.code() == ErrorCode::timeout || error.code() == ErrorCode::connection_lost),
+            "failure was not an expected media transport rejection");
+    passed(report, "opposite_protocol_rejected", {{"signaling_joined", joined}, {"error", error.what()},
       {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count()}});
     return;
   }
-  throw std::runtime_error("opposite protocol unexpectedly connected or returned without transport failure");
+  throw std::runtime_error("opposite protocol unexpectedly connected");
 }
 
 int main(int argc, char** argv) {

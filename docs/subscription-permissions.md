@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # 订阅权限与接收质量
 
 发布者通过 `RoomOptions.subscription_permissions` 设置首次发布前的权限，通过 `LocalParticipant::set_subscription_permissions` 替换运行时策略。`all_participants=false` 且 participants 为空表示拒绝所有人。

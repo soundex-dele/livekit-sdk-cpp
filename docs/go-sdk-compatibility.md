@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # Go SDK 核心 API 适配
 
 参考：同级 `server-sdk-go/v2`，revision `743ab2d6b12ff24c2b2f9a0cc208c7afe8602571`，Go module 使用 `livekit/protocol v1.53.0`。C++ 实现参考其对象模型、权限、wire 字段和调用语义，媒体底层为 `../webrtc` M137，不运行 Go/Pion。

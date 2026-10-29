@@ -9,7 +9,7 @@
 
 namespace demo {
 View::View() { std::snprintf(url.data(), url.size(), "ws://127.0.0.1:7880"); std::snprintf(room.data(), room.size(), "demo"); }
-sdk::RoomOptions View::options() const {
+SessionOptions View::options() const {
   auto o = username_options(url.data(), room.data(), username.data()); o.audio_playout = audio;
   for (int i = 0; i < std::clamp(video_count, 0, max_test_videos); ++i) { sdk::MediaSpec m; m.demo = true; o.media.push_back(m); }
   if (tone) { sdk::MediaSpec m; m.demo = true; m.video = false; o.media.push_back(m); }
@@ -78,18 +78,18 @@ void View::draw_quality(const Snapshot& snapshot) {
         ImGui::TableHeadersRow();
         bool any = false;
         for (const auto& [sid, participant] : snapshot.participants) for (const auto& track : participant.tracks) {
-          if (track.kind != sdk::TrackKind::video && track.kind != sdk::TrackKind::audio) continue;
+          if (track.kind != rtc::PublicationKind::video && track.kind != rtc::PublicationKind::audio) continue;
           any = true;
           const bool local = sid == snapshot.local_sid;
-          const char* kind = track.kind == sdk::TrackKind::video ? "Video" : "Audio";
+          const char* kind = track.kind == rtc::PublicationKind::video ? "Video" : "Audio";
           ImGui::TableNextRow(); ImGui::TableNextColumn();
           ImGui::TextWrapped("%s / %s", (participant.name.empty() ? participant.identity : participant.name).c_str(),
                              track.name.empty() ? kind : track.name.c_str());
           ImGui::TextWrapped("%s %s | %s%s", local ? "Send" : "Receive", kind, track.sid.c_str(),
-                             track.muted ? " | Muted" : (!local && !track.subscribed ? " | Unsubscribed" : ""));
+                             track.muted ? " | Muted" : (!local && !snapshot.subscriptions.contains(track.sid) ? " | Unsubscribed" : ""));
           for (const auto rate : {QualitySnapshot::Bitrate::rtp, QualitySnapshot::Bitrate::retransmit, QualitySnapshot::Bitrate::fec}) {
             ImGui::TableNextColumn();
-            const auto value = local || track.subscribed ? snapshot.quality.bitrate(rate, track.sid, local) : std::nullopt;
+            const auto value = local || snapshot.subscriptions.contains(track.sid) ? snapshot.quality.bitrate(rate, track.sid, local) : std::nullopt;
             if (value) ImGui::Text("%.1f", *value); else ImGui::TextUnformatted("--");
           }
         }
@@ -110,17 +110,17 @@ void View::draw_quality(const Snapshot& snapshot) {
         ImGui::TableHeadersRow();
         bool any = false;
         for (const auto& [sid, participant] : snapshot.participants) for (const auto& track : participant.tracks) {
-          if (track.kind != sdk::TrackKind::video) continue;
+          if (track.kind != rtc::PublicationKind::video) continue;
           any = true;
           const bool local = sid == snapshot.local_sid;
           ImGui::TableNextRow(); ImGui::TableNextColumn();
           ImGui::TextWrapped("%s / %s", (participant.name.empty() ? participant.identity : participant.name).c_str(),
                              track.name.empty() ? "Video" : track.name.c_str());
           ImGui::TextWrapped("%s | %s%s", local ? "Local" : "Remote", track.sid.c_str(),
-                             track.muted ? " | Muted" : (!local && !track.subscribed ? " | Unsubscribed" : ""));
+                             track.muted ? " | Muted" : (!local && !snapshot.subscriptions.contains(track.sid) ? " | Unsubscribed" : ""));
           for (auto stage : {Stage::capture, Stage::encode, Stage::send, Stage::receive, Stage::decode}) {
             ImGui::TableNextColumn();
-            const bool applicable = local ? stage <= Stage::send : track.subscribed && stage >= Stage::receive;
+            const bool applicable = local ? stage <= Stage::send : snapshot.subscriptions.contains(track.sid) && stage >= Stage::receive;
             const auto value = applicable ? snapshot.quality.fps(stage, track.sid) : std::nullopt;
             if (value) ImGui::Text("%.1f", *value); else ImGui::TextUnformatted("--");
           }
@@ -245,7 +245,7 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
     ImGui::TextUnformatted("YOUR VIDEO STREAMS");
     const auto local = snapshot.participants.find(snapshot.local_sid);
     int video_count = 0;
-    if (local != snapshot.participants.end()) for (const auto& t : local->second.tracks) if (t.kind == sdk::TrackKind::video) ++video_count;
+    if (local != snapshot.participants.end()) for (const auto& t : local->second.tracks) if (t.kind == rtc::PublicationKind::video) ++video_count;
     ImGui::TextDisabled("%d / %d active", video_count, max_test_videos);
     ImGui::TextWrapped("Pause unused video: %s", snapshot.pause_unused_video ? "ON" : "OFF");
     const bool changing = snapshot.state != State::Connected || snapshot.changing_video || action != Action::None;
@@ -253,14 +253,14 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
     if (ImGui::Button("Add test video")) action = Action::AddVideo;
     ImGui::EndDisabled();
     if (local != snapshot.participants.end()) for (const auto& t : local->second.tracks) {
-      if (t.kind != sdk::TrackKind::video) continue;
+      if (t.kind != rtc::PublicationKind::video) continue;
       ImGui::PushID(t.sid.c_str());
       ImGui::TextWrapped("%s", t.name.c_str());
       ImGui::TextWrapped("%s", t.sid.c_str());
       if (snapshot.pause_unused_video) {
         const auto demand = snapshot.video_demand.find(t.sid);
-        ImGui::TextWrapped("%s", demand == snapshot.video_demand.end() ? "Demand: waiting for server" :
-            demand->second ? "Demand: ON (viewers active)" : "Demand: OFF (no viewers)");
+        ImGui::TextWrapped("%s", demand == snapshot.video_demand.end() ? "Video production: waiting for feedback" :
+            demand->second ? "Video production: enabled" : "Video production: paused");
       }
       ImGui::BeginDisabled(changing || action != Action::None);
       if (ImGui::SmallButton("Stop stream")) { remove_video_sid = t.sid; action = Action::RemoveVideo; }
@@ -275,7 +275,7 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
       ImGui::PushID(sid.c_str());
       ImGui::TextWrapped("%s%s", (p.name.empty() ? p.identity : p.name).c_str(), sid == snapshot.local_sid ? " (you)" : "");
       bool has_audio = false, muted = true;
-      for (const auto& t : p.tracks) if (t.kind == sdk::TrackKind::audio) { has_audio = true; muted &= t.muted; }
+      for (const auto& t : p.tracks) if (t.kind == rtc::PublicationKind::audio) { has_audio = true; muted &= t.muted; }
       ImGui::TextDisabled("%s", !has_audio ? "No audio" : muted ? "Audio muted" : "Audio available");
       ImGui::Separator(); ImGui::PopID();
     }

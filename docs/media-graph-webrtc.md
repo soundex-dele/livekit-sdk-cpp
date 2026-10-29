@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # WebRTC 媒体图节点
 
 实现日期：2026-10-26；采集、视频编码、解码、呈现、渲染和录制已拆成独立节点，使用 GraphEngine 创建实际事件图。发送侧由 media_graph 主动编码，接收侧通过 DecoderFactory 的 Decode 入口进入每轨完整接收图。设计背景见 [接入方案](../../docs/architecture/webrtc-media-graph-design.md)。本实现保留 Room/Participant/TrackPublication 与 Player API，默认 RTC runtime 使用图节点工厂。

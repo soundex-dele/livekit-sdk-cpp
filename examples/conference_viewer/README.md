@@ -1,8 +1,8 @@
 # ImGui 多人会议观看客户端
 
-本示例从应用拆分提交 `03dd337` 的父版本恢复，保留原有 ImGui 界面和公开 SDK 调用方式。2026-10-28 已在当前 SDK 上通过 Windows Release 编译、`demo_render` 无窗口渲染测试（含 2x 像素缩放）及隔离 LiveKit Server 集成测试，检查多路视频、动态发布/停止、会话复用、取消连接和音视频录制。实际设备播放与桌面交互仍需人工验收。
+本示例使用新 `RtcEngine`：Room/信令由共享 backend 管理，每路发布和订阅分别创建独立 GraphEngine，输入、实际编解码、录制、预览和设备输出位于上层。已移除旧 Room API 和 `LiveKit::SDK` 链接依赖。2026-10-29 在关闭旧 SDK 的配置下通过无窗口渲染及真实 Go SFU 多流、动态增删、会话复用、录制、UDP/TCP 聚合需求回归；实际设备与桌面交互仍需人工验收。
 
-基于 Dear ImGui v1.91.9b 和 SDL2 的桌面客户端，支持 Windows 和 macOS 构建，界面使用英文。客户端在可滚动的视频网格中展示多位参与者，并播放远端音频。同一参与者可同时发布多路生成的测试视频，以及独立的 440 Hz 测试音调，方便打开多个实例演示会议，无需摄像头、麦克风或 FFmpeg。当前未实现自动重连、屏幕共享和聊天。
+基于 Dear ImGui v1.91.9b 和 SDL2 的桌面客户端，支持 Windows 和 macOS 构建，界面使用英文。客户端在可滚动的视频网格中展示多位参与者，并播放远端音频。同一参与者可同时发布多路生成的测试视频，以及独立的 440 Hz 测试音调，方便打开多个实例演示会议，无需摄像头、麦克风或 FFmpeg。界面不提供屏幕共享和聊天；网络恢复使用 backend 的整会话重新加入机制，终止性错误仍需手动重新加入。
 
 ## 构建与运行
 
@@ -13,6 +13,12 @@ $env:VCPKG_ROOT = 'D:\vcpkg'
 cmake --preset windows-x64 -DLIVEKIT_BUILD_DEMO=ON
 cmake --build --preset windows-release --target livekit_conference_demo lk
 .\out\windows-x64\Release\livekit_conference_demo.exe
+```
+
+可关闭旧 SDK，仅构建新路径：
+
+```powershell
+cmake --preset windows-x64 -DLIVEKIT_BUILD_RTC_NATIVE=ON -DLIVEKIT_BUILD_RTC_GRAPH_NODES=ON -DLIVEKIT_BUILD_RTC_MEDIA=ON -DLIVEKIT_BUILD_SERVER_SDK=ON -DLIVEKIT_BUILD_DEMO=ON
 ```
 
 作为顶层工程构建时，`LIVEKIT_BUILD_DEMO` 默认开启；通过 `add_subdirectory` 引用时默认关闭。同时关闭此选项和 `LIVEKIT_ENABLE_VIDEO_PLAYOUT`，即可构建不依赖 SDL 的 SDK。只有启用 demo 时才会下载 ImGui，其版本和 SHA-256 校验值均已固定；依赖库沿用工程的静态 MSVC 运行库配置。保留了 Linux 代码路径，但尚未验证。
@@ -88,22 +94,22 @@ $env:LIVEKIT_API_SECRET = 'your-test-secret'
 
 ## 手动验证聚合订阅启停
 
-入会前新增 **Pause video when nobody watches**，默认不勾选。发布者勾选后，初始测试视频和随后 **Add test video** 添加的视频均启用 SDK dynacast；音频不受该开关控制。该选项只在入会前设置，改变时需离会后重新加入。仍通过现有 GraphEngine 控制视频源和编码器。
+入会前新增 **Pause video when nobody watches**，默认不勾选。发布者勾选后，初始测试视频和随后 **Add test video** 添加的视频均设置 `follow_subscriber_demand`；音频不受该开关控制。该选项只在入会前设置，改变时需离会后重新加入。backend 将服务器聚合需求传给对应轨道的输入和编码节点，独立控制其生产与发送。
 
 在同一 Go SFU 房间打开三个 demo，分别输入用户名 `drone`、`viewer-a`、`viewer-b`。发布者设置 1 路测试视频并勾选该选项，观看者 A/B 设置 0 路，不发布测试音调。按以下顺序操作：
 
 | 操作 | 发布者每路 Demand | 观看及统计预期 |
 | --- | --- | --- |
-| 只有发布者入会 | 初始化后 OFF | 允许初始化帧和约 5 秒 OFF 防抖；随后视频 Capture/Encode/Send 帧率和视频 RTP 码率应降为 0 |
-| A 入会 | ON | A 收到视频 |
-| B 入会 | ON | A/B 均收到视频，发布者仍只有原来的轨道 |
-| A 点击 Leave，等待至少 6 秒 | ON | B 持续解码，发布者不能停流 |
-| B 点击 Leave，等待 5–10 秒 | OFF | 视频源和编码器暂停，视频 RTP 停止增长；轨道 SID 保留 |
-| A 再次 Join room | ON | 原 SID 恢复视频，无需发布者重新添加 |
+| 只有发布者入会 | 初始化后 paused | 允许初始化帧和服务端需求通知的延迟；随后视频 Capture/Encode/Send 帧率和视频 RTP 码率应降为 0 |
+| A 入会 | enabled | A 收到视频 |
+| B 入会 | enabled | A/B 均收到视频，发布者仍只有原来的轨道 |
+| A 点击 Leave，等待至少 6 秒 | enabled | B 持续解码，发布者不能停流 |
+| B 点击 Leave，等待 5–10 秒 | paused | 视频源和编码器暂停，视频 RTP 停止增长；轨道 SID 保留 |
+| A 再次 Join room | enabled | 原 SID 恢复视频，无需发布者重新添加 |
 
-发布者左侧 **YOUR VIDEO STREAMS** 显示全局开关和每路 `Demand: waiting for server`、`Demand: ON (viewers active)` 或 `Demand: OFF (no viewers)`。它们来自服务端订阅需求消息，不是仅按房间人数猜测。Demand 是控制状态，是否真正停止需结合 **Quality dashboard** 的该轨道 Capture/Encode/Send 与发送视频 RTP 码率；`--` 代表缺数据，不能当成 0。整体连接还可能有 RTCP/ICE 流量，不要求整个 TCP 连接完全无字节。
+发布者左侧 **YOUR VIDEO STREAMS** 显示全局开关和每路 `Video production: waiting for feedback`、`enabled` 或 `paused`。状态来自对应发送端的有效反馈，同时受服务器订阅需求、发送拥塞和静音门控影响，不能据此推断观看人数。是否真正停止需结合 **Quality dashboard** 的该轨道 Capture/Encode/Send 与发送视频 RTP 码率；`--` 代表缺数据，不能当成 0。整体连接仍可能有 RTCP/ICE 流量。
 
-不要用发布者的 **Stop stream** 模拟观看者退出，该按钮会主动撤轨。可以在无人观看时点击 **Add test video**，检查新轨道也在初始化后 OFF；再让 A/B 加入验证新旧两路都恢复。此前打开的旧版本没有此开关，需关闭后重开更新后的 exe。
+不要用发布者的 **Stop stream** 模拟观看者退出，该按钮会主动撤轨。可以在无人观看时点击 **Add test video**，检查新轨道也在初始化后 paused；再让 A/B 加入验证新旧两路都恢复。此前打开的旧版本没有此开关，需关闭后重开更新后的 exe。
 
 无窗口集成目标 `livekit_demo_dynacast_integration` 使用同一个 demo Session，检查初始／动态添加两轨、0→1→2→1→0→1、真实解码、6 秒单观看者持续观看、源／编码节点计数及 RTP 字节暂停、同 SID 恢复和离会清理。不操作桌面。
 

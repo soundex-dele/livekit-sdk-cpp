@@ -64,17 +64,32 @@ EncodedSourceReader::EncodedSourceReader(std::shared_ptr<EncodedMediaSource> sou
 EncodedSourceReader::~EncodedSourceReader(){stop();auto& s=*source_->impl_;std::lock_guard lock(s.mutex);if(s.lease==lease_)s.bound=false;}
 void EncodedSourceReader::start(){auto& s=*source_->impl_;std::lock_guard lock(s.mutex);if(s.stats.closed)return;s.clear();s.last.reset();++s.stats.generation;s.stats.accepting=true;}
 void EncodedSourceReader::stop(){auto& s=*source_->impl_;std::lock_guard lock(s.mutex);s.stats.accepting=false;s.clear();s.ready.notify_all();}
-std::optional<EncodedMediaFrame> EncodedSourceReader::read(std::stop_token stop,bool wait){
-  auto& s=*source_->impl_;std::unique_lock lock(s.mutex);
-  if(wait)s.ready.wait(lock,stop,[&]{return !s.stats.accepting||!s.frames.empty();});
-  if(stop.stop_requested()||!s.stats.accepting||s.lease!=lease_)return {};s.expire();if(s.frames.empty())return {};
-  if(s.frames.front().captured>std::chrono::steady_clock::now()){
-    if(!wait)return {};const auto time=s.frames.front().captured;
-    s.ready.wait_until(lock,stop,time,[&]{return !s.stats.accepting;});if(stop.stop_requested()||!s.stats.accepting||s.frames.empty())return {};
+std::optional<EncodedMediaFrame> EncodedSourceReader::read(std::stop_token stop,bool wait) {
+  auto& s=*source_->impl_; std::unique_lock lock(s.mutex);
+  for (;;) {
+    if(wait)s.ready.wait(lock,stop,[&] { return !s.stats.accepting || !s.frames.empty(); });
+    if(stop.stop_requested() || !s.stats.accepting || s.lease!=lease_)return {};
+    s.expire();
+    if(s.frames.empty()) { if(!wait)return {}; continue; }
+    const auto due=s.frames.front().captured;
+    if(due>std::chrono::steady_clock::now()) {
+      if(!wait)return {};
+      const auto generation=s.stats.generation;
+      s.ready.wait_until(lock,stop,due,[&] {
+        return !s.stats.accepting || s.stats.generation!=generation || s.frames.empty() || s.frames.front().captured!=due;
+      });
+      if(stop.stop_requested())return {};
+      continue;
+    }
+    auto frame=std::move(s.frames.front());s.frames.pop_front();s.stats.queued_bytes-=frame.data.size();
+    s.stats.queued_frames=s.frames.size();++s.stats.consumed;return frame;
   }
-  auto frame=std::move(s.frames.front());s.frames.pop_front();s.stats.queued_bytes-=frame.data.size();s.stats.queued_frames=s.frames.size();++s.stats.consumed;return frame;
 }
-void EncodedSourceReader::feedback(bool keyframe,uint32_t bitrate){auto& s=*source_->impl_;std::lock_guard lock(s.mutex);if(s.lease!=lease_)return;if(keyframe&&s.options.codec!="opus")s.clear();if(bitrate)s.stats.target_bitrate=bitrate;}
+void EncodedSourceReader::feedback(bool keyframe,uint32_t bitrate) {
+  auto& s=*source_->impl_;std::lock_guard lock(s.mutex);if(s.lease!=lease_)return;
+  if(keyframe&&s.options.codec!="opus") { s.clear(); s.ready.notify_all(); }
+  if(bitrate)s.stats.target_bitrate=bitrate;
+}
 EncodedOutput::EncodedOutput(std::shared_ptr<EncodedMediaStream> stream):stream_(std::move(stream)){auto& s=*stream_->impl_;std::lock_guard lock(s.mutex);if(s.bound||s.stats.closed)throw std::logic_error("Encoded stream already bound or closed");s.bound=true;s.stats.accepting=true;++s.stats.generation;}
 EncodedOutput::~EncodedOutput(){close();}
 uint64_t EncodedOutput::generation()const{std::lock_guard lock(stream_->impl_->mutex);return stream_->impl_->stats.generation;}

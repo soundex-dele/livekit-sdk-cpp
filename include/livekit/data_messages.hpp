@@ -4,6 +4,11 @@
 #include <vector>
 
 namespace livekit::sdk {
+struct DataReceiveParams {
+  std::string sender_identity, topic;
+  bool reliable = false;
+};
+
 struct DtmfDigit { uint32_t code = 0; std::string digit; };
 struct TranscriptionSegment {
   std::string id, text;

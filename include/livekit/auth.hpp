@@ -1,18 +1,14 @@
 #pragma once
-#include <nlohmann/json.hpp>
+#include "livekit/json.hpp"
+#include "livekit/encoding.hpp"
 #include <string>
 #include <string_view>
 #include <map>
 
 namespace livekit::sdk {
-using Json = nlohmann::json;
 std::string make_token(const std::string& key, const std::string& secret,
                        const std::string& identity, const Json& grants,
                        int ttl_seconds = 3600, const std::string& name = "");
-std::string base64url(std::string_view value);
-std::string percent_encode(std::string_view value);
-std::string endpoint(std::string url, bool websocket);
-std::string base64_decode(std::string_view value);
 // Go auth.AccessToken equivalent. Grants are protobuf-JSON objects.
 class AccessToken {
  public:

@@ -1,6 +1,5 @@
 #pragma once
-#include "engines/rtc/data_messages.hpp"
-#include "engines/rtc/session.hpp"
+#include "backends/rtc/data_messages.hpp"
 inline void data_messages_contract() {
   using namespace livekit::sdk;
   auto check=[](bool ok){if(!ok)throw std::runtime_error("Data message contract failed");};
@@ -20,17 +19,4 @@ inline void data_messages_contract() {
     check(!detail::valid_utf8(invalid));
   value.segments[0].end_time=1; reject([&]{detail::encode_transcription(value);});
   value.segments[0].end_time=456; value.segments[0].text=std::string(12001,'x'); reject([&]{detail::encode_transcription(value);});
-  value.segments[0].text="partial";
-  auto state=std::make_shared<detail::RoomState>();
-  int updates=0,digits=0;
-  state->callbacks.on_transcription_received=[&](const Transcription& t,const DataReceiveParams& p){
-    check(p.sender_identity=="publisher" && t.participant_identity=="subject" && t.segments[0].final==(updates==1)); ++updates;
-  };
-  state->callbacks.on_dtmf_received=[&](const DtmfDigit& d,const DataReceiveParams& p){check(d.code==11 && p.sender_identity=="publisher");++digits;};
-  for(bool final:{false,true}) {
-    value.segments[0].final=final;
-    detail::process_event(state,{{"event","transcription"},{"value",detail::transcription_json(detail::encode_transcription(value).transcription())},{"identity","publisher"}});
-  }
-  detail::process_event(state,{{"event","dtmf"},{"code",11},{"digit","#"},{"identity","publisher"}});
-  check(updates==2 && digits==1);
 }

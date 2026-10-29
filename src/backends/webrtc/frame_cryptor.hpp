@@ -1,6 +1,6 @@
 #pragma once
 #include "livekit/encryption.hpp"
-#include "engines/rtc/encryption.hpp"
+#include "backends/rtc/encryption.hpp"
 #include "livekit.pb.h"
 #include "api/crypto/frame_encryptor_interface.h"
 #include "api/crypto/frame_decryptor_interface.h"

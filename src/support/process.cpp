@@ -5,7 +5,9 @@
 #include <stdexcept>
 #include <thread>
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <cerrno>
@@ -28,7 +30,7 @@ std::wstring windows_quote(const std::wstring& arg) {
   out.append(slashes * 2, L'\\'); out += L'"'; return out;
 }
 struct Process::Impl {
-  std::mutex mutex;
+  std::mutex mutex, wait_mutex;
   int code = -1; bool waited = false;
 #ifdef _WIN32
   HANDLE process = nullptr, pipe = nullptr;
@@ -123,33 +125,47 @@ bool Process::read_exact(void* dst, std::size_t size) {
   return true;
 }
 int Process::wait() {
-  std::lock_guard lock(impl_->mutex);
-  if (impl_->waited) return impl_->code;
-#ifdef _WIN32
-  if (WaitForSingleObject(impl_->process, 10000) == WAIT_TIMEOUT) {
-    TerminateProcess(impl_->process, 1); WaitForSingleObject(impl_->process, INFINITE);
-  }
-  DWORD code = 1; GetExitCodeProcess(impl_->process, &code); impl_->code = static_cast<int>(code);
-#else
-  int status = 0;
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  // Serialize reaping, but never keep terminate() out while the child is alive.
+  std::lock_guard waiter(impl_->wait_mutex);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  bool killed = false;
   for (;;) {
-    auto result = waitpid(impl_->process, &status, WNOHANG);
-    if (result == impl_->process) break;
-    if (result < 0 && errno != EINTR) throw std::runtime_error("waitpid failed");
-    if (std::chrono::steady_clock::now() >= deadline) {
-      ::kill(impl_->process, SIGKILL);
-      while (waitpid(impl_->process, &status, 0) < 0 && errno == EINTR) {};
-      break;
+    {
+      std::lock_guard lock(impl_->mutex);
+      if (impl_->waited) return impl_->code;
+#ifdef _WIN32
+      const auto result = WaitForSingleObject(impl_->process, 0);
+      if (result == WAIT_FAILED) throw std::runtime_error("Child process wait failed");
+      if (result == WAIT_OBJECT_0) {
+        DWORD code = 1;
+        if (!GetExitCodeProcess(impl_->process, &code)) throw std::runtime_error("Cannot read child exit code");
+        impl_->code = static_cast<int>(code); impl_->waited = true; return impl_->code;
+      }
+      if (!killed && std::chrono::steady_clock::now() >= deadline) {
+        if (!TerminateProcess(impl_->process, 1) && WaitForSingleObject(impl_->process, 0) != WAIT_OBJECT_0)
+          throw std::runtime_error("Cannot terminate timed-out child");
+        killed = true;
+      }
+#else
+      int status = 0;
+      const auto result = waitpid(impl_->process, &status, WNOHANG);
+      if (result == impl_->process) {
+        impl_->code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        impl_->waited = true; return impl_->code;
+      }
+      if (result < 0 && errno != EINTR) throw std::runtime_error("waitpid failed");
+      if (!killed && std::chrono::steady_clock::now() >= deadline) {
+        if (::kill(impl_->process, SIGKILL) && errno != ESRCH) throw std::runtime_error("Cannot terminate timed-out child");
+        killed = true;
+      }
+#endif
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  impl_->code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
-#endif
-  impl_->waited = true; return impl_->code;
 }
 void Process::terminate() {
-  // wait() is called only after EOF or terminate; no other wait may hold this lock while reading.
+  // wait() only holds this mutex while polling/reaping, so an EOF child can
+  // still be stopped immediately instead of waiting for its normal exit.
   std::lock_guard lock(impl_->mutex);
   if (impl_->waited) return;
 #ifdef _WIN32

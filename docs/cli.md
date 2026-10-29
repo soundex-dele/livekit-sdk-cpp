@@ -1,17 +1,15 @@
-# SDK-based LiveKit CLI
+# GraphEngine-based LiveKit CLI
+
+CLI 已使用新的 `rtc::RoomBackend` 和 `rtc::engine::RtcEngine`，不再包含或链接旧 `Room` API。每条发布独立创建 `MediaInputNode → CodecNode → RtcPublishNode`，每条订阅创建 `RtcSubscribeNode → CodecNode → 输出/录制节点`，所有图共享同一个房间后端。房间管理和 Token 命令仍使用 ServerSDK。
 
 `room join/publish/subscribe --stats-interval-ms 500` 可输出 `rtc-stats` 事件。
 默认关闭；启用时范围为 200–60000 ms。`target=0` 是发布连接，`target=1` 是
 订阅连接；`stats` 保留 libwebrtc 原生 W3C 字段，包括帧数、编码器质量限制
 原因、码率、RTT、丢包、NACK/PLI 和候选连接对统计。未定义字段不会伪造为零。
 不输出 candidate 地址或 certificate 记录；采集为异步，每条连接最多一个
-未完成请求。事件仍在 SDK 会话线程串行交付，应用可通过
-`RoomOptions.stats_interval_ms` 和 `Room::run` 的 EventHandler 使用同一能力。
+未完成请求。统计通过 `rtc::RoomOptions::stats_interval` 启用，再用 `RoomBackend::next_event()` 读取 `RoomEventKind::statistics`。报告带连接 epoch；每个目标最多保留一条待读报告，控制事件优先。CLI 在自身控制线程串行输出 JSON。
 
-Windows 会话显式使用 libwebrtc 的 `CreateTaskQueueWinFactory`。构建直接编译
-原生 `task_queue_win.cc`，无需修改 WebRTC 源码；它避免本地清单默认 stdlib
-计时队列导致的探测时序问题。带宽估计、探测参数和 RTP/RTCP 算法仍由
-libwebrtc 决定。
+原生 W3C 指标描述传输 PeerConnection；实际编解码位于上层，使用 `media-graph-stats` 的节点计数查看其准入、完成、丢弃和错误。该事件的 `edges` 来自运行中 GraphEngine 节点的真实连接。带宽估计、探测参数和 RTP/RTCP 算法由 libwebrtc 决定，设备不放进传输 PeerConnection。
 
 原生 C++20 LiveKit CLI，当前迁移范围是**房间管理、音视频流发布与订阅**。
 直接编译链接同级目录的 WebRTC（本机为 `D:\workspace\webrtc`），不调用 Go CLI，也不通过 Rust FFI 转接媒体。
@@ -38,6 +36,12 @@ ctest --preset windows-release
 
 输出：`out/windows-x64/Release/lk.exe`。首次构建会下载固定版本的 IXWebSocket、CLI11、nlohmann/json、Protobuf 和 SDL2，并完整构建 WebRTC。
 使用静态 MSVC CRT；Debug/Release 不混用。`WEBRTC_SOURCE_DIR` 可用 CMake 参数覆盖。
+
+独立构建 CLI：配置 `LIVEKIT_BUILD_RTC_NATIVE=ON`、`LIVEKIT_BUILD_RTC_GRAPH_NODES=ON`、`LIVEKIT_BUILD_RTC_MEDIA=ON`、`LIVEKIT_BUILD_SERVER_SDK=ON`、`LIVEKIT_BUILD_CLI=ON`，随后构建 `lk`。基础视频 codec 是 VP8；`--codec h264/h265` 需要相应的媒体 codec 构建，FFmpeg 扩展由 `LIVEKIT_RTC_FFMPEG_CODECS` 启用。
+
+`--microphone` 使用独立 `MicrophoneSession`；`--audio-playout` 让音频订阅共享 `AudioOutputSession`，关闭一轨不会停止其他轨。`--video-playout` 在主线程操作 SDL，默认不打开设备或窗口。当前上层节点尚未实现共享 AEC/APM、NetEq/PLC 或发送端跨轨同步，不能把原生传输统计视为这些能力已存在。
+
+`--record` 使用独立有界录制 worker 写每轨 WAV/Y4M，退出时等待排队写入完成并更新 WAV 头；同一路径已存在时报告错误，不覆盖。epoch 或格式变化分段。Y4M 仍是名义 30 fps，WAV/Y4M 不保留 RTP 时间和音画同步关系。
 
 Linux 使用同一套业务、信令和媒体代码，子进程层采用 `posix_spawnp`，提供 `linux-x64`/`linux-release` preset。
 需为本地 WebRTC 配好 OpenSSL、libvpx、dav1d 的 CMake 包（含 `unofficial-libvpx`），以及 NASM、Perl、Ninja。

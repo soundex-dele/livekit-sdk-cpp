@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # 能力查询
 
 `sdk_capabilities()` 不初始化 WebRTC、不打开设备、不发网络请求。它报告当前公开 RTC API 的实现状态及可选择的信令版本。`supported` 表示 SDK 已实现该功能，不能代替当前服务端、远端参与者、设备或平台的验收结论。

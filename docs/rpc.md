@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # 客户端 RPC
 
 `Room::register_rpc_method` / `unregister_rpc_method` 注册处理器；`LocalParticipant::perform_rpc` 返回 `future<string>`。使用官方可靠 DataPacket request/ack/response，版本 1，可与 Go SDK 的 RegisterRpcMethod / PerformRpc 互通。

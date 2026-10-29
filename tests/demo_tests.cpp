@@ -1,6 +1,7 @@
 #define SDL_MAIN_HANDLED
 #include "ui.hpp"
 #include "connection.hpp"
+#include <livekit/auth.hpp>
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
@@ -65,6 +66,22 @@ static void test_repair_rates() {
         "Malformed FEC counter does not hide valid retransmit rate");
   check(q.peers[0].streams.at("rtp").retransmit_kbps == 80, "Connections retain independent repair baselines");
 }
+static void test_transport_track_mappings() {
+  demo::QualitySnapshot q;
+  auto publication = quality_report(0, 1000000, 1000);
+  publication["localTracks"] = {{"video-1", "TR_local"}};
+  q.update(publication);
+  auto subscription = quality_report(1, 1000000, 1000);
+  subscription["localTracks"] = demo::sdk::Json::object();
+  q.update(subscription);
+  check(q.local_tracks.at("video-1") == "TR_local", "Subscriber statistics erased publisher mapping");
+  publication["timestampUs"] = 500000; publication["localTracks"] = {{"video-1", "TR_stale"}};
+  q.update(publication);
+  check(q.local_tracks.at("video-1") == "TR_local", "Old report replaced current publication mapping");
+  publication["timestampUs"] = 2000000; publication["localTracks"] = demo::sdk::Json::object();
+  q.update(publication);
+  check(q.local_tracks.empty(), "Removed publication retained stats mapping");
+}
 static demo::QualitySnapshot test_quality() {
   demo::QualitySnapshot q;
   q.update(quality_report(1, 1000000, 1000));
@@ -83,14 +100,14 @@ static demo::QualitySnapshot test_quality() {
   auto graph = [](double time, double count, unsigned generation = 1) {
     using demo::sdk::Json;
     return Json{{"event", "media-graph-stats"}, {"timestampUs", time}, {"nodes", Json::array({
-      {{"id", 1u}, {"name", "source"}, {"trackId", "TR_local1"}, {"kind", "VideoSourceNode"}, {"generation", generation}, {"outputs", count * 30}},
+      {{"id", 1u}, {"name", "source"}, {"trackId", "TR_local1"}, {"kind", "MediaInputNode"}, {"generation", generation}, {"outputs", count * 30}},
       {{"id", 2u}, {"name", "encoder"}, {"trackId", "TR_local1"}, {"kind", "VideoEncoderNode"}, {"generation", generation}, {"outputs", count * 29}},
       {{"id", 3u}, {"name", "decoder"}, {"trackId", "TR_two"}, {"kind", "VideoDecoderNode"}, {"generation", generation}, {"outputs", count * 26}},
       {{"id", 4u}, {"name", "audio"}, {"kind", "AudioSourceNode"}, {"generation", generation}, {"outputs", count * 100}},
-      {{"id", 5u}, {"name", "encoded-file"}, {"kind", "VideoSourceNode"}, {"generation", generation}, {"outputs", count * 60}},
-      {{"id", 7u}, {"name", "receive"}, {"trackId", "TR_two"}, {"kind", "RtcEncodedSourceNode"}, {"generation", generation}, {"outputs", count * 27}}
-    })}, {"localTracks", {{"video-1", "TR_local1"}}}, {"edges", Json::array({{{"from", "source"}, {"dataType", "RawVideoFrame"}},
-                               {{"from", "encoded-file"}, {"dataType", "EncodedVideoFrame"}}})}};
+      {{"id", 5u}, {"name", "encoded-file"}, {"kind", "MediaInputNode"}, {"generation", generation}, {"outputs", count * 60}},
+      {{"id", 7u}, {"name", "receive"}, {"trackId", "TR_two"}, {"kind", "RtcSubscribeNode"}, {"generation", generation}, {"outputs", count * 27}}
+    })}, {"localTracks", {{"video-1", "TR_local1"}}}, {"edges", Json::array({{{"from", "source"}, {"dataType", "VideoFrameEvent"}},
+                               {{"from", "encoded-file"}, {"dataType", "EncodedFrameEvent"}}})}};
   };
   q.update(graph(1000000, 1));
   check(!q.fps(Stage::capture) && !q.fps(Stage::encode) && !q.fps(Stage::decode), "Graph requires baseline");
@@ -119,7 +136,7 @@ static demo::QualitySnapshot test_quality() {
   auto multi = graph(3000000, 3);
   auto second_source = multi["nodes"][0]; second_source["id"] = 6u; second_source["name"] = "source2"; second_source["trackId"] = "TR_local2";
   multi["nodes"].push_back(second_source);
-  multi["edges"].push_back({{"from", "source2"}, {"dataType", "RawVideoFrame"}});
+  multi["edges"].push_back({{"from", "source2"}, {"dataType", "VideoFrameEvent"}});
   auto multi_quality = fixture; multi_quality.update(multi);
   check(!multi_quality.fps(Stage::capture), "Partial multi-stream baseline must not undercount");
   multi["timestampUs"] = 4000000;
@@ -218,6 +235,7 @@ static std::shared_ptr<demo::sdk::VideoFrame> pixels(const std::string& id, int 
 int main(int argc, char** argv) {
   try {
     test_repair_rates();
+    test_transport_track_mappings();
     const auto quality_fixture = test_quality();
     test_track_bitrates(quality_fixture);
     SDL_SetMainReady(); check(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL init");
@@ -238,11 +256,12 @@ int main(int argc, char** argv) {
       auto invalid = *frame; invalid.v.clear(); bool rejected = false;
       try { texture.upload(renderer, invalid); } catch (...) { rejected = true; } check(rejected, "invalid buffer validation");
       demo::Snapshot state; state.state = demo::State::Connected; state.finished = false; state.room = "demo-room";
-      demo::sdk::ParticipantInfo local; local.sid = "PA_me"; local.identity = "viewer";
-      demo::sdk::ParticipantInfo alice; alice.sid = "PA_alice"; alice.identity = "alice"; alice.name = "Alice";
-      demo::sdk::TrackInfo t; t.sid = "TR_one"; t.kind = demo::sdk::TrackKind::video; t.subscribed = true; alice.tracks.push_back(t);
-      demo::sdk::ParticipantInfo bob = alice; bob.sid = "PA_bob"; bob.identity = "bob"; bob.name = "Bob"; bob.tracks[0].sid = "TR_two";
-      demo::sdk::ParticipantInfo guest; guest.sid = "PA_guest"; guest.identity = "guest";
+      demo::Participant local; local.sid = "PA_me"; local.identity = "viewer";
+      demo::Participant alice; alice.sid = "PA_alice"; alice.identity = "alice"; alice.name = "Alice";
+      demo::rtc::PublicationInfo t; t.sid = "TR_one"; t.kind = demo::rtc::PublicationKind::video; alice.tracks.push_back(t);
+      demo::Participant bob = alice; bob.sid = "PA_bob"; bob.identity = "bob"; bob.name = "Bob"; bob.tracks[0].sid = "TR_two";
+      demo::Participant guest; guest.sid = "PA_guest"; guest.identity = "guest";
+      state.subscriptions = {"TR_one", "TR_two", "TR_three"};
       state.frames[t.sid] = frame; // pixels may precede participant metadata
       state.update(local, {alice, bob, guest});
       check(demo::tiles(state).size() == 3, "roster tile count");
@@ -254,9 +273,9 @@ int main(int argc, char** argv) {
       std::snprintf(view.username.data(), view.username.size(), " alice ");
       view.video_count = 3; view.tone = true;
       auto publishing = view.options();
-      const auto first_dot = publishing.token.find('.'), last_dot = publishing.token.rfind('.');
+      const auto first_dot = publishing.connection.token.find('.'), last_dot = publishing.connection.token.rfind('.');
       const auto claims = demo::sdk::Json::parse(demo::sdk::base64_decode(
-        publishing.token.substr(first_dot + 1, last_dot - first_dot - 1)));
+        publishing.connection.token.substr(first_dot + 1, last_dot - first_dot - 1)));
       check(claims.at("sub") == "alice" && claims.at("name") == "alice" &&
         claims.at("video").at("room") == "demo" && claims.at("video").at("roomJoin") == true &&
         claims.at("video").at("canPublish") == true && claims.at("video").at("canSubscribe") == true,

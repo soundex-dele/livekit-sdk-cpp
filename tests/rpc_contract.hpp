@@ -1,5 +1,5 @@
 #pragma once
-#include "engines/rtc/rpc_session.hpp"
+#include "backends/rtc/rpc_session.hpp"
 #include "livekit/error.hpp"
 #include "support/compression.hpp"
 #include <atomic>

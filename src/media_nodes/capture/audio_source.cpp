@@ -42,8 +42,12 @@ PcmAudioSource::PcmAudioSource(PcmSourceOptions options) {
 PcmAudioSource::~PcmAudioSource() = default;
 PcmSourceOptions PcmAudioSource::options() const { return impl_->options; }
 AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame) {
+  return write(frame,{});
+}
+AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame,std::optional<uint64_t> expected_generation) {
   auto& s = *impl_; std::lock_guard lock(s.mutex);
   if (s.stats.closed) return AudioWriteStatus::closed;
+  if(expected_generation && *expected_generation!=s.stats.generation) { ++s.stats.rejected_writes; return AudioWriteStatus::backpressure; }
   const bool floating = s.options.format == AudioSampleFormat::float32;
   const auto input_count = floating ? frame.float_samples.size() : frame.samples.size();
   auto count=input_count;

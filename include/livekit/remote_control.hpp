@@ -1,5 +1,6 @@
 #pragma once
-#include <livekit/participant.hpp>
+#include <livekit/data_messages.hpp>
+#include <livekit/json.hpp>
 #include <chrono>
 #include <memory>
 #include <string>

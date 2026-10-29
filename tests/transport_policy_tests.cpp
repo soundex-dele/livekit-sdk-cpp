@@ -1,5 +1,5 @@
 #include "backends/webrtc/transport_policy.hpp"
-#include "engines/rtc/client_configuration.hpp"
+#include "backends/rtc/client_configuration.hpp"
 #include <iostream>
 
 using namespace livekit::sdk;
@@ -28,12 +28,6 @@ int main() {
       bool rejected = false;
       try { detail::relay_required(false, policy != MediaTransport::automatic, forced); }
       catch (const SDKError& e) { rejected = e.code() == ErrorCode::unsupported; }
-      check(rejected);
-      RoomOptions o; o.url = "ws://127.0.0.1:1"; o.token = "unused";
-      o.media_transport = policy; o.relay_only = true;
-      rejected = false;
-      try { Room room; room.run(o); }
-      catch (const std::invalid_argument& e) { rejected = std::string(e.what()).find("media_transport") != std::string::npos; }
       check(rejected);
     }
     detail::apply_media_transport(automatic, MediaTransport::automatic, true);

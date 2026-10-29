@@ -55,6 +55,11 @@ void QualitySnapshot::update(const Json& event) {
   auto& previous = peers[static_cast<size_t>(*target)];
   // Ignore reordered/cached reports; they cannot form a rate interval.
   if (*timestamp <= previous.timestamp_us) return;
+  if (*target == 0) if (auto tracks = event.find("localTracks"); tracks != event.end() && tracks->is_object()) {
+    local_tracks.clear();
+    for (auto it = tracks->begin(); it != tracks->end(); ++it)
+      if (it.value().is_string()) local_tracks[it.key()] = it.value().get<std::string>();
+  }
   PeerQuality next;
   next.timestamp_us = *timestamp;
   next.updated = std::chrono::steady_clock::now();
@@ -117,7 +122,7 @@ void QualitySnapshot::update_graph(const Json& event) {
       rows == event.end() || !rows->is_array() || edges == event.end() || !edges->is_array()) return;
   std::set<std::string> raw_sources;
   for (const auto& edge : *edges)
-    if (text(edge, "dataType").find("RawVideoFrame") != std::string::npos) raw_sources.insert(text(edge, "from"));
+    if (text(edge, "dataType").find("VideoFrameEvent") != std::string::npos) raw_sources.insert(text(edge, "from"));
   std::map<uint64_t, NodeQuality> next;
   const double seconds = (*timestamp - graph_sample.timestamp_us) / 1e6;
   for (const auto& row : *rows) {
@@ -128,8 +133,8 @@ void QualitySnapshot::update_graph(const Json& event) {
     Stage stage;
     if (kind == "VideoEncoderNode") stage = Stage::encode;
     else if (kind == "VideoDecoderNode") stage = Stage::decode;
-    else if (kind == "RtcEncodedSourceNode") stage = Stage::receive;
-    else if ((kind == "VideoSourceNode" || kind == "CameraCaptureNode" || kind == "ScreenCaptureNode") &&
+    else if (kind == "RtcSubscribeNode") stage = Stage::receive;
+    else if (kind == "MediaInputNode" &&
              raw_sources.contains(name)) stage = Stage::capture;
     else continue;
     const auto key = id->get<uint64_t>();
@@ -141,10 +146,11 @@ void QualitySnapshot::update_graph(const Json& event) {
     next.emplace(key, std::move(node));
   }
   nodes = std::move(next);
-  local_tracks.clear();
-  if (auto tracks = event.find("localTracks"); tracks != event.end() && tracks->is_object())
+  if (auto tracks = event.find("localTracks"); tracks != event.end() && tracks->is_object()) {
+    local_tracks.clear();
     for (auto it = tracks->begin(); it != tracks->end(); ++it)
       if (it.value().is_string()) local_tracks[it.key()] = it.value().get<std::string>();
+  }
   graph_sample.timestamp_us = *timestamp;
   graph_sample.updated = std::chrono::steady_clock::now();
 }

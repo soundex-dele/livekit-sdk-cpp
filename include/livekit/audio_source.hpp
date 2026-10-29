@@ -1,8 +1,8 @@
 #pragma once
-#include "livekit/audio_stream.hpp"
+#include "livekit/audio_frame.hpp"
 
 namespace livekit::sdk {
-namespace detail { class PcmSourceReader; }
+namespace detail { class PcmSourceReader; class PcmSourceWriter; }
 struct PcmSourceOptions {
   int sample_rate = 48000;
   size_t channels = 1;
@@ -47,6 +47,8 @@ class PcmAudioSource {
   void close();
  private:
   friend class detail::PcmSourceReader;
+  friend class detail::PcmSourceWriter;
+  AudioWriteStatus write(const PcmInputFrame&,std::optional<uint64_t> expected_generation);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

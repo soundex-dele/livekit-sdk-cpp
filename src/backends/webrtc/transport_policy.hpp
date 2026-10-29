@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/room.hpp"
+#include "livekit/transport_options.hpp"
 #include "api/peer_connection_interface.h"
 #include "p2p/base/port_allocator.h"
 

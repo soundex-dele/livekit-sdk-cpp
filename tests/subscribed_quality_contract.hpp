@@ -1,6 +1,5 @@
 #pragma once
-#include "engines/rtc/subscribed_quality.hpp"
-#include "engines/rtc/session.hpp"
+#include "backends/rtc/subscribed_quality.hpp"
 #include <stdexcept>
 
 inline void subscribed_quality_contract() {
@@ -25,12 +24,4 @@ inline void subscribed_quality_contract() {
   // A foreign-codec message must never fall back to the deprecated qualities.
   update.add_subscribed_codecs()->set_codec("h265");
   check(!subscribed_video_enabled(update, "h264").has_value());
-  livekit::sdk::MediaSpec media; media.dynacast = true; media.demo = true;
-  livekit::sdk::detail::validate_media(media);
-  media.video = false;
-  bool rejected = false; try { livekit::sdk::detail::validate_media(media); } catch (const std::invalid_argument&) { rejected = true; }
-  check(rejected);
-  media.video = true; media.demo = false; media.input = "recording.mp4";
-  rejected = false; try { livekit::sdk::detail::validate_media(media); } catch (const std::invalid_argument&) { rejected = true; }
-  check(rejected);
 }

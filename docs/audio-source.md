@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # 应用 PCM 音频输入
 
 `PcmAudioSource` 接受应用 PCM，经独立媒体图、独立流式重采样器和原生 AudioTrack 发布。每条轨道有自己的源及 Opus 编码状态，不经过默认麦克风 ADM，也不会在 SDK 内将多条应用音轨混成一路。

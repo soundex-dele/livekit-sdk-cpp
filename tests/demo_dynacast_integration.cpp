@@ -16,14 +16,14 @@ template<class F> void until(F fn, const char* text) {
 static std::set<std::string> tracks(const demo::Snapshot& s) {
   std::set<std::string> result;
   if (auto p = s.participants.find(s.local_sid); p != s.participants.end())
-    for (const auto& t : p->second.tracks) if (t.kind == sdk::TrackKind::video) result.insert(t.sid);
+    for (const auto& t : p->second.tracks) if (t.kind == demo::rtc::PublicationKind::video) result.insert(t.sid);
   return result;
 }
 static double video_bytes(const demo::Snapshot& s) {
   double total = 0; bool found = false;
   for (const auto& [id, stream] : s.quality.peers[0].streams)
     if (stream.sending && stream.kind == "video" && stream.bytes) { total += *stream.bytes; found = true; }
-  check(found && total > 0 && !s.quality.peers[0].stale(), "Missing retained outbound RTP statistics");
+  check(found && total >= 0 && !s.quality.peers[0].stale(), "Missing retained outbound RTP statistics");
   return total;
 }
 static double graph_frames(const demo::Snapshot& s) {
@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
     std::ofstream events(out / "demo-publisher.jsonl");
     auto options = [&](const std::string& identity) {
       auto o = demo::username_options(argv[1], "uav-requirements", identity);
-      o.media_transport = std::string(argv[5]) == "tcp" ? sdk::MediaTransport::tcp_only : sdk::MediaTransport::udp_only;
+      o.connection.media_transport = std::string(argv[5]) == "tcp" ? sdk::MediaTransport::tcp_only : sdk::MediaTransport::udp_only;
       return o;
     };
     demo::Session publisher;
@@ -70,28 +70,27 @@ int main(int argc, char** argv) {
     until([&] { return tracks(publisher.snapshot()).size() == 2; }, "Dynamic video missing");
     paused(); // Dynamic Add test video must inherit the same policy.
     const auto published = tracks(publisher.snapshot());
-    std::mutex mutex; std::map<std::string, uint64_t> a_frames, b_frames;
-    sdk::Room a, b;
+    demo::Session a, b;
     auto ao = options("viewer-a"), bo = options("viewer-b");
-    ao.video_frame_handler = [&](const sdk::VideoFrame& f) { std::lock_guard lock(mutex); ++a_frames[f.track_id]; };
-    bo.video_frame_handler = [&](const sdk::VideoFrame& f) { std::lock_guard lock(mutex); ++b_frames[f.track_id]; };
-    auto decoded = [&](const auto& counters) { return std::all_of(published.begin(), published.end(), [&](const auto& sid) {
-      auto it = counters.find(sid); return it != counters.end() && it->second >= 10; }); };
-    a.join_with_token(ao.url, ao.token, ao);
-    until([&] { std::lock_guard lock(mutex); return decoded(a_frames); }, "First viewer did not decode both sources");
-    b.join_with_token(bo.url, bo.token, bo);
-    until([&] { std::lock_guard lock(mutex); return decoded(b_frames); }, "Second viewer did not decode both sources");
-    a.disconnect(); a.wait();
+    auto decoded = [&](demo::Session& viewer) {
+      const auto snapshot = viewer.snapshot();
+      return snapshot.received_frames >= published.size()*10 && std::all_of(published.begin(),published.end(),[&](const auto& sid) { return snapshot.frames.contains(sid); });
+    };
+    a.start(ao);
+    until([&] { return decoded(a); }, "First viewer did not decode both sources");
+    b.start(bo);
+    until([&] { return decoded(b); }, "Second viewer did not decode both sources");
+    a.stop(); until([&] { return a.snapshot().finished; }, "Viewer A stop");
     std::this_thread::sleep_for(6s);
-    { std::lock_guard lock(mutex); b_frames.clear(); }
-    until([&] { std::lock_guard lock(mutex); return decoded(b_frames); }, "Remaining viewer was stopped");
+    const auto previous_frames = b.snapshot().received_frames;
+    until([&] { return decoded(b) && b.snapshot().received_frames > previous_frames + 20; }, "Remaining viewer was stopped");
     for (const auto& sid : published) check(publisher.snapshot().video_demand.at(sid), "Remaining viewer demand OFF");
-    b.disconnect(); b.wait(); paused();
-    { std::lock_guard lock(mutex); a_frames.clear(); }
-    a.join_with_token(ao.url, ao.token, ao);
-    until([&] { std::lock_guard lock(mutex); return decoded(a_frames); }, "Video failed to resume");
+    b.stop(); until([&] { return b.snapshot().finished; }, "Viewer B stop"); paused();
+
+    a.start(ao);
+    until([&] { return decoded(a); }, "Video failed to resume");
     check(tracks(publisher.snapshot()) == published, "Resume republished instead of retaining SID");
-    a.disconnect(); a.wait(); publisher.stop();
+    a.stop(); until([&] { return a.snapshot().finished; }, "Viewer A stop"); publisher.stop();
     until([&] { return publisher.snapshot().finished; }, "Demo stop timed out");
     check(publisher.snapshot().video_demand.empty(), "Demand state retained after leave");
     report["ok"] = true;

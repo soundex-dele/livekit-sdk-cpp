@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # Live video demand control
 
 Set `MediaSpec::dynacast = true` to let LiveKit's aggregate subscription demand pause and resume a live video source. It is off by default. Supported sources are application-fed I420, generated video, camera and screen capture. Audio and file/network playback are rejected: stopping and restarting a playback reader would lose its position.

@@ -16,12 +16,11 @@ struct VideoFrame {
   int stride_y = 0, stride_u = 0, stride_v = 0;
   int64_t timestamp_us = 0;
   std::vector<uint8_t> y, u, v;
-  // Pull stream transport/room generation; zero for the legacy callback path.
+  // Input source generation or decoded room epoch, as assigned by its node.
   uint64_t stream_generation = 0;
 };
 using VideoFrameHandler = std::function<void(const VideoFrame&)>;
 enum class CaptureKind { input, camera, screen };
-enum class MediaRestartPolicy { automatic, restart, fail };
 struct MediaSpec {
   std::string input;
   std::string ffmpeg = "ffmpeg";
@@ -31,9 +30,6 @@ struct MediaSpec {
   int device_index = 0; // camera enumeration index
   bool local_preview = false;
   std::string screen_id; // empty preserves legacy primary-display behavior
-  // automatic restarts generated/device/looping sources after full rejoin.
-  // Finite files/network inputs require an explicit restart (from the start).
-  MediaRestartPolicy reconnect = MediaRestartPolicy::automatic;
   // Application-fed live video. Mutually exclusive with input/demo/devices.
   std::shared_ptr<I420VideoSource> video_source;
   // Independent application PCM track; set video=false.

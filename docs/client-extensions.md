@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # RTC 客户端扩展
 
 本批实现只涉及 RTC 客户端；Go 对照为 server-sdk-go 2.19.0 / protocol v1.53.0。默认信令仍为 12，支持显式选择 15、17；single_peer_connection 必须使用 17。构建和互通结果单独记录，源码接口存在不代表所有服务端及设备已验收。

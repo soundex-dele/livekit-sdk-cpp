@@ -1,6 +1,6 @@
 # 本地文件播放器
 
-首版播放器按统一 SDK 架构落在本仓库中，入口为 `livekit::sdk::Player`、`LiveKit::Player`，与现有 `Room` / `LiveKit::SDK` 独立构建。FFmpeg 通过动态库解封装、软件解码和格式转换；SDK 不启动 ffmpeg 子进程播放。测试素材生成使用 ffmpeg 命令行。
+首版播放器按统一 SDK 架构落在本仓库中，入口为 `livekit::sdk::Player`、`LiveKit::Player`，与 RTC backend 独立构建。FFmpeg 通过动态库解封装、软件解码和格式转换；SDK 不启动 ffmpeg 子进程播放。测试素材生成使用 ffmpeg 命令行。
 
 ## 引擎构建
 
@@ -8,7 +8,8 @@
 
 ```powershell
 cmake -S . -B out/player-engine -G 'Visual Studio 17 2022' -A x64 `
-  -DLIVEKIT_BUILD_RTC=OFF -DLIVEKIT_BUILD_PLAYER=ON `
+  -DLIVEKIT_BUILD_RTC_NATIVE=OFF -DLIVEKIT_BUILD_RTC_GRAPH_NODES=OFF -DLIVEKIT_BUILD_RTC_MEDIA=OFF `
+  -DLIVEKIT_BUILD_CLI=OFF -DLIVEKIT_BUILD_DEMO=OFF -DLIVEKIT_BUILD_EXAMPLES=OFF -DLIVEKIT_BUILD_SERVER_SDK=OFF -DLIVEKIT_BUILD_PLAYER=ON `
   -DLIVEKIT_FFMPEG_ROOT='D:/ffmpeg-dev'
 cmake --build out/player-engine --config Release --parallel 4
 ctest --test-dir out/player-engine -C Release --output-on-failure

@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # 应用 I420 视频输入
 
 `I420VideoSource` 让应用直接提交 CPU I420 帧，经现有媒体图、libwebrtc 编码和 RTP 传输发布。无需 FFmpeg，不通过 JSON Command 传递像素。示例：`examples/video_source/main.cpp`，目标 `livekit_video_source_example`。

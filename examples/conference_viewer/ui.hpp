@@ -18,7 +18,7 @@ class View {
   std::string error;
   View();
   Action draw(SDL_Renderer* renderer, const Snapshot& snapshot);
-  sdk::RoomOptions options() const;
+  SessionOptions options() const;
  private:
   void draw_quality(const Snapshot& snapshot);
   struct Cached {

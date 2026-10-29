@@ -3,6 +3,13 @@
 #include <stop_token>
 
 namespace livekit::sdk::detail {
+class PcmSourceWriter {
+ public:
+  // Reject an in-flight device callback if the reader was reset meanwhile.
+  static AudioWriteStatus write(PcmAudioSource& source,const PcmInputFrame& frame,uint64_t generation) {
+    return source.write(frame,generation);
+  }
+};
 struct PcmSourceBlock {
   std::vector<int16_t> samples;
   std::chrono::steady_clock::time_point captured;

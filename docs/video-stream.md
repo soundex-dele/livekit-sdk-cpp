@@ -1,3 +1,5 @@
+> 历史接口记录：本文的旧 Room/Participant/帧流 API 已删除，不适用于当前构建。当前用法与支持范围见 [编码媒体 API](rtc-encoded-api.md) 和 [实施清单](rtc-backend-refactor.md)。
+
 # 有界视频帧读取
 
 `RoomOptions.video_frame_stream` 提供独立于应用处理速度的 I420 pull 输出。应用在自己的线程调用 `read`，SDK 不调用用户媒体处理函数；消费者暂停读取不会阻塞 Room 信令与控制事件。现有 `video_frame_handler` 保留串行回调语义，两者不能同时设置。音频 PCM 使用独立的 [AudioFrameStream](audio-stream.md)；原始帧输入及编码帧接口尚未提供。
