@@ -178,10 +178,6 @@ struct Peer {
             source->quiesce();
             codec->quiesce();
           };
-          graph.check_health = [source, codec] {
-            source->throw_if_failed();
-            codec->throw_if_failed();
-          };
           return graph;
         };
         if (d.kind == transport::MediaKind::video)
@@ -276,8 +272,8 @@ struct Peer {
                                                       : "video/h265";
   }
 
-  template <class T>
-  T await(std::future<T> future) {
+  template <class Future>
+  auto await(Future future) {
     const auto deadline = Clock::now() + 15s;
     while (future.wait_for(0ms) != std::future_status::ready) {
       require(!stopping_.load() && Clock::now() < deadline,
@@ -327,7 +323,6 @@ struct Peer {
           graph.connections.push_back(
               TrackGraph::connect<transport::nodes::KeyframeRequestEvent>(codec, source));
         graph.quiesce = [codec] { codec->quiesce(); };
-        graph.check_health = [codec] { codec->throw_if_failed(); };
         return graph;
       };
       if (d.kind == transport::MediaKind::video)
@@ -409,7 +404,7 @@ struct Peer {
   std::map<std::string, transport::TrackDescriptor> known_;
   std::set<std::string> active_;
   std::map<std::string, TestTrack> outgoing_;
-  std::map<std::string, std::future<transport::TrackId>> pending_;
+  std::map<std::string, livekit::sdk::AsyncResult<transport::TrackId>> pending_;
   std::unique_ptr<transport::engine::RtcEngine> engine_;
   livekit::sdk::app_support::RtcEventMailbox engine_events_;
   std::exception_ptr failure_;

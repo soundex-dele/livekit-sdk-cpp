@@ -10,11 +10,8 @@ namespace rtc = livekit::sdk::rtc;
 using namespace std::chrono_literals;
 
 namespace {
-template <class T>
-auto complete(rtc::engine::RtcEngine& engine, std::future<T> future) {
-  while (future.wait_for(0ms) != std::future_status::ready) {
-    std::this_thread::sleep_for(2ms);
-  }
+template <class Future>
+auto complete(rtc::engine::RtcEngine&, Future future) {
   return future.get();
 }
 
@@ -61,7 +58,7 @@ int main(int argc, char** argv) {
     const auto duration = std::chrono::seconds(argc > 3 ? std::stoi(argv[3]) : 10);
     std::vector<rtc::TrackId> tracks;
     std::vector<std::shared_ptr<EncodedConsumer>> consumers;
-    std::vector<std::future<rtc::TrackId>> subscriptions;
+    std::vector<livekit::sdk::AsyncResult<rtc::TrackId>> subscriptions;
     if (publishing)
       for (int i = 0; i < 2; ++i) {
         rtc::TrackDescriptor descriptor;

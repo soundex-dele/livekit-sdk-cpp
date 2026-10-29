@@ -1,5 +1,6 @@
 #pragma once
 #include "livekit/rtc/types.hpp"
+#include "support/wake_event.hpp"
 #include "api/frame_transformer_interface.h"
 #include <deque>
 #include <functional>
@@ -18,7 +19,7 @@ struct ReceivedAccessUnit {
 };
 
 // Terminal receive boundary: owns complete depacketized access units and never
-// calls the native decoder callback. poll() transfers ownership to RoomEngine.
+// calls the native decoder callback. take_frames() drains after a wakeup.
 // Native callback work is bounded even while the controller is busy signaling.
 class EncodedReceiver : public webrtc::FrameTransformerInterface {
  public:
@@ -27,7 +28,8 @@ class EncodedReceiver : public webrtc::FrameTransformerInterface {
   EncodedReceiver(MediaKind kind, QueueLimits limits, std::shared_ptr<QueueBudget> budget = {},
                   PayloadTransform transform = {});
   void Transform(std::unique_ptr<webrtc::TransformableFrameInterface> frame) override;
-  std::vector<ReceivedAccessUnit> poll();
+  std::vector<ReceivedAccessUnit> take_frames();
+  void attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent>);
   // Installed before exposing a new native receiver as a subscribed endpoint.
   void configure_queue(QueueLimits, std::shared_ptr<QueueBudget>);
   bool take_keyframe_request();
@@ -35,6 +37,7 @@ class EncodedReceiver : public webrtc::FrameTransformerInterface {
   uint64_t dropped() const;
 
  private:
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup_;
   PayloadTransform transform_;
   MediaKind kind_;
   QueueLimits limits_;

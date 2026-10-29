@@ -81,7 +81,8 @@ std::vector<std::string> fetch_regions(const std::string& url, const std::string
   }
 }
 
-SignalSocket::SignalSocket() {
+SignalSocket::SignalSocket(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup)
+    : wakeup_(std::move(wakeup)) {
   initialize_network();
   socket_.disableAutomaticReconnection();
   socket_.disablePerMessageDeflate();
@@ -113,6 +114,9 @@ SignalSocket::SignalSocket() {
         break;
     }
     cv_.notify_all();
+    if (wakeup_) {
+      wakeup_->signal();
+    }
   });
 }
 
@@ -154,13 +158,13 @@ void SignalSocket::connect(const std::string& url, const std::string& token, boo
   std::unique_lock lock(mutex_);
   auto deadline = std::min(
       deadline_limit, std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds));
-  while (!opened_ && error_.empty() && !stop.stop_requested()) {
-    cv_.wait_for(lock, std::chrono::milliseconds(50));
-    if (std::chrono::steady_clock::now() >= deadline)
-      throw SDKError(ErrorDomain::signaling, ErrorCode::timeout, "WebSocket connect timeout", true);
-  }
+  const bool completed =
+      cv_.wait_until(lock, stop, deadline, [&] { return opened_ || !error_.empty() || closing_; });
   if (stop.stop_requested())
     return;
+  if (!completed) {
+    throw SDKError(ErrorDomain::signaling, ErrorCode::timeout, "WebSocket connect timeout", true);
+  }
   if (!error_.empty())
     throw SDKError(
         ErrorDomain::signaling,
@@ -177,9 +181,21 @@ void SignalSocket::send(const std::string& bytes) {
 }
 
 std::optional<std::string> SignalSocket::receive(int timeout_ms) {
+  return receive_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+}
+
+std::optional<std::string> SignalSocket::take_message() {
+  return receive_until(std::chrono::steady_clock::now());
+}
+
+std::optional<std::string> SignalSocket::receive_until(
+    std::chrono::steady_clock::time_point deadline, std::stop_token stop) {
   std::unique_lock lock(mutex_);
-  cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-               [&] { return !messages_.empty() || !error_.empty(); });
+  cv_.wait_until(lock, stop, deadline,
+                 [&] { return !messages_.empty() || !error_.empty() || closing_; });
+  if (stop.stop_requested()) {
+    return {};
+  }
   if (!messages_.empty()) {
     auto message = std::move(messages_.front());
     messages_.pop_front();
@@ -196,6 +212,10 @@ void SignalSocket::close() {
   {
     std::lock_guard lock(mutex_);
     closing_ = true;
+    cv_.notify_all();
+    if (wakeup_) {
+      wakeup_->signal();
+    }
   }
   socket_.stop();
 }

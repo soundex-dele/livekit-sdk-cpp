@@ -11,7 +11,8 @@ namespace livekit::sdk::rtc::detail {
 // Each instance belongs to one binding; never reuse it across room epochs.
 class EncodedAudioSender : public webrtc::FrameTransformerInterface {
  public:
-  EncodedAudioSender(BindingToken binding, QueueLimits limits, std::string encoding_id = {});
+  EncodedAudioSender(BindingToken binding, QueueLimits limits, std::string encoding_id = {},
+                     std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup = {});
   void configure(uint32_t ssrc, uint8_t payload_type);
   SendResult send(const EncodedFrame& frame);
   void set_muted(bool);

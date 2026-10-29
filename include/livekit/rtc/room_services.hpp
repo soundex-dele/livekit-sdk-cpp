@@ -4,6 +4,8 @@
 #include "livekit/rpc.hpp"
 #include "livekit/streams.hpp"
 #include <variant>
+#include <functional>
+#include "livekit/error.hpp"
 
 namespace livekit::sdk::rtc {
 namespace detail {
@@ -24,12 +26,21 @@ struct ReceivedData {
 
 struct DataServiceError {
   std::string message;
+  std::shared_ptr<const FailureInfo> failure;
 };
 
 struct DataEvent {
   std::string sender_identity;
   bool reliable = true;
   std::variant<ReceivedData, DtmfDigit, Transcription, DataServiceError> value;
+};
+
+struct RoomServiceSnapshot {
+  bool connected = false, closed = false, handler_registered = false;
+  size_t queued_events = 0, queued_bytes = 0;
+  uint64_t dropped_events = 0;
+  std::shared_ptr<const FailureInfo> failure;
+  size_t queued_sends = 0, queued_send_bytes = 0, scheduled_send_deadlines = 0;
 };
 
 // Session services share the room's transport and lifetime. This handle can be
@@ -41,7 +52,15 @@ class RoomServices {
   std::future<void> send_data(std::vector<uint8_t>, DataSendOptions = {});
   std::future<void> send_dtmf(DtmfDigit, DataSendOptions = {});
   std::future<void> send_transcription(Transcription, DataSendOptions = {});
-  std::optional<DataEvent> next_event(std::chrono::milliseconds timeout, std::stop_token stop = {});
+  // Serial room notification queue, never a transport thread. Register before
+  // join. Event references are borrowed for the duration of the call.
+  // Replacing/clearing fences old invocations; self-removal is supported. Serialize
+  // registration calls and never hold application locks while waiting for them.
+  // A thrown exception disables delivery and fails the room with the same
+  // FailureInfo retained in snapshot(). Return promptly; do not destroy the room
+  // in a callback. Session close discards queued events; an active call may finish.
+  void set_event_handler(std::function<void(const DataEvent&)>);
+  RoomServiceSnapshot snapshot() const;
 
   void register_rpc(std::string method, RpcHandler);
   void unregister_rpc(const std::string& method);

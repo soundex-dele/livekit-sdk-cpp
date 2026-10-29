@@ -17,6 +17,11 @@ class RtcPublishNode final : public graphflow::core::GraphNode {
   // has been delivered on that worker. Then activate upstream media producers.
   void activate();
   void quiesce();
+
+  // Install before activate; invoked on the source worker, never during quiesce.
+  void set_terminal_handler(std::function<void()> handler) {
+    terminal_ = std::move(handler);
+  }
   void throw_if_failed() const;
 
   WriteStatus last_write() const {
@@ -48,5 +53,6 @@ class RtcPublishNode final : public graphflow::core::GraphNode {
   mutable std::mutex failure_mutex_;
   std::exception_ptr failure_;
   std::jthread worker_;
+  std::function<void()> terminal_;
 };
 }  // namespace livekit::sdk::rtc::nodes

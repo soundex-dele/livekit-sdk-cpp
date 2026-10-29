@@ -27,6 +27,7 @@ struct AudioOutputTrack::State {
   };
 
   TrackId id;
+  AudioOutputSession::FailureHandler failure_handler;
   AudioOutputTrackSnapshot stats;
   std::deque<Packet> queue;
   std::optional<uint64_t> base_timestamp, last_end;
@@ -59,6 +60,35 @@ struct AudioOutputSession::Impl {
         options.buffer > 200ms || options.max_latency < 120ms || options.max_latency > 2s ||
         options.buffer >= options.max_latency) {
       throw std::invalid_argument("Invalid audio output device options");
+    }
+  }
+
+  void fail(std::string message) {
+    auto error = normalized_failure(std::make_exception_ptr(std::runtime_error(message)),
+                                    {"playout", {}, "audio.device", 0}, ErrorDomain::media,
+                                    ErrorCode::processing_failed);
+    std::vector<AudioOutputSession::FailureHandler> handlers;
+    {
+      std::lock_guard lock(mutex);
+      if (stats.failure) {
+        return;
+      }
+      stats.failure = describe_failure(error);
+      stats.error = std::move(message);
+      for (const auto& [id, track] : tracks) {
+        track->reset();
+        if (track->failure_handler) {
+          handlers.push_back(track->failure_handler);
+        }
+      }
+    }
+    for (const auto& handler : handlers) {
+      try {
+        handler(error);
+      } catch (...) {
+        // Device callbacks are an exception boundary. The failure remains in
+        // the shared session snapshot even if an external handler throws.
+      }
     }
   }
 
@@ -135,19 +165,21 @@ AudioOutputSession::~AudioOutputSession() {
   impl_->driver->stop();
 }
 
-std::shared_ptr<AudioOutputTrack> AudioOutputSession::open_track(TrackId id) {
+std::shared_ptr<AudioOutputTrack> AudioOutputSession::open_track(TrackId id,
+                                                                 FailureHandler failure_handler) {
   auto self = shared_from_this();
   auto& s = *impl_;
   auto state = std::make_shared<AudioOutputTrack::State>();
   state->id = std::move(id);
+  state->failure_handler = std::move(failure_handler);
   state->stats.closed = true;
   auto track = std::shared_ptr<AudioOutputTrack>(new AudioOutputTrack(std::move(self), state));
   std::lock_guard control(s.control);
   bool first;
   {
     std::lock_guard lock(s.mutex);
-    if (!s.stats.error.empty()) {
-      throw std::runtime_error(s.stats.error);
+    if (s.stats.failure) {
+      throw SDKError(s.stats.failure);
     }
     if (state->id.empty() || s.tracks.contains(state->id) ||
         s.tracks.size() >= s.options.max_tracks) {
@@ -162,16 +194,11 @@ std::shared_ptr<AudioOutputTrack> AudioOutputSession::open_track(TrackId id) {
     try {
       s.driver->start(
           s.options, [&s](auto output) { s.render(output); },
-          [&s](std::string message) {
-            std::lock_guard lock(s.mutex);
-            if (s.stats.error.empty()) {
-              s.stats.error = std::move(message);
-              for (const auto& [id, track] : s.tracks) {
-                track->reset();
-              }
-            }
-          });
+          [&s](std::string message) { s.fail(std::move(message)); });
       std::lock_guard lock(s.mutex);
+      if (s.stats.failure) {
+        throw SDKError(s.stats.failure);
+      }
       s.stats.running = true;
     } catch (...) {
       s.driver->stop();
@@ -194,8 +221,8 @@ AudioOutputSnapshot AudioOutputSession::snapshot() const {
 
 void AudioOutputSession::throw_if_failed() const {
   const auto state = snapshot();
-  if (!state.error.empty()) {
-    throw std::runtime_error(state.error);
+  if (state.failure) {
+    throw SDKError(state.failure);
   }
 }
 
@@ -336,6 +363,7 @@ void AudioOutputTrack::close() {
       return;
     }
     state_->stats.closed = true;
+    state_->failure_handler = {};
     state_->reset();
     const auto found = device.tracks.find(state_->id);
     if (found != device.tracks.end() && found->second == state_) {
@@ -397,7 +425,7 @@ bool AudioOutputNode::doStart() {
   if (impl_->closed) {
     return false;
   }
-  impl_->track = impl_->session->open_track(impl_->id);
+  impl_->track = impl_->session->open_track(impl_->id, failureReporter());
   impl_->track->set_gain(impl_->gain);
   impl_->track->set_muted(impl_->muted);
   return true;

@@ -74,7 +74,7 @@ struct MediaInputNode::Impl {
   SenderFeedback feedback;
   SteadyClock::time_point boundary{}, origin = SteadyClock::now();
   uint64_t generation = 0;
-  bool started = false, closed = false;
+  bool started = false, closed = false, microphone_reporter = false;
   std::atomic<bool> stop{false};
   std::atomic<bool> capture_stop{false};
   std::jthread worker;
@@ -357,8 +357,6 @@ struct MediaInputNode::Impl {
                source_token(input->frame.stream_generation));
         next = SteadyClock::now() + std::chrono::microseconds(1000000 / options.fps);
       } else if (audio) {
-        if (options.microphone)
-          options.microphone->throw_if_failed();
         auto input = audio->read(cancel);
         if (!input) {
           if (options.audio_source->stats().closed)
@@ -574,23 +572,38 @@ struct MediaInputNode::Impl {
           generated_or_file(cancel);
         }
       }
-    } catch (const std::exception& e) {
-      std::lock_guard lock(mutex);
-      if (!stop)
-        stats.error = e.what();
     } catch (...) {
-      std::lock_guard lock(mutex);
-      if (!stop)
-        stats.error = "Unknown media input failure";
+      if (!stop) {
+        const auto error = normalized_failure(std::current_exception(),
+                                              {"capture", descriptor.id, owner.getName(), 0},
+                                              ErrorDomain::media, ErrorCode::processing_failed);
+        {
+          std::lock_guard lock(mutex);
+          stats.error = describe_failure(error)->message;
+        }
+        owner.reportFailure(error);
+      }
     }
-    if (options.microphone)
+    if (options.microphone) {
       options.microphone->stop();
-    std::lock_guard lock(mutex);
-    if (options.microphone && stats.error.empty() && !stop)
-      stats.error = options.microphone->snapshot().error;
-    stats.finished = true;
-    stats.active = false;
-    stop_readers();
+    }
+    std::exception_ptr device_error;
+    {
+      std::lock_guard lock(mutex);
+      if (options.microphone && stats.error.empty() && !stop) {
+        const auto device = options.microphone->snapshot();
+        stats.error = device.error;
+        if (device.failure) {
+          device_error = std::make_exception_ptr(SDKError(device.failure));
+        }
+      }
+      stats.finished = true;
+      stats.active = false;
+      stop_readers();
+    }
+    if (device_error) {
+      owner.reportFailure(device_error);
+    }
   }
 };
 
@@ -623,6 +636,10 @@ void MediaInputNode::activate() {
   if (impl_->worker.joinable())
     return;
   impl_->start_readers();
+  if (impl_->options.microphone) {
+    impl_->options.microphone->set_failure_handler(failureReporter());
+    impl_->microphone_reporter = true;
+  }
   impl_->stats.active = true;
   impl_->worker = std::jthread([this](std::stop_token cancel) { impl_->run(cancel); });
 }
@@ -643,6 +660,10 @@ void MediaInputNode::quiesce() {
   if (impl_->worker.joinable())
     impl_->worker.join();
   std::lock_guard lock(impl_->mutex);
+  if (impl_->microphone_reporter) {
+    impl_->options.microphone->set_failure_handler({});
+    impl_->microphone_reporter = false;
+  }
   impl_->video.reset();
   impl_->audio.reset();
   impl_->encoded.reset();
@@ -659,8 +680,8 @@ MediaInputSnapshot MediaInputNode::snapshot() const {
 }
 
 void MediaInputNode::throw_if_failed() const {
-  const auto state = snapshot();
-  if (!state.error.empty())
-    throw std::runtime_error(state.error);
+  if (auto error = failure()) {
+    std::rethrow_exception(error);
+  }
 }
 }  // namespace livekit::sdk::rtc::nodes

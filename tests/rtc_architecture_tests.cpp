@@ -38,27 +38,30 @@ class LocalTransport final : public detail::RoomTransport {
  public:
   void start(const RoomOptions&, Epoch) override {
     events_.push_back({detail::TransportEventKind::connected});
+    wakeup_->signal();
   }
 
-  std::vector<detail::TransportEvent> poll(std::chrono::milliseconds, std::stop_token) override {
+  std::vector<detail::TransportEvent> take_events() override {
     return std::exchange(events_, {});
   }
 
   void publish(const detail::BindingToken& token, const TrackDescriptor&) override {
     if (token.id != "pending") {
       events_.push_back({detail::TransportEventKind::published, token, "sid"});
+      wakeup_->signal();
     }
   }
 
   void subscribe(const detail::BindingToken& token, const TrackDescriptor&,
                  std::shared_ptr<detail::QueueBudget>) override {
     events_.push_back({detail::TransportEventKind::subscribed, token, "remote"});
+    wakeup_->signal();
   }
 
-  std::future<void> remove(const detail::BindingToken&, bool) override {
-    std::promise<void> done;
+  livekit::sdk::AsyncResult<void> remove(const detail::BindingToken&, bool) override {
+    livekit::sdk::CompletionSource<void> done;
     done.set_value();
-    return done.get_future();
+    return done.get_result();
   }
 
   detail::SendResult send(const detail::BindingToken&, const EncodedFrame&) override {
@@ -243,15 +246,84 @@ void callback_isolation() {
 class FakeSpeaker final : public detail::AudioOutputDriver {
  public:
   Render render;
+  Failure fail;
 
-  void start(const AudioOutputOptions&, Render callback, Failure) override {
+  void start(const AudioOutputOptions&, Render callback, Failure failure) override {
     render = std::move(callback);
+    fail = std::move(failure);
   }
 
   void stop() noexcept override {
     render = {};
+    fail = {};
   }
 };
+
+void active_device_failure() {
+  auto driver = std::make_unique<FakeSpeaker>();
+  auto* speaker = driver.get();
+  auto session = detail::AudioOutputFactory::create({}, std::move(driver));
+  auto first = std::make_shared<nodes::AudioOutputNode>("speaker.first", "first", session);
+  auto second = std::make_shared<nodes::AudioOutputNode>("speaker.second", "second", session);
+  std::promise<std::exception_ptr> a, b;
+  auto ra = a.get_future(), rb = b.get_future();
+  first->setFailureHandler([&](auto error) { a.set_value(error); });
+  second->setFailureHandler([&](auto error) { b.set_value(error); });
+  check(first->init() && second->init() && first->start() && second->start(),
+        "Unable to start shared device sinks");
+  // No PCM is delivered: idle sinks must still learn of device failure.
+  speaker->fail("device unplugged");
+  check(
+      ra.wait_for(1s) == std::future_status::ready && rb.wait_for(1s) == std::future_status::ready,
+      "Idle shared sinks required a health scan to observe device failure");
+  const auto fa = livekit::sdk::describe_failure(ra.get());
+  const auto fb = livekit::sdk::describe_failure(rb.get());
+  check(fa->id == fb->id && fa->id == session->snapshot().failure->id,
+        "Shared device failure lost correlation between sinks");
+  first->quiesce();
+  second->quiesce();
+}
+
+void retained_failure_reporter() {
+  graphflow::core::GraphNode::FailureHandler report;
+  std::promise<std::exception_ptr> result;
+  auto ready = result.get_future();
+  {
+    auto node = std::make_unique<graphflow::core::GraphNode>("external.device", nullptr);
+    report = node->failureReporter();
+    node->setFailureHandler([&](auto error) { result.set_value(error); });
+  }
+  const auto cause = std::make_exception_ptr(std::runtime_error("late device callback"));
+  report(cause);
+  report(cause);
+  check(ready.wait_for(1s) == std::future_status::ready && ready.get() == cause,
+        "Retained reporter required a live node or delivered the failure twice");
+}
+
+void active_output_failure() {
+  MediaOutput options;
+  options.audio = [](const auto&) { throw std::runtime_error("consumer failed"); };
+  auto source = std::make_shared<Source>();
+  auto output = std::make_shared<ApplicationOutput>(options);
+  std::promise<std::exception_ptr> result;
+  auto ready = result.get_future();
+  output->setFailureHandler([&](auto error) { result.set_value(error); });
+  graphflow::engine::GraphEngine graph{1};
+  check(graph.loadFromNodes({output, source},
+                            {TrackGraphSpec::connect<nodes::AudioFrameEvent>(source, output)}) &&
+            graph.init() && graph.start(),
+        "Unable to start failing output graph");
+  source->raw(rtc_audio_test::tone(1, 0, 48000, 1, false));
+  check(ready.wait_for(1s) == std::future_status::ready,
+        "Application worker did not actively report its exception");
+  const auto info = livekit::sdk::describe_failure(ready.get());
+  check(
+      info->code == livekit::sdk::ErrorCode::callback_failed && info->message == "consumer failed",
+      "Output failure lost its type or message");
+  output->quiesce();
+  graph.stop();
+  graph.release();
+}
 
 void capture_processing_reference() {
   auto reference = std::make_shared<AudioRenderReference>();
@@ -331,6 +403,9 @@ int main() {
     automatic_executor();
     shared_storage_and_clock();
     callback_isolation();
+    active_output_failure();
+    active_device_failure();
+    retained_failure_reporter();
     capture_processing_reference();
     echo_convergence();
     std::cout << "architecture contracts passed\n";

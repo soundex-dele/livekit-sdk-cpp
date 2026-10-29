@@ -41,17 +41,31 @@ void RtcSubscribeNode::activate() {
       while (!stop.stop_requested()) {
         auto item = track_->wait_frame(stop);
         if (item.status == ReadStatus::failed) {
-          throw std::runtime_error(track_->snapshot().error);
+          const auto state = track_->snapshot();
+          if (state.failure) {
+            throw SDKError(state.failure);
+          }
+          throw std::runtime_error(state.error);
         }
         if (item.status != ReadStatus::frame || stop.stop_requested()) {
+          if (!stop.stop_requested() && terminal_) {
+            terminal_();
+          }
           break;
         }
         publish(EncodedFrameEvent(std::move(*item.frame)));
         ++delivered_;
       }
     } catch (...) {
-      std::lock_guard lock(failure_mutex_);
-      failure_ = std::current_exception();
+      const auto error = normalized_failure(
+          std::current_exception(),
+          {"receive", track_->descriptor().id, getName(), track_->snapshot().epoch},
+          ErrorDomain::media, ErrorCode::processing_failed);
+      {
+        std::lock_guard lock(failure_mutex_);
+        failure_ = error;
+      }
+      reportFailure(error);
     }
   });
 }

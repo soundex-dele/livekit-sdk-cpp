@@ -18,8 +18,8 @@ void check(bool condition, const char* message) {
   }
 }
 
-template <class T>
-T await(std::future<T> future) {
+template <class Future>
+auto await(Future future) {
   check(future.wait_for(20s) == std::future_status::ready, "Automatic media operation timed out");
   return future.get();
 }

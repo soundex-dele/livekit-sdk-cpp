@@ -13,7 +13,8 @@ struct CodecBoundaryCounters;
 // it owns no pixels and cannot perform capture, scaling or encoding.
 class EncodedVideoSender : public webrtc::VideoTrackSource {
  public:
-  EncodedVideoSender(BindingToken binding, TrackDescriptor descriptor);
+  EncodedVideoSender(BindingToken binding, TrackDescriptor descriptor,
+                     std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup = {});
   ~EncodedVideoSender() override;
   SendResult send(const EncodedFrame& frame);
   SenderFeedback feedback() const;
@@ -28,7 +29,18 @@ class EncodedVideoSender : public webrtc::VideoTrackSource {
 
  private:
   std::shared_ptr<VideoSenderState> state_;
-  webrtc::VideoBroadcaster broadcaster_;
+
+  struct Broadcaster : webrtc::VideoBroadcaster {
+    std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
+
+    void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
+                         const webrtc::VideoSinkWants& wants) override {
+      webrtc::VideoBroadcaster::AddOrUpdateSink(sink, wants);
+      if (wakeup) {
+        wakeup->signal();
+      }
+    }
+  } broadcaster_;
 };
 
 std::unique_ptr<webrtc::VideoEncoderFactory> create_transport_video_encoder_factory();

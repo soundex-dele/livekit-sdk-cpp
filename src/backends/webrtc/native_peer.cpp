@@ -15,7 +15,7 @@ std::exception_ptr failure(webrtc::RTCError error) {
 
 template <class T>
 struct Completion {
-  std::promise<T> promise;
+  CompletionSource<T> promise;
   std::atomic<bool> settled{false};
 
   void reject(std::exception_ptr error) {
@@ -138,7 +138,13 @@ struct NativePeer::Channel : webrtc::DataChannelObserver {
     native->UnregisterObserver();
   }
 
-  void OnStateChange() override {}
+  void OnStateChange() override {
+    peer.notify();
+  }
+
+  void OnBufferedAmountChange(uint64_t) override {
+    peer.notify();
+  }
 
   void OnMessage(const webrtc::DataBuffer& buffer) override {
     try {
@@ -150,25 +156,31 @@ struct NativePeer::Channel : webrtc::DataChannelObserver {
       if (peer.data_.size() >= std::min<size_t>(256, peer.max_events_) ||
           buffer.data.size() > max_data_bytes - peer.data_bytes_) {
         // Reliable stream/RPC data cannot be silently truncated.
-        if (label == "_reliable")
+        if (label == "_reliable") {
           peer.failed = true;
+          peer.notify();
+        }
         return;
       }
       peer.data_.push_back({label, {buffer.data.begin(), buffer.data.end()}});
       peer.data_bytes_ += buffer.data.size();
+      peer.notify();
     } catch (...) {
       peer.failed = true;
+      peer.notify();
     }
   }
 };
 
 NativePeer::NativePeer(TransportRuntime& runtime, PC::RTCConfiguration configuration,
                        QueueLimits receive_limits, size_t max_events,
-                       std::shared_ptr<QueueBudget> budget)
+                       std::shared_ptr<QueueBudget> budget,
+                       std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup)
     : runtime_(runtime),
       receive_limits_(receive_limits),
       budget_(std::move(budget)),
-      max_events_(max_events) {
+      max_events_(max_events),
+      wakeup_(std::move(wakeup)) {
   if (!max_events)
     throw std::invalid_argument("Native peer needs a bounded event queue");
   configuration.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
@@ -185,9 +197,9 @@ NativePeer::~NativePeer() {
   close();
 }
 
-std::future<TransportStatistics> NativePeer::statistics() {
+AsyncResult<TransportStatistics> NativePeer::statistics() {
   auto observer = webrtc::make_ref_counted<StatisticsObserver>();
-  auto result = observer->completion.promise.get_future();
+  auto result = observer->completion.promise.get_result();
   runtime_.signaling->BlockingCall([&] {
     if (pc)
       pc->GetStats(observer.get());
@@ -221,9 +233,9 @@ void NativePeer::close() {
   connected = false;
 }
 
-std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_restart) {
+AsyncResult<NativeDescription> NativePeer::create_local(bool offer, bool ice_restart) {
   auto completion = std::make_shared<Completion<NativeDescription>>();
-  auto future = completion->promise.get_future();
+  auto future = completion->promise.get_result();
   if (!pc) {
     completion->reject(std::make_exception_ptr(std::runtime_error("Native peer is closed")));
     return future;
@@ -251,10 +263,10 @@ std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_res
   return future;
 }
 
-std::future<void> NativePeer::set_remote(NativeDescription description,
+AsyncResult<void> NativePeer::set_remote(NativeDescription description,
                                          std::map<std::string, std::string> mid_to_track) {
   auto observer = webrtc::make_ref_counted<SetRemote>();
-  auto future = observer->completion.promise.get_future();
+  auto future = observer->completion.promise.get_result();
   webrtc::SdpParseError error;
   auto native = webrtc::CreateSessionDescription(description.type, description.sdp, &error);
   if (!pc || !native) {
@@ -296,12 +308,15 @@ void NativePeer::add_ice(const NativeIceCandidate& candidate) {
 
 void NativePeer::OnConnectionChange(PC::PeerConnectionState state) {
   connected = state == PC::PeerConnectionState::kConnected;
-  if (state == PC::PeerConnectionState::kFailed)
+  if (state == PC::PeerConnectionState::kFailed) {
     failed = true;
+  }
+  notify();
 }
 
 void NativePeer::OnIceGatheringChange(PC::IceGatheringState state) {
   gathered = state == PC::kIceGatheringComplete;
+  notify();
 }
 
 void NativePeer::OnIceCandidate(const webrtc::IceCandidateInterface* candidate) {
@@ -313,20 +328,25 @@ void NativePeer::OnIceCandidate(const webrtc::IceCandidateInterface* candidate) 
       return;
     if (ice_.size() == max_events_) {
       failed = true;
+      notify();
       return;
     }
     ice_.push_back(std::move(value));
+    notify();
   } catch (...) {
     failed = true;
+    notify();
   }
 }
 
 void NativePeer::track_event(bool added, const std::string& sid) {
   if (tracks_.size() == max_events_) {
     failed = true;
+    notify();
     return;
   }
   tracks_.push_back({added, sid});
+  notify();
 }
 
 void NativePeer::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
@@ -368,6 +388,7 @@ void NativePeer::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> 
     track_event(true, sid);
   } catch (...) {
     failed = true;
+    notify();
   }
 }
 
@@ -395,6 +416,7 @@ void NativePeer::OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterfac
     return;
   }
   channels_.push_back(std::make_unique<Channel>(*this, std::move(channel)));
+  notify();
 }
 
 void NativePeer::create_data_channel(const std::string& label, bool reliable) {
@@ -447,6 +469,9 @@ std::vector<NativeDataMessage> NativePeer::take_data(size_t max_messages) {
     data_bytes_ -= data_.front().bytes.size();
     result.push_back(std::move(data_.front()));
     data_.pop_front();
+  }
+  if (!data_.empty()) {
+    notify();
   }
   return result;
 }

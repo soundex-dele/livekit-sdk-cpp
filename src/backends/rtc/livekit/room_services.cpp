@@ -2,6 +2,7 @@
 #include "backends/rtc/livekit/data_message_wire.hpp"
 #include "livekit/error.hpp"
 #include <algorithm>
+#include <utility>
 
 namespace livekit::sdk::rtc::detail {
 namespace {
@@ -47,6 +48,56 @@ void RoomServiceState::configure(EncryptionOptions options,
   tracks->configure(encryption);
 }
 
+void RoomServiceState::attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup) {
+  if (!wakeup) {
+    throw std::invalid_argument("Room services require a wake source");
+  }
+  {
+    std::lock_guard lock(mutex);
+    if (active || closed || !outgoing.empty()) {
+      throw std::logic_error("Attach room service wake source before connecting");
+    }
+    cancellations = std::make_shared<livekit::sdk::detail::ReadySet<uint64_t>>(wakeup, max_packets);
+    work_wakeup = wakeup;
+  }
+  rpc.attach_wakeup(std::move(wakeup));
+}
+
+std::optional<Clock::time_point> RoomServiceState::next_data_deadline() const {
+  std::lock_guard lock(mutex);
+  return send_deadlines.next();
+}
+
+void RoomServiceState::erase_send_locked(std::map<uint64_t, Pending>::iterator position) {
+  outgoing_bytes -= position->second.bytes;
+  send_deadlines.erase(position->first);
+  cancellations->forget(position->first);
+  outgoing.erase(position);
+}
+
+void RoomServiceState::expire_sends_locked() {
+  auto ready = cancellations->take();
+  const auto now = Clock::now();
+  for (const auto id : send_deadlines.take_due(now)) {
+    ready.insert(id);
+  }
+  for (const auto id : ready) {
+    const auto found = outgoing.find(id);
+    if (found == outgoing.end()) {
+      continue;
+    }
+    const auto& pending = found->second;
+    if (pending.stop.stop_requested()) {
+      pending.promise->set_exception(failure(ErrorCode::cancelled, "Data send cancelled"));
+    } else if (now >= pending.deadline) {
+      pending.promise->set_exception(failure(ErrorCode::timeout, "Data send timed out"));
+    } else {
+      continue;
+    }
+    erase_send_locked(found);
+  }
+}
+
 void RoomServiceState::connect() {
   {
     std::lock_guard lock(mutex);
@@ -65,9 +116,12 @@ void RoomServiceState::interrupt() {
     if (!active)
       return;
     active = false;
-    for (auto& pending : outgoing)
+    for (auto& [id, pending] : outgoing)
       pending.promise->set_exception(failure(ErrorCode::connection_lost, "Data send interrupted"));
+    send_deadlines.clear();
+    cancellations->clear();
     outgoing.clear();
+    work_wakeup->signal();
     incoming.clear();
     outgoing_bytes = incoming_bytes = 0;
     changed.notify_all();
@@ -79,15 +133,20 @@ void RoomServiceState::interrupt() {
 }
 
 void RoomServiceState::close() {
+  std::shared_ptr<Handler> retired;
   {
     std::lock_guard lock(mutex);
     if (closed)
       return;
     closed = true;
     active = false;
-    for (auto& pending : outgoing)
+    retired = std::move(handler);
+    for (auto& [id, pending] : outgoing)
       pending.promise->set_exception(failure(ErrorCode::session_closed, "Room services closed"));
+    send_deadlines.clear();
+    cancellations->clear();
     outgoing.clear();
+    work_wakeup->signal();
     incoming.clear();
     outgoing_bytes = incoming_bytes = 0;
     changed.notify_all();
@@ -136,11 +195,23 @@ std::future<void> RoomServiceState::enqueue(livekit::DataPacket packet, DataSend
       std::rethrow_exception(failure(ErrorCode::cancelled, "Data send cancelled"));
     if (outgoing.size() >= max_packets || bytes > max_bytes - outgoing_bytes)
       std::rethrow_exception(failure(ErrorCode::resource_exhausted, "Data send queue exhausted"));
-    outgoing.push_back(
-        {std::move(packet), bytes, promise,
-         Clock::now() + (options.operation.timeout.count() ? options.operation.timeout : timeout),
-         options.operation.stop});
-    outgoing_bytes += bytes;
+    const auto id = ++next_send;
+    const auto deadline =
+        Clock::now() + (options.operation.timeout.count() ? options.operation.timeout : timeout);
+    try {
+      const auto wake = cancellations->watch(id);
+      auto cancellation = std::make_shared<std::stop_callback<std::function<void()>>>(
+          options.operation.stop, [wake] { wake->signal(); });
+      send_deadlines.set(id, deadline);
+      outgoing.emplace(id, Pending{std::move(packet), bytes, promise, deadline,
+                                   options.operation.stop, std::move(cancellation)});
+      outgoing_bytes += bytes;
+      work_wakeup->signal();
+    } catch (...) {
+      send_deadlines.erase(id);
+      cancellations->forget(id);
+      throw;
+    }
   } catch (...) {
     promise->set_exception(std::current_exception());
   }
@@ -153,30 +224,125 @@ void RoomServiceState::emit(DataEvent event) {
   if (!active || closed)
     return;
   if (incoming.size() >= max_packets || bytes > max_bytes - incoming_bytes) {
-    if (!event.reliable)
+    if (!event.reliable) {
+      ++dropped_events;
       return;
-    throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
-                   "Reliable data receive queue exhausted");
+    }
+    const auto error = SDKError(ErrorDomain::data, ErrorCode::resource_exhausted,
+                                "Reliable data receive queue exhausted");
+    callback_failure = error.failure();
+    throw error;
   }
   incoming.push_back(std::move(event));
   incoming_bytes += bytes;
-  changed.notify_all();
+  schedule_events_locked();
 }
 
-std::optional<DataEvent> RoomServiceState::next_event(std::chrono::milliseconds wait,
-                                                      std::stop_token stop) {
-  if (wait.count() < 0)
-    throw std::invalid_argument("Negative data read timeout");
+void RoomServiceState::set_dispatcher(Dispatch value,
+                                      std::function<void(std::exception_ptr)> failure) {
+  std::lock_guard lock(mutex);
+  if (active || closed || dispatch) {
+    throw std::logic_error("Install room service notifications once, before connect");
+  }
+  dispatch = std::move(value);
+  report_failure = std::move(failure);
+}
+
+void RoomServiceState::set_event_handler(std::function<void(const DataEvent&)> value) {
+  auto next = value ? std::make_shared<Handler>() : nullptr;
+  if (next) {
+    next->call = std::move(value);
+  }
   std::unique_lock lock(mutex);
-  changed.wait_for(lock, stop, wait, [&] { return closed || !active || !incoming.empty(); });
-  if (stop.stop_requested())
-    std::rethrow_exception(failure(ErrorCode::cancelled, "Data receive cancelled"));
-  if (incoming.empty())
-    return {};
-  auto event = std::move(incoming.front());
-  incoming.pop_front();
-  incoming_bytes -= size(event);
-  return event;
+  if (next && (!dispatch || closed || callback_failure)) {
+    throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed,
+                   "Room service notification delivery is unavailable");
+  }
+  auto previous = std::exchange(handler, std::move(next));
+  auto executing = in_flight;
+  if (!handler) {
+    incoming.clear();
+    incoming_bytes = 0;
+  }
+  schedule_events_locked();
+  if (executing && executing->thread != std::this_thread::get_id()) {
+    changed.wait(lock, [&] { return !executing->running; });
+  }
+  lock.unlock();
+}
+
+RoomServiceSnapshot RoomServiceState::snapshot() const {
+  std::lock_guard lock(mutex);
+  return {
+      active,         closed,           bool(handler),   incoming.size(), incoming_bytes,
+      dropped_events, callback_failure, outgoing.size(), outgoing_bytes,  send_deadlines.size()};
+}
+
+void RoomServiceState::schedule_events_locked() {
+  if (notification_scheduled || !handler || incoming.empty() || !active || closed) {
+    return;
+  }
+  notification_scheduled = true;
+  try {
+    dispatch([weak = weak_from_this()] {
+      if (auto state = weak.lock()) {
+        state->deliver_events();
+      }
+    });
+  } catch (...) {
+    notification_scheduled = false;
+    throw;
+  }
+}
+
+void RoomServiceState::deliver_events() {
+  // A bounded batch yields to room/graph notifications sharing this queue.
+  for (size_t count = 0; count < 32; ++count) {
+    std::shared_ptr<Handler> target;
+    std::optional<DataEvent> event;
+    {
+      std::lock_guard lock(mutex);
+      if (!handler || incoming.empty() || !active || closed) {
+        break;
+      }
+      target = in_flight = handler;
+      target->running = true;
+      target->thread = std::this_thread::get_id();
+      event = std::move(incoming.front());
+      incoming.pop_front();
+      incoming_bytes -= size(*event);
+    }
+    std::exception_ptr error;
+    std::shared_ptr<Handler> retired;
+    try {
+      target->call(*event);
+    } catch (...) {
+      error = normalized_failure(std::current_exception(), {"data_callback", {}, {}, 0},
+                                 ErrorDomain::data, ErrorCode::callback_failed);
+    }
+    {
+      std::lock_guard lock(mutex);
+      target->running = false;
+      target->thread = {};
+      in_flight.reset();
+      if (error) {
+        callback_failure = describe_failure(error);
+        retired = std::move(handler);
+        incoming.clear();
+        incoming_bytes = 0;
+      }
+      changed.notify_all();
+    }
+    if (error) {
+      if (report_failure) {
+        report_failure(error);
+      }
+      break;
+    }
+  }
+  std::lock_guard lock(mutex);
+  notification_scheduled = false;
+  schedule_events_locked();
 }
 
 void RoomServiceState::receive(const std::string& label, std::span<const uint8_t> bytes) {
@@ -193,7 +359,9 @@ void RoomServiceState::receive(const std::string& label, std::span<const uint8_t
     packet = livekit::sdk::detail::decrypt_packet(packet, encryption);
   } catch (const std::exception&) {
     emit({packet.participant_identity(), label == "_reliable",
-          DataServiceError{"Data authentication failed"}});
+          DataServiceError{"Data authentication failed",
+                           describe_failure(std::current_exception(), {"decrypt_data", {}, {}, 0},
+                                            ErrorDomain::data, ErrorCode::permission_denied)}});
     return;
   }
   if (packet.has_rpc_request() || packet.has_rpc_ack() || packet.has_rpc_response()) {
@@ -247,14 +415,17 @@ void RoomServiceState::pump(const Send& send,
     std::lock_guard lock(mutex);
     if (!active || closed)
       return;
+    // Cancellation and expiry must progress behind a backpressured FIFO head.
+    expire_sends_locked();
   }
+  bool data_blocked = false;
   for (int i = 0; i < 4; ++i) {
     std::optional<Pending> pending;
     {
       std::lock_guard lock(mutex);
       if (outgoing.empty())
         break;
-      pending = outgoing.front();
+      pending = outgoing.begin()->second;
     }
     std::exception_ptr error;
     if (pending->stop.stop_requested())
@@ -263,20 +434,29 @@ void RoomServiceState::pump(const Send& send,
       error = failure(ErrorCode::timeout, "Data send timed out");
     else
       try {
-        if (!send_packet(pending->packet, send))
+        if (!send_packet(pending->packet, send)) {
+          data_blocked = true;
           break;
+        }
       } catch (...) {
         error = std::current_exception();
       }
     std::lock_guard lock(mutex);
-    if (outgoing.empty() || outgoing.front().promise != pending->promise)
+    if (outgoing.empty() || outgoing.begin()->second.promise != pending->promise)
       continue;
     if (error)
       pending->promise->set_exception(error);
     else
       pending->promise->set_value();
-    outgoing.pop_front();
-    outgoing_bytes -= pending->bytes;
+    erase_send_locked(outgoing.begin());
+  }
+  {
+    std::lock_guard lock(mutex);
+    // A bounded send quantum yields to native work, then continues without a timer.
+    // Capacity notifications, cancellations and deadlines wake a blocked sender.
+    if (!data_blocked && !outgoing.empty()) {
+      work_wakeup->signal();
+    }
   }
   if (rpc_pending.empty())
     for (auto& packet : rpc.take_packets(4))
@@ -293,6 +473,9 @@ void RoomServiceState::pump(const Send& send,
       rpc.send_failed(rpc_pending.front());
     }
     rpc_pending.pop_front();
+  }
+  if (rpc_pending.empty() && rpc.has_outgoing()) {
+    work_wakeup->signal();
   }
   streams->pump([&](const auto& packet) { return send_packet(packet, send); }, 4, reliable_ready);
   for (const auto& request : tracks->take_signals())
@@ -324,9 +507,12 @@ std::future<void> RoomServices::send_transcription(Transcription value, DataSend
   return state_->enqueue(livekit::sdk::detail::encode_transcription(value), std::move(options));
 }
 
-std::optional<DataEvent> RoomServices::next_event(std::chrono::milliseconds wait,
-                                                  std::stop_token stop) {
-  return state_->next_event(wait, stop);
+void RoomServices::set_event_handler(std::function<void(const DataEvent&)> handler) {
+  state_->set_event_handler(std::move(handler));
+}
+
+RoomServiceSnapshot RoomServices::snapshot() const {
+  return state_->snapshot();
 }
 
 void RoomServices::register_rpc(std::string method, RpcHandler handler) {

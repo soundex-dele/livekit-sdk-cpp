@@ -18,8 +18,8 @@ void check(bool ok, const char* message) {
     throw std::runtime_error(message);
 }
 
-template <class T>
-auto await(engine::RtcEngine& engine, std::future<T> future) {
+template <class Future>
+auto await(engine::RtcEngine& engine, Future future) {
   const auto deadline = SteadyClock::now() + 15s;
   while (future.wait_for(0ms) != std::future_status::ready) {
     check(SteadyClock::now() < deadline, "Audio graph operation timed out");
@@ -143,7 +143,6 @@ int main() {
                              G::connect<nodes::EncodedFrameEvent>(encoders[i], sink),
                              G::connect<nodes::SenderFeedbackEvent>(sink, encoders[i])};
         graph.quiesce = [node = encoders[i]] { node->quiesce(); };
-        graph.check_health = [node = encoders[i]] { node->throw_if_failed(); };
         return graph;
       }));
     }
@@ -169,10 +168,6 @@ int main() {
             graph.quiesce = [node = decoders[i], output = speakers[i]] {
               node->quiesce();
               output->quiesce();
-            };
-            graph.check_health = [node = decoders[i], output = speakers[i]] {
-              node->throw_if_failed();
-              output->throw_if_failed();
             };
             return graph;
           }));

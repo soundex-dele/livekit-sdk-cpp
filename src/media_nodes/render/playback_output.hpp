@@ -6,7 +6,7 @@
 
 namespace livekit::sdk::detail {
 // Lifecycle and media subscriptions run on the graph worker. Channel access is
-// synchronized so the application's render/device thread can pull frames.
+// synchronized so the delivery worker can dispatch due frames.
 template <class T>
 class PlaybackOutputNode final : public MediaNode {
  public:
@@ -29,9 +29,14 @@ class PlaybackOutputNode final : public MediaNode {
       return channel_.push(frame, frame.pcm->size() * sizeof(float));
   }
 
-  std::optional<T> poll(int64_t time, uint64_t generation) {
+  std::optional<T> take_due(int64_t time, uint64_t generation) {
     std::lock_guard lock(mutex_);
     return channel_.pop_due(time, generation);
+  }
+
+  std::optional<int64_t> next_timestamp() const {
+    std::lock_guard lock(mutex_);
+    return channel_.next_timestamp();
   }
 
   void flush(uint64_t generation) {

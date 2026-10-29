@@ -9,10 +9,12 @@ using namespace livekit::sdk;
 using Clock = std::chrono::steady_clock;
 
 SignalSession::SignalSession(const SignalingOptions& options, std::stop_token stop,
-                             EventEmitter events, detail::SignalRecoveryState* recovery)
+                             EventEmitter events, detail::SignalRecoveryState* recovery,
+                             std::shared_ptr<detail::WakeEvent> wakeup)
     : options_(options),
       stop_(stop),
       events_(std::move(events)),
+      socket_(std::move(wakeup)),
       recovery_(recovery ? *recovery : local_recovery_) {
   if (!recovery) {
     recovery_.budget = detail::RecoveryBudget(options.reconnect);
@@ -258,7 +260,7 @@ bool SignalSession::recover(const SyncBuilder& sync, const ReconnectHandler& con
       while (!stop_.stop_requested() && Clock::now() < attempt_deadline) {
         events_.dispatch();
         events_.rethrow();
-        auto bytes = socket_.receive(50);
+        auto bytes = socket_.receive_until(attempt_deadline, stop_);
         if (!bytes)
           continue;
         livekit::SignalResponse response;

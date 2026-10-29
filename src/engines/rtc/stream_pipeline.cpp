@@ -4,6 +4,41 @@
 #include <utility>
 
 namespace livekit::sdk::rtc::engine {
+// Node handlers retain only this shared report state, not the pipeline or its
+// owner. Owner teardown drains source workers before releasing the registry.
+struct GraphObservation {
+  mutable std::mutex mutex;
+  std::exception_ptr cause;
+  GraphStopped stopped;
+  std::function<Epoch()> epoch;
+  TrackId id;
+
+  std::exception_ptr failure() const {
+    std::lock_guard lock(mutex);
+    return cause;
+  }
+
+  void report(std::exception_ptr value, const std::string& node) {
+    {
+      std::lock_guard lock(mutex);
+      if (cause) {
+        return;
+      }
+      cause = normalized_failure(value, {"graph", id, node, epoch()}, ErrorDomain::media,
+                                 ErrorCode::processing_failed);
+      value = cause;
+    }
+    if (stopped) {
+      stopped(value);
+    }
+  }
+
+  void terminal() {
+    if (stopped) {
+      stopped(failure());
+    }
+  }
+};
 namespace {
 std::atomic<uint64_t> next_graph{0};
 
@@ -11,9 +46,45 @@ std::string name(const char* role, const TrackId& id) {
   return std::string("rtc.") + role + "." + std::to_string(++next_graph) + "." + id;
 }
 
+template <class Endpoint>
+std::shared_ptr<GraphObservation> observe(const std::shared_ptr<Endpoint>& endpoint,
+                                          GraphStopped stopped) {
+  auto result = std::make_shared<GraphObservation>();
+  result->id = endpoint->descriptor().id;
+  result->stopped = std::move(stopped);
+  result->epoch = [weak = std::weak_ptr<Endpoint>(endpoint)] {
+    auto track = weak.lock();
+    return track ? track->snapshot().epoch : Epoch{};
+  };
+  return result;
+}
+
+template <class Endpoint>
+std::exception_ptr startup_failure(const std::shared_ptr<GraphObservation>& observation,
+                                   const std::shared_ptr<Endpoint>& endpoint) {
+  if (auto reported = observation->failure()) {
+    return reported;
+  }
+  const auto state = endpoint->snapshot();
+  // A transport may fail after ACK but before this graph starts. Preserve that
+  // cause instead of replacing it with a generic node-start failure.
+  if (state.failure) {
+    return std::make_exception_ptr(SDKError(state.failure));
+  }
+  return normalized_failure(std::current_exception(),
+                            {"start_graph", endpoint->descriptor().id, {}, state.epoch},
+                            ErrorDomain::media, ErrorCode::processing_failed);
+}
+
 void build(graphflow::engine::GraphEngine& graph,
            std::vector<std::shared_ptr<graphflow::core::GraphNode>> nodes,
-           std::vector<graphflow::engine::NodeConnection> connections) {
+           std::vector<graphflow::engine::NodeConnection> connections,
+           const std::shared_ptr<GraphObservation>& observation) {
+  for (const auto& node : nodes) {
+    node->setFailureHandler([observation, name = node->getName()](auto failure) {
+      observation->report(failure, name);
+    });
+  }
   if (!graph.loadFromNodes(nodes, connections) || !graph.init())
     throw std::runtime_error("Unable to prepare RTC track graph");
 }
@@ -50,19 +121,21 @@ PublishPipeline::PublishPipeline(std::shared_ptr<PublishedTrack> track,
             return spec;
           })) {}
 
-PublishPipeline::PublishPipeline(std::shared_ptr<PublishedTrack> track,
-                                 PublishGraphFactory factory) {
+PublishPipeline::PublishPipeline(std::shared_ptr<PublishedTrack> track, PublishGraphFactory factory,
+                                 GraphStopped stopped) {
   if (!track || !factory)
     throw std::invalid_argument("RTC publication requires endpoint and graph factory");
   input_ = std::make_shared<Input>(track->descriptor().id);
   sink_ = std::make_shared<nodes::RtcPublishNode>(name("publish", track->descriptor().id), track);
   extension_ = factory(sink_);
+  observation_ = observe(track, std::move(stopped));
+  sink_->set_terminal_handler([state = observation_] { state->terminal(); });
   auto graph_nodes = extension_.nodes;
   auto connections = extension_.connections;
   graph_nodes.insert(graph_nodes.begin(), sink_);
   graph_nodes.push_back(input_);
   connections.push_back(TrackGraphSpec::connect<nodes::EncodedFrameEvent>(input_, sink_));
-  build(graph_, std::move(graph_nodes), std::move(connections));
+  build(graph_, std::move(graph_nodes), std::move(connections), observation_);
 }
 
 PublishPipeline::~PublishPipeline() {
@@ -86,17 +159,22 @@ void PublishPipeline::start() {
     if (extension_.activate)
       extension_.activate();
     std::lock_guard lock(mutex_);
+    if (auto error = observation_->failure()) {
+      std::rethrow_exception(error);
+    }
     running_ = true;
   } catch (...) {
     {
       std::lock_guard lock(mutex_);
       closed_ = true;
     }
+    const auto error = startup_failure(observation_, sink_->track());
+    notify_failure(error);
     sink_->quiesce();
     quiesce(extension_);
     graph_.stop();
     sink_->track()->close();
-    throw;
+    std::rethrow_exception(error);
   }
 }
 
@@ -109,19 +187,18 @@ WriteStatus PublishPipeline::write(EncodedFrame frame) {
   return input_->push(std::move(frame));
 }
 
-void PublishPipeline::check() {
-  {
-    std::lock_guard lock(mutex_);
-    if (!running_)
-      return;
-  }
-  sink_->throw_if_failed();
-  if (extension_.check_health) {
-    extension_.check_health();
+std::exception_ptr PublishPipeline::failure() const {
+  return observation_->failure();
+}
+
+void PublishPipeline::notify_failure(std::exception_ptr failure) {
+  sink_->track()->report_failure(failure);
+  if (extension_.on_failure) {
+    extension_.on_failure(failure);
   }
 }
 
-std::future<void> PublishPipeline::close() {
+AsyncResult<void> PublishPipeline::close() {
   bool stop = false;
   {
     std::lock_guard lock(mutex_);
@@ -154,15 +231,17 @@ SubscribePipeline::SubscribePipeline(std::shared_ptr<SubscribedTrack> track,
                         })) {}
 
 SubscribePipeline::SubscribePipeline(std::shared_ptr<SubscribedTrack> track,
-                                     SubscribeGraphFactory factory) {
+                                     SubscribeGraphFactory factory, GraphStopped stopped) {
   if (!track || !factory)
     throw std::invalid_argument("RTC subscription requires endpoint and graph factory");
   source_ =
       std::make_shared<nodes::RtcSubscribeNode>(name("subscribe", track->descriptor().id), track);
   extension_ = factory(source_);
+  observation_ = observe(track, std::move(stopped));
+  source_->set_terminal_handler([state = observation_] { state->terminal(); });
   auto graph_nodes = extension_.nodes;
   graph_nodes.push_back(source_);
-  build(graph_, std::move(graph_nodes), extension_.connections);
+  build(graph_, std::move(graph_nodes), extension_.connections, observation_);
 }
 
 SubscribePipeline::~SubscribePipeline() {
@@ -189,34 +268,37 @@ void SubscribePipeline::start() {
     }
     source_->activate();
     std::lock_guard lock(mutex_);
+    if (auto error = observation_->failure()) {
+      std::rethrow_exception(error);
+    }
     running_ = true;
   } catch (...) {
     {
       std::lock_guard lock(mutex_);
       closed_ = true;
     }
+    const auto error = startup_failure(observation_, source_->track());
+    notify_failure(error);
     source_->quiesce();
     quiesce(extension_);
     graph_.stop();
     source_->track()->close();
-    throw;
+    std::rethrow_exception(error);
   }
 }
 
-void SubscribePipeline::check() {
-  {
-    std::lock_guard lock(mutex_);
-    if (!running_) {
-      return;
-    }
-  }
-  source_->throw_if_failed();
-  if (extension_.check_health) {
-    extension_.check_health();
+std::exception_ptr SubscribePipeline::failure() const {
+  return observation_->failure();
+}
+
+void SubscribePipeline::notify_failure(std::exception_ptr failure) {
+  source_->track()->report_failure(failure);
+  if (extension_.on_failure) {
+    extension_.on_failure(failure);
   }
 }
 
-std::future<void> SubscribePipeline::close() {
+AsyncResult<void> SubscribePipeline::close() {
   bool stop = false;
   {
     std::lock_guard lock(mutex_);

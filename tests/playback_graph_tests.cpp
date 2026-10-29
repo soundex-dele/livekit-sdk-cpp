@@ -75,12 +75,12 @@ int drain(PlaybackGraph& graph, uint64_t generation, int64_t lower_bound) {
   int video = 0, audio = 0;
   for (int i = 0; i < 10000; ++i) {
     auto step = graph.step();
-    while (auto frame = output->video->poll(std::numeric_limits<int64_t>::max(), generation)) {
+    while (auto frame = output->video->take_due(std::numeric_limits<int64_t>::max(), generation)) {
       require(frame->generation == generation && frame->timestamp_us >= lower_bound,
               "stale video after graph seek");
       ++video;
     }
-    while (auto frame = output->audio->poll(std::numeric_limits<int64_t>::max(), generation)) {
+    while (auto frame = output->audio->take_due(std::numeric_limits<int64_t>::max(), generation)) {
       require(frame->generation == generation && frame->timestamp_us >= lower_bound,
               "stale audio after graph seek");
       ++audio;
@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
         }
       require(blocked && output->video->size() <= 2 && output->audio->size() <= 3,
               "output nodes failed to backpressure");
-      retained = output->video->poll(std::numeric_limits<int64_t>::max(), 10);
+      retained = output->video->take_due(std::numeric_limits<int64_t>::max(), 10);
       require(retained && !retained->rgba->empty(), "missing retained video buffer");
       graph.pause();
       state_is(graph, graphflow::core::LifecycleState::Stopped);

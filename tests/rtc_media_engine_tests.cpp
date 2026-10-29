@@ -7,6 +7,8 @@
 #include <thread>
 #include <utility>
 
+using livekit::sdk::AsyncResult;
+using livekit::sdk::CompletionSource;
 using namespace livekit::sdk::rtc;
 using namespace livekit::sdk::rtc::engine;
 using namespace livekit::sdk::rtc::detail;
@@ -20,6 +22,7 @@ void check(bool value, const char* message) {
 
 struct Wire {
   std::mutex mutex;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
   std::vector<TransportEvent> events;
   std::map<TrackId, BindingToken> subscribers;
   std::map<TrackId, BindingToken> publishers;
@@ -31,6 +34,9 @@ struct Wire {
   void emit(TransportEvent event) {
     std::lock_guard lock(mutex);
     events.push_back(std::move(event));
+    if (wakeup) {
+      wakeup->signal();
+    }
   }
 };
 
@@ -40,6 +46,10 @@ class Transport final : public RoomTransport {
 
   void start(const RoomOptions&, Epoch) override {
     ++w->starts;
+    {
+      std::lock_guard lock(w->mutex);
+      w->wakeup = wakeup_;
+    }
     w->emit({TransportEventKind::connected});
   }
 
@@ -65,13 +75,13 @@ class Transport final : public RoomTransport {
     w->emit({TransportEventKind::subscribed, binding, d.remote_sid});
   }
 
-  std::future<void> remove(const BindingToken& binding, bool) override {
+  AsyncResult<void> remove(const BindingToken& binding, bool) override {
     std::lock_guard lock(w->mutex);
     std::erase_if(w->subscribers, [&](const auto& item) { return item.second == binding; });
     std::erase_if(w->publishers, [&](const auto& item) { return item.second == binding; });
-    std::promise<void> done;
+    CompletionSource<void> done;
     done.set_value();
-    return done.get_future();
+    return done.get_result();
   }
 
   SendResult send(const BindingToken& binding, const EncodedFrame& frame) override {
@@ -81,6 +91,7 @@ class Transport final : public RoomTransport {
       TransportEvent event{TransportEventKind::frame, it->second};
       event.frame = frame;
       w->events.push_back(std::move(event));
+      wakeup_->signal();
     }
     return SendResult::sent;
   }
@@ -102,11 +113,11 @@ class Transport final : public RoomTransport {
       TransportEvent event{TransportEventKind::feedback, publisher};
       event.feedback = feedback;
       w->events.push_back(std::move(event));
+      wakeup_->signal();
     }
   }
 
-  std::vector<TransportEvent> poll(std::chrono::milliseconds, std::stop_token) override {
-    std::this_thread::sleep_for(1ms);
+  std::vector<TransportEvent> take_events() override {
     std::lock_guard lock(w->mutex);
     return std::exchange(w->events, {});
   }
@@ -126,7 +137,7 @@ void until(RtcEngine& engine, F done) {
 }
 
 template <class T>
-auto await(RtcEngine& engine, std::future<T>& operation) {
+auto await(RtcEngine& engine, AsyncResult<T>& operation) {
   until(engine, [&] { return operation.wait_for(0ms) == std::future_status::ready; });
   return operation.get();
 }
@@ -143,7 +154,7 @@ MediaPublishSpec video(std::string id) {
 
 std::unique_ptr<RtcEngine> make_engine(std::shared_ptr<Wire> wire) {
   auto result = std::make_unique<RtcEngine>([wire] { return std::make_unique<Transport>(wire); });
-  result->enable_media();
+  result->enable_media().get();
   LiveKitRoomOptions options;
   options.url = "ws://test";
   options.token = "test";
@@ -295,7 +306,7 @@ void shared_capture() {
   auto engine = make_engine(wire);
   auto other = make_engine(std::make_shared<Wire>());
   const auto format = video("capture");
-  auto shared = engine->create_shared_input(format.track, format.input);
+  auto shared = engine->create_shared_input(format.track, format.input).get();
   auto a = video("shared-a"), b = video("shared-b");
   a.input = {};
   b.input = {};
@@ -344,7 +355,7 @@ void shared_audio() {
   a.track.format.channels = 2;
   MediaInput input;
   input.audio_source = source;
-  auto shared = engine->create_shared_input(a.track, input);
+  auto shared = engine->create_shared_input(a.track, input).get();
   a.shared_input = shared;
   auto b = a;
   b.track.id = "pcm-b";

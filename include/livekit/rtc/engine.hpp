@@ -9,7 +9,7 @@ namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
 
 // Single-room facade with an owned serial task queue. Control methods marshal
-// to that queue and may be called from application threads. Futures progress
+// to that queue without waiting for command execution. Results progress
 // automatically. Media/feedback source nodes dispatch on their own workers.
 // Never wait for lifecycle operations from media callbacks or graph hooks.
 // Destruction requires callers to have stopped using this facade.
@@ -22,27 +22,27 @@ class RtcEngine final {
   RtcEngine& operator=(const RtcEngine&) = delete;
 
   // Links LiveKit::RTCMediaEngine. Call before join; repeated installation is rejected.
-  void enable_media(AudioOutputOptions = {});
+  AsyncResult<void> enable_media(AudioOutputOptions = {});
   bool media_enabled() const;
-  std::future<void> join(RoomOptions);
+  AsyncResult<void> join(RoomOptions);
   // Quiesces graphs before leaving. Await completion before joining again.
-  std::future<void> leave();
+  AsyncResult<void> leave();
   // Terminal and idempotent. Rejects subsequent control operations.
-  std::future<void> close();
+  AsyncResult<void> close();
 
   MediaOperation publish_media(MediaPublishSpec);
   MediaOperation publish_video(MediaPublishSpec);
   MediaOperation publish_audio(MediaPublishSpec);
   MediaOperation subscribe_media(MediaSubscribeSpec);
-  std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput);
+  AsyncResult<std::shared_ptr<SharedMediaInput>> create_shared_input(TrackDescriptor, MediaInput);
 
   // Encoded publication. Advanced graph composition requires graph_api.hpp.
-  std::future<TrackId> publish(TrackDescriptor);
+  AsyncResult<TrackId> publish(TrackDescriptor);
   RtcGraphApi graph();
-  std::future<void> unpublish(const TrackId&);
-  std::future<void> unsubscribe(const TrackId&);
-  std::future<void> set_muted(const TrackId&, bool, ControlOptions = {});
-  std::future<void> set_receive_demand(const TrackId&, ReceiveDemand, ControlOptions = {});
+  AsyncResult<void> unpublish(const TrackId&);
+  AsyncResult<void> unsubscribe(const TrackId&);
+  AsyncResult<void> set_muted(const TrackId&, bool, ControlOptions = {});
+  AsyncResult<void> set_receive_demand(const TrackId&, ReceiveDemand, ControlOptions = {});
   // Producer threads may write; closed/absent publications return WriteStatus::closed.
   WriteStatus write(const TrackId&, EncodedFrame);
   TrackSnapshot publication(const TrackId&) const;
@@ -52,6 +52,9 @@ class RtcEngine final {
     TrackId id;
     bool publication;
     std::string message;
+    // The same failure may also arrive as a RoomEvent. Deduplicate by failure->id;
+    // no ordering between the two notification paths is guaranteed.
+    std::shared_ptr<const FailureInfo> failure;
   };
 
   struct Callbacks {
@@ -71,6 +74,10 @@ class RtcEngine final {
 
  private:
   friend class RtcGraphApi;
+  friend class RtcExecutor;
+  MediaOperation start_media(MediaPublishSpec, std::optional<MediaKind> expected = {});
+  void post_control(std::function<void()>);
+  bool on_control_thread() const;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

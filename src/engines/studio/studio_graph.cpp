@@ -6,6 +6,7 @@
 #include <cstring>
 #include <exception>
 #include <set>
+#include <utility>
 
 namespace livekit::sdk::studio_detail {
 namespace {
@@ -210,12 +211,35 @@ class SourcesNode final : public Node {
   explicit SourcesNode(Context& context) : Node("studio.sources", context) {}
 
  private:
+  // Callbacks retain no scene/node pointer. Keep only the newest image and at
+  // most 200 ms of stereo PCM; a slow compositor cannot grow player output.
+  struct PlaybackState {
+    std::mutex mutex;
+    std::optional<media::VideoFrame> video;
+    std::deque<float> audio;
+    std::deque<std::function<void()>> completions;
+    PlayerSnapshot snapshot;
+    uint64_t generation = 0;
+    std::string error;
+    bool pending = true;
+
+    void accept(uint64_t value) {
+      if (generation != value) {
+        generation = value;
+        video.reset();
+        audio.clear();
+      }
+    }
+  };
+
   struct Source {
     StudioSource spec;
     std::unique_ptr<Capture> capture;
-    std::unique_ptr<Player> player;
+    std::shared_ptr<PlaybackState> playback;
+    std::shared_ptr<Player> player;
     std::shared_ptr<const StudioImage> image;
     std::deque<float> audio;
+    uint64_t generation = 0;
     std::string error;
     Time attempt = Clock::now();
   };
@@ -223,6 +247,40 @@ class SourcesNode final : public Node {
   std::map<std::string, Source> sources_;
   std::unique_ptr<AudioCapture> microphone_, system_;
   Time device_retry_{};
+
+  static auto dispatcher(const std::shared_ptr<PlaybackState>& state) {
+    return [weak = std::weak_ptr(state)](std::function<void()> task) {
+      auto target = weak.lock();
+      if (!target) {
+        throw SDKError(ErrorDomain::lifecycle, ErrorCode::cancelled, "Studio source removed");
+      }
+      std::lock_guard lock(target->mutex);
+      if (target->completions.size() >= 8) {
+        throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
+                       "Studio source completion queue exhausted");
+      }
+      target->completions.push_back(std::move(task));
+    };
+  }
+
+  static void complete(Source& source, AsyncResult<void> operation) {
+    std::move(operation).then(dispatcher(source.playback),
+                              [weak = std::weak_ptr(source.playback)](AsyncResult<void> result) {
+                                auto target = weak.lock();
+                                if (!target) {
+                                  return;
+                                }
+                                std::string error;
+                                try {
+                                  result.get();
+                                } catch (const std::exception& e) {
+                                  error = e.what();
+                                }
+                                std::lock_guard lock(target->mutex);
+                                target->pending = false;
+                                target->error = std::move(error);
+                              });
+  }
 
   bool doInit() override {
     listen<Tick>([this](const Tick& event) { process(event.data); });
@@ -249,9 +307,44 @@ class SourcesNode final : public Node {
     else if (spec.kind == StudioSourceKind::text)
       source.image = text_image(spec.input, spec.color);
     else if (spec.kind == StudioSourceKind::video) {
-      source.player = std::make_unique<Player>();
-      source.player->open(spec.input).get();
-      source.player->play().get();
+      source.playback = std::make_shared<PlaybackState>();
+      source.player = std::make_shared<Player>();
+      const auto weak = std::weak_ptr(source.playback);
+      PlayerCallbacks callbacks;
+      callbacks.video = [weak](const media::VideoFrame& frame) {
+        if (auto target = weak.lock()) {
+          std::lock_guard lock(target->mutex);
+          target->accept(frame.generation);
+          target->video = frame;
+        }
+      };
+      callbacks.audio = [weak](const media::AudioFrame& frame) {
+        if (auto target = weak.lock()) {
+          std::lock_guard lock(target->mutex);
+          target->accept(frame.generation);
+          append(target->audio, *frame.pcm);
+        }
+      };
+      callbacks.state = [weak](const PlayerSnapshot& snapshot) {
+        if (auto target = weak.lock()) {
+          std::lock_guard lock(target->mutex);
+          target->accept(snapshot.generation);
+          target->snapshot = snapshot;
+        }
+      };
+      source.player->set_callbacks(std::move(callbacks));
+      complete(source,
+               source.player->open(spec.input)
+                   .then(dispatcher(source.playback), [player = std::weak_ptr(source.player)](
+                                                          AsyncResult<PlayerMediaInfo> result) {
+                     result.get();
+                     auto target = player.lock();
+                     if (!target) {
+                       throw SDKError(ErrorDomain::lifecycle, ErrorCode::cancelled,
+                                      "Studio source removed");
+                     }
+                     return target->play();
+                   }));
     } else {
       auto image = std::make_shared<StudioImage>();
       image->width = image->height = 2;
@@ -310,25 +403,51 @@ class SourcesNode final : public Node {
           source.image = source.capture->frame();
       }
       if (source.player) {
-        while (auto frame = source.player->poll_video()) {
+        std::deque<std::function<void()>> completions;
+        {
+          std::lock_guard lock(source.playback->mutex);
+          completions.swap(source.playback->completions);
+        }
+        for (auto& completion : completions) {
+          completion();
+        }
+        std::optional<media::VideoFrame> frame;
+        bool replay = false;
+        {
+          auto& playback = *source.playback;
+          std::lock_guard lock(playback.mutex);
+          if (source.generation != playback.generation) {
+            source.generation = playback.generation;
+            source.audio.clear();
+          }
+          frame = std::exchange(playback.video, {});
+          source.audio.insert(source.audio.end(), playback.audio.begin(), playback.audio.end());
+          playback.audio.clear();
+          while (source.audio.size() > 19200) {
+            source.audio.pop_front();
+          }
+          source.error = playback.error.empty() ? playback.snapshot.error : playback.error;
+          replay = playback.snapshot.state == PlayerState::ended && spec.loop && !playback.pending;
+          if (replay) {
+            playback.pending = true;
+            playback.snapshot.state = PlayerState::ready;
+          }
+        }
+        if (frame) {
           auto image = std::make_shared<StudioImage>();
           image->width = frame->width;
           image->height = frame->height;
           image->rgba.resize(size_t(image->width) * image->height * 4);
-          for (int y = 0; y < image->height; ++y)
+          for (int y = 0; y < image->height; ++y) {
             memcpy(image->rgba.data() + size_t(y) * image->width * 4,
                    frame->rgba->data() + size_t(y) * frame->stride, size_t(image->width) * 4);
+          }
           source.image = std::move(image);
         }
-        while (auto frame = source.player->poll_audio())
-          append(source.audio, *frame->pcm);
-        auto state = source.player->snapshot();
-        if (state.state == PlayerState::ended && spec.loop) {
-          source.player->seek(std::chrono::microseconds(0)).get();
-          source.player->play().get();
+        if (replay) {
+          // Player owns rewind-at-EOS; never block the compositor on file I/O.
+          complete(source, source.player->play());
         }
-        if (!state.error.empty())
-          source.error = state.error;
       }
       if (!source.error.empty()) {
         if (source.error != previous_error)

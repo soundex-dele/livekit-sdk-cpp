@@ -2,6 +2,7 @@
 #include "backends/rtc/livekit/rpc_session.hpp"
 #include "livekit/error.hpp"
 #include "support/compression.hpp"
+#include "support/wake_event.hpp"
 #include <atomic>
 #include <source_location>
 #include <thread>
@@ -65,14 +66,89 @@ inline livekit::DataPacket response(const livekit::DataPacket& request,
 }
 
 inline livekit::RpcResponse read_response(detail::RpcSession& session, const std::string& id) {
+  const auto wake = std::make_shared<detail::WakeEvent>();
+  session.attach_wakeup(wake);
   const auto end = std::chrono::steady_clock::now() + 2s;
-  do {
-    for (auto& packet : session.take_packets(512))
-      if (packet.has_rpc_response() && packet.rpc_response().request_id() == id)
+  while (std::chrono::steady_clock::now() < end) {
+    const auto observed = wake->revision();
+    for (auto& packet : session.take_packets(512)) {
+      if (packet.has_rpc_response() && packet.rpc_response().request_id() == id) {
         return packet.rpc_response();
-    std::this_thread::sleep_for(1ms);
-  } while (std::chrono::steady_clock::now() < end);
+      }
+    }
+    wake->wait(observed, {}, end);
+  }
   throw std::runtime_error("RPC response deadline: " + id);
+}
+
+inline void indexed_deadlines() {
+  detail::RpcSession session;
+  session.connect();
+  auto wake = std::make_shared<detail::WakeEvent>();
+  session.attach_wakeup(wake);
+  RpcCallOptions call{"peer", "echo", "indexed"};
+  call.response_timeout = 5min;
+  std::vector<std::stop_source> stops(128);
+  std::vector<std::future<std::string>> pending;
+  const auto observed = wake->revision();
+  for (auto& stop : stops) {
+    call.stop = stop.get_token();
+    pending.push_back(session.call(call));
+  }
+  check(wake->revision() != observed);
+  check(session.snapshot().scheduled_deadlines == 128);
+  stops[63].request_stop();
+  sdk_error(pending[63], ErrorCode::cancelled);
+  auto state = session.snapshot();
+  check(state.outgoing_requests == 127 && state.scheduled_deadlines == 127 &&
+        state.requests_serviced == 1);
+  for (size_t i = 0; i < pending.size(); ++i) {
+    if (i != 63) {
+      check(pending[i].wait_for(0ms) == std::future_status::timeout);
+    }
+  }
+  session.disconnect();
+  state = session.snapshot();
+  check(state.scheduled_deadlines == 0 && state.pending_cancellations == 0 &&
+        !state.next_deadline && state.queued_packets == 0);
+  for (size_t i = 0; i < pending.size(); ++i) {
+    if (i != 63) {
+      rpc_error(pending[i], RpcErrorCode::recipient_disconnected);
+    }
+  }
+  // Retired cancellation callbacks cannot enqueue work for a reconnected session.
+  for (auto& stop : stops) {
+    stop.request_stop();
+  }
+  check(session.snapshot().pending_cancellations == 0);
+  session.connect();
+  call.stop = {};
+  call.response_timeout = 15s;
+  const auto start = std::chrono::steady_clock::now();
+  auto result = session.call(call);
+  const auto packets = session.take_packets();
+  check(packets.size() == 1);
+  state = session.snapshot();
+  check(state.next_deadline && *state.next_deadline < start + 10s);
+  livekit::DataPacket ack;
+  ack.set_participant_identity("peer");
+  ack.mutable_rpc_ack()->set_request_id(packets[0].rpc_request().id());
+  for (int i = 0; i < 1000; ++i) {
+    session.receive(ack);
+  }
+  state = session.snapshot();
+  check(state.scheduled_deadlines == 1 && state.next_deadline &&
+        *state.next_deadline >= start + 15s);
+  // Installing an earlier deadline interrupts a wait for the acknowledged request.
+  call.response_timeout = 25ms;
+  auto earlier = session.call(call);
+  rpc_error(earlier, RpcErrorCode::response_timeout);
+  check(result.wait_for(0ms) == std::future_status::timeout);
+  session.receive(response(packets[0]));
+  ready(result);
+  check(result.get() == "reply");
+  check(session.snapshot().scheduled_deadlines == 0);
+  session.disconnect();
 }
 
 inline void run() {
@@ -316,10 +392,13 @@ inline void run() {
   check(session.take_packets().empty());
   fresh({"second", {}});
   check(read_response(session, "evicted").payload() == "second");
+  check(session.snapshot().scheduled_deadlines == session.snapshot().incoming_requests);
   session.disconnect();  // Finish cancellation before captured test state is destroyed.
+  check(session.snapshot().scheduled_deadlines == 0);
 }
 }  // namespace rpc_contract_test
 
 inline void rpc_contract() {
+  rpc_contract_test::indexed_deadlines();
   rpc_contract_test::run();
 }

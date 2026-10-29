@@ -36,8 +36,8 @@ void until(F fn, const std::string& message) {
   }
 }
 
-template <class T>
-T done(std::future<T> f) {
+template <class Future>
+auto done(Future f) {
   require(f.wait_for(15s) == std::future_status::ready, "SDK operation timed out");
   return f.get();
 }

@@ -24,6 +24,8 @@ struct Endpoint {
     SteadyClock::time_point queued;
   };
 
+  void attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent>);
+  std::optional<SteadyClock::time_point> next_expiration();
   TrackSnapshot snapshot() const;
   SenderFeedback feedback() const;
   std::optional<SenderFeedback> wait_feedback(Epoch, uint64_t, std::stop_token);
@@ -36,7 +38,7 @@ struct Endpoint {
   bool matches(const BindingToken&) const;
   void rebind(Epoch);
   void ready(std::string server_sid);
-  void finish(TrackState, std::string error = {});
+  void finish(TrackState, std::string error = {}, std::shared_ptr<const FailureInfo> = {});
   WriteStatus write(EncodedFrame);
   ReadResult read(std::chrono::milliseconds, std::stop_token);
   ReadResult wait_frame(std::stop_token);
@@ -54,6 +56,8 @@ struct Endpoint {
   void expire_locked();
   mutable std::mutex mutex_;
   std::condition_variable_any changed_;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup_;
+  void notify_locked();
   BindingToken binding_;
   TrackSnapshot stats_;
   SenderFeedback feedback_;

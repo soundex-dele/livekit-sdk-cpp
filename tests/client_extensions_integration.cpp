@@ -19,8 +19,8 @@ void check(bool ok, const char* message) {
     throw std::runtime_error(message);
 }
 
-template <class T>
-auto await(std::future<T> future) {
+template <class Future>
+auto await(Future future) {
   check(future.wait_for(20s) == std::future_status::ready, "RTC operation timed out");
   return future.get();
 }

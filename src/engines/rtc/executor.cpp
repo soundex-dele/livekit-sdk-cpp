@@ -1,6 +1,6 @@
 #include "livekit/rtc/executor.hpp"
 #include "livekit/error.hpp"
-#include "utoolkit/task_queue/task_queue.h"
+#include <map>
 #include <mutex>
 
 namespace livekit::sdk::rtc::engine {
@@ -12,78 +12,30 @@ std::exception_ptr cancelled() {
 }  // namespace
 
 struct RtcExecutor::Impl {
-  struct Pending {
-    std::function<bool()> complete;
-    std::function<void(std::exception_ptr)> cancel;
+  struct State {
+    mutable std::mutex mutex;
+    ExecutorSnapshot stats;
+    bool accepting = true;
+    uint64_t next_id = 0;
+    std::map<uint64_t, std::function<void(std::exception_ptr)>> pending;
+
+    void finish(uint64_t id) {
+      std::lock_guard lock(mutex);
+      if (pending.erase(id)) {
+        ++stats.commands_completed;
+        stats.pending_operations = pending.size() - stats.queued_operations;
+      }
+    }
   };
 
-  const ExecutorOptions options;
-  mutable std::mutex mutex;
-  std::mutex shutdown_mutex;
-  ExecutorSnapshot stats;
-  bool accepting = true;
-  size_t outstanding = 0;
-  std::unique_ptr<vi::TaskQueue> queue;
+  ExecutorOptions options;
+  std::shared_ptr<State> state = std::make_shared<State>();
   std::unique_ptr<RtcEngine> engine;
-  std::vector<Pending> pending;  // Queue only.
-  bool completion_scheduled = false;
+  std::mutex shutdown_mutex;
 
   explicit Impl(ExecutorOptions value) : options(value) {
     if (!options.max_operations || options.max_operations > 65536) {
       throw std::invalid_argument("Invalid RTC executor configuration");
-    }
-    queue = vi::TaskQueue::create("rtc.commands");
-  }
-
-  ~Impl() {
-    // Join before members referenced by deferred tasks are destroyed.
-    queue.reset();
-  }
-
-  void finished() {
-    std::lock_guard lock(mutex);
-    --outstanding;
-    ++stats.commands_completed;
-  }
-
-  void finish_futures() {
-    completion_scheduled = false;
-    for (auto it = pending.begin(); it != pending.end();) {
-      bool complete = false;
-      try {
-        complete = it->complete();
-      } catch (...) {
-        it->cancel(std::current_exception());
-        complete = true;
-      }
-      if (complete) {
-        it = pending.erase(it);
-        finished();
-      } else {
-        ++it;
-      }
-    }
-    {
-      std::lock_guard lock(mutex);
-      stats.pending_operations = pending.size();
-    }
-    if (!pending.empty() && !completion_scheduled) {
-      completion_scheduled = true;
-      // std::future has no continuation API. This adapter only checks the
-      // caller's returned futures; it never advances the engine or graph.
-      try {
-        queue->postDelayedTask([this] { finish_futures(); }, 2);
-      } catch (...) {
-        completion_scheduled = false;
-        const auto failure = std::current_exception();
-        for (auto& operation : pending) {
-          operation.cancel(failure);
-          finished();
-        }
-        pending.clear();
-        std::lock_guard lock(mutex);
-        stats.pending_operations = 0;
-      }
     }
   }
 };
@@ -93,17 +45,11 @@ RtcExecutor::RtcExecutor(Factory factory, ExecutorOptions options)
   if (!factory) {
     throw std::invalid_argument("RTC executor requires an engine factory");
   }
-  std::packaged_task<void()> create([&] {
-    impl_->engine = factory();
-    if (!impl_->engine) {
-      throw std::invalid_argument("RTC executor factory returned no engine");
-    }
-    std::lock_guard lock(impl_->mutex);
-    impl_->stats.running = true;
-  });
-  auto ready = create.get_future();
-  impl_->queue->postSyncTask([&] { create(); });
-  ready.get();
+  impl_->engine = factory();
+  if (!impl_->engine) {
+    throw std::invalid_argument("RTC executor factory returned no engine");
+  }
+  impl_->state->stats.running = true;
 }
 
 RtcExecutor::~RtcExecutor() {
@@ -111,87 +57,93 @@ RtcExecutor::~RtcExecutor() {
 }
 
 void RtcExecutor::enqueue(Command command) {
+  auto state = impl_->state;
   std::exception_ptr rejection;
   {
-    std::lock_guard lock(impl_->mutex);
-    if (!impl_->accepting) {
+    std::lock_guard lock(state->mutex);
+    if (!state->accepting) {
       rejection = cancelled();
-    } else if (impl_->outstanding >= impl_->options.max_operations) {
+    } else if (state->pending.size() >= impl_->options.max_operations) {
       rejection =
-          std::make_exception_ptr(std::runtime_error("RTC executor operation limit reached"));
+          std::make_exception_ptr(SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
+                                           "Executor operation limit reached"));
     } else {
-      ++impl_->outstanding;
-      ++impl_->stats.queued_operations;
+      const auto id = ++state->next_id;
+      state->pending.emplace(id, command.cancel);
+      ++state->stats.queued_operations;
+      auto operation = std::make_shared<Command>(std::move(command));
       try {
-        impl_->queue->postTask([state = impl_.get(), command = std::move(command)]() mutable {
+        impl_->engine->post_control([state, id, operation, engine = impl_->engine.get()] {
           bool accepting;
           {
             std::lock_guard lock(state->mutex);
             --state->stats.queued_operations;
-            accepting = state->accepting;
             ++state->stats.commands_started;
+            state->stats.pending_operations =
+                state->pending.size() - state->stats.queued_operations;
+            accepting = state->accepting;
           }
           if (!accepting) {
-            command.cancel(cancelled());
-            state->finished();
+            operation->cancel(cancelled());
+            state->finish(id);
             return;
           }
           const auto begin = SteadyClock::now();
-          try {
-            auto waiting = command.start(*state->engine);
-            if (waiting) {
-              state->pending.push_back({std::move(waiting), command.cancel});
-              if (!state->completion_scheduled) {
-                state->finish_futures();
-              }
-            } else {
-              state->finished();
-            }
-          } catch (...) {
-            command.cancel(std::current_exception());
-            state->finished();
-          }
+          operation->start(*engine, [state, id] { state->finish(id); });
           std::lock_guard lock(state->mutex);
           state->stats.max_command_duration = std::max(
               state->stats.max_command_duration,
               std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - begin));
-          state->stats.pending_operations = state->pending.size();
         });
+        return;
       } catch (...) {
-        --impl_->outstanding;
-        --impl_->stats.queued_operations;
-        throw;
+        --state->stats.queued_operations;
+        state->pending.erase(id);
+        rejection = std::current_exception();
+        command = std::move(*operation);
       }
-      return;
     }
   }
   command.cancel(rejection);
 }
 
 ExecutorSnapshot RtcExecutor::snapshot() const {
-  std::lock_guard lock(impl_->mutex);
-  return impl_->stats;
+  std::lock_guard lock(impl_->state->mutex);
+  return impl_->state->stats;
 }
 
 void RtcExecutor::shutdown() {
-  if (impl_->queue->isCurrent()) {
+  // Borrowed engine tasks cannot join the queue on which they are running.
+  // shutdown callers must serialize object destruction with other API callers.
+  std::lock_guard shutdown_lock(impl_->shutdown_mutex);
+  if (!impl_->engine) {
+    return;
+  }
+  if (impl_->engine->on_control_thread()) {
     throw std::logic_error("Cannot shut down RTC executor from its own task");
   }
-  std::lock_guard shutdown_lock(impl_->shutdown_mutex);
+  auto state = impl_->state;
   {
-    std::lock_guard lock(impl_->mutex);
-    impl_->accepting = false;
+    std::lock_guard lock(state->mutex);
+    state->accepting = false;
   }
-  impl_->queue->postSyncTask([this] {
-    for (auto& operation : impl_->pending) {
-      operation.cancel(cancelled());
-      impl_->finished();
-    }
-    impl_->pending.clear();
-    impl_->engine.reset();
-    std::lock_guard lock(impl_->mutex);
-    impl_->stats.running = false;
-    impl_->stats.pending_operations = 0;
-  });
+  try {
+    impl_->engine->close().get();
+  } catch (const std::exception& error) {
+    std::lock_guard lock(state->mutex);
+    state->stats.error = error.what();
+  }
+  impl_->engine.reset();  // Fences and joins all queued engine commands.
+  std::map<uint64_t, std::function<void(std::exception_ptr)>> pending;
+  {
+    std::lock_guard lock(state->mutex);
+    pending.swap(state->pending);
+    state->stats.commands_completed += pending.size();
+    state->stats.pending_operations = state->stats.queued_operations = 0;
+    state->stats.running = false;
+  }
+  for (auto& [id, cancel] : pending) {
+    cancel(cancelled());
+  }
 }
 }  // namespace livekit::sdk::rtc::engine

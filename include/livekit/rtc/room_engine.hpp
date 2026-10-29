@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/async_result.hpp"
 
 #include "livekit/rtc/types.hpp"
 #include "livekit/rtc/room_services.hpp"
@@ -12,6 +13,9 @@
 namespace livekit::sdk::rtc {
 namespace engine {
 class RtcEngine;
+class RtcPipelineEngine;
+class PublishPipeline;
+class SubscribePipeline;
 }
 
 namespace detail {
@@ -37,12 +41,15 @@ class PublishedTrack {
   WriteStatus try_write(EncodedFrame frame);
   // Local gate plus signaling submission, not a server ACK. Already transmitted
   // packets cannot be retracted. Muting does not unpublish the track.
-  std::future<void> set_muted(bool muted, ControlOptions = {});
+  AsyncResult<void> set_muted(bool muted, ControlOptions = {});
   // Completes after local transport detachment; it does not disconnect the room.
-  std::future<void> close();
+  AsyncResult<void> close();
 
  private:
   friend class RoomEngine;
+  friend class engine::RtcPipelineEngine;
+  friend class engine::PublishPipeline;
+  void report_failure(std::exception_ptr);
   PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
   std::shared_ptr<detail::Endpoint> endpoint_;
   std::weak_ptr<detail::RoomEngineState> session_;
@@ -57,14 +64,17 @@ class SubscribedTrack {
   // returns on media, cancellation, failure or close. No timeout polling.
   ReadResult wait_frame(std::stop_token stop = {});
   // Sends a rate-limited PLI independently of incoming media arrival.
-  std::future<void> request_keyframe();
+  AsyncResult<void> request_keyframe();
   // SFU forwarding demand, not a local decoder/device gate. Success means
   // signaling submission; in-flight media can still arrive. Full replacement.
-  std::future<void> set_demand(ReceiveDemand, ControlOptions = {});
-  std::future<void> close();
+  AsyncResult<void> set_demand(ReceiveDemand, ControlOptions = {});
+  AsyncResult<void> close();
 
  private:
   friend class RoomEngine;
+  friend class engine::RtcPipelineEngine;
+  friend class engine::SubscribePipeline;
+  void report_failure(std::exception_ptr);
   SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
   std::shared_ptr<detail::Endpoint> endpoint_;
   std::weak_ptr<detail::RoomEngineState> session_;
@@ -82,23 +92,23 @@ class RoomEngine {
   RoomEngine(const RoomEngine&) = delete;
   RoomEngine& operator=(const RoomEngine&) = delete;
 
-  std::future<void> join(RoomOptions options);
-  std::future<std::shared_ptr<PublishedTrack>> publish(TrackDescriptor descriptor);
-  std::future<std::shared_ptr<SubscribedTrack>> subscribe(TrackDescriptor remote_track);
+  AsyncResult<void> join(RoomOptions options);
+  AsyncResult<std::shared_ptr<PublishedTrack>> publish(TrackDescriptor descriptor);
+  AsyncResult<std::shared_ptr<SubscribedTrack>> subscribe(TrackDescriptor remote_track);
   // Also cancels an operation still waiting for publication/subscription ACK.
-  std::future<void> unpublish(const TrackId& id);
-  std::future<void> unsubscribe(const TrackId& id);
-  std::future<void> set_muted(const TrackId& id, bool muted, ControlOptions = {});
-  std::future<void> set_receive_demand(const TrackId& id, ReceiveDemand, ControlOptions = {});
+  AsyncResult<void> unpublish(const TrackId& id);
+  AsyncResult<void> unsubscribe(const TrackId& id);
+  AsyncResult<void> set_muted(const TrackId& id, bool muted, ControlOptions = {});
+  AsyncResult<void> set_receive_demand(const TrackId& id, ReceiveDemand, ControlOptions = {});
   // Replaces the publisher's allowlist. Success means signaling submission,
   // not server acknowledgement. Native policy intent survives rejoin even if
   // an interrupted submission has an unknown outcome.
-  std::future<void> set_subscription_permissions(SubscriptionPermissions, ControlOptions = {});
+  AsyncResult<void> set_subscription_permissions(SubscriptionPermissions, ControlOptions = {});
   // Requires signaling protocol 15+. Resolves only on the server's ACK, not
   // after a local send. A dispatched operation interrupted/cancelled/timed out
   // can have an unknown outcome and is never automatically replayed.
-  std::future<void> update_local_participant(ParticipantUpdate, ControlOptions = {});
-  std::future<void> leave();
+  AsyncResult<void> update_local_participant(ParticipantUpdate, ControlOptions = {});
+  AsyncResult<void> leave();
   RoomSnapshot snapshot() const;
   std::shared_ptr<RoomServices> services() const;
   // Events run serially on the notification task queue, never the transport
@@ -110,9 +120,6 @@ class RoomEngine {
 
  private:
   friend class engine::RtcEngine;
-  // Internal completion notification. Called on the backend thread; only enqueue
-  // control work here, never execute graph/application code synchronously.
-  void set_completion_wakeup(std::function<void()>);
   void post_notification(std::function<void()>);
   std::shared_ptr<detail::RoomEngineState> state_;
 };
@@ -130,12 +137,12 @@ class RoomView {
     return room_->services();
   }
 
-  std::future<void> update_local_participant(ParticipantUpdate update,
+  AsyncResult<void> update_local_participant(ParticipantUpdate update,
                                              ControlOptions options = {}) const {
     return room_->update_local_participant(std::move(update), options);
   }
 
-  std::future<void> set_subscription_permissions(SubscriptionPermissions policy,
+  AsyncResult<void> set_subscription_permissions(SubscriptionPermissions policy,
                                                  ControlOptions options = {}) const {
     return room_->set_subscription_permissions(std::move(policy), options);
   }

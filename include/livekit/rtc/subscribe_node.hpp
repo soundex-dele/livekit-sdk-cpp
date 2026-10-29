@@ -17,6 +17,11 @@ class RtcSubscribeNode final : public graphflow::core::GraphNode {
   ~RtcSubscribeNode() override;
   void activate();  // After all graph nodes and downstream producers are ready.
   void quiesce();
+
+  // Install before activate; invoked on the source worker, never during quiesce.
+  void set_terminal_handler(std::function<void()> handler) {
+    terminal_ = std::move(handler);
+  }
   void throw_if_failed() const;
 
   std::shared_ptr<SubscribedTrack> track() const {
@@ -39,5 +44,6 @@ class RtcSubscribeNode final : public graphflow::core::GraphNode {
   mutable std::mutex failure_mutex_;
   std::exception_ptr failure_;
   std::jthread worker_;
+  std::function<void()> terminal_;
 };
 }  // namespace livekit::sdk::rtc::nodes

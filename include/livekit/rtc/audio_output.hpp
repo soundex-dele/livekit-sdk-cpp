@@ -1,4 +1,6 @@
 #pragma once
+#include <exception>
+#include <functional>
 #include "livekit/rtc/audio_nodes.hpp"
 #include "livekit/rtc/audio_output_options.hpp"
 
@@ -17,6 +19,7 @@ struct AudioOutputSnapshot {
   uint64_t rendered_blocks = 0, contention_blocks = 0;
   bool running = false;
   std::string error;
+  std::shared_ptr<const FailureInfo> failure;
 };
 
 struct AudioOutputTrackSnapshot {
@@ -38,7 +41,10 @@ class AudioOutputSession final : public std::enable_shared_from_this<AudioOutput
   AudioOutputSession(const AudioOutputSession&) = delete;
   AudioOutputSession& operator=(const AudioOutputSession&) = delete;
   // Construct the session with shared ownership before opening tracks.
-  std::shared_ptr<AudioOutputTrack> open_track(TrackId);
+  // Failure callbacks run on the device reporting thread, outside mixer locks.
+  // They must enqueue lifecycle work and must not stop the device themselves.
+  using FailureHandler = std::function<void(std::exception_ptr)>;
+  std::shared_ptr<AudioOutputTrack> open_track(TrackId, FailureHandler = {});
   AudioOutputSnapshot snapshot() const;
   void throw_if_failed() const;
 

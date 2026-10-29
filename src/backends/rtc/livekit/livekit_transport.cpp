@@ -1,6 +1,7 @@
 #include "livekit/rtc/livekit.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include "backends/rtc/bounded_events.hpp"
+#include "support/ready_set.hpp"
 #include "backends/webrtc/native_peer.hpp"
 #include "backends/webrtc/encoded_audio_sender.hpp"
 #include "backends/webrtc/encoded_video_sender.hpp"
@@ -27,10 +28,48 @@ using livekit::sdk::ErrorCode;
 using livekit::sdk::ErrorDomain;
 using livekit::sdk::SDKError;
 
-template <class T>
-bool ready(std::future<T>& value) {
-  return value.valid() && value.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
-}
+// Native completions post back to the session owner. At most two SDP operations
+// per peer and two statistics requests can be outstanding; the queue is bounded
+// independently and carries no transport/peer owner pointer.
+struct CompletionTasks {
+  std::mutex mutex;
+  std::deque<std::function<void()>> tasks;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
+  bool overflow = false;
+
+  void post(std::function<void()> task) {
+    bool rejected;
+    {
+      std::lock_guard lock(mutex);
+      rejected = tasks.size() >= 64;
+      if (rejected) {
+        overflow = true;
+      } else {
+        tasks.push_back(std::move(task));
+      }
+    }
+    wakeup->signal();
+    if (rejected) {
+      throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
+                     "Native completion queue exhausted");
+    }
+  }
+
+  void run() {
+    std::deque<std::function<void()>> ready;
+    {
+      std::lock_guard lock(mutex);
+      if (overflow) {
+        throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
+                       "Native completion queue exhausted");
+      }
+      ready.swap(tasks);
+    }
+    for (auto& task : ready) {
+      task();
+    }
+  }
+};
 
 std::string codec_name(Codec codec) {
   switch (codec) {
@@ -98,7 +137,8 @@ struct Subscription {
   TrackDescriptor descriptor;
   webrtc::scoped_refptr<EncodedReceiver> receiver;
   std::shared_ptr<QueueBudget> budget;
-  // Timestamp and dependency state belongs exclusively to poll().
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> media_wakeup;
+  // Timestamp and dependency state belongs exclusively to take_events().
   std::optional<uint32_t> last_timestamp;
   uint64_t timestamp = 0;
   std::optional<std::pair<uint64_t, int64_t>> sender_clock;
@@ -119,12 +159,13 @@ struct Command {
 
   BindingToken binding;
   TrackDescriptor descriptor;
-  std::shared_ptr<std::promise<void>> completion;
+  std::shared_ptr<CompletionSource<void>> completion;
   std::shared_ptr<QueueBudget> budget;
   std::optional<ParticipantUpdateRequest> participant_update;
   std::optional<MuteRequest> mute_request;
   std::optional<ReceiveDemandRequest> demand_request;
   std::optional<SubscriptionPermissionsRequest> permissions_request;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> media_wakeup;
 };
 
 class LiveKitTransport final : public RoomTransport {
@@ -175,8 +216,11 @@ class LiveKitTransport final : public RoomTransport {
     livekit::sdk::detail::validate_reconnect(options.reconnect);
     if (options.encryption.media && !options.encryption.keys)
       throw std::invalid_argument("Media E2EE requires a key provider");
+    services_->attach_wakeup(session_wakeup_);
     services_->configure(options.encryption, options.operation_timeout);
     options_ = options;
+    media_ready_ =
+        std::make_shared<livekit::sdk::detail::ReadySet<BindingToken>>(wakeup_, options.max_tracks);
     if (options.subscription_permissions)
       validate_subscription_permissions(*options.subscription_permissions);
     permissions_ = options.subscription_permissions;
@@ -197,7 +241,14 @@ class LiveKitTransport final : public RoomTransport {
     if (descriptor.encodings.size() != 1)
       throw SDKError(ErrorDomain::media, ErrorCode::unsupported,
                      "Encoded native publication currently requires one encoding per track");
-    post({Command::publish, binding, descriptor});
+    Command command{Command::publish, binding, descriptor};
+    command.media_wakeup = media_ready_->watch(binding);
+    try {
+      post(std::move(command));
+    } catch (...) {
+      media_ready_->forget(binding);
+      throw;
+    }
   }
 
   void subscribe(const BindingToken& binding, const TrackDescriptor& descriptor,
@@ -206,14 +257,23 @@ class LiveKitTransport final : public RoomTransport {
       throw std::invalid_argument("Subscription requires a discovered remote_sid");
     Command command{Command::subscribe, binding, descriptor};
     command.budget = std::move(budget);
-    post(std::move(command));
+    command.media_wakeup = media_ready_->watch(binding);
+    try {
+      post(std::move(command));
+    } catch (...) {
+      media_ready_->forget(binding);
+      throw;
+    }
   }
 
-  std::future<void> remove(const BindingToken& binding, bool publication) override {
+  AsyncResult<void> remove(const BindingToken& binding, bool publication) override {
+    if (media_ready_) {
+      media_ready_->forget(binding);
+    }
     // The old peer has already been detached before interrupted is emitted.
     // Do not wait for the next network connection to close an offline track.
-    auto completion = std::make_shared<std::promise<void>>();
-    auto detached = completion->get_future();
+    auto completion = std::make_shared<CompletionSource<void>>();
+    auto detached = completion->get_result();
     if (binding.epoch < detached_epoch_.load()) {
       completion->set_value();
       return detached;
@@ -268,26 +328,43 @@ class LiveKitTransport final : public RoomTransport {
     post(std::move(command));
   }
 
-  std::vector<TransportEvent> poll(std::chrono::milliseconds wait, std::stop_token stop) override {
+  void attach_notifications(Dispatch dispatch,
+                            std::function<void(std::exception_ptr)> failure) override {
+    services_->set_dispatcher(std::move(dispatch), std::move(failure));
+  }
+
+  std::vector<TransportEvent> take_events() override {
     std::vector<TransportEvent> result;
     std::vector<std::shared_ptr<Publication>> publications;
     std::vector<std::shared_ptr<Subscription>> subscriptions;
+    const auto ready = media_ready_->take();
     {
       std::unique_lock lock(mutex_);
-      if (events_.empty())
-        changed_.wait_for(lock, stop, wait, [&] { return !events_.empty(); });
       while (!events_.empty()) {
         result.push_back(std::move(events_.front()));
         events_.pop_front();
       }
-      for (const auto& [id, value] : publications_)
-        if (value->ready && value->video)
-          publications.push_back(value);
-      for (const auto& [id, value] : subscriptions_)
-        if (value->receiver)
-          subscriptions.push_back(value);
+      for (const auto& binding : ready) {
+        if (binding.publication) {
+          const auto found = publications_.find(binding.id);
+          if (found != publications_.end() && found->second->binding == binding &&
+              found->second->ready) {
+            publications.push_back(found->second);
+          }
+        } else {
+          const auto found = subscriptions_.find(binding.id);
+          if (found != subscriptions_.end() && found->second->binding == binding &&
+              found->second->receiver) {
+            subscriptions.push_back(found->second);
+          }
+        }
+      }
     }
     for (const auto& sender : publications) {
+      result.push_back(event(TransportEventKind::writable, sender->binding));
+      if (!sender->video) {
+        continue;
+      }
       auto feedback = sender->video->feedback();
       if (feedback.revision == sender->feedback_revision)
         continue;
@@ -300,7 +377,7 @@ class LiveKitTransport final : public RoomTransport {
       const bool video = receiver->descriptor.kind == MediaKind::video;
       if (video && receiver->receiver->take_keyframe_request())
         request_keyframe(receiver->binding);
-      for (auto& unit : receiver->receiver->poll()) {
+      for (auto& unit : receiver->receiver->take_frames()) {
         uint64_t timestamp = unit.timestamp;
         if (receiver->last_timestamp) {
           const auto delta = int32_t(unit.timestamp - *receiver->last_timestamp);
@@ -362,6 +439,7 @@ class LiveKitTransport final : public RoomTransport {
   void stop() noexcept override {
     worker_.request_stop();
     changed_.notify_all();
+    session_wakeup_->signal();
     if (worker_.joinable())
       worker_.join();
     services_->close();
@@ -375,6 +453,9 @@ class LiveKitTransport final : public RoomTransport {
     subscriptions_.clear();
     commands_.clear();
     events_.clear();
+    if (media_ready_) {
+      media_ready_->clear();
+    }
   }
 
  private:
@@ -383,6 +464,9 @@ class LiveKitTransport final : public RoomTransport {
   std::optional<SubscriptionPermissions>
       permissions_;  // Session-worker intent, retained across full rejoin.
   std::shared_ptr<QueueBudget> budget_;
+  std::shared_ptr<livekit::sdk::detail::ReadySet<BindingToken>> media_ready_;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> session_wakeup_ =
+      std::make_shared<livekit::sdk::detail::WakeEvent>();
   std::jthread worker_;
   std::mutex mutex_;
   std::condition_variable_any changed_;
@@ -403,6 +487,7 @@ class LiveKitTransport final : public RoomTransport {
                      "RTC native control queue exhausted");
     commands_.push_back(std::move(command));
     changed_.notify_all();
+    session_wakeup_->signal();
   }
 
   void emit(TransportEvent value) {
@@ -411,6 +496,10 @@ class LiveKitTransport final : public RoomTransport {
   }
 
   void emit_locked(TransportEvent value) {
+    if (value.kind == TransportEventKind::operation_failed ||
+        value.kind == TransportEventKind::removed) {
+      media_ready_->forget(value.binding);
+    }
     const auto result =
         enqueue_event(events_, std::move(value), options_.max_events,
                       TransportEventKind::statistics, [](auto& queued, auto& incoming) {
@@ -433,6 +522,9 @@ class LiveKitTransport final : public RoomTransport {
       worker_.request_stop();
     }
     changed_.notify_all();
+    if (wakeup_) {
+      wakeup_->signal();
+    }
   }
 
   void run(std::stop_token stop) noexcept {
@@ -517,12 +609,12 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
                      "Initial room event queue exhausted");
     initial_events.push_back(std::move(value));
   };
-  lk::SignalSession signal(options_, stop, lk::EventEmitter{}, &recovery);
+  lk::SignalSession signal(options_, stop, lk::EventEmitter{}, &recovery, session_wakeup_);
   signal.connect();
   livekit::JoinResponse join;
   while (!stop.stop_requested() && join.participant().sid().empty()) {
     try {
-      auto bytes = signal.receive(10);
+      auto bytes = signal.receive_until(signal.connect_deadline());
       if (bytes) {
         livekit::SignalResponse response;
         if (!response.ParseFromString(*bytes))
@@ -562,8 +654,8 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
     config.type = PC::kRelay;
   livekit::sdk::detail::apply_media_transport(config, options_.media_transport, false);
   auto runtime = std::make_shared<TransportRuntime>();
-  NativePeer publisher(*runtime, config, {}, options_.max_events, budget_),
-      subscriber(*runtime, config, {}, options_.max_events, budget_);
+  NativePeer publisher(*runtime, config, {}, options_.max_events, budget_, session_wakeup_),
+      subscriber(*runtime, config, {}, options_.max_events, budget_, session_wakeup_);
   auto cryptor = std::make_shared<livekit::sdk::detail::MediaCryptorContext>();
   cryptor->options = options_.encryption;
   cryptor->sif.assign(join.sif_trailer().begin(), join.sif_trailer().end());
@@ -614,17 +706,41 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
     emit(std::move(value));
   };
   bool publisher_dirty = true, offer_pending = false;
-  std::future<TransportStatistics> pending_stats[2];
+  bool stats_pending[2] = {};
+  std::optional<AsyncResult<TransportStatistics>> completed_stats[2];
   auto next_stats = SteadyClock::now() + options_.stats_interval;
 
   struct Negotiation {
-    std::future<NativeDescription> local;
-    std::future<void> remote;
+    bool local_pending = false, remote_pending = false;
+    std::optional<AsyncResult<NativeDescription>> local;
+    std::optional<AsyncResult<void>> remote;
     std::deque<livekit::SessionDescription> offers;
     std::vector<NativeIceCandidate> ice;
     bool remote_set = false;
     uint32_t id = 0;
   } publish_sdp, subscribe_sdp;
+
+  // Destroy queued closures before their session-owned result slots. A late
+  // native callback sees an expired weak queue and cancels its continuation.
+  auto completions = std::make_shared<CompletionTasks>();
+  completions->wakeup = session_wakeup_;
+  auto on_complete = [weak = std::weak_ptr(completions)](auto operation, auto& destination,
+                                                         bool& pending) {
+    pending = true;
+    std::move(operation).then(
+        [weak](std::function<void()> task) {
+          auto queue = weak.lock();
+          if (!queue) {
+            throw SDKError(ErrorDomain::lifecycle, ErrorCode::cancelled,
+                           "Native session completion owner closed");
+          }
+          queue->post(std::move(task));
+        },
+        [&destination, &pending](auto result) {
+          pending = false;
+          destination = std::move(result);
+        });
+  };
 
   auto clean = [&] {
     services_->interrupt();
@@ -637,6 +753,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
           value->receiver->close();
       publications_.clear();
       subscriptions_.clear();
+      media_ready_->clear();
     }
     for (auto& [cid, value] : pending_publications)
       value->close();
@@ -774,21 +891,25 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
     destination->set_sdp(source.sdp);
   };
   auto process_sdp = [&](NativePeer& peer, Negotiation& negotiation, bool publishing) {
-    if (ready(negotiation.remote)) {
-      negotiation.remote.get();
+    if (negotiation.remote) {
+      auto result = std::move(*negotiation.remote);
+      negotiation.remote.reset();
+      result.get();
       negotiation.remote_set = true;
       for (const auto& ice : negotiation.ice)
         peer.add_ice(ice);
       negotiation.ice.clear();
-      if (!publishing)
-        negotiation.local = peer.create_local(false);
-      else {
+      if (!publishing) {
+        on_complete(peer.create_local(false), negotiation.local, negotiation.local_pending);
+      } else {
         offer_pending = false;
         peer.refresh_receivers();
       }
     }
-    if (ready(negotiation.local)) {
-      const auto description = negotiation.local.get();
+    if (negotiation.local) {
+      auto result = std::move(*negotiation.local);
+      negotiation.local.reset();
+      const auto description = result.get();
       livekit::SignalRequest request;
       auto* payload = publishing ? request.mutable_offer() : request.mutable_answer();
       local_description(description, payload);
@@ -797,15 +918,15 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
       if (!publishing)
         peer.refresh_receivers();
     }
-    if (!publishing && !negotiation.remote.valid() && !negotiation.local.valid() &&
+    if (!publishing && !negotiation.remote_pending && !negotiation.local_pending &&
         !negotiation.offers.empty()) {
       auto description = std::move(negotiation.offers.front());
       negotiation.offers.pop_front();
       negotiation.id = description.id();
       std::map<std::string, std::string> mids(description.mid_to_track_id().begin(),
                                               description.mid_to_track_id().end());
-      negotiation.remote =
-          peer.set_remote({webrtc::SdpType::kOffer, description.sdp()}, std::move(mids));
+      on_complete(peer.set_remote({webrtc::SdpType::kOffer, description.sdp()}, std::move(mids)),
+                  negotiation.remote, negotiation.remote_pending);
     }
     for (const auto& ice : peer.take_ice()) {
       livekit::SignalRequest request;
@@ -831,6 +952,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
     const auto deadline = std::min(signal.operation_deadline(), signal.connect_deadline());
     while (!stop.stop_requested()) {
       recovery.budget.check();
+      completions->run();
       std::deque<Command> commands;
       {
         std::lock_guard lock(mutex_);
@@ -982,6 +1104,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
             subscription->binding = command.binding;
             subscription->descriptor = command.descriptor;
             subscription->budget = command.budget;
+            subscription->media_wakeup = command.media_wakeup;
             for (const auto& [id, existing] : pending_subscriptions)
               if (existing->descriptor.remote_sid == command.descriptor.remote_sid)
                 throw std::invalid_argument(
@@ -1002,13 +1125,13 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
             if (command.descriptor.kind == MediaKind::audio) {
               publication->audio = webrtc::make_ref_counted<EncodedAudioSender>(
                   command.binding, command.descriptor.queue,
-                  command.descriptor.encodings.front().id);
+                  command.descriptor.encodings.front().id, command.media_wakeup);
               publication->audio->set_muted(command.descriptor.muted);
               track = runtime->factory->CreateAudioTrack(publication->cid, nullptr);
             } else {
               publication->video = runtime->signaling->BlockingCall([&] {
-                return webrtc::make_ref_counted<EncodedVideoSender>(command.binding,
-                                                                    command.descriptor);
+                return webrtc::make_ref_counted<EncodedVideoSender>(
+                    command.binding, command.descriptor, command.media_wakeup);
               });
               track = runtime->factory->CreateVideoTrack(publication->video, publication->cid);
             }
@@ -1120,7 +1243,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
       if (publisher_dirty && !offer_pending) {
         publisher_dirty = false;
         offer_pending = true;
-        publish_sdp.local = publisher.create_local(true);
+        on_complete(publisher.create_local(true), publish_sdp.local, publish_sdp.local_pending);
       }
       if (publisher.failed || subscriber.failed)
         throw SDKError(ErrorDomain::transport, ErrorCode::connection_lost,
@@ -1143,9 +1266,11 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
                        "Native room transport establishment timed out", true);
       if (connected && options_.stats_interval.count()) {
         for (int target = 0; target < 2; ++target)
-          if (ready(pending_stats[target])) {
+          if (completed_stats[target]) {
+            auto result = std::move(*completed_stats[target]);
+            completed_stats[target].reset();
             try {
-              auto report = pending_stats[target].get();
+              auto report = result.get();
               report.target = target;
               auto value = event(TransportEventKind::statistics, {{}, epoch_, 0, false});
               if (target == 0)
@@ -1158,10 +1283,12 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
             }
           }
         if (SteadyClock::now() >= next_stats) {
-          if (!pending_stats[0].valid())
-            pending_stats[0] = publisher.statistics();
-          if (!pending_stats[1].valid())
-            pending_stats[1] = subscriber.statistics();
+          if (!stats_pending[0]) {
+            on_complete(publisher.statistics(), completed_stats[0], stats_pending[0]);
+          }
+          if (!stats_pending[1]) {
+            on_complete(subscriber.statistics(), completed_stats[1], stats_pending[1]);
+          }
           next_stats = SteadyClock::now() + options_.stats_interval;
         }
       }
@@ -1181,6 +1308,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
                                         uint8_t(codec->payload_type));
         }
         publication->ready = true;
+        media_ready_->mark(publication->binding);
         auto value = event(TransportEventKind::published, publication->binding);
         value.server_sid = publication->sid;
         emit(std::move(value));
@@ -1191,19 +1319,22 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
         const auto found = receivers.find(subscription->descriptor.remote_sid);
         if (found == receivers.end() || subscription->receiver == found->second.output)
           continue;
-        // Publish a new immutable routing snapshot; poll owns its own timestamp state.
+        // Publish a new immutable routing snapshot; the controller owns timestamp state.
         auto bound = std::make_shared<Subscription>();
         bound->binding = subscription->binding;
         bound->descriptor = subscription->descriptor;
         bound->receiver = found->second.output;
         bound->budget = subscription->budget;
+        bound->media_wakeup = subscription->media_wakeup;
         bound->receiver->configure_queue(bound->descriptor.queue, bound->budget);
+        bound->receiver->attach_wakeup(bound->media_wakeup);
         subscription = bound;
         auto value = event(TransportEventKind::subscribed, bound->binding);
         value.server_sid = bound->descriptor.remote_sid;
         {
           std::lock_guard lock(mutex_);
           subscriptions_[id] = bound;
+          media_ready_->mark(bound->binding);
           emit_locked(std::move(value));
         }
       }
@@ -1255,11 +1386,11 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
                          "Too many pending SDP offers");
         subscribe_sdp.offers.push_back(response.offer());
       } else if (response.has_answer()) {
-        if (!offer_pending || publish_sdp.remote.valid())
+        if (!offer_pending || publish_sdp.remote_pending || publish_sdp.remote)
           throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message,
                          "Unexpected publisher SDP answer");
-        publish_sdp.remote =
-            publisher.set_remote({webrtc::SdpType::kAnswer, response.answer().sdp()});
+        on_complete(publisher.set_remote({webrtc::SdpType::kAnswer, response.answer().sdp()}),
+                    publish_sdp.remote, publish_sdp.remote_pending);
       } else if (response.has_trickle()) {
         if (response.trickle().candidateinit().empty())
           continue;

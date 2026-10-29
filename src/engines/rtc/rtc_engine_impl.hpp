@@ -2,6 +2,7 @@
 #include "livekit/rtc/engine.hpp"
 #include "engines/rtc/pipeline_engine.hpp"
 #include "engines/rtc/media_module.hpp"
+#include "support/task_dispatcher.hpp"
 #include <memory>
 #include <thread>
 #include <atomic>
@@ -27,22 +28,37 @@ struct RtcEngine::Impl {
     using Result = std::invoke_result_t<Function>;
     auto task = std::make_shared<std::packaged_task<Result()>>(std::forward<Function>(fn));
     auto future = task->get_future();
-    dispatch([task] { (*task)(); });  // packaged_task captures exceptions.
+    if (control_is_current()) {
+      (*task)();
+    } else {
+      dispatch([task] { (*task)(); });
+    }
     return future.get();
   }
 
+  template <class Function>
+  auto submit(Function fn) const {
+    CompletionSource<void> admitted;
+    auto result = admitted.get_result().then(
+        [this](std::function<void()> task) { dispatch(std::move(task)); },
+        [fn = std::move(fn)](AsyncResult<void> ready) mutable {
+          ready.get();
+          return fn();
+        });
+    admitted.set_value();
+    return result;
+  }
+
+  bool control_is_current() const;
   void dispatch(std::function<void()>) const;
-  void completion_ready();
-  void schedule_health();
-  void fail_control(std::exception_ptr);
 
   std::unique_ptr<vi::TaskQueue> control;
   mutable std::atomic<size_t> queued_commands{0};
-  std::atomic<bool> completion_queued{false};
+  livekit::sdk::detail::TaskDispatcher completion_dispatch;
   std::shared_ptr<std::atomic<bool>> callback_active;
   bool stopping = false;
-  std::exception_ptr control_failure;
   bool closed = false;
+  std::atomic<bool> has_media{false};
   std::unique_ptr<RoomEngine> room;
   std::unique_ptr<RtcPipelineEngine> pipelines;
   std::unique_ptr<MediaModule> media;

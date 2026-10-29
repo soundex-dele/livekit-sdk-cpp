@@ -2,6 +2,8 @@
 
 当前分层、帧契约与迁移说明见 [架构说明](docs/architecture.md)。最新的 [源节点分发与任务队列设计](docs/source-driven-runtime.md) 已移除 RtcEngine/pipeline 的 poll 接口。
 
+计划中的 [RTC 同步控制与 Result 重构方案](docs/rtc-sync-result-refactor-20261029.md) 说明专属 TaskQueue、同步返回值、取消与关闭约束及迁移验收；该方案尚未实施。
+
 C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 
 普通媒体会话通过 RtcEngine 装配可选的内部 RtcMediaEngine：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。

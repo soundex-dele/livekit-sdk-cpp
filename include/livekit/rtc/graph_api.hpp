@@ -7,12 +7,12 @@ namespace livekit::sdk::rtc::engine {
 // registry and serial task-queue contract; it must not outlive the engine.
 class RtcGraphApi final {
  public:
-  std::future<TrackId> publish(TrackDescriptor,
+  AsyncResult<TrackId> publish(TrackDescriptor,
                                std::shared_ptr<graphflow::core::GraphNode> feedback_sink = {});
-  std::future<TrackId> subscribe(TrackDescriptor,
+  AsyncResult<TrackId> subscribe(TrackDescriptor,
                                  std::shared_ptr<graphflow::core::GraphNode> consumer);
-  std::future<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
-  std::future<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  AsyncResult<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
+  AsyncResult<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
 
  private:
   friend class RtcEngine;

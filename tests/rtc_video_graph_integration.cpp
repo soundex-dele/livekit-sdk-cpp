@@ -17,8 +17,8 @@ void check(bool ok, const char* message) {
     throw std::runtime_error(message);
 }
 
-template <class T>
-auto await(engine::RtcEngine& engine, std::future<T> future) {
+template <class Future>
+auto await(engine::RtcEngine& engine, Future future) {
   const auto deadline = SteadyClock::now() + 15s;
   while (future.wait_for(0ms) != std::future_status::ready) {
     check(SteadyClock::now() < deadline, "Media graph operation timed out");
@@ -107,10 +107,6 @@ int main() {
           input->quiesce();
           node->quiesce();
         };
-        graph.check_health = [input = inputs[i], node = encoders[i]] {
-          input->throw_if_failed();
-          node->throw_if_failed();
-        };
         return graph;
       }));
     }
@@ -134,7 +130,6 @@ int main() {
                 engine::TrackGraphSpec::connect<nodes::VideoFrameEvent>(decoders[i], verify[i]),
                 engine::TrackGraphSpec::connect<nodes::KeyframeRequestEvent>(decoders[i], source)};
             graph.quiesce = [node = decoders[i]] { node->quiesce(); };
-            graph.check_health = [node = decoders[i]] { node->throw_if_failed(); };
             return graph;
           }));
         }

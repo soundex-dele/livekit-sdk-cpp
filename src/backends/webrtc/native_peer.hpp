@@ -2,6 +2,7 @@
 #include "backends/webrtc/encoded_receiver.hpp"
 #include "backends/webrtc/transport_runtime.hpp"
 #include "api/rtp_transceiver_interface.h"
+#include "livekit/async_result.hpp"
 #include <deque>
 #include <future>
 #include <map>
@@ -37,22 +38,23 @@ struct NativeDataMessage {
   std::vector<uint8_t> bytes;
 };
 
-// Peer/session transport with asynchronous SDP completion. The room controller
-// polls futures and queues instead of waiting on a native callback. All native
+// Peer/session transport with asynchronous SDP completion and producer wakeups.
+// The session owner attaches continuations and drains notified queues. All native
 // callbacks end at owned queues; no graph/application callback is invoked.
 class NativePeer : public webrtc::PeerConnectionObserver {
  public:
   NativePeer(TransportRuntime& runtime,
              webrtc::PeerConnectionInterface::RTCConfiguration configuration,
              QueueLimits receive_limits = {}, size_t max_events = 4096,
-             std::shared_ptr<QueueBudget> budget = {});
+             std::shared_ptr<QueueBudget> budget = {},
+             std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup = {});
   ~NativePeer() override;
   NativePeer(const NativePeer&) = delete;
   NativePeer& operator=(const NativePeer&) = delete;
 
-  std::future<NativeDescription> create_local(bool offer, bool ice_restart = false);
-  std::future<TransportStatistics> statistics();
-  std::future<void> set_remote(NativeDescription description,
+  AsyncResult<NativeDescription> create_local(bool offer, bool ice_restart = false);
+  AsyncResult<TransportStatistics> statistics();
+  AsyncResult<void> set_remote(NativeDescription description,
                                std::map<std::string, std::string> mid_to_track = {});
   // Call when offer/answer negotiation is stable to bind reused/preallocated receivers.
   void refresh_receivers();
@@ -88,6 +90,13 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   QueueLimits receive_limits_;
   std::shared_ptr<QueueBudget> budget_;
   size_t max_events_;
+  const std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup_;
+
+  void notify() const {
+    if (wakeup_) {
+      wakeup_->signal();
+    }
+  }
   mutable std::mutex mutex_;
   std::deque<NativeIceCandidate> ice_;
   std::deque<NativeTrackEvent> tracks_;

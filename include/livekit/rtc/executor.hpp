@@ -1,6 +1,7 @@
 #pragma once
 #include "livekit/rtc/engine.hpp"
 #include <functional>
+#include <atomic>
 #include <type_traits>
 #include <utility>
 
@@ -13,7 +14,7 @@ struct ExecutorResult {
 };
 
 template <class T>
-struct ExecutorResult<std::future<T>> {
+struct ExecutorResult<AsyncResult<T>> {
   using Type = T;
   static constexpr bool future = true;
 };
@@ -31,10 +32,10 @@ struct ExecutorSnapshot {
   std::string error;
 };
 
-// Optional bounded command/future adapter using utoolkit task_queue. RtcEngine
+// Optional bounded command adapter reusing the engine task queue; no extra thread. RtcEngine
 // itself progresses autonomously; this adapter is not a media driver. submit() may be
 // called from any thread; functions execute serially and must not block or retain
-// a borrowed engine reference. Returning a future is supported and flattened:
+// a borrowed engine reference. Returning AsyncResult is supported and flattened:
 // never call get() in the submitted function. Use shutdown() for terminal close.
 class RtcExecutor final {
  public:
@@ -45,41 +46,61 @@ class RtcExecutor final {
   RtcExecutor& operator=(const RtcExecutor&) = delete;
 
   template <class Function>
-  auto submit(Function&& function) -> std::future<
+  auto submit(Function&& function) -> AsyncResult<
       typename executor_detail::ExecutorResult<std::invoke_result_t<Function, RtcEngine&>>::Type> {
     using Return = std::invoke_result_t<Function, RtcEngine&>;
     using Value = typename executor_detail::ExecutorResult<Return>::Type;
     static_assert(!std::is_reference_v<Value>, "Executor results must own their lifetime");
-    auto promise = std::make_shared<std::promise<Value>>();
-    auto future = promise->get_future();
+    auto promise = std::make_shared<CompletionSource<Value>>();
+    auto result = promise->get_result();
+    auto settled = std::make_shared<std::atomic<bool>>(false);
     auto call = std::make_shared<std::decay_t<Function>>(std::forward<Function>(function));
-    enqueue({[call, promise](RtcEngine& engine) -> std::function<bool()> {
-               if constexpr (executor_detail::ExecutorResult<Return>::future) {
-                 auto pending = std::make_shared<Return>((*call)(engine));
-                 return [pending, promise] {
-                   if (pending->wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-                     return false;
-                   }
-                   if constexpr (std::is_void_v<Value>) {
-                     pending->get();
-                     promise->set_value();
-                   } else {
-                     promise->set_value(pending->get());
-                   }
-                   return true;
-                 };
-               } else {
-                 if constexpr (std::is_void_v<Value>) {
-                   (*call)(engine);
-                   promise->set_value();
+    auto cancel = [promise, settled](std::exception_ptr failure) {
+      if (!settled->exchange(true)) {
+        promise->set_exception(failure);
+      }
+    };
+    enqueue({[call, promise, settled, cancel](RtcEngine& engine, std::function<void()> finished) {
+               try {
+                 if constexpr (executor_detail::ExecutorResult<Return>::future) {
+                   auto pending = (*call)(engine);
+                   std::move(pending).then([](auto task) { task(); },
+                                           [promise, settled, finished](AsyncResult<Value> ready) {
+                                             if (!settled->exchange(true)) {
+                                               try {
+                                                 if constexpr (std::is_void_v<Value>) {
+                                                   ready.get();
+                                                   promise->set_value();
+                                                 } else {
+                                                   promise->set_value(ready.get());
+                                                 }
+                                               } catch (...) {
+                                                 promise->set_exception(std::current_exception());
+                                               }
+                                             }
+                                             finished();
+                                           });
                  } else {
-                   promise->set_value((*call)(engine));
+                   if constexpr (std::is_void_v<Value>) {
+                     (*call)(engine);
+                     if (!settled->exchange(true)) {
+                       promise->set_value();
+                     }
+                   } else {
+                     auto value = (*call)(engine);
+                     if (!settled->exchange(true)) {
+                       promise->set_value(std::move(value));
+                     }
+                   }
+                   finished();
                  }
-                 return {};
+               } catch (...) {
+                 cancel(std::current_exception());
+                 finished();
                }
              },
-             [promise](std::exception_ptr error) { promise->set_exception(error); }});
-    return future;
+             std::move(cancel)});
+    return result;
   }
 
   ExecutorSnapshot snapshot() const;
@@ -89,7 +110,7 @@ class RtcExecutor final {
 
  private:
   struct Command {
-    std::function<std::function<bool()>(RtcEngine&)> start;
+    std::function<void(RtcEngine&, std::function<void()>)> start;
     std::function<void(std::exception_ptr)> cancel;
   };
 

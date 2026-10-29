@@ -72,11 +72,23 @@ struct AudioCodecNode::Impl {
   }
 
   void fail(std::string message) {
-    std::lock_guard lock(mutex);
-    stats.error = std::move(message);
-    active = false;
-    discard_locked();
-    changed.notify_all();
+    std::exception_ptr error;
+    {
+      std::lock_guard lock(mutex);
+      if (!stats.error.empty()) {
+        return;
+      }
+      stats.error = message;
+      error = normalized_failure(std::current_exception()
+                                     ? std::current_exception()
+                                     : std::make_exception_ptr(std::runtime_error(message)),
+                                 {"codec", descriptor.id, owner.getName(), epoch},
+                                 ErrorDomain::media, ErrorCode::processing_failed);
+      active = false;
+      discard_locked();
+      changed.notify_all();
+    }
+    owner.reportFailure(error);
   }
 
   void update(const SenderFeedback& value) {
@@ -626,8 +638,8 @@ AudioCodecSnapshot AudioCodecNode::snapshot() const {
 }
 
 void AudioCodecNode::throw_if_failed() const {
-  const auto status = snapshot();
-  if (!status.error.empty())
-    throw std::runtime_error(status.error);
+  if (auto error = failure()) {
+    std::rethrow_exception(error);
+  }
 }
 }  // namespace livekit::sdk::rtc::nodes

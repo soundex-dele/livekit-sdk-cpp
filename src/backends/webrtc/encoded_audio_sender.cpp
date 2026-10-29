@@ -10,6 +10,7 @@ namespace livekit::sdk::rtc::detail {
 struct EncodedAudioSender::Budget {
   explicit Budget(QueueLimits limits) : limits(limits) {}
 
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
   std::mutex mutex;
   QueueLimits limits;
   size_t frames = 0, bytes = 0;
@@ -29,14 +30,19 @@ struct EncodedAudioSender::Reservation {
     std::lock_guard lock(budget->mutex);
     --budget->frames;
     budget->bytes -= bytes;
+    if (budget->wakeup) {
+      budget->wakeup->signal();
+    }
   }
 };
 
 EncodedAudioSender::EncodedAudioSender(BindingToken binding, QueueLimits limits,
-                                       std::string encoding_id)
+                                       std::string encoding_id,
+                                       std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup)
     : binding_(std::move(binding)),
       encoding_id_(std::move(encoding_id)),
       budget_(std::make_shared<Budget>(limits)) {
+  budget_->wakeup = std::move(wakeup);
   if (!limits.max_frames || !limits.max_bytes || limits.max_age.count() <= 0)
     throw std::invalid_argument("Encoded audio sender needs bounded nonempty queues");
 }
@@ -50,6 +56,9 @@ void EncodedAudioSender::configure(uint32_t ssrc, uint8_t payload_type) {
   ssrc_ = ssrc;
   payload_type_ = payload_type;
   configured_ = true;
+  if (budget_->wakeup) {
+    budget_->wakeup->signal();
+  }
 }
 
 SendResult EncodedAudioSender::send(const EncodedFrame& frame) {
@@ -100,8 +109,12 @@ SendResult EncodedAudioSender::send(const EncodedFrame& frame) {
 void EncodedAudioSender::RegisterTransformedFrameCallback(
     webrtc::scoped_refptr<webrtc::TransformedFrameCallback> callback) {
   std::lock_guard lock(mutex_);
-  if (!closed_)
+  if (!closed_) {
     callback_ = std::move(callback);
+    if (budget_->wakeup) {
+      budget_->wakeup->signal();
+    }
+  }
 }
 
 void EncodedAudioSender::UnregisterTransformedFrameCallback() {

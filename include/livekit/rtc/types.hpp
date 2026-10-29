@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/error.hpp"
 #include "livekit/rtc/backend_options.hpp"
 #include "livekit/rtc/session_info.hpp"
 #include "livekit/encryption.hpp"
@@ -161,6 +162,7 @@ struct TrackSnapshot {
   size_t outstanding_frames = 0, outstanding_bytes = 0;
   uint64_t accepted = 0, consumed = 0, dropped = 0;
   std::string error;
+  std::shared_ptr<const FailureInfo> failure;
   bool muted = false;            // Current local publication gate, preserved on rejoin.
   ReceiveDemand receive_demand;  // Last locally submitted demand, not a server acknowledgement.
 };
@@ -215,6 +217,10 @@ struct RoomSnapshot {
   // Native join observations are released after transport establishment. Retained
   // snapshots remain historical values; compare epoch before using server SIDs.
   std::shared_ptr<const SessionInfo> session;
+  // Controller diagnostics are cumulative for this RoomEngine. Track work
+  // counts only notified/expired instances, not registry-wide readiness scans.
+  uint64_t controller_wakeups = 0, tracks_serviced = 0;
+  size_t scheduled_deadlines = 0, ready_work = 0;
 };
 
 enum class RoomEventKind {
@@ -243,6 +249,7 @@ struct RoomEvent {
   std::optional<EncryptionStateEvent> encryption;
   std::optional<SubscriptionPermissionChange> permission;
   std::shared_ptr<const TransportStatistics> statistics;
+  std::shared_ptr<const FailureInfo> failure;
 };
 
 }  // namespace livekit::sdk::rtc

@@ -12,7 +12,7 @@ using Json = sdk::Json;
 struct Track {
   TrackDescriptor descriptor;
   bool publication = false, ready = false;
-  std::future<TrackId> pending;
+  livekit::sdk::AsyncResult<TrackId> pending;
   std::shared_ptr<engine::MediaTrack> media;
 
   std::string sid() const {

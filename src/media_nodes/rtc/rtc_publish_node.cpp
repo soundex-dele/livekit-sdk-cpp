@@ -52,8 +52,21 @@ void RtcPublishNode::activate() {
       while (!stop.stop_requested()) {
         auto feedback = track_->wait_feedback(epoch, revision, stop);
         if (!feedback) {
+          if (stop.stop_requested()) {
+            break;
+          }
+          const auto state = track_->snapshot();
+          if (state.state == TrackState::failed) {
+            if (state.failure) {
+              throw SDKError(state.failure);
+            }
+            throw std::runtime_error(state.error);
+          }
           if (!initialized) {
             throw std::runtime_error("RTC publication closed before initial feedback");
+          }
+          if (terminal_) {
+            terminal_();
           }
           break;
         }
@@ -66,11 +79,15 @@ void RtcPublishNode::activate() {
         }
       }
     } catch (...) {
-      const auto failure = std::current_exception();
+      const auto failure = normalized_failure(
+          std::current_exception(),
+          {"feedback", track_->descriptor().id, getName(), track_->snapshot().epoch},
+          ErrorDomain::media, ErrorCode::processing_failed);
       {
         std::lock_guard lock(failure_mutex_);
         failure_ = failure;
       }
+      reportFailure(failure);
       if (!initialized) {
         initial.set_exception(failure);
       }

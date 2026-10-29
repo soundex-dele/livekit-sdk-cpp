@@ -13,6 +13,7 @@ struct MicrophoneSession::Impl {
   std::mutex control;
   mutable std::mutex mutex;
   MicrophoneSnapshot stats;
+  std::function<void(std::exception_ptr)> failure_handler;
   std::unique_ptr<detail::PcmResampler> resampler;
   int rate = 0;
   uint64_t generation = 0;
@@ -29,7 +30,7 @@ struct MicrophoneSession::Impl {
   }
 
   void capture(const detail::MicrophoneBlock& block) noexcept {
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     if (!stats.running || !stats.error.empty())
       return;
     try {
@@ -79,12 +80,21 @@ struct MicrophoneSession::Impl {
       *next += 10ms;
       if (detail::PcmSourceWriter::write(*source, frame, generation) != AudioWriteStatus::accepted)
         ++stats.dropped_blocks;
-    } catch (const std::exception& e) {
-      stats.error = e.what();
-      source->close();
     } catch (...) {
-      stats.error = "Microphone capture failed";
+      const auto error =
+          normalized_failure(std::current_exception(), {"capture", {}, "microphone.device", 0},
+                             ErrorDomain::media, ErrorCode::processing_failed);
+      stats.failure = describe_failure(error);
+      stats.error = stats.failure->message;
+      auto handler = failure_handler;
       source->close();
+      lock.unlock();
+      if (handler) {
+        try {
+          handler(error);
+        } catch (...) {
+        }
+      }
     }
   }
 };
@@ -109,8 +119,9 @@ void MicrophoneSession::start() {
   std::lock_guard control(s.control);
   {
     std::lock_guard lock(s.mutex);
-    if (!s.stats.error.empty())
-      throw std::runtime_error(s.stats.error);
+    if (s.stats.failure) {
+      throw SDKError(s.stats.failure);
+    }
     if (s.stats.running)
       return;
     const auto state = s.source->stats();
@@ -146,9 +157,22 @@ MicrophoneSnapshot MicrophoneSession::snapshot() const {
   return impl_->stats;
 }
 
+void MicrophoneSession::set_failure_handler(std::function<void(std::exception_ptr)> handler) {
+  std::shared_ptr<const FailureInfo> failure;
+  {
+    std::lock_guard lock(impl_->mutex);
+    impl_->failure_handler = handler;
+    failure = impl_->stats.failure;
+  }
+  if (handler && failure) {
+    handler(std::make_exception_ptr(SDKError(failure)));
+  }
+}
+
 void MicrophoneSession::throw_if_failed() const {
   const auto state = snapshot();
-  if (!state.error.empty())
-    throw std::runtime_error(state.error);
+  if (state.failure) {
+    throw SDKError(state.failure);
+  }
 }
 }  // namespace livekit::sdk

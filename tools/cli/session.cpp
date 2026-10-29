@@ -1,3 +1,4 @@
+#include "data_event_mailbox.hpp"
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "session.hpp"
@@ -63,7 +64,7 @@ class Output final {
 struct Track {
   TrackDescriptor descriptor;
   bool publication = false, closing = false, reported = false, ready = false;
-  std::future<TrackId> pending;
+  livekit::sdk::AsyncResult<TrackId> pending;
   std::shared_ptr<engine::MediaTrack> media;
   std::shared_ptr<Output> output;
 
@@ -128,6 +129,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
       options.video_playout ? std::make_shared<lk::VideoPlayout>(display_events) : nullptr;
   auto engine = engine::create_livekit_engine({});  // Destroy before consumers/display.
   livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
+  livekit::sdk::app_support::DataEventMailbox data_events(engine->room().services());
   LiveKitRoomOptions room;
   room.url = options.url;
   room.token = options.token;
@@ -313,7 +315,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
         sending.reset();
         report({{"event", "data-sent"}});
       }
-      while (auto data = engine->room().services()->next_event(0ms)) {
+      while (auto data = data_events.take_event(0ms)) {
         if (const auto* value = std::get_if<ReceivedData>(&data->value))
           report({{"event", "data"},
                   {"identity", data->sender_identity},

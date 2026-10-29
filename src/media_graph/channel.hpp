@@ -35,6 +35,11 @@ class MediaChannel {
     return pop();
   }
 
+  std::optional<int64_t> next_timestamp() const {
+    return queue_.empty() ? std::nullopt
+                          : std::optional<int64_t>(queue_.front().first.timestamp_us);
+  }
+
   void clear() {
     queue_.clear();
     bytes_ = 0;

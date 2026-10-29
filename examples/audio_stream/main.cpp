@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     options.url = url;
     options.token = token;
     engine->join(options).get();
-    std::vector<std::future<TrackId>> pending;
+    std::vector<livekit::sdk::AsyncResult<TrackId>> pending;
     std::map<TrackId, uint64_t> samples;
     size_t blocks = 0;
     const auto deadline = SteadyClock::now() + 30s;

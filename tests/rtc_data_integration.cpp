@@ -1,3 +1,4 @@
+#include "data_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/error.hpp"
@@ -16,7 +17,7 @@ void check(bool ok, const char* message) {
 }
 
 template <class T>
-auto await(std::future<T> future) {
+auto await(T future) {
   check(future.wait_for(15s) == std::future_status::ready, "Data operation timed out");
   return future.get();
 }
@@ -43,6 +44,7 @@ int main() {
     const bool encrypted = env("LIVEKIT_DATA_ENCRYPTION") == "1";
     auto tx = create_livekit_room(), rx = create_livekit_room();
     auto sending = tx->services(), receiving = rx->services();
+    app_support::DataEventMailbox data_events(receiving);
     receiving->register_rpc("echo", [](RpcInvocation call, RpcCompletion complete) {
       check(call.caller_identity == "publisher", "RPC caller identity lost");
       complete({"reply:" + call.payload, {}});
@@ -77,7 +79,7 @@ int main() {
     await(rx->join(options));
     if (encrypted) {
       await(sending->send_data({0xfe}));
-      auto failure = receiving->next_event(5s);
+      auto failure = data_events.take_event(5s);
       check(failure && std::holds_alternative<DataServiceError>(failure->value),
             "Wrong data key did not fail closed");
       receiver_keys->set_passphrase(0, "room-data-contract");
@@ -89,7 +91,7 @@ int main() {
       send.topic = "sample";
       send.destinations = {"subscriber"};
       await(sending->send_data({1, 3, 5, 7}, send));
-      auto event = receiving->next_event(5s);
+      auto event = data_events.take_event(5s);
       check(event && event->sender_identity == "publisher" && event->reliable == reliable,
             "Data routing metadata lost");
       const auto* data = std::get_if<ReceivedData>(&event->value);
@@ -97,7 +99,7 @@ int main() {
             "Data payload changed");
     }
     await(sending->send_dtmf({5, "5"}));
-    auto digit = receiving->next_event(5s);
+    auto digit = data_events.take_event(5s);
     check(digit && std::holds_alternative<DtmfDigit>(digit->value) &&
               std::get<DtmfDigit>(digit->value).code == 5,
           "DTMF not delivered");
@@ -106,7 +108,7 @@ int main() {
     transcript.track_id = "source";
     transcript.segments.push_back({"segment", "hello", 1, 2, true, "en"});
     await(sending->send_transcription(transcript));
-    auto speech = receiving->next_event(5s);
+    auto speech = data_events.take_event(5s);
     check(speech && speech->sender_identity == "publisher" &&
               std::holds_alternative<Transcription>(speech->value) &&
               std::get<Transcription>(speech->value).participant_identity == "speaker",

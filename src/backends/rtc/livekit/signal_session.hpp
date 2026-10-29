@@ -17,7 +17,8 @@ class SignalSession {
   using ReconnectHandler = std::function<void(const livekit::ReconnectResponse&)>;
   using MovedHandler = std::function<void(const livekit::RoomMovedResponse&)>;
   SignalSession(const SignalingOptions& options, std::stop_token stop, EventEmitter events,
-                livekit::sdk::detail::SignalRecoveryState* recovery = nullptr);
+                livekit::sdk::detail::SignalRecoveryState* recovery = nullptr,
+                std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup = {});
   void connect();
 
   void initial_offer(const livekit::SessionDescription& offer,
@@ -58,6 +59,14 @@ class SignalSession {
   void enqueue_ice(const livekit::SignalRequest& request) noexcept;
   void flush_ice();
   std::optional<std::string> receive(int timeout_ms);
+
+  std::optional<std::string> receive_until(std::chrono::steady_clock::time_point deadline) {
+    return socket_.receive_until(deadline, stop_);
+  }
+
+  std::optional<std::string> take_message() {
+    return socket_.take_message();
+  }
   bool recover(const SyncBuilder& sync, const ReconnectHandler& configure,
                const MovedHandler& moved = {});
 

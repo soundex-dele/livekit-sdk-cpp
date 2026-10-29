@@ -7,6 +7,8 @@
 #include "livekit/rtc/room_engine.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/bounded_events.hpp"
+#include "support/ready_set.hpp"
+#include "support/deadline_index.hpp"
 #include <algorithm>
 #include <condition_variable>
 #include <iostream>
@@ -18,6 +20,8 @@
 #include "engines/rtc/pipeline_engine.hpp"
 #endif
 
+using livekit::sdk::AsyncResult;
+using livekit::sdk::CompletionSource;
 using namespace livekit::sdk::rtc;
 using namespace livekit::sdk::rtc::detail;
 using namespace std::chrono_literals;
@@ -35,6 +39,12 @@ T get(std::future<T> future) {
     future.get();
   else
     return future.get();
+}
+
+template <class T>
+T get(AsyncResult<T> result) {
+  check(result.wait_for(2s) == std::future_status::ready, "Asynchronous operation hung");
+  return result.get();
 }
 
 template <class F>
@@ -66,7 +76,13 @@ EncodedFrame frame(Epoch epoch, uint64_t timestamp, bool key = true, size_t size
 
 struct Harness {
   std::mutex mutex;
-  std::condition_variable_any ready;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
+
+  void signal() {
+    if (wakeup) {
+      wakeup->signal();
+    }
+  }
   std::vector<TransportEvent> events;
   std::vector<BindingToken> published, subscribed, removed, plis;
 
@@ -76,6 +92,7 @@ struct Harness {
   };
 
   std::vector<Sent> sent;
+  std::map<TrackId, size_t> send_attempts;
   std::vector<ParticipantUpdateRequest> updates;
   std::vector<std::pair<BindingToken, TrackDescriptor>> publication_descriptors;
   std::vector<MuteRequest> mutes;
@@ -87,14 +104,14 @@ struct Harness {
   std::set<TrackId> send_failures;
   bool confirm = true, connect = true;
   bool defer_removal = false;
-  std::vector<std::shared_ptr<std::promise<void>>> removal_completions;
+  std::vector<std::shared_ptr<CompletionSource<void>>> removal_completions;
   int starts = 0, stops = 0;
   std::thread::id owner;
 
   void push(TransportEvent e) {
     std::lock_guard lock(mutex);
     events.push_back(std::move(e));
-    ready.notify_all();
+    signal();
   }
 };
 
@@ -110,6 +127,7 @@ class FakeTransport : public RoomTransport {
 
   void start(const RoomOptions& options, Epoch) override {
     std::lock_guard lock(h->mutex);
+    h->wakeup = wakeup_;
     const auto* connection = dynamic_cast<const LiveKitConnectionOptions*>(options.backend.get());
     supports_ack_ = connection && connection->signaling.signal_protocol >= 15;
     h->owner = std::this_thread::get_id();
@@ -117,12 +135,12 @@ class FakeTransport : public RoomTransport {
     h->initial_permissions = options.subscription_permissions;
     if (h->connect)
       h->events.push_back({TransportEventKind::connected});
+    h->signal();
   }
 
-  std::vector<TransportEvent> poll(std::chrono::milliseconds wait, std::stop_token stop) override {
+  std::vector<TransportEvent> take_events() override {
     std::unique_lock lock(h->mutex);
     check(h->owner == std::this_thread::get_id(), "Transport accessed outside controller");
-    h->ready.wait_for(lock, stop, wait, [&] { return !h->events.empty(); });
     auto result = std::move(h->events);
     h->events.clear();
     return result;
@@ -134,6 +152,7 @@ class FakeTransport : public RoomTransport {
     h->publication_descriptors.emplace_back(b, descriptor);
     if (h->confirm)
       h->events.push_back({TransportEventKind::published, b, "sid-" + b.id});
+    h->signal();
   }
 
   void subscribe(const BindingToken& b, const TrackDescriptor& d,
@@ -143,24 +162,26 @@ class FakeTransport : public RoomTransport {
     h->subscription_descriptors.emplace_back(b, d);
     if (h->confirm)
       h->events.push_back({TransportEventKind::subscribed, b, "remote-" + b.id});
+    h->signal();
   }
 
-  std::future<void> remove(const BindingToken& b, bool) override {
+  AsyncResult<void> remove(const BindingToken& b, bool) override {
     std::lock_guard lock(h->mutex);
     h->removed.push_back(b);
     if (h->defer_removal) {
-      auto completion = std::make_shared<std::promise<void>>();
-      auto result = completion->get_future();
+      auto completion = std::make_shared<CompletionSource<void>>();
+      auto result = completion->get_result();
       h->removal_completions.push_back(std::move(completion));
       return result;
     }
-    std::promise<void> done;
+    CompletionSource<void> done;
     done.set_value();
-    return done.get_future();
+    return done.get_result();
   }
 
   SendResult send(const BindingToken& b, const EncodedFrame& f) override {
     std::lock_guard lock(h->mutex);
+    ++h->send_attempts[b.id];
     if (h->send_failures.contains(b.id))
       throw std::runtime_error("Synthetic per-track send failure");
     if (h->blocked.contains(b.id))
@@ -186,6 +207,7 @@ class FakeTransport : public RoomTransport {
     TransportEvent event{TransportEventKind::control_completed, request.binding};
     event.operation_id = request.id;
     h->events.push_back(std::move(event));
+    h->signal();
   }
 
   void set_receive_demand(ReceiveDemandRequest request) override {
@@ -215,6 +237,114 @@ LiveKitRoomOptions options(size_t budget = 4096) {
   o.max_queued_bytes = budget;
   o.operation_timeout = 500ms;
   return o;
+}
+
+void indexed_work_contract() {
+  using namespace livekit::sdk::detail;
+  auto owner = std::make_shared<WakeEvent>();
+  auto ready = std::make_shared<ReadySet<int>>(owner, 2);
+  auto old = ready->watch(1);
+  auto current = ready->watch(2);
+  for (int i = 0; i < 10000; ++i) {
+    old->signal();
+  }
+  check(ready->pending() == 1 && ready->take() == std::set<int>{1},
+        "Producer bursts did not coalesce");
+  bool limited = false;
+  try {
+    ready->watch(3);
+  } catch (const std::length_error&) {
+    limited = true;
+  }
+  check(limited, "Ready registrations were not bounded");
+  ready->forget(1);
+  old->signal();
+  current->signal();
+  check(ready->take() == std::set<int>{2}, "Retired producer revived stale work");
+  const auto observed = owner->revision();
+  current->signal();  // Arrives after drain but before wait.
+  check(owner->revision() != observed && ready->take() == std::set<int>{2},
+        "Drain-to-wait race lost producer work");
+  std::weak_ptr retained = ready;
+  ready.reset();
+  old->signal();
+  current->signal();
+  check(retained.expired(), "Producer wake handle retained its owner");
+
+  DeadlineIndex<int> deadlines;
+  const auto now = SteadyClock::now();
+  for (int i = 1; i <= 10000; ++i) {
+    deadlines.set(1, now + std::chrono::microseconds(i));
+  }
+  deadlines.set(2, now + 20ms);
+  check(deadlines.size() == 2 && deadlines.next() == now + 10ms,
+        "Deadline updates accumulated stale entries");
+  check(deadlines.take_due(now + 9ms).empty(), "Deadline fired early");
+  check(deadlines.take_due(now + 10ms) == std::vector<int>{1}, "Due deadline lost");
+  deadlines.erase(2);
+  check(!deadlines.next() && deadlines.size() == 0, "Cancelled deadline retained");
+}
+
+void dirty_track_dispatch_contract() {
+  auto h = std::make_shared<Harness>();
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::RtcEventMailbox room_events(room);
+  get(room.join(options()));
+  std::vector<std::shared_ptr<PublishedTrack>> tracks;
+  for (int i = 0; i < 128; ++i) {
+    auto descriptor = video("load-" + std::to_string(i));
+    descriptor.queue.max_age = 5s;
+    tracks.push_back(get(room.publish(std::move(descriptor))));
+  }
+  eventually([&] { return room.snapshot().scheduled_deadlines == 0; },
+             "Confirmed tracks retained operation deadlines");
+  const auto baseline = room.snapshot().tracks_serviced;
+  BindingToken blocked;
+  {
+    std::lock_guard lock(h->mutex);
+    h->blocked.insert("load-0");
+    blocked = h->published.front();
+  }
+  check(tracks.front()->try_write(frame(1, 1)) == WriteStatus::accepted, "Load frame rejected");
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->send_attempts["load-0"] == 1;
+      },
+      "Blocked track not serviced");
+  const auto previous_wake = room.snapshot().controller_wakeups;
+  {
+    std::lock_guard lock(h->mutex);
+    h->signal();
+  }
+  eventually([&] { return room.snapshot().controller_wakeups > previous_wake; },
+             "Controller did not observe explicit wake");
+  for (int i = 1; i <= 20; ++i) {
+    check(tracks[i]->try_write(frame(1, 1)) == WriteStatus::accepted, "Sibling admission failed");
+  }
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->sent.size() == 20;
+      },
+      "Blocked sender starved active siblings");
+  eventually([&] { return room.snapshot().tracks_serviced >= baseline + 21; },
+             "Work diagnostics did not include active tracks");
+  check(room.snapshot().tracks_serviced == baseline + 21,
+        "Unrelated wake or sibling media serviced idle/blocked tracks");
+  {
+    std::lock_guard lock(h->mutex);
+    check(h->send_attempts["load-0"] == 1, "Blocked sender was polled without capacity event");
+    h->blocked.erase("load-0");
+  }
+  h->push({TransportEventKind::writable, blocked});
+  eventually([&] { return tracks.front()->snapshot().consumed == 1; },
+             "Writable callback did not resume blocked sender");
+  eventually([&] { return room.snapshot().scheduled_deadlines == 0; },
+             "Drained tracks retained expiry deadlines");
+  get(room.leave());
+  check(room.snapshot().publications == 0 && room.snapshot().scheduled_deadlines == 0,
+        "Room teardown retained track scheduling state");
 }
 
 void asynchronous_detachment() {
@@ -417,12 +547,14 @@ void statistics_events() {
       TransportEvent e{TransportEventKind::statistics, {{}, epoch}};
       e.statistics = std::make_shared<TransportStatistics>(TransportStatistics{i % 2, i, "[]"});
       h->events.push_back(std::move(e));
+      h->signal();
     }
     // A control event must displace diagnostics, never overflow because of them.
     TransportEvent e{TransportEventKind::remote_track_added, {"remote", epoch}};
     e.descriptor = video("remote");
     h->events.push_back(e);
-    h->ready.notify_all();
+    h->signal();
+    h->signal();
   }
   bool remote = false;
   int statistics = 0;
@@ -884,7 +1016,7 @@ void participant_controls() {
     event.error = "synthetic rejection";
     h->push(std::move(event));
   };
-  const auto rejects = [&](std::future<void> result, ErrorCode code) {
+  const auto rejects = [&](AsyncResult<void> result, ErrorCode code) {
     bool rejected = false;
     try {
       get(std::move(result));
@@ -939,7 +1071,7 @@ void participant_controls() {
         "Wrong-epoch ACK resolved new operation");
   respond(current);
   get(std::move(replacement));
-  std::vector<std::future<void>> full;
+  std::vector<AsyncResult<void>> full;
   for (int i = 0; i < 128; ++i)
     full.push_back(room.update_local_participant({"queued", {}, {}}, {5s}));
   request(133);
@@ -1550,7 +1682,18 @@ void source_worker_contract() {
 
   auto failed_track = get(room.subscribe(video("throwing-source")));
   auto throwing = std::make_shared<CallbackConsumer>([] {});
-  engine::SubscribePipeline failed(failed_track, throwing);
+  std::promise<std::exception_ptr> reported;
+  auto report = reported.get_future();
+  engine::SubscribePipeline failed(
+      failed_track,
+      [throwing](auto source) {
+        engine::TrackGraphSpec spec;
+        spec.nodes = {throwing};
+        spec.connections = {
+            engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(source, throwing)};
+        return spec;
+      },
+      [&](auto error) { reported.set_value(error); });
   failed.start();
   BindingToken failed_binding;
   {
@@ -1560,16 +1703,10 @@ void source_worker_contract() {
   TransportEvent failure{TransportEventKind::operation_failed, failed_binding};
   failure.error = "source receive failed";
   h->push(std::move(failure));
-  eventually(
-      [&] {
-        try {
-          failed.check();
-        } catch (const std::runtime_error& error) {
-          return std::string(error.what()) == "source receive failed";
-        }
-        return false;
-      },
-      "Worker exception was not handed back to control health checks");
+  const auto source_failure = get(std::move(report));
+  check(bool(source_failure), "Source failure notification lost its cause");
+  check(livekit::sdk::describe_failure(source_failure)->message == "source receive failed",
+        "Source failure callback lost details");
   get(failed.close());
 }
 
@@ -1580,7 +1717,7 @@ void engine_callback_contract() {
   auto connected_future = connected.get_future();
   auto failed_future = failed.get_future();
   std::thread::id callback_thread;
-  std::atomic<bool> fail{false};
+  auto fault = std::make_shared<graphflow::core::GraphNode>("fault", nullptr);
   engine.set_callbacks({[&](const RoomEvent& event) {
                           if (event.kind == RoomEventKind::connected) {
                             callback_thread = std::this_thread::get_id();
@@ -1592,7 +1729,7 @@ void engine_callback_contract() {
                           check(std::this_thread::get_id() == callback_thread,
                                 "Engine notifications did not share a serial queue");
                           check(failure.id == "failed-graph" && failure.publication &&
-                                    failure.message == "node health failure",
+                                    failure.message == "node failure",
                                 "Graph failure callback lost details");
                           get(engine.unpublish("callback-control"));
                           engine.set_callbacks({});  // Self-removal must not wait on its own queue.
@@ -1603,17 +1740,87 @@ void engine_callback_contract() {
   check(callback_thread != std::this_thread::get_id(), "Callback ran on caller thread");
   get(engine.graph().publish_graph(video("failed-graph"), [&](auto) {
     engine::TrackGraphSpec spec;
-    spec.check_health = [&] {
-      if (fail) {
-        throw std::runtime_error("node health failure");
-      }
-    };
+    spec.nodes = {fault};
     return spec;
   }));
-  fail = true;
+  fault->reportFailure(std::make_exception_ptr(std::runtime_error("node failure")));
   get(std::move(failed_future));
   engine.set_callbacks({});
   get(engine.close());
+}
+
+void active_failure_correlation_contract() {
+  auto h = std::make_shared<Harness>();
+  engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
+  std::promise<std::shared_ptr<const livekit::sdk::FailureInfo>> graph_report, room_report;
+  auto graph_result = graph_report.get_future(), room_result = room_report.get_future();
+  std::atomic<size_t> notifications{0};
+  engine.set_callbacks({[&](const RoomEvent& event) {
+                          if (event.kind == RoomEventKind::track_failed &&
+                              event.track_id == "fault") {
+                            room_report.set_value(event.failure);
+                          }
+                        },
+                        [&](const engine::RtcEngine::GraphFailure& failure) {
+                          if (++notifications == 1) {
+                            graph_report.set_value(failure.failure);
+                          }
+                        }});
+  get(engine.join(options()));
+  auto node = std::make_shared<graphflow::core::GraphNode>("codec.failure", nullptr);
+  std::shared_ptr<PublishedTrack> endpoint;
+  get(engine.graph().publish_graph(video("fault"), [&](auto sink) {
+    endpoint = sink->track();
+    engine::TrackGraphSpec spec;
+    spec.nodes = {node};
+    return spec;
+  }));
+  {
+    std::lock_guard lock(h->mutex);
+    h->defer_removal = true;
+  }
+  const auto cause = std::make_exception_ptr(std::runtime_error("asynchronous codec failure"));
+  std::jthread reporter([&] {
+    node->reportFailure(cause);
+    node->reportFailure(cause);
+  });
+  const auto graph = get(std::move(graph_result));
+  const auto room = get(std::move(room_result));
+  const auto snapshot = endpoint->snapshot();
+  check(graph && room && snapshot.failure && graph->id == room->id &&
+            graph->id == snapshot.failure->id && graph->context.node == "codec.failure" &&
+            snapshot.state == TrackState::failed && notifications == 1,
+        "Failure was duplicated or lost correlation across graph, room and track");
+  auto closed = endpoint->close();
+  // A later room operation fences close admission without releasing the native
+  // detachment. Source failure must not bypass the normal teardown barrier.
+  get(engine.publish(video("failure-fence")));
+  check(closed.wait_for(0ms) == std::future_status::timeout,
+        "Failed graph close bypassed its native detachment barrier");
+  {
+    std::lock_guard lock(h->mutex);
+    check(h->removal_completions.size() == 1, "Failed graph detached more than once");
+    h->removal_completions.front()->set_value();
+    h->defer_removal = false;
+  }
+  get(std::move(closed));
+
+  auto old_node = std::make_shared<graphflow::core::GraphNode>("old.node", nullptr);
+  std::shared_ptr<PublishedTrack> old_endpoint;
+  get(engine.graph().publish_graph(video("reused-fault"), [&](auto sink) {
+    old_endpoint = sink->track();
+    engine::TrackGraphSpec spec;
+    spec.nodes = {old_node};
+    return spec;
+  }));
+  get(engine.unpublish("reused-fault"));
+  get(engine.publish(video("reused-fault")));
+  old_node->reportFailure(cause);
+  get(engine.set_muted("reused-fault", false));  // Fences the stale owner notification.
+  check(engine.publication("reused-fault").state == TrackState::ready && notifications == 1,
+        "Old graph failure destroyed or reported against a replacement track");
+  get(engine.close());
+  engine.set_callbacks({});
 }
 
 void engine_contract() {
@@ -1721,7 +1928,7 @@ void composed_graph_contract() {
   engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox engine_events(engine);
   get(engine.join(options()));
-  std::atomic<int> activations{0}, quiescences{0}, health_checks{0};
+  std::atomic<int> activations{0}, quiescences{0};
   bool teardown_while_running = false;
   std::shared_ptr<GraphProducer> producer;
   auto publication = engine.graph().publish_graph(video("composed"), [&](auto sink) {
@@ -1745,7 +1952,6 @@ void composed_graph_contract() {
       teardown_while_running = producer->state() == graphflow::core::LifecycleState::Running &&
                                sink->track()->snapshot().state == TrackState::ready;
     };
-    spec.check_health = [&] { ++health_checks; };
     return spec;
   });
   eventually(
@@ -1755,7 +1961,6 @@ void composed_graph_contract() {
       },
       "Composed graph never started");
   check(publication.get() == "composed" && activations == 1, "Composed graph lifecycle failed");
-  eventually([&] { return health_checks > 0; }, "Automatic graph health checks did not run");
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -1981,10 +2186,13 @@ int main() {
     engine_contract();
     std::cout << "engine callbacks" << std::endl;
     engine_callback_contract();
+    active_failure_correlation_contract();
     std::cout << "composed graphs" << std::endl;
     composed_graph_contract();
     std::cout << "RTC graph pipeline contracts passed\n";
 #else
+    indexed_work_contract();
+    dirty_track_dispatch_contract();
     task_queue_wakeup_contract();
     room_callback_contract();
     endpoint_wait_contract();

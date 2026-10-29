@@ -20,9 +20,8 @@ RtcEngine::Impl::Impl(std::unique_ptr<RoomEngine> value)
     throw std::invalid_argument("RTC engine requires a room engine");
   }
   control = vi::TaskQueue::create("rtc.engine.control");
-  call([this] { pipelines = std::make_unique<RtcPipelineEngine>(*room); });
-  room->set_completion_wakeup([this] { completion_ready(); });
-  call([this] { schedule_health(); });
+  completion_dispatch.bind(*control);
+  call([this] { pipelines = std::make_unique<RtcPipelineEngine>(*room, completion_dispatch); });
 }
 
 RtcEngine::Impl::~Impl() {
@@ -35,7 +34,6 @@ RtcEngine::Impl::~Impl() {
     pipelines->set_failure_handler({});
   });
   room->set_event_handler({});
-  room->set_completion_wakeup({});
   try {
     call([this] {
       stopping = true;
@@ -45,6 +43,7 @@ RtcEngine::Impl::~Impl() {
     });
   } catch (...) {
   }
+  completion_dispatch.close();
   control.reset();
   try {
     room->leave().get();
@@ -52,11 +51,11 @@ RtcEngine::Impl::~Impl() {
   }
 }
 
+bool RtcEngine::Impl::control_is_current() const {
+  return control->isCurrent();
+}
+
 void RtcEngine::Impl::dispatch(std::function<void()> task) const {
-  if (control->isCurrent()) {
-    task();
-    return;
-  }
   if (queued_commands.fetch_add(1) >= 1024) {
     --queued_commands;
     throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
@@ -65,7 +64,7 @@ void RtcEngine::Impl::dispatch(std::function<void()> task) const {
   try {
     control->postTask([this, task = std::move(task)] {
       --queued_commands;
-      task();  // Always a packaged_task; exceptions become future failures.
+      task();  // Packaged task or AsyncResult continuation captures exceptions.
     });
   } catch (...) {
     --queued_commands;
@@ -73,55 +72,9 @@ void RtcEngine::Impl::dispatch(std::function<void()> task) const {
   }
 }
 
-void RtcEngine::Impl::fail_control(std::exception_ptr failure) {
-  control_failure = failure;
-  try {
-    clear_tracks();
-  } catch (...) {
-  }
-}
-
-void RtcEngine::Impl::completion_ready() {
-  if (completion_queued.exchange(true)) {
-    return;
-  }
-  control->postTask([this] {
-    completion_queued = false;
-    if (stopping || control_failure) {
-      return;
-    }
-    try {
-      pipelines->complete_operations();
-    } catch (...) {
-      fail_control(std::current_exception());
-    }
-  });
-}
-
-void RtcEngine::Impl::schedule_health() {
-  // Legacy/custom nodes report failures through bounded snapshot checks. This
-  // timer performs no receive, feedback, graph creation or media dispatch.
-  control->postDelayedTask(
-      [this] {
-        if (stopping || control_failure) {
-          return;
-        }
-        try {
-          pipelines->check_health();
-          schedule_health();
-        } catch (...) {
-          fail_control(std::current_exception());
-        }
-      },
-      20);
-}
-
 void RtcEngine::Impl::require_owner() const {
   if (!control->isCurrent()) {
     throw std::logic_error("RTC control requires its task queue");
-  }
-  if (control_failure) {
-    std::rethrow_exception(control_failure);
   }
   if (closed) {
     throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
@@ -140,141 +93,178 @@ void RtcEngine::Impl::clear_tracks() {
   pipelines->clear();
 }
 
+void RtcEngine::post_control(std::function<void()> task) {
+  impl_->dispatch(std::move(task));
+}
+
+bool RtcEngine::on_control_thread() const {
+  return impl_->control_is_current();
+}
+
 bool RtcEngine::media_enabled() const {
-  return impl_->call([&] {
-    impl_->require_owner();
-    return bool(impl_->media);
-  });
+  return impl_->has_media;
 }
 
-std::future<void> RtcEngine::join(RoomOptions options) {
-  return impl_->call([&] {
-    impl_->require_owner();
-    const auto state = impl_->room->snapshot().state;
-    if (state == ConnectionState::failed || state == ConnectionState::closed) {
-      impl_->clear_tracks();
+AsyncResult<void> RtcEngine::join(RoomOptions options) {
+  return impl_->submit([state = impl_.get(), options = std::move(options)]() mutable {
+    state->require_owner();
+    const auto connection = state->room->snapshot().state;
+    if (connection == ConnectionState::failed || connection == ConnectionState::closed) {
+      state->clear_tracks();
     }
-    return impl_->room->join(std::move(options));
+    return state->room->join(std::move(options));
   });
 }
 
-std::future<void> RtcEngine::leave() {
-  return impl_->call([&] {
-    impl_->require_owner();
-    impl_->clear_tracks();
-    return impl_->room->leave();
+AsyncResult<void> RtcEngine::leave() {
+  return impl_->submit([state = impl_.get()] {
+    state->require_owner();
+    state->clear_tracks();
+    return state->room->leave();
   });
 }
 
-std::future<void> RtcEngine::close() {
-  return impl_->call([&] {
-    impl_->closed = true;
-    impl_->clear_tracks();
-    return impl_->room->leave();
+AsyncResult<void> RtcEngine::close() {
+  return impl_->submit([state = impl_.get()] {
+    state->closed = true;
+    state->clear_tracks();
+    return state->room->leave();
   });
+}
+
+MediaOperation RtcEngine::start_media(MediaPublishSpec spec, std::optional<MediaKind> expected) {
+  auto track = std::shared_ptr<MediaTrack>(new MediaTrack(spec.track));
+  auto submitted =
+      impl_->submit([state = impl_.get(), spec = std::move(spec), expected, track]() mutable {
+        if (expected && spec.track.kind != *expected) {
+          throw std::invalid_argument("Publication kind does not match the requested media API");
+        }
+        auto operation = state->require_media().publish_media(std::move(spec));
+        track->bind_pending(std::move(operation.track));
+        return std::move(operation.ready);
+      });
+  auto ready = std::move(submitted).then([](auto task) { task(); },
+                                         [track](AsyncResult<TrackId> result) {
+                                           try {
+                                             return result.get();
+                                           } catch (...) {
+                                             track->fail_pending(std::current_exception());
+                                             throw;
+                                           }
+                                         });
+  return {std::move(ready), std::move(track)};
 }
 
 MediaOperation RtcEngine::publish_media(MediaPublishSpec spec) {
-  return impl_->call([&] { return impl_->require_media().publish_media(std::move(spec)); });
+  return start_media(std::move(spec));
 }
-
 MediaOperation RtcEngine::publish_video(MediaPublishSpec spec) {
-  if (spec.track.kind != MediaKind::video) {
-    throw std::invalid_argument("Expected video publication");
-  }
-  return publish_media(std::move(spec));
+  return start_media(std::move(spec), MediaKind::video);
 }
-
 MediaOperation RtcEngine::publish_audio(MediaPublishSpec spec) {
-  if (spec.track.kind != MediaKind::audio) {
-    throw std::invalid_argument("Expected audio publication");
-  }
-  return publish_media(std::move(spec));
+  return start_media(std::move(spec), MediaKind::audio);
 }
 
 MediaOperation RtcEngine::subscribe_media(MediaSubscribeSpec spec) {
-  return impl_->call([&] { return impl_->require_media().subscribe_media(std::move(spec)); });
-}
-
-std::shared_ptr<SharedMediaInput> RtcEngine::create_shared_input(TrackDescriptor format,
-                                                                 MediaInput input) {
-  return impl_->call([&] {
-    return impl_->require_media().create_shared_input(std::move(format), std::move(input));
+  auto track = std::shared_ptr<MediaTrack>(new MediaTrack(spec.track));
+  auto submitted = impl_->submit([state = impl_.get(), spec = std::move(spec), track]() mutable {
+    auto operation = state->require_media().subscribe_media(std::move(spec));
+    track->bind_pending(std::move(operation.track));
+    return std::move(operation.ready);
   });
+  auto ready = std::move(submitted).then([](auto task) { task(); },
+                                         [track](AsyncResult<TrackId> result) {
+                                           try {
+                                             return result.get();
+                                           } catch (...) {
+                                             track->fail_pending(std::current_exception());
+                                             throw;
+                                           }
+                                         });
+  return {std::move(ready), std::move(track)};
 }
 
-std::future<TrackId> RtcEngine::publish(TrackDescriptor descriptor) {
-  return impl_->call([&] {
-    impl_->require_owner();
-    return impl_->pipelines->publish(std::move(descriptor));
+AsyncResult<std::shared_ptr<SharedMediaInput>> RtcEngine::create_shared_input(
+    TrackDescriptor format, MediaInput input) {
+  return impl_->submit(
+      [state = impl_.get(), format = std::move(format), input = std::move(input)]() mutable {
+        return state->require_media().create_shared_input(std::move(format), std::move(input));
+      });
+}
+
+AsyncResult<TrackId> RtcEngine::publish(TrackDescriptor descriptor) {
+  return impl_->submit([state = impl_.get(), descriptor = std::move(descriptor)]() mutable {
+    state->require_owner();
+    return state->pipelines->publish(std::move(descriptor));
   });
 }
 
 RtcGraphApi RtcEngine::graph() {
-  impl_->call([&] { impl_->require_owner(); });
   return RtcGraphApi(*this);
 }
 
-std::future<TrackId> RtcGraphApi::publish(TrackDescriptor descriptor,
+AsyncResult<TrackId> RtcGraphApi::publish(TrackDescriptor descriptor,
                                           std::shared_ptr<graphflow::core::GraphNode> sink) {
-  return engine_->impl_->call([&] {
-    engine_->impl_->require_owner();
-    return engine_->impl_->pipelines->publish(std::move(descriptor), std::move(sink));
+  return engine_->impl_->submit([state = engine_->impl_.get(), descriptor = std::move(descriptor),
+                                 sink = std::move(sink)]() mutable {
+    state->require_owner();
+    return state->pipelines->publish(std::move(descriptor), std::move(sink));
   });
 }
 
-std::future<TrackId> RtcGraphApi::subscribe(TrackDescriptor descriptor,
+AsyncResult<TrackId> RtcGraphApi::subscribe(TrackDescriptor descriptor,
                                             std::shared_ptr<graphflow::core::GraphNode> consumer) {
-  return engine_->impl_->call([&] {
-    engine_->impl_->require_owner();
-    return engine_->impl_->pipelines->subscribe(std::move(descriptor), std::move(consumer));
+  return engine_->impl_->submit([state = engine_->impl_.get(), descriptor = std::move(descriptor),
+                                 consumer = std::move(consumer)]() mutable {
+    state->require_owner();
+    return state->pipelines->subscribe(std::move(descriptor), std::move(consumer));
   });
 }
 
-std::future<TrackId> RtcGraphApi::publish_graph(TrackDescriptor descriptor,
+AsyncResult<TrackId> RtcGraphApi::publish_graph(TrackDescriptor descriptor,
                                                 PublishGraphFactory factory) {
-  return engine_->impl_->call([&] {
-    engine_->impl_->require_owner();
-    return engine_->impl_->pipelines->publish_graph(std::move(descriptor), std::move(factory));
+  return engine_->impl_->submit([state = engine_->impl_.get(), descriptor = std::move(descriptor),
+                                 factory = std::move(factory)]() mutable {
+    state->require_owner();
+    return state->pipelines->publish_graph(std::move(descriptor), std::move(factory));
   });
 }
 
-std::future<TrackId> RtcGraphApi::subscribe_graph(TrackDescriptor descriptor,
+AsyncResult<TrackId> RtcGraphApi::subscribe_graph(TrackDescriptor descriptor,
                                                   SubscribeGraphFactory factory) {
-  return engine_->impl_->call([&] {
-    engine_->impl_->require_owner();
-    return engine_->impl_->pipelines->subscribe_graph(std::move(descriptor), std::move(factory));
+  return engine_->impl_->submit([state = engine_->impl_.get(), descriptor = std::move(descriptor),
+                                 factory = std::move(factory)]() mutable {
+    state->require_owner();
+    return state->pipelines->subscribe_graph(std::move(descriptor), std::move(factory));
   });
 }
 
-std::future<void> RtcEngine::unpublish(const TrackId& id) {
-  return impl_->call([&] {
-    impl_->require_owner();
-    auto result = impl_->pipelines->unpublish(id);
-    return result;
+AsyncResult<void> RtcEngine::unpublish(const TrackId& id) {
+  return impl_->submit([state = impl_.get(), id] {
+    state->require_owner();
+    return state->pipelines->unpublish(id);
   });
 }
 
-std::future<void> RtcEngine::unsubscribe(const TrackId& id) {
-  return impl_->call([&] {
-    impl_->require_owner();
-    auto result = impl_->pipelines->unsubscribe(id);
-    return result;
+AsyncResult<void> RtcEngine::unsubscribe(const TrackId& id) {
+  return impl_->submit([state = impl_.get(), id] {
+    state->require_owner();
+    return state->pipelines->unsubscribe(id);
   });
 }
 
-std::future<void> RtcEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
-  return impl_->call([&] {
-    impl_->require_owner();
-    return impl_->room->set_muted(id, muted, options);
+AsyncResult<void> RtcEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
+  return impl_->submit([state = impl_.get(), id, muted, options] {
+    state->require_owner();
+    return state->room->set_muted(id, muted, options);
   });
 }
 
-std::future<void> RtcEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
+AsyncResult<void> RtcEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                                 ControlOptions options) {
-  return impl_->call([&] {
-    impl_->require_owner();
-    return impl_->room->set_receive_demand(id, demand, options);
+  return impl_->submit([state = impl_.get(), id, demand, options] {
+    state->require_owner();
+    return state->room->set_receive_demand(id, demand, options);
   });
 }
 
@@ -303,7 +293,8 @@ void RtcEngine::set_callbacks(Callbacks callbacks) {
             state->room->post_notification([active, handler, failure = std::move(failure)] {
               if (*active) {
                 try {
-                  handler(GraphFailure{failure.id, failure.publication, failure.message});
+                  handler(GraphFailure{failure.id, failure.publication, failure.message,
+                                       failure.failure});
                 } catch (...) {
                   *active = false;
                   throw;

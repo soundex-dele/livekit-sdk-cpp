@@ -5,6 +5,27 @@
 
 namespace livekit::sdk::rtc::detail {
 
+void Endpoint::attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup) {
+  std::lock_guard lock(mutex_);
+  wakeup_ = std::move(wakeup);
+}
+
+std::optional<SteadyClock::time_point> Endpoint::next_expiration() {
+  std::lock_guard lock(mutex_);
+  expire_locked();
+  if (queue_.empty()) {
+    return {};
+  }
+  return queue_.front().queued + descriptor.queue.max_age;
+}
+
+void Endpoint::notify_locked() {
+  changed_.notify_all();
+  if (wakeup_) {
+    wakeup_->signal();
+  }
+}
+
 void validate_receive_demand(const ReceiveDemand& d, MediaKind kind) {
   if (d.quality != ReceiveQuality::low && d.quality != ReceiveQuality::medium &&
       d.quality != ReceiveQuality::high)
@@ -157,7 +178,7 @@ void Endpoint::require_keyframe_locked() {
     ++encoding.keyframe_requests;
   }
   ++feedback_.revision;
-  changed_.notify_all();
+  notify_locked();
 }
 
 void Endpoint::require_keyframe() {
@@ -166,13 +187,13 @@ void Endpoint::require_keyframe() {
     return;
   clear_locked();
   require_keyframe_locked();
-  changed_.notify_all();
+  notify_locked();
 }
 
 void Endpoint::expire_locked() {
   // Dropping an encoded frame invalidates the reference chain. Clear queued
   // dependants, not merely the oldest compressed frame, then ask for recovery.
-  if (!queue_.empty() && SteadyClock::now() - queue_.front().queued > descriptor.queue.max_age) {
+  if (!queue_.empty() && SteadyClock::now() - queue_.front().queued >= descriptor.queue.max_age) {
     clear_locked();
     require_keyframe_locked();
   }
@@ -191,7 +212,7 @@ void Endpoint::rebind(Epoch epoch) {
     feedback_.encodings.at(encoding.id).active = encoding.active && !stats_.muted;
   require_keyframe_locked();
   ++feedback_.revision;
-  changed_.notify_all();
+  notify_locked();
 }
 
 void Endpoint::ready(std::string sid) {
@@ -199,15 +220,17 @@ void Endpoint::ready(std::string sid) {
   stats_.server_sid = std::move(sid);
   stats_.state = TrackState::ready;
   ++feedback_.revision;
-  changed_.notify_all();
+  notify_locked();
 }
 
-void Endpoint::finish(TrackState state, std::string error) {
+void Endpoint::finish(TrackState state, std::string error,
+                      std::shared_ptr<const FailureInfo> failure) {
   std::lock_guard lock(mutex_);
   stats_.state = state;
   stats_.error = std::move(error);
+  stats_.failure = std::move(failure);
   clear_locked();
-  changed_.notify_all();
+  notify_locked();
 }
 
 WriteStatus Endpoint::write(EncodedFrame frame) {
@@ -267,7 +290,7 @@ WriteStatus Endpoint::write(EncodedFrame frame) {
   ++stats_.accepted;
   stats_.queued_frames = queue_.size();
   stats_.queued_bytes += size;
-  changed_.notify_all();
+  notify_locked();
   return WriteStatus::accepted;
 }
 
@@ -315,6 +338,7 @@ ReadResult Endpoint::read_locked(std::stop_token stop) {
   stats_.queued_frames = queue_.size();
   ++stats_.consumed;
   QueueBudget::release_to_caller(item.frame.buffer);
+  notify_locked();
   return {ReadStatus::frame, std::move(item.frame)};
 }
 
@@ -373,7 +397,7 @@ void Endpoint::update_feedback(const SenderFeedback& feedback) {
   }
   transport_feedback_ = feedback;
   ++feedback_.revision;
-  changed_.notify_all();
+  notify_locked();
 }
 
 void Endpoint::set_muted(bool muted) {
@@ -393,7 +417,7 @@ void Endpoint::set_muted(bool muted) {
         (transport == transport_feedback_.encodings.end() || transport->second.active);
   }
   ++feedback_.revision;
-  changed_.notify_all();
+  notify_locked();
 }
 
 }  // namespace livekit::sdk::rtc::detail

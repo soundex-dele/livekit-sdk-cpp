@@ -27,8 +27,8 @@ void check(bool value, const char* message) {
     throw std::runtime_error(message);
 }
 
-template <class T>
-void ready(std::future<T>& future) {
+template <class Result>
+void ready(Result& future) {
   check(future.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
         "Native task queue timed out");
 }
@@ -372,7 +372,7 @@ void audio_loopback() {
   while ((received["microphone"].empty() || received["music"].empty()) &&
          SteadyClock::now() < deadline) {
     for (auto& [id, output] : outputs) {
-      auto frames = output->poll();
+      auto frames = output->take_frames();
       for (auto& frame : frames)
         received[id].push_back(std::move(frame));
     }
@@ -392,7 +392,7 @@ void audio_loopback() {
   deadline = SteadyClock::now() + std::chrono::seconds(5);
   std::vector<native::ReceivedAccessUnit> sibling;
   while (sibling.empty() && SteadyClock::now() < deadline) {
-    sibling = outputs["music"]->poll();
+    sibling = outputs["music"]->take_frames();
     if (sibling.empty())
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
@@ -424,7 +424,7 @@ void audio_loopback() {
   deadline = SteadyClock::now() + std::chrono::seconds(5);
   std::vector<native::ReceivedAccessUnit> rebound;
   while (rebound.empty() && SteadyClock::now() < deadline) {
-    rebound = remapped_outputs.at("TR_music")->poll();
+    rebound = remapped_outputs.at("TR_music")->take_frames();
     if (rebound.empty())
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
@@ -548,7 +548,7 @@ void video_loopback(Codec codec) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     for (auto& [id, output] : outputs) {
-      auto frames = output->poll();
+      auto frames = output->take_frames();
       if (!frames.empty())
         received.insert_or_assign(id, std::move(frames.back()));
     }
@@ -581,11 +581,11 @@ void video_loopback(Codec codec) {
     auto frame = sample(timestamp);
     frame.buffer = EncodedBuffer(fixture_video(codec, false));
     frame.keyframe = true;
-    outputs.at("camera")->poll();
+    outputs.at("camera")->take_frames();
     check(inputs[0]->send(frame) == native::SendResult::sent, "Timed video frame rejected");
     const auto until = SteadyClock::now() + std::chrono::seconds(2);
     while (SteadyClock::now() < until) {
-      auto frames = outputs.at("camera")->poll();
+      auto frames = outputs.at("camera")->take_frames();
       if (!frames.empty())
         return frames.back().timestamp;
       std::this_thread::sleep_for(std::chrono::milliseconds(5));

@@ -21,6 +21,7 @@ struct RecordingNode::Impl {
     size_t bytes;
   };
 
+  RecordingNode& owner;
   const std::filesystem::path directory;
   const std::string id;
   const MediaKind kind;
@@ -35,30 +36,39 @@ struct RecordingNode::Impl {
   Epoch epoch = 0;
   uint32_t width = 0, height = 0, rate = 0, channels = 0, part = 0;
 
-  Impl(std::filesystem::path path, TrackId id, MediaKind kind)
-      : directory(std::move(path)), id(std::move(id)), kind(kind) {
+  Impl(RecordingNode& owner, std::filesystem::path path, TrackId id, MediaKind kind)
+      : owner(owner), directory(std::move(path)), id(std::move(id)), kind(kind) {
     if (directory.empty() || this->id.empty())
       throw std::invalid_argument("Recording needs directory and track ID");
   }
 
   void fail(std::string message) {
-    std::lock_guard lock(mutex);
-    if (stats.error.empty())
-      stats.error = std::move(message);
-    closed = true;
-    queue.clear();
-    stats.queued_bytes = stats.queued_frames = 0;
-    changed.notify_all();
+    std::exception_ptr error;
+    {
+      std::lock_guard lock(mutex);
+      if (!stats.error.empty()) {
+        return;
+      }
+      stats.error = message;
+      error = normalized_failure(
+          std::current_exception() ? std::current_exception()
+                                   : std::make_exception_ptr(std::runtime_error(message)),
+          {"record", id, owner.getName(), 0}, ErrorDomain::media, ErrorCode::processing_failed);
+      closed = true;
+      queue.clear();
+      stats.queued_bytes = stats.queued_frames = 0;
+      changed.notify_all();
+    }
+    owner.reportFailure(error);
   }
 
   void enqueue(Item item) {
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     if (!active || closed)
       return;
     if (queue.size() >= 32 || item.bytes > 64 * 1024 * 1024 - stats.queued_bytes) {
-      stats.error = "Recording queue overflow";
-      closed = true;
-      changed.notify_all();
+      lock.unlock();
+      fail("Recording queue overflow");
       return;
     }
     stats.queued_bytes += item.bytes;
@@ -192,7 +202,7 @@ struct RecordingNode::Impl {
 RecordingNode::RecordingNode(std::string name, std::filesystem::path directory, TrackId id,
                              MediaKind kind)
     : GraphNode(name, nullptr),
-      impl_(std::make_unique<Impl>(std::move(directory), std::move(id), kind)) {}
+      impl_(std::make_unique<Impl>(*this, std::move(directory), std::move(id), kind)) {}
 
 RecordingNode::~RecordingNode() {
   quiesce();
@@ -265,8 +275,8 @@ RecordingSnapshot RecordingNode::snapshot() const {
 }
 
 void RecordingNode::throw_if_failed() const {
-  const auto state = snapshot();
-  if (!state.error.empty())
-    throw std::runtime_error(state.error);
+  if (auto error = failure()) {
+    std::rethrow_exception(error);
+  }
 }
 }  // namespace livekit::sdk::rtc::nodes

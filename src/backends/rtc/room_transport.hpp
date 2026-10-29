@@ -1,10 +1,14 @@
 #pragma once
+#include "livekit/async_result.hpp"
 
 #include "livekit/rtc/types.hpp"
 #include "livekit/error.hpp"
+#include "support/wake_event.hpp"
 #include <stop_token>
 #include <exception>
 #include <future>
+#include <functional>
+#include <compare>
 
 namespace livekit::sdk::rtc {
 class RoomServices;
@@ -20,6 +24,7 @@ struct BindingToken {
   uint64_t incarnation = 0;
   bool publication = true;
   bool operator==(const BindingToken&) const = default;
+  auto operator<=>(const BindingToken&) const = default;
 };
 
 enum class TransportEventKind {
@@ -32,6 +37,7 @@ enum class TransportEventKind {
   operation_failed,
   frame,
   feedback,
+  writable,
   remote_track_added,
   remote_track_removed,
   encryption_state_changed,
@@ -96,7 +102,7 @@ enum class SendResult { sent, would_block, dropped };
 
 // All methods execute on the RoomEngine controller, never on a graph thread.
 // start/publish/subscribe enqueue work and must not wait for a server response.
-// poll collects native callbacks and drives signaling. Native threads never
+// take_events drains callbacks after a wakeup; it never waits. Native threads never
 // enter application code. Connection recovery is adapter-owned; restoring the
 // desired publication/subscription registry is exclusively RoomEngineState-owned.
 class RoomTransport {
@@ -111,16 +117,29 @@ class RoomTransport {
     return {};
   }
 
+  // Borrowed, lifetime-fenced room notification lane. The failure reporter
+  // retains no room/adapter pointer and remains safe after transport shutdown.
+  using Dispatch = std::function<void(std::function<void()>)>;
+
+  virtual void attach_notifications(Dispatch, std::function<void(std::exception_ptr)>) {}
+
   virtual void set_queue_budget(std::shared_ptr<QueueBudget>) {}
 
   virtual void start(const RoomOptions&, Epoch initial_epoch) = 0;
-  virtual std::vector<TransportEvent> poll(std::chrono::milliseconds wait, std::stop_token) = 0;
+
+  void attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup) {
+    wakeup_ = std::move(wakeup);
+  }
+
+  virtual std::vector<TransportEvent> take_events() = 0;
   virtual void publish(const BindingToken&, const TrackDescriptor&) = 0;
   virtual void subscribe(const BindingToken&, const TrackDescriptor&,
                          std::shared_ptr<QueueBudget>) = 0;
   // Completion fences native detachment, not a server ACK. Do not wait on the
   // controller: other tracks and control requests must continue to progress.
-  virtual std::future<void> remove(const BindingToken&, bool publication) = 0;
+  virtual AsyncResult<void> remove(const BindingToken&, bool publication) = 0;
+  // would_block requires a later writable event for this exact binding when
+  // native capacity returns. Merely waking the room is not a track notification.
   virtual SendResult send(const BindingToken&, const EncodedFrame&) = 0;
   virtual void request_keyframe(const BindingToken&) = 0;
 
@@ -145,6 +164,9 @@ class RoomTransport {
   }
 
   virtual void stop() noexcept = 0;
+
+ protected:
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup_;
 };
 
 }  // namespace livekit::sdk::rtc::detail

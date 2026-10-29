@@ -57,7 +57,7 @@ FileSourceNode → DemuxerNode
 
 文件字节读取适配 FFmpeg 的同步 AVIO 契约：Demuxer 在 AVIO 回调里通过控制总线向源节点请求读取，FileSource 发布最多 32 KiB 的 `SeekableBytes`，Demuxer 的订阅回调将数据填入 AVIO 缓冲。Seek/文件大小查询走同一 IO 控制接口。源节点和解封装器之间没有直接的方法调用。所有节点完成初始化和订阅后，Demuxer 发布含自有编解码参数的准备事件，解码器据此打开编解码上下文；解码器不持有 Demuxer 引用。
 
-编码包通过 `av_packet_clone`、解码帧通过 `av_frame_clone` 持有 FFmpeg 引用计数缓冲，发布事件复制共享引用，不复制完整像素/PCM。背压时事件可以跨多个调度轮次保留。输出为共享只读 SDK Buffer，通过输出节点的 MediaChannel 交给应用线程。
+编码包通过 `av_packet_clone`、解码帧通过 `av_frame_clone` 持有 FFmpeg 引用计数缓冲，发布事件复制共享引用，不复制完整像素/PCM。背压时事件可以跨多个调度轮次保留。输出为共享只读 SDK Buffer，进入输出节点的有界 MediaChannel，再由独立交付线程调用应用回调。
 
 节点初始化、启动、停止和释放统一由 GraphEngine 按下游到上游顺序执行，媒体准备按上游到下游顺序执行。初始化或准备失败都释放整图。Seek 递增内部 epoch，并清空各节点的输入/待发布事件、解码器、重采样器和输出队列；旧 epoch 事件会被丢弃。EOS 沿媒体边传播，解码器和重采样器完成尾部排空后才向下游发布 EOS，所有节点完成后图才返回 `end`。纯音频/纯视频仍保留固定拓扑，未使用的分支只转发 EOS。订阅回调的异常通过投递确认显式回传，避免 EventBus 日志捕获导致静默失败。`nodes()` / `edges()` 提供内部拓扑、生命周期和实际收发计数。
 
@@ -72,38 +72,53 @@ FileSourceNode → DemuxerNode
 using namespace std::chrono_literals;
 
 livekit::sdk::Player player;
+livekit::sdk::PlayerCallbacks callbacks;
+callbacks.video = [](const livekit::sdk::media::VideoFrame& frame) {
+  // 将共享帧放入应用有界队列；Qt 等 UI 操作回到应用自己的线程执行。
+};
+callbacks.audio = [](const livekit::sdk::media::AudioFrame& frame) {
+  // frame.pcm 可保留，回调应及时返回。
+};
+player.set_callbacks(std::move(callbacks));
 auto info = player.open("D:/media/example.mp4").get();
 player.play().get();
-// 在应用的 UI / 输出循环中持续调用：
-auto video = player.poll_video();
-auto audio = player.poll_audio();
-// 按输出格式将数据交给自己的显示与音频设备。
 player.pause().get();
 player.seek(1500ms).get();
 player.play().get();
 player.close().get();
+player.set_callbacks({});
 ```
 
-`open/play/pause/seek/stop/close` 返回 future，表示操作实际完成，而非仅入队。无回调线程，公共方法线程安全，错误可通过 future 异常或 `snapshot().error` 获取；媒体工作线程失败会进入 `failed`。参数或状态错误抛出标准逻辑异常，保留现有会话；后端失败需要重新 open。
+`open/play/pause/seek/stop/close` 返回 `AsyncResult`，表示操作实际完成，而非仅入队。应用可以调用 `.then(dispatch, callback)` 将完成处理投递到自己的事件循环，无需定时检查结果；以上 `.get()` 仅用于展示顺序，不应在媒体回调或 UI 线程阻塞等待。控制命令队列上限为 1024。
+
+源工作线程持有媒体图并执行有界解码，独立的串行交付线程执行视频、音频和状态回调。公共方法线程安全；注册/替换回调的调用须由应用串行化。替换/清除回调等待旧调用结束，支持回调自行注销。回调不得等待播放器生命周期操作或销毁播放器。状态回调报告状态变化，进度显示可读取 `snapshot()`，不需要通过读取快照推进播放。当前同一播放器的音频、视频及状态回调共用交付线程，回调必须及时返回。
+
+错误通过操作结果异常、状态回调及 `snapshot().failure` 获取，关联 ID 在传播中保留。参数或状态错误保留现有会话；后端或媒体回调失败进入 `failed`，重新 open 可恢复。抛异常的媒体回调会被禁用；状态回调抛异常后同样被禁用，避免递归报告。
 
 - `open` 仅接受本地常规文件路径；FFmpeg 协议白名单为 `file`，不开放网络 URL。
 - `open` 后为 `ready`，尚未自动播放；`play` 后为 `playing`，`pause` 冻结时钟并停止常规帧交付。
-- 暂停状态的 `seek` 在完成清理后异步准备一个目标视频帧，由 `poll_video()` 取出一次；`poll_audio()` 保持为空，时钟不推进。预览阶段静默消费音频避免队列背压，恢复播放前从目标位置重新解码，避免丢失音频。纯音频或文件末尾没有预览帧；新 seek/stop/close 会清除待交付预览。
+- 暂停状态的 `seek` 在完成清理后异步准备一个目标视频帧，通过视频回调交付一次；不触发音频回调，时钟不推进。预览阶段静默消费音频避免队列背压，恢复播放前从目标位置重新解码，避免丢失音频。纯音频或文件末尾没有预览帧；新 seek/stop/close 会清除待交付预览。
 - `seek` 保留正在播放状态，否则进入 `paused`；定位范围为 `[0, duration]`，未知总时长时只检查非负。多个 Seek 串行完成。
 - `stop` 定位到零并回到 `ready`；`ended` 上调用 `play` 自动从头播放。
 - 解封装 EOF 后排空两个解码器和重采样器；输出队列取空且最后一帧时间结束后才进入 `ended`。
-- `close` 释放图和媒体资源，幂等，之后可再次 open。析构取消 I/O 并等待工作线程退出。
-- FFmpeg I/O 支持中断和默认 10 秒操作超时；`cancel_pending_io()` 可显式中断当前操作。open/close 会请求中断正在进行的 I/O。Seek/stop 按命令队列串行执行，不取消前一个 Seek 的 future。无法中断不检查 interrupt callback 的底层内核调用或单次 codec 运算。
+- `close` 释放图和媒体资源，幂等，之后可再次 open。析构取消 I/O 并等待源工作线程和回调交付线程退出。
+- FFmpeg I/O 支持中断和默认 10 秒操作超时；`cancel_pending_io()` 可显式中断当前操作。open/close 会请求中断正在进行的 I/O。Seek/stop 按命令队列串行执行，不取消前一个 Seek 的完成结果。无法中断不检查 interrupt callback 的底层内核调用或单次 codec 运算。
 
 ## 输出契约与首版边界
 
-SDK 使用 steady clock 作为主时钟。`poll_video()` 返回当前应显示的视频；`poll_audio()` 允许最多提前 100 ms 取出 PCM，以供设备缓冲。应用必须消费文件中存在的两种媒体；有界队列满后暂停解码，仍可处理控制命令。默认输出队列每支路最多 8 个视频帧 / 64 个音频帧及 128 MiB。此外，Demuxer 最多保留一个待发布包，每个解码/转换节点最多保留一个输入事件和一个待发布事件，另有 FFmpeg 内部缓冲。编码包限制为 64 MiB，视频转换限制为 32M 像素，超过输出队列字节限额的单帧报告错误。输出队列字节限额不代表整个图的总内存上限。
+SDK 使用 steady clock 作为主时钟。视频在到期时回调；音频默认按时钟回调，可通过 `PlayerOutputOptions::audio_ahead` 配置 0–100 ms 的提前量。没有注册回调的媒体分支会被丢弃，不要求应用消费未使用的流。
 
-暂停/Seek/stop/close 时，应用负责同步暂停或清理自己的音频设备、显示缓存。设备缓存不属于 SDK；跨控制操作保留的帧须检查 generation。当前 Qt6 应用已接入这些清理操作；暂停保留设备缓存，Seek/stop/close 清理设备缓存。慢消费者会产生播放迟到，示例只显示本轮最新到期视频。第一版不承诺音频硬件时钟主导的长期同步、无缝音频、实时低延迟或逐样本同步精度。
+音频设备可以选择 `PlayerAudioDelivery::on_demand`，并在有容量时调用 `request_audio(generation, frames)`。每个 credit 对应一个完整解码音频帧，不是一个 PCM sample；请求受音频队列帧数上限约束，只有当前 generation、playing 状态且注册音频回调时才接受。没有 credit 时不交付音频；pause/seek/stop/close 和回调配置改变都会清空 credit。设备驱动和 Qt 调用仍在应用线程执行。队列满后解码等待消费通知，控制命令仍可唤醒工作线程。
+
+默认输出队列每支路最多 8 个视频帧 / 64 个音频帧及 128 MiB。此外，Demuxer 最多保留一个待发布包，每个解码/转换节点最多保留一个输入事件和一个待发布事件，另有 FFmpeg 内部缓冲。编码包限制为 64 MiB，视频转换限制为 32M 像素，超过输出队列字节限额的单帧报告错误。输出队列字节限额不代表整个图的总内存上限。
+
+pause/seek/stop/close 完成前会等待正在执行的媒体回调结束；seek/stop/close 还会更新 generation。应用负责同步暂停或清理自己的音频设备、显示缓存。设备缓存不属于 SDK；跨控制操作保留的帧须检查 generation。当前 Qt6 应用已接入这些清理操作；暂停保留设备缓存，Seek/stop/close 清理设备缓存。慢消费者会产生播放迟到，示例只显示本轮最新到期视频。第一版不承诺音频硬件时钟主导的长期同步、无缝音频、实时低延迟或逐样本同步精度。
 
 当前选择第一条最佳音频/视频流，软件解码；暂不包含网络播放、倍速、硬件解码、音轨切换、字幕、HDR 色调映射、旋转元数据处理和共享音频设备/AEC 协调。解码音频中途变更格式会明确报错。Windows x64 为本次验证平台，其他平台尚未验收。
 
 ## 验证
+
+当前回调和设备需求重构尚未编译或运行测试；以下历史记录不证明本次改动已通过验证。
 
 以下 2026-10-26 记录为历史 Windows/SDL 验证。当前 Qt6 应用的构建方法和自动化测试归属见应用 README；历史结果不代表 Qt6 Windows 版本已经验收。
 

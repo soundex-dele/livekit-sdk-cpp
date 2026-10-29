@@ -20,7 +20,7 @@ int main() {
     options.url = url;
     options.token = token;
     engine->join(options).get();
-    std::vector<std::future<TrackId>> pending;
+    std::vector<livekit::sdk::AsyncResult<TrackId>> pending;
     const auto deadline = SteadyClock::now() + 30s;
     while (received < 50 && SteadyClock::now() < deadline) {
       if (auto event = engine_events.take_event(10ms);

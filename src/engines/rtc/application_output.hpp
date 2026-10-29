@@ -157,11 +157,17 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
             deliver(pending->sample);
           }
         } catch (...) {
-          std::lock_guard lock(mutex_);
-          failure_ = std::current_exception();
-          dropped += queue_.size();
-          queue_.clear();
-          queued_bytes_ = 0;
+          const auto error =
+              normalized_failure(std::current_exception(), {"output_callback", {}, getName(), 0},
+                                 ErrorDomain::media, ErrorCode::callback_failed);
+          {
+            std::lock_guard lock(mutex_);
+            failure_ = error;
+            dropped += queue_.size();
+            queue_.clear();
+            queued_bytes_ = 0;
+          }
+          reportFailure(error);
         }
       });
     }

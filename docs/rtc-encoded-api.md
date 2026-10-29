@@ -240,7 +240,7 @@ auto output = std::make_shared<nodes::AudioOutputNode>("speaker", descriptor.id,
 
 ## 数据服务与加密
 
-`room->services()` 返回共享会话的数据服务句柄，提供可靠/不可靠消息、DTMF、转写、RPC、文本/文件流和 DataTrack。这些功能使用后端原生数据通道，不依赖编解码或 GraphEngine。用 `next_event()` 拉取数据事件；RPC/流处理器运行在服务执行器上，不运行在原生网络回调中。
+`room->services()` 返回共享会话的数据服务句柄，提供可靠/不可靠消息、DTMF、转写、RPC、文本/文件流和 DataTrack。这些功能使用后端原生数据通道，不依赖编解码或 GraphEngine。用 `set_event_handler()` 接收数据事件，回调运行在房间串行通知队列；注销或替换会等待旧调用结束，支持回调自行注销。回调抛异常会停止交付并以同一 FailureInfo 报告房间故障。RPC/流处理器运行在有界服务执行器上，不运行在原生网络回调中。
 
 用户数据发送/接收队列各限制为 256 条、4 MiB；单次编码前的数据包最多 15,000 字节，大内容使用流或 DataTrack。发送 future 表示本地提交，不表示对端业务已消费。会话关闭会拒绝待处理发送；断线取消当前 RPC/流请求并重建 DataTrack 绑定，处理器注册保留。保留的服务句柄不会悬空，但会话关闭后不能继续发送。
 

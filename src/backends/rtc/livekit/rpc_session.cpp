@@ -2,6 +2,8 @@
 #include "backends/rtc/livekit/data_message_wire.hpp"
 #include "livekit/error.hpp"
 #include "support/compression.hpp"
+#include "support/deadline_index.hpp"
+#include "support/ready_set.hpp"
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
@@ -11,6 +13,7 @@
 #include <random>
 #include <sstream>
 #include <thread>
+#include <set>
 
 namespace livekit::sdk::detail {
 using Clock = std::chrono::steady_clock;
@@ -19,6 +22,8 @@ using namespace std::chrono_literals;
 namespace {
 constexpr size_t max_payload = 15360, max_pending = 128, max_packets = 512;
 using Key = std::pair<std::string, std::string>;
+// False: locally initiated request; true: remote request/cache entry.
+using DeadlineKey = std::pair<bool, Key>;
 
 bool identifier(const std::string& s, size_t limit) {
   return !s.empty() && s.size() <= limit && s.find('\0') == std::string::npos && valid_utf8(s);
@@ -81,6 +86,7 @@ struct RpcSession::State {
     std::promise<std::string> promise;
     Clock::time_point deadline, ack_deadline;
     std::stop_token stop;
+    std::unique_ptr<std::stop_callback<std::function<void()>>> cancellation;
     bool acknowledged = false, sent = false;
   };
 
@@ -95,18 +101,54 @@ struct RpcSession::State {
 
   mutable std::mutex mutex;
   std::condition_variable_any changed;
+  std::shared_ptr<WakeEvent> timer_wakeup = std::make_shared<WakeEvent>();
+  std::shared_ptr<ReadySet<std::string>> cancellations =
+      std::make_shared<ReadySet<std::string>>(timer_wakeup, max_pending);
+  // Protected by mutex, including all changes by async handler completions.
+  DeadlineIndex<DeadlineKey> deadlines;
+  std::shared_ptr<WakeEvent> transport_wakeup;
   bool active = false, closed = false;
-  uint64_t epoch = 0, next_incarnation = 0;
+  uint64_t epoch = 0, next_incarnation = 0, requests_serviced = 0;
   std::map<std::string, RpcHandler> methods;
   std::map<std::string, std::shared_ptr<Outgoing>> outgoing;
   std::map<Key, Incoming> incoming;
   std::deque<livekit::DataPacket> packets;
   std::deque<std::function<void()>> handlers;
 
+  void wake_transport() {
+    if (transport_wakeup) {
+      transport_wakeup->signal();
+    }
+  }
+
+  void schedule(const std::string& id, const Outgoing& request) {
+    deadlines.set({false, {"", id}}, request.acknowledged
+                                         ? request.deadline
+                                         : std::min(request.deadline, request.ack_deadline));
+    timer_wakeup->signal();
+  }
+
+  auto erase_outgoing(decltype(outgoing)::iterator position) {
+    deadlines.erase({false, {"", position->first}});
+    cancellations->forget(position->first);
+    auto next = outgoing.erase(position);
+    timer_wakeup->signal();
+    wake_transport();  // Drop a cancelled packet already held by the native sender.
+    return next;
+  }
+
+  auto erase_incoming(decltype(incoming)::iterator position) {
+    deadlines.erase({true, position->first});
+    auto next = incoming.erase(position);
+    timer_wakeup->signal();
+    return next;
+  }
+
   bool enqueue(livekit::DataPacket packet) {
     if (!active || closed || packets.size() >= max_packets)
       return false;
     packets.push_back(std::move(packet));
+    wake_transport();
     return true;
   }
 
@@ -137,6 +179,8 @@ struct RpcSession::State {
     request.completed = true;
     request.expires = Clock::now() + 60s;
     request.response = packet;
+    deadlines.set({true, key}, request.expires);
+    timer_wakeup->signal();
     enqueue(std::move(packet));
   }
 };
@@ -150,43 +194,67 @@ RpcSession::RpcSession()
   auto state = state_;
   threads_->timer = std::jthread([state](std::stop_token stop) {
     while (!stop.stop_requested()) {
+      const auto observed = state->timer_wakeup->revision();
       std::vector<std::stop_source> cancelled;
+      std::optional<Clock::time_point> next;
       {
-        std::unique_lock lock(state->mutex);
-        state->changed.wait_for(lock, stop, 10ms, [] { return false; });
+        std::lock_guard lock(state->mutex);
+        if (state->closed) {
+          break;
+        }
         const auto now = Clock::now();
-        for (auto it = state->outgoing.begin(); it != state->outgoing.end();) {
-          auto& request = *it->second;
+        std::set<DeadlineKey> ready;
+        for (const auto& id : state->cancellations->take()) {
+          ready.insert({false, {"", id}});
+        }
+        for (const auto& key : state->deadlines.take_due(now)) {
+          ready.insert(key);
+        }
+        for (const auto& [remote, key] : ready) {
+          if (remote) {
+            const auto found = state->incoming.find(key);
+            if (found == state->incoming.end()) {
+              continue;
+            }
+            ++state->requests_serviced;
+            auto& request = found->second;
+            if (request.completed) {
+              state->erase_incoming(found);
+            } else {
+              cancelled.push_back(request.stop);
+              state->respond(key, request, {{}, failure(RpcErrorCode::response_timeout)});
+            }
+            continue;
+          }
+          const auto found = state->outgoing.find(key.second);
+          if (found == state->outgoing.end()) {
+            continue;
+          }
+          ++state->requests_serviced;
+          auto& request = *found->second;
           std::exception_ptr error;
-          if (request.stop.stop_requested())
+          if (request.stop.stop_requested()) {
             error = std::make_exception_ptr(
                 SDKError(ErrorDomain::lifecycle,
                          request.sent ? ErrorCode::outcome_unknown : ErrorCode::cancelled,
                          "RPC cancelled; remote execution may already have occurred"));
-          else if (now >= request.deadline)
+          } else if (now >= request.deadline) {
             error = std::make_exception_ptr(failure(RpcErrorCode::response_timeout));
-          else if (!request.acknowledged && now >= request.ack_deadline)
+          } else if (!request.acknowledged && now >= request.ack_deadline) {
             error = std::make_exception_ptr(failure(RpcErrorCode::connection_timeout));
+          }
           if (error) {
             request.promise.set_exception(error);
-            it = state->outgoing.erase(it);
-          } else
-            ++it;
-        }
-        for (auto it = state->incoming.begin(); it != state->incoming.end();) {
-          auto& request = it->second;
-          if (!request.completed && now >= request.deadline) {
-            cancelled.push_back(request.stop);
-            state->respond(it->first, request, {{}, failure(RpcErrorCode::response_timeout)});
+            state->erase_outgoing(found);
           }
-          if (request.completed && now >= request.expires)
-            it = state->incoming.erase(it);
-          else
-            ++it;
         }
+        next = state->deadlines.next();
       }
-      for (auto& source : cancelled)
+      // Cancellation may invoke application code; never run it under the session lock.
+      for (auto& source : cancelled) {
         source.request_stop();
+      }
+      state->timer_wakeup->wait(observed, stop, next);
     }
   });
   threads_->dispatcher = std::jthread([state](std::stop_token stop) {
@@ -218,10 +286,19 @@ RpcSession::~RpcSession() {
   threads_->timer.request_stop();
   threads_->dispatcher.request_stop();
   state_->changed.notify_all();
+  state_->timer_wakeup->signal();
   threads_->timer.join();
   // Application async starters are required to return promptly, but must never
   // make Room destruction unbounded. The detached worker owns only State, not Room.
   threads_->dispatcher.detach();
+}
+
+void RpcSession::attach_wakeup(std::shared_ptr<WakeEvent> wakeup) {
+  std::lock_guard lock(state_->mutex);
+  state_->transport_wakeup = std::move(wakeup);
+  if (!state_->packets.empty()) {
+    state_->wake_transport();
+  }
 }
 
 void RpcSession::connect() {
@@ -244,6 +321,9 @@ void RpcSession::disconnect() {
     for (auto& [key, request] : state_->incoming)
       if (!request.completed)
         stops.push_back(request.stop);
+    state_->deadlines.clear();
+    state_->cancellations->clear();
+    state_->timer_wakeup->signal();
     state_->outgoing.clear();
     state_->incoming.clear();
     state_->packets.clear();
@@ -261,13 +341,13 @@ void RpcSession::participant_left(const std::string& identity) {
       if (it->second->destination == identity) {
         it->second->promise.set_exception(
             std::make_exception_ptr(failure(RpcErrorCode::recipient_disconnected)));
-        it = state_->outgoing.erase(it);
+        it = state_->erase_outgoing(it);
       } else
         ++it;
     for (auto it = state_->incoming.begin(); it != state_->incoming.end();)
       if (it->first.first == identity) {
         stops.push_back(it->second.stop);
-        it = state_->incoming.erase(it);
+        it = state_->erase_incoming(it);
       } else
         ++it;
     std::erase_if(state_->packets, [&](const auto& packet) {
@@ -335,9 +415,16 @@ std::future<std::string> RpcSession::call(const RpcCallOptions& options) {
     if (!state_->outgoing.emplace(id, request).second)
       throw std::runtime_error("RPC request ID collision");
     try {
+      const auto wake = state_->cancellations->watch(id);
+      // This callback takes no session lock, including when registration invokes
+      // it synchronously or its destructor fences a concurrent request_stop().
+      request->cancellation = std::make_unique<std::stop_callback<std::function<void()>>>(
+          request->stop, [wake] { wake->signal(); });
+      state_->schedule(id, *request);
       state_->packets.push_back(std::move(packet));
+      state_->wake_transport();
     } catch (...) {
-      state_->outgoing.erase(id);
+      state_->erase_outgoing(state_->outgoing.find(id));
       throw;
     }
   } catch (...) {
@@ -373,11 +460,12 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
       terminal = std::make_exception_ptr(failure(RpcErrorCode::connection_timeout));
     if (terminal) {
       request.promise.set_exception(terminal);
-      state_->outgoing.erase(found);
+      state_->erase_outgoing(found);
       return;
     }
     if (packet.has_rpc_ack()) {
       request.acknowledged = true;
+      state_->schedule(id, request);
       return;
     }
     auto response = packet.rpc_response();
@@ -387,7 +475,7 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
       } catch (...) {
         request.promise.set_exception(
             std::make_exception_ptr(failure(RpcErrorCode::response_payload_too_large)));
-        state_->outgoing.erase(found);
+        state_->erase_outgoing(found);
         return;
       }
     if (response.has_error()) {
@@ -406,7 +494,7 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
     else
       request.promise.set_exception(
           std::make_exception_ptr(failure(RpcErrorCode::response_payload_too_large)));
-    state_->outgoing.erase(found);
+    state_->erase_outgoing(found);
     return;
   }
   if (!packet.has_rpc_request())
@@ -449,7 +537,7 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
           (oldest == state_->incoming.end() || it->second.expires < oldest->second.expires))
         oldest = it;
     if (oldest != state_->incoming.end())
-      state_->incoming.erase(oldest);
+      state_->erase_incoming(oldest);
     else {
       livekit::DataPacket busy;
       busy.add_destination_identities(sender);
@@ -468,6 +556,8 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
   request.incarnation = ++state_->next_incarnation;
   request.deadline =
       Clock::now() + std::chrono::milliseconds(std::clamp(wire.response_timeout_ms(), 1u, 300000u));
+  state_->deadlines.set({true, key}, request.deadline);
+  state_->timer_wakeup->signal();
   auto reject = [&](RpcErrorCode error) { state_->respond(key, request, {{}, failure(error)}); };
   if (wire.version() != 1 || !wire.compressed_payload().empty()) {
     reject(RpcErrorCode::unsupported_version);
@@ -530,6 +620,13 @@ bool RpcSession::sendable(const livekit::DataPacket& packet) const {
          Clock::now() < found->second->deadline;
 }
 
+RpcSessionSnapshot RpcSession::snapshot() const {
+  std::lock_guard lock(state_->mutex);
+  return {state_->outgoing.size(),  state_->incoming.size(),          state_->packets.size(),
+          state_->deadlines.size(), state_->cancellations->pending(), state_->requests_serviced,
+          state_->deadlines.next()};
+}
+
 bool RpcSession::has_outgoing() const {
   std::lock_guard lock(state_->mutex);
   return !state_->packets.empty();
@@ -561,6 +658,6 @@ void RpcSession::send_failed(const livekit::DataPacket& packet) {
   if (found == state_->outgoing.end())
     return;
   found->second->promise.set_exception(std::make_exception_ptr(failure(RpcErrorCode::send_failed)));
-  state_->outgoing.erase(found);
+  state_->erase_outgoing(found);
 }
 }  // namespace livekit::sdk::detail

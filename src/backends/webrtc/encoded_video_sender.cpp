@@ -41,6 +41,7 @@ struct VideoSenderState {
   TrackDescriptor descriptor;
   mutable std::mutex mutex;
   SenderFeedback feedback;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
   size_t outstanding_frames = 0, outstanding_bytes = 0;
   bool closed = false;
   bool muted = false;
@@ -57,6 +58,9 @@ struct VideoSenderState {
     encoding.keyframe_required = true;
     ++encoding.keyframe_requests;
     ++feedback.revision;
+    if (wakeup) {
+      wakeup->signal();
+    }
   }
 };
 
@@ -97,6 +101,9 @@ class PacketBuffer : public VideoFrameBuffer {
     std::lock_guard lock(state->mutex);
     --state->outstanding_frames;
     state->outstanding_bytes -= frame.buffer.size();
+    if (state->wakeup) {
+      state->wakeup->signal();
+    }
   }
 
   Type type() const override {
@@ -213,6 +220,9 @@ class PacketEncoder final : public VideoEncoder {
       if (encoding.keyframe_requests == request_revision) {
         encoding.keyframe_required = false;
         ++packet->state->feedback.revision;
+        if (packet->state->wakeup) {
+          packet->state->wakeup->signal();
+        }
       }
     }
     return result.error == EncodedImageCallback::Result::OK ? WEBRTC_VIDEO_CODEC_OK
@@ -262,6 +272,9 @@ class PacketEncoder final : public VideoEncoder {
         encoding.target_bitrate_bps = *bitrate_;
         encoding.active = *bitrate_ > 0;
         ++state->feedback.revision;
+        if (state->wakeup) {
+          state->wakeup->signal();
+        }
       }
     }
   }
@@ -334,16 +347,20 @@ class DecoderFactory final : public VideoDecoderFactory {
 };
 }  // namespace
 
-EncodedVideoSender::EncodedVideoSender(BindingToken binding, TrackDescriptor descriptor)
-    : webrtc::VideoTrackSource(false), state_(std::make_shared<VideoSenderState>()) {
+EncodedVideoSender::EncodedVideoSender(BindingToken binding, TrackDescriptor descriptor,
+                                       std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup)
+    : VideoTrackSource(false), state_(std::make_shared<VideoSenderState>()) {
   if (descriptor.kind != MediaKind::video || descriptor.encodings.size() != 1 ||
       native_codec(descriptor.format.codec) == webrtc::kVideoCodecGeneric ||
       !descriptor.format.width || !descriptor.format.height || descriptor.format.width > 16384 ||
       descriptor.format.height > 16384 || descriptor.format.clock_rate != 90000 ||
       !descriptor.queue.max_frames || !descriptor.queue.max_bytes ||
-      descriptor.queue.max_age.count() <= 0)
+      descriptor.queue.max_age.count() <= 0) {
     throw std::invalid_argument(
         "Encoded video transport requires one encoding and a valid video descriptor");
+  }
+  state_->wakeup = wakeup;
+  broadcaster_.wakeup = std::move(wakeup);
   state_->binding = std::move(binding);
   state_->descriptor = std::move(descriptor);
   state_->muted = state_->descriptor.muted;
@@ -426,6 +443,9 @@ void EncodedVideoSender::set_muted(bool muted) {
     ++encoding.keyframe_requests;
   }
   ++state_->feedback.revision;
+  if (state_->wakeup) {
+    state_->wakeup->signal();
+  }
 }
 
 void EncodedVideoSender::close() {
@@ -444,6 +464,9 @@ void EncodedVideoSender::set_demand(bool enabled) {
     ++encoding.keyframe_requests;
   }
   ++state_->feedback.revision;
+  if (state_->wakeup) {
+    state_->wakeup->signal();
+  }
 }
 
 std::unique_ptr<webrtc::VideoEncoderFactory> create_transport_video_encoder_factory() {

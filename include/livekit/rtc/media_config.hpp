@@ -1,4 +1,6 @@
 #pragma once
+#include "livekit/async_result.hpp"
+#include <mutex>
 #include "livekit/media_core/frame_view.hpp"
 #include "livekit/rtc/audio_processing.hpp"
 #include "livekit/rtc/media_types.hpp"
@@ -130,7 +132,31 @@ class MediaTrack {
 
  private:
   friend class RtcMediaEngine;
+  friend class RtcEngine;
   struct State;
+
+  struct Pending {
+    mutable std::mutex mutex;
+    TrackDescriptor descriptor;
+    std::shared_ptr<MediaTrack> track;
+    std::exception_ptr failure;
+  };
+
+  explicit MediaTrack(TrackDescriptor descriptor) : pending_(std::make_shared<Pending>()) {
+    pending_->descriptor = std::move(descriptor);
+  }
+
+  void bind_pending(std::shared_ptr<MediaTrack> track) {
+    std::lock_guard lock(pending_->mutex);
+    pending_->track = std::move(track);
+  }
+
+  void fail_pending(std::exception_ptr failure) {
+    std::lock_guard lock(pending_->mutex);
+    pending_->failure = std::move(failure);
+  }
+
+  std::shared_ptr<Pending> pending_;
 
   explicit MediaTrack(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
@@ -138,7 +164,7 @@ class MediaTrack {
 };
 
 struct MediaOperation {
-  std::future<TrackId> ready;
+  AsyncResult<TrackId> ready;
   std::shared_ptr<MediaTrack> track;
 };
 

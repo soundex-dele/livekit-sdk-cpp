@@ -41,9 +41,10 @@ nodes::MediaInputOptions input_options(const MediaInput& source) {
 }
 }  // namespace
 
-struct SharedMediaInput::Impl {
+struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::Impl> {
   struct Target {
     std::shared_ptr<detail::RawFrameQueue> frames;
+    graphflow::core::GraphNode::FailureHandler report;
     bool active = false;  // lifecycle mutex
   };
 
@@ -62,6 +63,7 @@ struct SharedMediaInput::Impl {
   MediaInput options;
   mutable std::mutex lifecycle, targets_mutex;
   std::vector<std::weak_ptr<Target>> targets;
+  std::exception_ptr failure;  // targets_mutex
   size_t consumers = 0;
   uint64_t emitted = 0;
   std::unique_ptr<graphflow::engine::GraphEngine> graph;
@@ -74,6 +76,23 @@ struct SharedMediaInput::Impl {
       if (auto target = weak.lock())
         result.push_back(std::move(target));
     return result;
+  }
+
+  void report_failure(std::exception_ptr error) {
+    error = normalized_failure(error, {"shared_capture", {}, "shared.capture", 0},
+                               ErrorDomain::media, ErrorCode::processing_failed);
+    {
+      std::lock_guard lock(targets_mutex);
+      if (failure) {
+        return;
+      }
+      failure = error;
+    }
+    for (const auto& target : receivers()) {
+      if (target->report) {
+        target->report(error);
+      }
+    }
   }
 
   void stop_capture() {
@@ -97,6 +116,12 @@ struct SharedMediaInput::Impl {
       throw std::runtime_error("Shared capture consumer limit reached");
     {
       std::lock_guard lock(targets_mutex);
+      if (!consumers) {
+        failure = {};
+      }
+      if (failure) {
+        std::rethrow_exception(failure);
+      }
       targets.push_back(target);
     }
     try {
@@ -127,6 +152,14 @@ struct SharedMediaInput::Impl {
           edges.push_back(TrackGraphSpec::connect<nodes::VideoFrameEvent>(input, output));
         else
           edges.push_back(TrackGraphSpec::connect<nodes::AudioFrameEvent>(input, output));
+        auto report = [weak = weak_from_this()](auto error) {
+          if (auto state = weak.lock()) {
+            state->report_failure(error);
+          }
+        };
+        input->setFailureHandler(report);
+        output->setFailureHandler(report);
+        feedback->setFailureHandler(report);
         graph = std::make_unique<graphflow::engine::GraphEngine>(1);
         if (!graph->loadFromNodes({output, input, feedback}, edges) || !graph->init() ||
             !graph->start())
@@ -160,12 +193,6 @@ struct SharedMediaInput::Impl {
       stop_capture();
   }
 
-  void check() const {
-    std::lock_guard lock(lifecycle);
-    if (input)
-      input->throw_if_failed();
-  }
-
   ~Impl() {
     stop_capture();
   }
@@ -195,27 +222,20 @@ struct MediaTrack::State {
   std::shared_ptr<nodes::AudioOutputNode> speaker;
   std::shared_ptr<nodes::RecordingNode> recording;
   std::vector<MediaEdgeSnapshot> edges;
-  std::function<void()> start_source, stop_source, check_source;
+  std::function<void()> start_source, stop_source;
 
   void check() const {
     std::lock_guard lock(mutex);
-    if (failure)
+    if (failure) {
       std::rethrow_exception(failure);
-    if (input)
-      input->throw_if_failed();
-    if (video)
-      video->throw_if_failed();
-    if (audio)
-      audio->throw_if_failed();
-    if (output) {
-      output->throw_if_failed();
     }
-    if (speaker)
-      speaker->throw_if_failed();
-    if (recording)
-      recording->throw_if_failed();
-    if (check_source)
-      check_source();
+  }
+
+  void failed(std::exception_ptr value) {
+    std::lock_guard lock(mutex);
+    if (!failure) {
+      failure = value;
+    }
   }
 
   // Fields are installed before graph start and never replaced. Never hold
@@ -275,6 +295,32 @@ struct MediaTrack::State {
 };
 
 MediaTrackSnapshot MediaTrack::snapshot() const {
+  if (pending_) {
+    std::shared_ptr<MediaTrack> track;
+    std::exception_ptr failure;
+    MediaTrackSnapshot result;
+    {
+      std::lock_guard lock(pending_->mutex);
+      track = pending_->track;
+      failure = pending_->failure;
+      result.transport.id = pending_->descriptor.id;
+    }
+    if (track) {
+      result = track->snapshot();
+    }
+    if (failure) {
+      result.transport.state = TrackState::failed;
+      result.transport.failure = describe_failure(failure);
+      try {
+        std::rethrow_exception(failure);
+      } catch (const std::exception& error) {
+        result.transport.error = error.what();
+      } catch (...) {
+        result.transport.error = "Media operation failed";
+      }
+    }
+    return result;
+  }
   const auto& s = *state_;
   std::lock_guard lock(s.mutex);
   MediaTrackSnapshot result;
@@ -285,6 +331,7 @@ MediaTrackSnapshot MediaTrack::snapshot() const {
     result.transport.id = s.descriptor.id;
   if (s.failure) {
     result.transport.state = TrackState::failed;
+    result.transport.failure = describe_failure(s.failure);
     try {
       std::rethrow_exception(s.failure);
     } catch (const std::exception& error) {
@@ -344,6 +391,22 @@ MediaTrackSnapshot MediaTrack::snapshot() const {
 }
 
 void MediaTrack::throw_if_failed() const {
+  if (pending_) {
+    std::shared_ptr<MediaTrack> track;
+    std::exception_ptr failure;
+    {
+      std::lock_guard lock(pending_->mutex);
+      track = pending_->track;
+      failure = pending_->failure;
+    }
+    if (failure) {
+      std::rethrow_exception(failure);
+    }
+    if (track) {
+      track->throw_if_failed();
+    }
+    return;
+  }
   state_->check();
 }
 
@@ -356,13 +419,14 @@ RtcMediaEngine::RtcMediaEngine(RtcPipelineEngine& engine, AudioOutputOptions opt
       }())),
       engine_(&engine) {}
 
-void RtcEngine::enable_media(AudioOutputOptions options) {
-  impl_->call([&] {
-    impl_->require_owner();
-    if (impl_->media || impl_->room->snapshot().state != ConnectionState::disconnected) {
-      throw std::logic_error("Enable RTC media once, before joining");
+AsyncResult<void> RtcEngine::enable_media(AudioOutputOptions options) {
+  return impl_->submit([state = impl_.get(), options = std::move(options)]() mutable {
+    state->require_owner();
+    if (state->media || state->room->snapshot().state != ConnectionState::disconnected) {
+      throw std::logic_error("Install media once before joining a room");
     }
-    impl_->media = std::make_unique<RtcMediaEngine>(*impl_->pipelines, options);
+    state->media = std::make_unique<RtcMediaEngine>(*state->pipelines, std::move(options));
+    state->has_media = true;
   });
 }
 
@@ -370,8 +434,7 @@ RtcPipelineEngine::FailureCleanup RtcMediaEngine::failure_cleanup(
     std::shared_ptr<MediaTrack::State> state) {
   return [state = std::move(state)](std::exception_ptr failure) {
     state->quiesce();
-    std::lock_guard lock(state->mutex);
-    state->failure = failure;
+    state->failed(failure);
   };
 }
 
@@ -391,6 +454,7 @@ MediaOperation RtcMediaEngine::publish_media(MediaPublishSpec spec) {
   state->descriptor = spec.track;
   state->publication = true;
   std::shared_ptr<detail::RawFrameQueue> shared_frames;
+  std::shared_ptr<SharedMediaInput::Impl::Target> shared_target;
   if (spec.shared_input) {
     if (spec.input.generated || !spec.input.input.empty() ||
         spec.input.capture != CaptureKind::input || spec.input.video_source ||
@@ -403,7 +467,7 @@ MediaOperation RtcMediaEngine::publish_media(MediaPublishSpec spec) {
                                              format.format.height != spec.track.format.height)) ||
         (format.kind == MediaKind::audio && format.format.channels != spec.track.format.channels))
       throw std::invalid_argument("Shared input raw format must match publication");
-    auto target = std::make_shared<SharedMediaInput::Impl::Target>();
+    auto target = shared_target = std::make_shared<SharedMediaInput::Impl::Target>();
     spec.input.fps = shared->options.fps;
     QueueLimits limits;
     limits.max_frames =
@@ -414,12 +478,14 @@ MediaOperation RtcMediaEngine::publish_media(MediaPublishSpec spec) {
     shared_frames = target->frames = std::make_shared<detail::RawFrameQueue>(limits);
     state->start_source = [shared, target] { shared->start(target); };
     state->stop_source = [shared, target] { shared->stop(target); };
-    state->check_source = [shared] { shared->check(); };
   }
   auto source_options = input_options(spec.input);
   source_options.shared_frames = std::move(shared_frames);
   state->input =
       std::make_shared<nodes::MediaInputNode>("input", spec.track, std::move(source_options));
+  if (shared_target) {
+    shared_target->report = state->input->failureReporter();
+  }
   auto ready = engine_->publish_graph(
       spec.track,
       [state, spec, device = output_](auto sink) {
@@ -459,7 +525,7 @@ MediaOperation RtcMediaEngine::publish_media(MediaPublishSpec spec) {
             state->start_source();
         };
         graph.quiesce = [state] { state->quiesce(); };
-        graph.check_health = [state] { state->check(); };
+        graph.on_failure = [state](auto error) { state->failed(error); };
         return graph;
       },
       failure_cleanup(state));
@@ -517,7 +583,7 @@ MediaOperation RtcMediaEngine::subscribe_media(MediaSubscribeSpec spec) {
         }
         state->topology(graph);
         graph.quiesce = [state] { state->quiesce(); };
-        graph.check_health = [state] { state->check(); };
+        graph.on_failure = [state](auto error) { state->failed(error); };
         return graph;
       },
       failure_cleanup(state));

@@ -1,5 +1,8 @@
 #pragma once
 #include "livekit/media_core/frame.hpp"
+#include "livekit/async_result.hpp"
+#include "livekit/error.hpp"
+#include <functional>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -30,40 +33,66 @@ struct PlayerSnapshot {
   uint64_t generation = 0;
   size_t queued_video = 0, queued_audio = 0;
   std::string error;
+  std::shared_ptr<const FailureInfo> failure;
+  size_t pending_commands = 0, audio_demand = 0;
 };
 
-class PlayerError : public std::runtime_error {
+class PlayerError : public SDKError {
  public:
-  using std::runtime_error::runtime_error;
+  explicit PlayerError(std::string message)
+      : SDKError(ErrorDomain::media, ErrorCode::processing_failed, std::move(message)) {}
+
+  explicit PlayerError(std::shared_ptr<const FailureInfo> failure) : SDKError(std::move(failure)) {}
 };
 
-// Independent of RTC, FFmpeg and GraphFlow headers. One serialized worker owns
-// the private graph; control completion is reported by futures, never callbacks.
-// Public methods are thread safe. Destruction requires callers to stop using
-// the object, interrupts I/O and joins the worker. No callbacks outlive close.
+enum class PlayerAudioDelivery { clocked, on_demand };
+
+struct PlayerOutputOptions {
+  PlayerAudioDelivery audio = PlayerAudioDelivery::clocked;
+  std::chrono::microseconds audio_ahead{100000};  // 0..100 ms on the file clock.
+};
+
+struct PlayerCallbacks {
+  std::function<void(const media::VideoFrame&)> video;
+  std::function<void(const media::AudioFrame&)> audio;
+  std::function<void(const PlayerSnapshot&)> state;
+};
+
+// Independent of RTC, FFmpeg and GraphFlow headers. The source worker owns the
+// graph and performs bounded decoding. A separate serial delivery worker invokes
+// application callbacks. No application polling is needed to progress playback.
+// Public methods are thread safe; serialize callback registration. Destruction
+// requires callers to stop using the object and fences both workers.
 class Player {
  public:
   explicit Player(PlayerOptions options = {});
   ~Player();
   Player(const Player&) = delete;
   Player& operator=(const Player&) = delete;
-  std::future<PlayerMediaInfo> open(std::string utf8_local_path);
-  std::future<void> play();
-  std::future<void> pause();
-  // Paused seek asynchronously prepares one target video frame for poll_video;
-  // the clock remains frozen and poll_audio stays empty until play().
-  std::future<void> seek(std::chrono::microseconds position);
-  std::future<void> stop();   // rewind to zero, retain the source, transition to ready
-  std::future<void> close();  // idempotent; may open again after completion
+  AsyncResult<PlayerMediaInfo> open(std::string utf8_local_path);
+  AsyncResult<void> play();
+  AsyncResult<void> pause();
+  // Paused seek asynchronously delivers one target video frame. The clock stays
+  // frozen; audio callbacks resume only after play().
+  AsyncResult<void> seek(std::chrono::microseconds position);
+  AsyncResult<void> stop();   // rewind to zero, retain the source, transition to ready
+  AsyncResult<void> close();  // idempotent; may open again after completion
   void cancel_pending_io();   // interrupted open/read/seek reports an error
   PlayerSnapshot snapshot() const;
-  // Pull output on the application/device thread; no user code runs on the
-  // control worker. Poll both existing streams until ended. Queues use backpressure.
-  // Video is due at the media clock; audio may be queued up to 100 ms ahead.
-  // Pause/seek/stop/close require the consumer to pause/flush its own device queues.
-  // Discard externally retained frames whose generation differs from snapshot().
-  std::optional<media::VideoFrame> poll_video();
-  std::optional<media::AudioFrame> poll_audio();
+  // Video is delivered when due; audio follows the clock or explicit demand.
+  // Missing callbacks discard that stream. Frames own immutable shared storage.
+  // Replacing/clearing fences old callbacks; self-removal is supported. Callbacks
+  // must return promptly and must not wait for lifecycle results or destroy this
+  // player: lifecycle completion fences delivery. Exceptions fail the player and
+  // retain the same FailureInfo in its state callback and snapshot.
+  void set_callbacks(PlayerCallbacks, PlayerOutputOptions = {});
+  // On-demand audio grants bounded credits, one per complete decoded audio frame.
+  // Accepted only while playing, for the current generation, with an audio handler.
+  // Returns false for a stale generation, disabled output, or exhausted credit
+  // budget. Pause/seek/stop/close reset credits. No device work runs in this call.
+  bool request_audio(uint64_t generation, size_t frames = 1);
+  // Pause fences callbacks; seek/stop/close also invalidate retained frames.
+  // The application must pause/flush its device buffers on these transitions.
 
  private:
   class Impl;

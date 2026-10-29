@@ -15,8 +15,8 @@ void check(bool ok, const char* message) {
     throw std::runtime_error(message);
 }
 
-template <class T>
-auto await(engine::RtcEngine& engine, std::future<T> future) {
+template <class Future>
+auto await(engine::RtcEngine& engine, Future future) {
   const auto deadline = SteadyClock::now() + 15s;
   while (future.wait_for(0ms) != std::future_status::ready) {
     check(SteadyClock::now() < deadline, "Engine operation timed out");
@@ -62,7 +62,7 @@ int main() {
     await(*rx, rx->join(options));
     std::vector<TrackDescriptor> descriptors;
     std::vector<std::vector<uint8_t>> payloads;
-    std::vector<std::future<TrackId>> publishing;
+    std::vector<livekit::sdk::AsyncResult<TrackId>> publishing;
     for (int i = 0; i < 4; ++i) {
       TrackDescriptor d;
       d.id = d.name = "graph-" + std::to_string(i);
@@ -80,7 +80,7 @@ int main() {
     for (auto& future : publishing)
       await(*tx, std::move(future));
     std::vector<std::shared_ptr<Consumer>> sinks(4);
-    std::vector<std::future<TrackId>> subscribing;
+    std::vector<livekit::sdk::AsyncResult<TrackId>> subscribing;
     const auto discovered_by = SteadyClock::now() + 10s;
     while (subscribing.size() < 4) {
       check(SteadyClock::now() < discovered_by, "Engine remote discovery timed out");

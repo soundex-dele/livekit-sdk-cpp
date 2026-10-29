@@ -33,6 +33,14 @@ void EncodedReceiver::configure_queue(QueueLimits limits, std::shared_ptr<QueueB
   budget_ = std::move(budget);
 }
 
+void EncodedReceiver::attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup) {
+  std::lock_guard lock(mutex_);
+  wakeup_ = std::move(wakeup);
+  if (wakeup_) {
+    wakeup_->signal();
+  }
+}
+
 void EncodedReceiver::Transform(std::unique_ptr<webrtc::TransformableFrameInterface> frame) {
   try {
     receive(std::move(frame));
@@ -41,6 +49,10 @@ void EncodedReceiver::Transform(std::unique_ptr<webrtc::TransformableFrameInterf
     std::lock_guard lock(mutex_);
     discard_chain();
     ++dropped_;
+  }
+  std::lock_guard lock(mutex_);
+  if (wakeup_) {
+    wakeup_->signal();
   }
 }
 
@@ -122,7 +134,7 @@ void EncodedReceiver::receive(std::unique_ptr<webrtc::TransformableFrameInterfac
   bytes_ += data.size();
 }
 
-std::vector<ReceivedAccessUnit> EncodedReceiver::poll() {
+std::vector<ReceivedAccessUnit> EncodedReceiver::take_frames() {
   std::lock_guard lock(mutex_);
   if (!queue_.empty() && SteadyClock::now() - queue_.front().arrival > limits_.max_age)
     discard_chain();
