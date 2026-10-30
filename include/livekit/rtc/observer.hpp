@@ -33,6 +33,8 @@ class RoomObserver {
   virtual void on_subscription_permissions_completed(const OperationResult&) {}
 
   virtual void on_room_event(const RoomEvent&) {}
+
+  virtual void on_video_codec_policy_changed(const VideoCodecPolicySnapshot&) {}
 };
 
 class PublicationObserver {

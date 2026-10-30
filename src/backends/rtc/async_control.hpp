@@ -1,9 +1,12 @@
 #pragma once
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/observer.hpp"
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <exception>
+#include <memory>
 #include <set>
 #include <thread>
 
@@ -47,13 +50,55 @@ inline OperationResult operation_result(ErrorCode code, const std::string& opera
 // The notification dispatcher must retain every accepted completion. Capacity
 // remains reserved until delivery, so a slow observer cannot grow the queue.
 class AsyncControl {
+  // A rejected/dropped notification must release its reservation as surely as
+  // a delivered one. Construct before admission; arm only after enqueue succeeds.
+  struct CompletionLease {
+    AsyncControl* owner = nullptr;
+    std::string key;
+    bool barrier = false;
+    bool started = false;
+    std::atomic<bool> finished{false};
+
+    ~CompletionLease() {
+      finish();
+    }
+
+    void begin() {
+      std::lock_guard lock(owner->mutex_);
+      owner->keys_.erase(key);
+      if (barrier) {
+        owner->barrier_pending_ = false;
+      }
+      started = true;
+      owner->changed_.notify_all();
+    }
+
+    void finish() {
+      if (!owner || finished.exchange(true)) {
+        return;
+      }
+      std::lock_guard lock(owner->mutex_);
+      if (!started) {
+        owner->keys_.erase(key);
+        if (barrier) {
+          owner->barrier_pending_ = false;
+        }
+      }
+      --owner->outstanding_;
+      owner->changed_.notify_all();
+    }
+  };
+
  public:
   using Task = std::function<void()>;
+  using Failure = std::function<void(std::exception_ptr)>;
 
-  AsyncControl(SessionControl& control, std::function<void(Task)> dispatch, Task wake)
+  AsyncControl(SessionControl& control, std::function<void(Task)> dispatch, Task wake,
+               Failure failure = {})
       : control_(control),
         dispatch_(std::move(dispatch)),
         wake_(std::move(wake)),
+        failure_(std::move(failure)),
         worker_([this] { run(); }) {}
 
   ~AsyncControl() {
@@ -67,6 +112,9 @@ class AsyncControl {
     if (observer.expired()) {
       return ErrorCode::invalid_state;
     }
+    auto lease = std::make_shared<CompletionLease>();
+    lease->key = key;
+    lease->barrier = barrier;
     std::lock_guard lock(mutex_);
     if (stopping_ || terminal_) {
       return ErrorCode::session_closed;
@@ -79,7 +127,7 @@ class AsyncControl {
       return ErrorCode::resource_exhausted;
     }
     auto work = [this, key, function = std::move(function), observer,
-                 completion = std::move(completion), barrier](bool cancelled) mutable {
+                 completion = std::move(completion), lease](bool cancelled) mutable {
       control_failure.reset();
       auto value = control_boundary([&]() -> Value {
         if (cancelled) {
@@ -105,26 +153,20 @@ class AsyncControl {
           return std::move(value);
         }
       }();
-      dispatch_([this, key, observer, completion = std::move(completion),
-                 result = std::move(result), barrier]() mutable {
+      dispatch_([observer, completion = std::move(completion), result = std::move(result),
+                 lease]() mutable {
         // Release the operation identity before calling external code: observers
         // may submit the next operation of the same kind from this notification.
-        {
-          std::lock_guard lock(mutex_);
-          keys_.erase(key);
-          if (barrier) {
-            barrier_pending_ = false;
-          }
-        }
+        lease->begin();
         try {
           if (auto target = observer.lock()) {
             completion(*target, std::move(result));
           }
         } catch (...) {
-          finish();
+          lease->finish();
           throw;
         }
-        finish();
+        lease->finish();
       });
     };
     keys_.insert(key);
@@ -135,6 +177,7 @@ class AsyncControl {
       throw;
     }
     ++outstanding_;
+    lease->owner = this;
     if (barrier) {
       barrier_pending_ = true;
       terminal_ = terminal;
@@ -150,10 +193,27 @@ class AsyncControl {
     return ErrorCode::ok;
   }
 
+  // One coalesced internal task, independent of observer capacity. Requests
+  // arriving during execution schedule another pass. Leave/close take priority.
+  void set_maintenance(Task task) {
+    auto handler = task ? std::make_shared<Task>(std::move(task)) : nullptr;
+    std::lock_guard lock(mutex_);
+    maintenance_ = std::move(handler);
+  }
+
+  void request_maintenance() {
+    std::lock_guard lock(mutex_);
+    if (!stopping_ && !terminal_) {
+      maintenance_pending_ = true;
+      changed_.notify_all();
+    }
+  }
+
   void shutdown() {
     {
       std::lock_guard lock(mutex_);
       stopping_ = true;
+      maintenance_pending_ = false;
       for (auto& item : queue_) {
         item.cancelled = true;
       }
@@ -171,42 +231,62 @@ class AsyncControl {
  private:
   struct Work {
     std::function<void(bool)> run;
-    bool cancelled;
-    bool barrier;
+    bool cancelled = false;
+    bool barrier = false;
   };
-
-  void finish() {
-    std::lock_guard lock(mutex_);
-    --outstanding_;
-    changed_.notify_all();
-  }
 
   void run() {
     for (;;) {
       Work work;
+      std::shared_ptr<Task> maintenance;
       {
         std::unique_lock lock(mutex_);
-        changed_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-        if (queue_.empty()) {
-          return;
-        }
-        work = std::move(queue_.front());
-        queue_.pop_front();
-        if (work.barrier) {
-          control_.interrupted = false;
+        changed_.wait(lock, [&] {
+          return stopping_ || !queue_.empty() || (maintenance_pending_ && !barrier_pending_);
+        });
+        if (maintenance_pending_ && !barrier_pending_ && !stopping_) {
+          maintenance_pending_ = false;
+          maintenance = maintenance_;
+        } else {
+          if (queue_.empty()) {
+            return;
+          }
+          work = std::move(queue_.front());
+          queue_.pop_front();
+          if (work.barrier && !stopping_) {
+            control_.interrupted = false;
+          }
         }
       }
-      work.run(work.cancelled);
+      try {
+        if (maintenance) {
+          (*maintenance)();
+        } else if (work.run) {
+          work.run(work.cancelled);
+        }
+      } catch (...) {
+        // Allocation/dispatch failures must not escape a std::thread entry.
+        // Work destruction returns any undelivered completion reservation.
+        if (failure_) {
+          try {
+            failure_(std::current_exception());
+          } catch (...) {
+          }
+        }
+      }
     }
   }
 
   SessionControl& control_;
   std::function<void(Task)> dispatch_;
   Task wake_;
+  Failure failure_;
   std::mutex mutex_;
   std::condition_variable changed_;
   std::deque<Work> queue_;
   std::set<std::string> keys_;
+  std::shared_ptr<Task> maintenance_;
+  bool maintenance_pending_ = false;
   size_t outstanding_ = 0;
   bool stopping_ = false, terminal_ = false, barrier_pending_ = false;
   std::thread worker_;

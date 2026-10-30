@@ -73,6 +73,7 @@ class RoomEngine {
   ErrorCode update_local_participant_locked(ParticipantUpdate, ControlOptions = {});
   ErrorCode leave_locked();
   void set_event_handler_locked(std::function<void(const RoomEvent&)>);
+  void set_internal_room_observer(std::weak_ptr<RoomObserver>);
   void post_notification(std::function<void()>);
   void notification_failed();
   std::shared_ptr<detail::RoomEngineState> state_;

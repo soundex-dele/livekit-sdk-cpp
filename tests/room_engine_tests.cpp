@@ -9,6 +9,7 @@
 #include "livekit/rtc/room_engine.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/bounded_events.hpp"
+#include "backends/rtc/async_control.hpp"
 #include "support/ready_set.hpp"
 #include "support/deadline_index.hpp"
 #include <algorithm>
@@ -71,6 +72,131 @@ void eventually(F predicate, const char* message) {
       throw std::runtime_error(message);
     std::this_thread::sleep_for(1ms);
   }
+}
+
+void completion_dispatch_failure_contract() {
+  using livekit::sdk::ErrorCode;
+  // Exercise queue rejection, silent task destruction and observer exceptions.
+  for (int mode = 0; mode < 3; ++mode) {
+    SessionControl control;
+    std::atomic<int> dispatched{0}, failures{0}, completed{0};
+    auto observer = std::make_shared<int>(0);
+    AsyncControl queue(
+        control,
+        [&](auto task) {
+          ++dispatched;
+          if (mode == 0) {
+            throw std::bad_alloc();
+          }
+          if (mode == 2) {
+            task();
+          }
+        },
+        [] {}, [&](auto) { ++failures; });
+    const auto submit = [&] {
+      return queue.submit(
+          "same-key", [] { return ErrorCode::ok; }, std::weak_ptr(observer),
+          [&](auto&, auto) {
+            ++completed;
+            throw std::runtime_error("observer failure");
+          });
+    };
+    check(submit() == ErrorCode::ok, "Fault-injection request rejected");
+    eventually([&] { return dispatched.load() == 1; }, "First dispatch missing");
+    eventually([&] { return submit() == ErrorCode::ok; }, "Dropped completion retained its key");
+    queue.shutdown();
+    check(dispatched == 2 && completed == (mode == 2 ? 2 : 0) && failures == (mode == 1 ? 0 : 2),
+          "Dispatch failure killed the worker or duplicated completion");
+  }
+}
+
+void completion_lease_reuse_contract() {
+  using livekit::sdk::ErrorCode;
+  SessionControl control;
+  std::mutex mutex;
+  std::vector<AsyncControl::Task> pending;
+  auto observer = std::make_shared<int>(0);
+  AsyncControl queue(
+      control,
+      [&](auto task) {
+        std::lock_guard lock(mutex);
+        pending.push_back(std::move(task));
+      },
+      [] {});
+  const auto submit = [&] {
+    return queue.submit(
+        "reused", [] { return ErrorCode::ok; }, std::weak_ptr(observer), [](auto&, auto) {});
+  };
+  const auto take = [&] {
+    AsyncControl::Task result;
+    eventually(
+        [&] {
+          std::lock_guard lock(mutex);
+          if (pending.empty()) {
+            return false;
+          }
+          result = std::move(pending.back());
+          pending.pop_back();
+          return true;
+        },
+        "Notification missing");
+    return result;
+  };
+  check(submit() == ErrorCode::ok, "First request rejected");
+  auto first = take();
+  first();
+  check(submit() == ErrorCode::ok, "Completed key remained busy");
+  auto second = take();
+  first = {};
+  check(submit() == ErrorCode::busy, "Old completion erased a new operation identity");
+  second();
+  queue.shutdown();
+}
+
+void maintenance_capacity_contract() {
+  using livekit::sdk::ErrorCode;
+  SessionControl control;
+  auto observer = std::make_shared<int>(0);
+  std::promise<void> started, release;
+  auto released = release.get_future().share();
+  std::atomic<int> passes{0}, following{0};
+  std::atomic<bool> wrong_order{false};
+  AsyncControl queue(control, [](auto task) { task(); }, [] {});
+  queue.set_maintenance([&] {
+    if (++passes == 1) {
+      queue.request_maintenance();
+    }
+  });
+  check(queue.submit(
+            "blocked",
+            [&] {
+              started.set_value();
+              released.wait();
+              return ErrorCode::ok;
+            },
+            std::weak_ptr(observer), [](auto&, auto) {}) == ErrorCode::ok,
+        "First request rejected");
+  get(started.get_future());
+  for (int i = 0; i < 127; ++i) {
+    check(queue.submit(
+              std::to_string(i),
+              [&] {
+                if (passes != 2) {
+                  wrong_order = true;
+                }
+                ++following;
+                return ErrorCode::ok;
+              },
+              std::weak_ptr(observer), [](auto&, auto) {}) == ErrorCode::ok,
+          "Queue filled prematurely");
+  }
+  for (int i = 0; i < 1000; ++i) {
+    queue.request_maintenance();
+  }
+  release.set_value();
+  eventually([&] { return following == 127; }, "Full queue prevented maintenance progress");
+  queue.shutdown();
+  check(passes == 2 && !wrong_order, "Maintenance was not coalesced or lost a concurrent request");
 }
 
 TrackDescriptor video(std::string id, size_t frames = 4, size_t bytes = 1024) {
@@ -2053,6 +2179,101 @@ void coordinated_detachment_contract() {
   get(rtc.close());
 }
 
+void automatic_graph_reclamation_contract() {
+  auto h = std::make_shared<Harness>();
+  livekit::sdk::app_support::BlockingRtc rtc([h] { return std::make_unique<FakeTransport>(h); });
+  get(rtc.join(options()));
+  get(rtc.publish(video("healthy")));
+  for (bool publication : {true, false}) {
+    std::atomic<int> stopped{0};
+    auto node = std::make_shared<GraphRelay>();
+    std::weak_ptr<GraphRelay> retained = node;
+    auto factory = [&](auto) {
+      engine::TrackGraphSpec spec;
+      spec.nodes = {node};
+      spec.quiesce = [&] { ++stopped; };
+      return spec;
+    };
+    if (publication) {
+      get(rtc.graph().publish_graph(video("automatic"), factory));
+    } else {
+      get(rtc.graph().subscribe_graph(video("automatic"), factory));
+    }
+    {
+      std::lock_guard lock(h->mutex);
+      h->defer_removal = true;
+    }
+    node->reportFailure(std::make_exception_ptr(std::runtime_error("automatic cleanup")));
+    node.reset();
+    // No subsequent control call is allowed to trigger cleanup for this test.
+    eventually([&] { return stopped == 1; }, "Failed graph was not automatically quiesced");
+    eventually(
+        [&] {
+          std::lock_guard lock(h->mutex);
+          return !h->removal_completions.empty();
+        },
+        "Failed endpoint detachment missing");
+    check(!retained.expired(), "Automatic cleanup released graph before native detach");
+    RoomTransport::Removed complete;
+    {
+      std::lock_guard lock(h->mutex);
+      complete = std::move(h->removal_completions.back());
+      h->removal_completions.clear();
+      h->defer_removal = false;
+    }
+    complete({});
+    eventually([&] { return retained.expired(); }, "Failed graph retained without user controls");
+    check(stopped == 1 && rtc.publication("healthy").state == TrackState::ready,
+          "Automatic cleanup stopped twice or disturbed a healthy sibling");
+  }
+  std::atomic<int> revoked_stops{0};
+  std::weak_ptr<GraphRelay> revoked_node;
+  get(rtc.graph().publish_graph(video("revoked"), [&](auto) {
+    auto node = std::make_shared<GraphRelay>();
+    revoked_node = node;
+    engine::TrackGraphSpec spec;
+    spec.nodes = {node};
+    spec.quiesce = [&] { ++revoked_stops; };
+    return spec;
+  }));
+  BindingToken revoked;
+  {
+    std::lock_guard lock(h->mutex);
+    revoked = h->published.back();
+  }
+  h->push({TransportEventKind::removed, revoked, {}, "server revoke"});
+  eventually([&] { return revoked_node.expired(); }, "Terminal graph without failure was retained");
+  check(revoked_stops == 1, "Server revoke did not quiesce graph once");
+  get(rtc.close());
+}
+
+void reclamation_shutdown_contract() {
+  auto h = std::make_shared<Harness>();
+  std::atomic<int> stopped{0};
+  auto rtc = std::make_unique<livekit::sdk::app_support::BlockingRtc>(
+      [h] { return std::make_unique<FakeTransport>(h); });
+  get(rtc->join(options()));
+  auto node = std::make_shared<GraphRelay>();
+  std::weak_ptr<GraphRelay> retained = node;
+  get(rtc->graph().publish_graph(video("shutdown-reap"), [&](auto) {
+    engine::TrackGraphSpec spec;
+    spec.nodes = {node};
+    spec.quiesce = [&] { ++stopped; };
+    return spec;
+  }));
+  {
+    std::lock_guard lock(h->mutex);
+    h->defer_removal = true;
+  }
+  node->reportFailure(std::make_exception_ptr(std::runtime_error("shutdown cleanup")));
+  node.reset();
+  eventually([&] { return stopped == 1; }, "Reclamation did not start");
+  // Native remove never completes. Destruction must interrupt the internal
+  // wait and use transport stop as the final detachment barrier.
+  rtc.reset();
+  check(retained.expired() && stopped == 1, "Shutdown failed to drain active reclamation");
+}
+
 class RejectGraphInit final : public graphflow::core::GraphNode {
  public:
   RejectGraphInit() : GraphNode("reject.init", nullptr) {}
@@ -2778,6 +2999,9 @@ void typed_join_failure() {
 
 int main() {
   try {
+    completion_dispatch_failure_contract();
+    completion_lease_reuse_contract();
+    maintenance_capacity_contract();
     observer_control_contract<RoomEngine, PublicationProbe>();
     observer_capacity_and_destruction(false);
     observer_capacity_and_destruction(true);
@@ -2807,6 +3031,8 @@ int main() {
     composed_graph_contract();
     independent_registry_contract();
     coordinated_detachment_contract();
+    automatic_graph_reclamation_contract();
+    reclamation_shutdown_contract();
     graph_prepare_rollback_contract();
     std::cout << "RTC graph pipeline contracts passed\n";
 #else

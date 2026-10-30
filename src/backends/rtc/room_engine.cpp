@@ -128,6 +128,20 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   };
 
   std::shared_ptr<ServiceFailure> service_failure;
+  // Notification/control workers never access the adapter-specific pointer,
+  // which is replaced by the controller on rejoin.
+  ServiceFailure notification_failure;
+
+  void report_notification_failure(std::exception_ptr cause) noexcept {
+    try {
+      std::lock_guard lock(notification_failure.mutex);
+      if (!notification_failure.cause) {
+        notification_failure.cause = cause;
+      }
+      wakeup->signal();
+    } catch (...) {
+    }
+  }
 
   void attach_service_notifications(RoomTransport& adapter) {
     service_failure = std::make_shared<ServiceFailure>();
@@ -153,6 +167,12 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       std::lock_guard lock(service_failure->mutex);
       error = std::exchange(service_failure->cause, {});
     }
+    {
+      std::lock_guard lock(notification_failure.mutex);
+      if (auto failure = std::exchange(notification_failure.cause, {})) {
+        error = failure;
+      }
+    }
     if (error && connection != ConnectionState::failed &&
         (connection != ConnectionState::closed ||
          describe_failure(error)->code == ErrorCode::callback_failed)) {
@@ -161,6 +181,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   }
 
   ObserverSlot<RoomObserver> room_observer;
+  ObserverSlot<RoomObserver> internal_room_observer;
   ObserverSlot<PublicationObserver> publication_observer;
   ObserverSlot<SubscriptionObserver> subscription_observer;
   std::function<void(const RoomEvent&)> event_handler;
@@ -173,10 +194,8 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
         std::lock_guard lock(mutex);
         event_handler = {};
       }
-      std::lock_guard failure_lock(service_failure->mutex);
-      service_failure->cause =
-          error("RTC event callback threw; handler disabled", ErrorCode::callback_failed);
-      wakeup->signal();
+      report_notification_failure(
+          error("RTC event callback threw; handler disabled", ErrorCode::callback_failed));
     } catch (...) {
       // The queue boundary must not propagate callback/dispatch exceptions.
     }
@@ -225,9 +244,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       });
     } catch (...) {
       notification_scheduled = false;
-      std::lock_guard failure_lock(service_failure->mutex);
-      service_failure->cause = std::current_exception();
-      wakeup->signal();
+      report_notification_failure(std::current_exception());
     }
   }
 
@@ -245,10 +262,8 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     {
       std::lock_guard lock(mutex);
       if (!completion && extra_notifications >= 256) {
-        std::lock_guard failure_lock(service_failure->mutex);
-        service_failure->cause =
-            error("RTC notification task queue exhausted", ErrorCode::resource_exhausted);
-        wakeup->signal();
+        report_notification_failure(
+            error("RTC notification task queue exhausted", ErrorCode::resource_exhausted));
         return;
       }
       ++extra_notifications;
@@ -268,9 +283,8 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     } catch (...) {
       std::lock_guard lock(mutex);
       --extra_notifications;
-      std::lock_guard failure_lock(service_failure->mutex);
-      service_failure->cause = std::current_exception();
-      wakeup->signal();
+      changed.notify_all();
+      report_notification_failure(std::current_exception());
     }
   }
 
@@ -1333,9 +1347,13 @@ RoomEngine::RoomEngine(TransportFactory factory, std::shared_ptr<detail::Session
   auto* state = state_.get();
   state_->control->async = std::make_shared<detail::AsyncControl>(
       *state_->control, [state](auto task) { state->post_notification(std::move(task), true); },
-      [wakeup = state_->wakeup] { wakeup->signal(); });
+      [wakeup = state_->wakeup] { wakeup->signal(); },
+      [state](auto failure) { state->report_notification_failure(failure); });
   state_->set_handler([state](const RoomEvent& event) {
     if (!event.publication) {
+      if (auto observer = state->internal_room_observer.get().lock()) {
+        observer->on_room_event(event);
+      }
       if (auto observer = state->room_observer.get().lock()) {
         observer->on_room_event(event);
       }
@@ -1375,6 +1393,9 @@ Result<std::shared_ptr<RoomServices>> RoomEngine::services() const {
 }
 
 ErrorCode RoomEngine::join(RoomOptions options) {
+  if (options.video_codec_policy) {
+    return ErrorCode::unsupported;
+  }
   return detail::control_boundary([&] {
     return state_->control->async->submit(
         "room.join",
@@ -1863,6 +1884,10 @@ ErrorCode RoomEngine::close() {
 
 void RoomEngine::set_event_handler_locked(std::function<void(const RoomEvent&)> handler) {
   state_->set_handler(std::move(handler));
+}
+
+void RoomEngine::set_internal_room_observer(std::weak_ptr<RoomObserver> observer) {
+  state_->internal_room_observer.set(std::move(observer));
 }
 
 void RoomEngine::notification_failed() {

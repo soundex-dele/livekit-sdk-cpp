@@ -30,6 +30,8 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 普通 Session 的入口、共享源示例及所有权规则见 [媒体引擎 API](docs/rtc-media-engine.md)。
 
+房间内出现 H264-only 成员时，可启用 [房间视频统一回退](docs/room-video-codec-policy.md)，由各发布端自动将 H265 切换为 H264，并为后续发布保留回退决定。
+
     输入 → 编码节点 → 发布节点 ─┐
     输入 → 编码节点 → 发布节点 ─┼─ 共享 RoomEngine / LiveKit 连接
     显示 ← 解码节点 ← 订阅节点 ─┤

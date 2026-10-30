@@ -45,6 +45,8 @@ class TrackGraphRegistry {
   };
 
   void set_failure_handler(std::function<void(GraphFailure)>);
+  // Schedules owner-side reclamation; never stops a graph on a reporting worker.
+  void set_reap_handler(std::function<void()>);
 
  private:
   static void stop(const RetiredGraphs&);
@@ -56,6 +58,7 @@ class TrackGraphRegistry {
     std::map<std::shared_ptr<PublishedTrack>, std::exception_ptr> publications;
     std::map<std::shared_ptr<SubscribedTrack>, std::exception_ptr> subscriptions;
     std::function<void(GraphFailure)> handler;
+    std::function<void()> reap;
   };
 
   std::shared_ptr<Reports> reports_ = std::make_shared<Reports>();

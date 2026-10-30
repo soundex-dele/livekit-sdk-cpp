@@ -90,6 +90,11 @@ struct MediaPublishSpec {
   VideoCodecOptions video;
   AudioCodecOptions audio;
   std::shared_ptr<SharedMediaInput> shared_input;  // Replaces input; raw format must match track.
+  // Optional replacement for an encoded H265 input. Called on the control worker
+  // after the old graph has stopped; return an H264 encoded or raw input. Must
+  // return promptly, must not call engine controls, and may throw to fail the
+  // replacement. Without this callback an encoded source cannot be downgraded.
+  std::function<MediaInput()> h264_fallback_input;
 };
 
 struct MediaSubscribeSpec {

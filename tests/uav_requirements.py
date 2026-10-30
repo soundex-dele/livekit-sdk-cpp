@@ -61,7 +61,7 @@ REQUIREMENTS = {
 # when the corresponding implementation is delivered; successful static-codec
 # smoke tests cannot clear an absent regression/FEC/business pipeline.
 KNOWN_IMPLEMENTATION_GAPS = {
-    "V-12": "SDK 尚未实现首位能力决策及备用编码 REGRESSION 发布，分别解码 H.264/H.265 不证明全体回退。",
+    "V-12": "SDK 已提供房间级统一回退及独立 rtc_codec_policy 集成入口；本运行器的独立 H.264/H.265 场景不能证明全体回退或机载设备切换。",
     "Q-06": "当前发送路径缺少与 BWE 联动的 pacing、队列字节/时长硬边界及完整帧依赖恢复。",
     "Q-07": "视频 FEC 协商、生成及恢复尚无端到端实现；Opus FEC 或 RTX 不能替代。",
     "Q-08": "1 s 基础统计已接通，但业务标识、冻结/音频中断及重连增量基线仍未闭环。",

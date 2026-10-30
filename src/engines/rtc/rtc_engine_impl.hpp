@@ -20,6 +20,11 @@ struct RtcEngine::Impl {
   Result<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
   Result<TrackId> publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> = {});
   Result<TrackId> subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode>);
+  Result<MediaPublication> start_media_locked(MediaPublishSpec);
+  void reconcile_video_codec_policy();
+  void notify_video_codec_policy();
+  void reset_video_codec_policy(std::optional<RoomVideoCodecPolicy> = {});
+  void use_h264(MediaPublishSpec&);
 
   // Runs inline and never retains the callable; references to caller arguments are safe.
   template <class Function>
@@ -60,6 +65,7 @@ struct RtcEngine::Impl {
   detail::ObserverSlot<PublicationObserver> publication_observer;
   detail::ObserverSlot<SubscriptionObserver> subscription_observer;
   std::shared_ptr<rtc::PublicationObserver> publication_events;
+  std::shared_ptr<RoomObserver> room_events;
   std::shared_ptr<rtc::SubscriptionObserver> subscription_events;
   bool closed = false;
   std::atomic<bool> has_media{false};
@@ -69,5 +75,13 @@ struct RtcEngine::Impl {
   std::unique_ptr<MediaResources> media_resources;
   std::unique_ptr<MediaGraphBuilder> media;
   RoomView room_view;
+  // Control sequence owns intent/recipes; snapshot is also read by application threads.
+  std::optional<RoomVideoCodecPolicy> codec_policy;
+  std::map<TrackId, MediaPublishSpec> media_publications;
+  bool building_media = false;
+  Epoch policy_advertised_epoch = 0;
+  bool policy_advertised_latch = false;
+  mutable std::mutex policy_mutex;
+  VideoCodecPolicySnapshot policy_status;
 };
 }  // namespace livekit::sdk::rtc::engine

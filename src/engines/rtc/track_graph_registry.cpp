@@ -18,6 +18,7 @@ GraphStopped TrackGraphRegistry::observer(const std::shared_ptr<Endpoint>& endpo
       endpoint->report_failure(failure);
     }
     std::function<void(GraphFailure)> handler;
+    std::function<void()> reap;
     {
       std::lock_guard lock(reports->mutex);
       if constexpr (std::is_same_v<Endpoint, PublishedTrack>) {
@@ -26,6 +27,10 @@ GraphStopped TrackGraphRegistry::observer(const std::shared_ptr<Endpoint>& endpo
         reports->subscriptions[endpoint] = failure;
       }
       handler = reports->handler;
+      reap = reports->reap;
+    }
+    if (reap) {
+      reap();
     }
     if (failure && handler) {
       auto info = describe_failure(failure);
@@ -38,6 +43,11 @@ GraphStopped TrackGraphRegistry::observer(const std::shared_ptr<Endpoint>& endpo
 void TrackGraphRegistry::set_failure_handler(std::function<void(GraphFailure)> handler) {
   std::lock_guard lock(reports_->mutex);
   reports_->handler = std::move(handler);
+}
+
+void TrackGraphRegistry::set_reap_handler(std::function<void()> handler) {
+  std::lock_guard lock(reports_->mutex);
+  reports_->reap = std::move(handler);
 }
 
 TrackGraphRegistry::RetiredGraphs TrackGraphRegistry::take_failed() {

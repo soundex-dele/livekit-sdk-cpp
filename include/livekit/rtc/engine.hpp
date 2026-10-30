@@ -26,6 +26,8 @@ class RtcEngine final {
   // Links LiveKit::RTCMediaEngine. Call before join; repeated installation is rejected.
   ErrorCode enable_media(AudioOutputOptions = {});
   bool media_enabled() const;
+  // Thread-safe local policy observation; not a room-wide transition ACK.
+  VideoCodecPolicySnapshot video_codec_policy() const;
   ErrorCode join(RoomOptions);
   // Cancels preceding requests, then quiesces graphs before leaving.
   ErrorCode leave();

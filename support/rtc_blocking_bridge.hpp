@@ -22,6 +22,29 @@ struct BridgeCallbackScope {
   }
 };
 
+// The blocking adapter must also reject waits from media callbacks. A close
+// waits for these callbacks to finish, so waiting for close here would deadlock.
+template <class Value, class... Args>
+void guard_bridge_callback(std::function<Value(Args...)>& callback) {
+  if (callback) {
+    callback = [handler = std::move(callback)](Args... args) -> Value {
+      BridgeCallbackScope scope;
+      return handler(std::forward<Args>(args)...);
+    };
+  }
+}
+
+inline void guard_media_callbacks(rtc::engine::MediaOutput& output) {
+  guard_bridge_callback(output.video);
+  guard_bridge_callback(output.audio);
+  guard_bridge_callback(output.frame);
+}
+
+inline void guard_media_callbacks(rtc::engine::MediaPublishSpec& spec) {
+  guard_media_callbacks(spec.preview);
+  guard_bridge_callback(spec.h264_fallback_input);
+}
+
 struct BlockingObservers : rtc::RoomObserver,
                            rtc::PublicationObserver,
                            rtc::SubscriptionObserver,
@@ -337,24 +360,28 @@ class BlockingEngine {
   }
 
   Result<rtc::engine::MediaPublication> publish_media(rtc::engine::MediaPublishSpec spec) {
+    guard_media_callbacks(spec);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaPublication>>(
         "publish:" + id, [&] { return engine_->publish_media(std::move(spec)); });
   }
 
   Result<rtc::engine::MediaPublication> publish_video(rtc::engine::MediaPublishSpec spec) {
+    guard_media_callbacks(spec);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaPublication>>(
         "publish:" + id, [&] { return engine_->publish_video(std::move(spec)); });
   }
 
   Result<rtc::engine::MediaPublication> publish_audio(rtc::engine::MediaPublishSpec spec) {
+    guard_media_callbacks(spec);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaPublication>>(
         "publish:" + id, [&] { return engine_->publish_audio(std::move(spec)); });
   }
 
   Result<rtc::engine::MediaSubscription> subscribe_media(rtc::engine::MediaSubscribeSpec spec) {
+    guard_media_callbacks(spec.output);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaSubscription>>(
         "subscribe:" + id, [&] { return engine_->subscribe_media(std::move(spec)); });

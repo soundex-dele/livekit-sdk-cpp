@@ -6,6 +6,20 @@
 
 namespace livekit::sdk::rtc::engine {
 namespace {
+struct RoomEvents final : RoomObserver {
+  explicit RoomEvents(std::weak_ptr<detail::AsyncControl> queue) : queue(std::move(queue)) {}
+
+  void on_room_event(const RoomEvent& event) override {
+    if (event.kind == RoomEventKind::session_changed || event.kind == RoomEventKind::connected) {
+      if (auto worker = queue.lock()) {
+        worker->request_maintenance();
+      }
+    }
+  }
+
+  std::weak_ptr<detail::AsyncControl> queue;
+};
+
 struct PublicationEvents final : rtc::PublicationObserver {
   explicit PublicationEvents(detail::ObserverSlot<engine::PublicationObserver>& slot)
       : slot(slot) {}
@@ -49,11 +63,24 @@ RtcEngine::Impl::Impl(std::unique_ptr<RoomEngine> value)
     room_view = RoomView(room.get());
   }
   control = room->control();
+  room_events = std::make_shared<RoomEvents>(control->async);
+  room->set_internal_room_observer(room_events);
   publication_events = std::make_shared<PublicationEvents>(publication_observer);
   subscription_events = std::make_shared<SubscriptionEvents>(subscription_observer);
   room->set_publication_observer(publication_events);
   room->set_subscription_observer(subscription_events);
   graphs = std::make_unique<TrackGraphRegistry>();
+  control->async->set_maintenance([this] {
+    const auto result = execute([this] { reconcile_video_codec_policy(); }, true);
+    if (result != ErrorCode::ok) {
+      throw SDKError(ErrorDomain::lifecycle, result, "RTC failed graph reclamation failed");
+    }
+  });
+  graphs->set_reap_handler([weak = std::weak_ptr<detail::AsyncControl>(control->async)] {
+    if (auto queue = weak.lock()) {
+      queue->request_maintenance();
+    }
+  });
   graphs->set_failure_handler([this](auto failure) {
     GraphFailure value{failure.id, failure.publication, failure.message, failure.failure};
     auto publisher = publication_observer.get();
@@ -72,11 +99,13 @@ RtcEngine::Impl::Impl(std::unique_ptr<RoomEngine> value)
 
 RtcEngine::Impl::~Impl() {
   control->async->shutdown();
+  control->async->set_maintenance({});
   // Applications must join all callers before destroying the facade.
   try {
     detail::OperationGuard guard(*control);
     room->set_event_handler_locked({});
     graphs->set_failure_handler({});
+    graphs->set_reap_handler({});
     (void)clear_tracks();
     media.reset();
     media_resources.reset();
@@ -87,6 +116,7 @@ RtcEngine::Impl::~Impl() {
 }
 
 ErrorCode RtcEngine::Impl::clear_tracks() {
+  media_publications.clear();
   return detach(graphs->take_all());
 }
 
@@ -110,6 +140,13 @@ ErrorCode RtcEngine::Impl::detach(TrackGraphRegistry::RetiredGraphs retired) con
 Result<TrackId> RtcEngine::Impl::publish_graph(TrackDescriptor descriptor,
                                                PublishGraphFactory factory) {
   return detail::control_boundary([&]() -> Result<TrackId> {
+    if (codec_policy && descriptor.kind == MediaKind::video &&
+        ((descriptor.format.codec != Codec::h264 && descriptor.format.codec != Codec::h265) ||
+         (!building_media && descriptor.format.codec != Codec::h264))) {
+      return detail::failure_result<TrackId>(
+          ErrorCode::unsupported,
+          "Room codec policy requires managed H264/H265 media; encoded graphs must use H264");
+    }
     if (!factory) {
       return detail::failure_result<TrackId>(ErrorCode::invalid_argument,
                                              "RTC engine requires a graph factory");
@@ -130,6 +167,11 @@ Result<TrackId> RtcEngine::Impl::publish_graph(TrackDescriptor descriptor,
       }
       graph = graphs->prepare(node, prepared);
       graphs->install(graph);
+      if (!building_media) {
+        // A caller may reuse the id of a failed managed publication for a
+        // custom H264 graph. Never retain the previous source's restart recipe.
+        media_publications.erase(descriptor.id);
+      }
       return Result<TrackId>::success(descriptor.id);
     } catch (...) {
       auto error = normalized_failure(
@@ -232,6 +274,11 @@ bool RtcEngine::media_enabled() const {
   return impl_->has_media;
 }
 
+VideoCodecPolicySnapshot RtcEngine::video_codec_policy() const {
+  std::lock_guard lock(impl_->policy_mutex);
+  return impl_->policy_status;
+}
+
 ErrorCode RtcEngine::join(RoomOptions options) {
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
@@ -239,13 +286,39 @@ ErrorCode RtcEngine::join(RoomOptions options) {
         [this, options = std::move(options)]() mutable {
           return impl_->execute([state = impl_.get(), options = std::move(options)]() mutable {
             const auto connection = state->room->snapshot().state;
+            if (connection != ConnectionState::disconnected &&
+                connection != ConnectionState::closed && connection != ConnectionState::failed) {
+              return ErrorCode::invalid_state;
+            }
             if (connection == ConnectionState::failed || connection == ConnectionState::closed) {
               auto cleaned = state->clear_tracks();
               if (cleaned != ErrorCode::ok) {
                 return cleaned;
               }
             }
-            return state->room->join_locked(std::move(options));
+            state->reset_video_codec_policy(options.video_codec_policy);
+            options.video_codec_policy.reset();
+            auto joined = state->room->join_locked(std::move(options));
+            if (joined != ErrorCode::ok) {
+              return joined;
+            }
+            if (state->codec_policy && !state->room->snapshot().session) {
+              (void)state->room->leave_locked();
+              throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
+                             "Room codec policy requires participant snapshots");
+            }
+            state->reconcile_video_codec_policy();
+            std::shared_ptr<const FailureInfo> failure;
+            {
+              std::lock_guard lock(state->policy_mutex);
+              failure = state->policy_status.failure;
+            }
+            if (failure) {
+              (void)state->room->leave_locked();
+              detail::control_failure = failure;
+              return failure->code;
+            }
+            return ErrorCode::ok;
           });
         },
         impl_->room_observer.get(),
@@ -261,6 +334,7 @@ ErrorCode RtcEngine::leave() {
           return impl_->execute([state = impl_.get()] {
             auto graphs = state->clear_tracks();
             auto left = state->room->leave_locked();
+            state->reset_video_codec_policy();
             return graphs == ErrorCode::ok ? left : graphs;
           });
         },
@@ -283,6 +357,7 @@ ErrorCode RtcEngine::close() {
                 state->control->closed = true;
                 auto graphs = state->clear_tracks();
                 auto left = state->room->leave_locked();
+                state->reset_video_codec_policy();
                 state->closed = graphs == ErrorCode::ok && left == ErrorCode::ok;
                 return graphs == ErrorCode::ok ? left : graphs;
               },
@@ -305,17 +380,8 @@ Result<MediaPublication> RtcEngine::start_media(MediaPublishSpec spec,
       return detail::failure_result<MediaPublication>(ErrorCode::unsupported,
                                                       "RTC media module is not enabled");
     }
-    auto& builder = *impl_->media;
-    std::shared_ptr<MediaTrack> track;
-    auto ready = impl_->publish_graph(spec.track, [&](auto node) {
-      auto prepared = builder.build_publish(std::move(spec), std::move(node));
-      track = std::move(prepared.track);
-      return std::move(prepared.graph);
-    });
-    if (!ready) {
-      return Result<MediaPublication>::failure(ready.failure_record());
-    }
-    return Result<MediaPublication>::success({*ready, std::move(track)});
+    impl_->reconcile_video_codec_policy();
+    return impl_->start_media_locked(std::move(spec));
   });
 }
 
@@ -518,6 +584,7 @@ ErrorCode RtcEngine::unpublish(const TrackId& id) {
         "publication.remove" + std::string(":") + track_id,
         [this, id]() mutable {
           return impl_->execute([state = impl_.get(), id] {
+            state->media_publications.erase(id);
             auto retired = state->graphs->take(id, true);
             // Keep graph leases alive until the native remove operation completes.
             return state->room->unpublish_locked(id);

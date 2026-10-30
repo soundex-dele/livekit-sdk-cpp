@@ -2,6 +2,7 @@
 #include "livekit/error.hpp"
 #include "livekit/rtc/backend_options.hpp"
 #include "livekit/rtc/session_info.hpp"
+#include "livekit/rtc/video_codec_policy.hpp"
 #include "livekit/encryption.hpp"
 
 #include <chrono>
@@ -190,6 +191,8 @@ struct RoomSettings {
   size_t max_events = 4096;
   std::chrono::milliseconds operation_timeout{30000};
   std::chrono::milliseconds stats_interval{0};  // Disabled, or 200..60000 ms.
+  // Applied by RtcEngine, which owns encoder graphs. RoomEngine alone rejects it.
+  std::optional<RoomVideoCodecPolicy> video_codec_policy;
 };
 
 struct RoomOptions : RoomSettings {
