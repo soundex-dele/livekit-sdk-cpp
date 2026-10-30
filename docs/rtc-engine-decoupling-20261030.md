@@ -52,7 +52,7 @@ classDiagram
 | TrackGraphRegistry | 每轨图准备、启动、索引、失败收集、停止 | 不持有或调用 RoomEngine；接收每轨 RTC 节点及 TrackGraphSpec |
 | MediaGraphBuilder / RtcMediaGraphBuilder | 采集、编解码、同步、播放、录制节点及连接 | 不持有或调用注册表和 RoomEngine；返回未启动的 PreparedMediaGraph |
 | RtcMediaResources | 音频输出会话、回声参考、共享同步时钟 | 由 RtcEngine 持有，构图器借用 |
-| SessionControl | 同步控制互斥及终止状态 | 独立共享对象，房间和门面共享；独立 RoomEngine 创建自己的上下文 |
+| SessionControl | 控制发起互斥、按轨道异步调度及终止状态 | 独立共享对象，房间和门面共享；独立 RoomEngine 创建自己的上下文 |
 
 `track_endpoint.hpp` 提供 PublishedTrack / SubscribedTrack 端口。RTC 节点不再为了使用端口包含整个 `room_engine.hpp`。`track_graph.hpp` 提供构图数据，不包含 Pipeline 或 RtcEngine 的声明。
 
@@ -93,3 +93,20 @@ python livekit-sdk-cpp/tests/media_graph_integration.py --lk livekit-sdk-cpp/out
 构建与测试日志位于聚合仓库 `out/rtc-refactor-{backend,full}-{build,tests}.log` 和 `out/rtc-refactor-integration.log`。完整构建仍有第三方及存量代码警告，没有编译错误。验证使用编译、自动化测试和无窗口渲染；不代表真实摄像头、麦克风或扬声器已完成人工验收。
 
 聚合仓库的 `docs/architecture/sdk-class-diagrams/` 已同步总体图和受影响模块图。
+
+## 后续按轨道调度进展（2026-10-30）
+
+RoomEngine 已将协议发起与结果等待分离：共享待完成对象由后台状态机结算，控制队列可
+调度其它轨道；同轨操作及房间 join/leave/close 保持顺序屏障。同步端点控制仅在发起时
+持有控制互斥锁，原生解绑支持多个等待者。结果交付继续使用独立 observer 通知线程。
+
+RtcEngine 的图构造、回滚、失败图回收和编解码策略仍使用同步适配器，尚待迁移。
+此处记录的是分阶段进展，完整跨轨并发目标仍未完成。验证与约束见
+[observer 异步控制](rtc-observers.md)。
+
+## 单次完成回调迁移（2026-10-30）
+
+后续接口已统一为每次调用传入 Completion<T>，Observer 只接收持续事件。RtcEngine 的普通发布/订阅
+端点等待与建图已分阶段执行，解绑期间保留图资源并让出控制调度，媒体启停和自动维护运行于生命周期
+序列。编解码策略事务及失败回滚仍在该生命周期序列串行执行。当前契约与本次验证见
+[Completion/Observer](rtc-observers.md) 和 [重构记录](rtc-completion-refactor-20261030.md)。

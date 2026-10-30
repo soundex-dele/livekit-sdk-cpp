@@ -1,10 +1,10 @@
 #pragma once
 // Non-installed bridge for existing blocking CLI/test supervisors. The SDK API
-// remains observer-only; new applications should implement its observers directly.
+// uses per-call completions; application events still use observers.
 #include "livekit/rtc/engine.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "rtc_result.hpp"
-#include <any>
+#include <future>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -52,19 +52,9 @@ struct BlockingObservers : rtc::RoomObserver,
                            rtc::engine::SubscriptionObserver {
   std::mutex mutex;
   std::condition_variable changed;
-  std::map<std::string, std::any> results;
   std::function<void(const rtc::RoomEvent&)> event;
   std::function<void(const rtc::engine::GraphFailure&)> failure;
   size_t invoking = 0;
-
-  template <class T>
-  void complete(const std::string& key, T result) {
-    std::lock_guard lock(mutex);
-    if (auto it = results.find(key); it != results.end()) {
-      it->second = std::move(result);
-    }
-    changed.notify_all();
-  }
 
   template <class T>
   static T rejected(ErrorCode code) {
@@ -77,31 +67,33 @@ struct BlockingObservers : rtc::RoomObserver,
   }
 
   template <class T, class Submit>
-  T wait(const std::string& key, Submit submit) {
-    if (in_blocking_bridge_callback) {
+  T wait(const std::string&, Submit submit) {
+    if (in_blocking_bridge_callback || rtc::is_callback_thread()) {
       return rejected<T>(ErrorCode::invalid_thread);
     }
-    {
-      std::lock_guard lock(mutex);
-      if (!results.emplace(key, std::any{}).second) {
-        return rejected<T>(ErrorCode::busy);
-      }
-    }
-    auto code = submit();
-    std::unique_lock lock(mutex);
+    using Completed = std::conditional_t<std::is_same_v<T, ErrorCode>, Result<void>, T>;
+    auto promise = std::make_shared<std::promise<Completed>>();
+    auto pending = promise->get_future();
+    auto code = submit([promise](Completed result) { promise->set_value(std::move(result)); });
+    promise.reset();
     if (code != ErrorCode::ok) {
-      results.erase(key);
       return rejected<T>(code);
     }
-    changed.wait(lock, [&] { return results.at(key).has_value(); });
-    auto result = std::any_cast<T>(std::move(results.at(key)));
-    results.erase(key);
-    return result;
+    try {
+      auto result = pending.get();
+      if constexpr (std::is_same_v<T, ErrorCode>) {
+        return result ? ErrorCode::ok : result.error().code;
+      } else {
+        return result;
+      }
+    } catch (const std::future_error&) {
+      return rejected<T>(ErrorCode::callback_failed);
+    }
   }
 
   ErrorCode set_handlers(std::function<void(const rtc::RoomEvent&)> e,
                          std::function<void(const rtc::engine::GraphFailure&)> f) {
-    if (in_blocking_bridge_callback) {
+    if (in_blocking_bridge_callback || rtc::is_callback_thread()) {
       return ErrorCode::invalid_thread;
     }
     std::unique_lock lock(mutex);
@@ -164,75 +156,7 @@ struct BlockingObservers : rtc::RoomObserver,
     invoke(std::move(handler), value);
   }
 
-  void on_join_completed(const rtc::OperationResult& r) override {
-    complete("join", r.code);
-  }
 
-  void on_leave_completed(const rtc::OperationResult& r) override {
-    complete("leave", r.code);
-  }
-
-  void on_close_completed(const rtc::OperationResult& r) override {
-    complete("close", r.code);
-  }
-
-  void on_participant_update_completed(const rtc::OperationResult& r) override {
-    complete("participant", r.code);
-  }
-
-  void on_subscription_permissions_completed(const rtc::OperationResult& r) override {
-    complete("permissions", r.code);
-  }
-
-  void on_unpublish_completed(const rtc::TrackId& id, const rtc::OperationResult& r) override {
-    complete("unpublish:" + id, r.code);
-  }
-
-  void on_unsubscribe_completed(const rtc::TrackId& id, const rtc::OperationResult& r) override {
-    complete("unsubscribe:" + id, r.code);
-  }
-
-  void on_muted_completed(const rtc::TrackId& id, bool, const rtc::OperationResult& r) override {
-    complete("mute:" + id, r.code);
-  }
-
-  void on_receive_demand_completed(const rtc::TrackId& id, rtc::ReceiveDemand,
-                                   const rtc::OperationResult& r) override {
-    complete("demand:" + id, r.code);
-  }
-
-  void on_publish_completed(const rtc::TrackId& id,
-                            Result<std::shared_ptr<rtc::PublishedTrack>> r) override {
-    complete("publish:" + id, std::move(r));
-  }
-
-  void on_subscribe_completed(const rtc::TrackId& id,
-                              Result<std::shared_ptr<rtc::SubscribedTrack>> r) override {
-    complete("subscribe:" + id, std::move(r));
-  }
-
-  void on_publish_completed(const rtc::TrackId& id, Result<rtc::TrackId> r) override {
-    complete("publish:" + id, std::move(r));
-  }
-
-  void on_subscribe_completed(const rtc::TrackId& id, Result<rtc::TrackId> r) override {
-    complete("subscribe:" + id, std::move(r));
-  }
-
-  void on_shared_input_created(const rtc::TrackId& id,
-                               Result<std::shared_ptr<rtc::engine::SharedMediaInput>> r) override {
-    complete("input:" + id, std::move(r));
-  }
-
-  void on_media_publish_completed(const rtc::TrackId& id,
-                                  Result<rtc::engine::MediaPublication> r) override {
-    complete("publish:" + id, std::move(r));
-  }
-
-  void on_media_subscribe_completed(const rtc::TrackId& id,
-                                    Result<rtc::engine::MediaSubscription> r) override {
-    complete("subscribe:" + id, std::move(r));
-  }
 };
 
 template <class Engine>
@@ -288,22 +212,25 @@ class BlockingEngine {
   }
 
   ErrorCode join(rtc::RoomOptions options) {
-    return observer_->template wait<ErrorCode>("join",
-                                               [&] { return engine_->join(std::move(options)); });
+    return observer_->template wait<ErrorCode>("join", [&](auto completion) {
+      return engine_->join(std::move(options), std::move(completion));
+    });
   }
 
   ErrorCode leave() {
-    return observer_->template wait<ErrorCode>("leave", [&] { return engine_->leave(); });
+    return observer_->template wait<ErrorCode>(
+        "leave", [&](auto completion) { return engine_->leave(std::move(completion)); });
   }
 
   ErrorCode close() {
-    if (in_blocking_bridge_callback) {
+    if (in_blocking_bridge_callback || rtc::is_callback_thread()) {
       return ErrorCode::invalid_thread;
     }
     if (closed_) {
       return ErrorCode::ok;
     }
-    auto code = observer_->template wait<ErrorCode>("close", [&] { return engine_->close(); });
+    auto code = observer_->template wait<ErrorCode>(
+        "close", [&](auto completion) { return engine_->close(std::move(completion)); });
     if (code == ErrorCode::ok) {
       closed_ = true;
     }
@@ -314,48 +241,56 @@ class BlockingEngine {
     using Value = std::conditional_t<std::is_same_v<Engine, rtc::RoomEngine>,
                                      std::shared_ptr<rtc::PublishedTrack>, rtc::TrackId>;
     const auto id = descriptor.id;
-    return observer_->template wait<Result<Value>>(
-        "publish:" + id, [&] { return engine_->publish(std::move(descriptor)); });
+    return observer_->template wait<Result<Value>>("publish:" + id, [&](auto completion) {
+      return engine_->publish(std::move(descriptor), std::move(completion));
+    });
   }
 
   auto subscribe(rtc::TrackDescriptor descriptor) {
     const auto id = descriptor.id;
     return observer_->template wait<Result<std::shared_ptr<rtc::SubscribedTrack>>>(
-        "subscribe:" + id, [&] { return engine_->subscribe(std::move(descriptor)); });
+        "subscribe:" + id, [&](auto completion) {
+          return engine_->subscribe(std::move(descriptor), std::move(completion));
+        });
   }
 
   ErrorCode unpublish(const rtc::TrackId& id) {
-    return observer_->template wait<ErrorCode>("unpublish:" + id,
-                                               [&] { return engine_->unpublish(id); });
+    return observer_->template wait<ErrorCode>("unpublish:" + id, [&](auto completion) {
+      return engine_->unpublish(id, std::move(completion));
+    });
   }
 
   ErrorCode unsubscribe(const rtc::TrackId& id) {
-    return observer_->template wait<ErrorCode>("unsubscribe:" + id,
-                                               [&] { return engine_->unsubscribe(id); });
+    return observer_->template wait<ErrorCode>("unsubscribe:" + id, [&](auto completion) {
+      return engine_->unsubscribe(id, std::move(completion));
+    });
   }
 
   ErrorCode set_muted(const rtc::TrackId& id, bool muted, rtc::ControlOptions options = {}) {
-    return observer_->template wait<ErrorCode>(
-        "mute:" + id, [&] { return engine_->set_muted(id, muted, options); });
+    return observer_->template wait<ErrorCode>("mute:" + id, [&](auto completion) {
+      return engine_->set_muted(id, muted, std::move(completion), options);
+    });
   }
 
   ErrorCode set_receive_demand(const rtc::TrackId& id, rtc::ReceiveDemand demand,
                                rtc::ControlOptions options = {}) {
-    return observer_->template wait<ErrorCode>(
-        "demand:" + id, [&] { return engine_->set_receive_demand(id, demand, options); });
+    return observer_->template wait<ErrorCode>("demand:" + id, [&](auto completion) {
+      return engine_->set_receive_demand(id, demand, std::move(completion), options);
+    });
   }
 
   ErrorCode update_local_participant(rtc::ParticipantUpdate value,
                                      rtc::ControlOptions options = {}) {
-    return observer_->template wait<ErrorCode>("participant", [&] {
-      return room_raw().update_local_participant(std::move(value), options);
+    return observer_->template wait<ErrorCode>("participant", [&](auto completion) {
+      return room_raw().update_local_participant(std::move(value), std::move(completion), options);
     });
   }
 
   ErrorCode set_subscription_permissions(rtc::SubscriptionPermissions value,
                                          rtc::ControlOptions options = {}) {
-    return observer_->template wait<ErrorCode>("permissions", [&] {
-      return room_raw().set_subscription_permissions(std::move(value), options);
+    return observer_->template wait<ErrorCode>("permissions", [&](auto completion) {
+      return room_raw().set_subscription_permissions(std::move(value), std::move(completion),
+                                                     options);
     });
   }
 
@@ -363,28 +298,36 @@ class BlockingEngine {
     guard_media_callbacks(spec);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaPublication>>(
-        "publish:" + id, [&] { return engine_->publish_media(std::move(spec)); });
+        "publish:" + id, [&](auto completion) {
+          return engine_->publish_media(std::move(spec), std::move(completion));
+        });
   }
 
   Result<rtc::engine::MediaPublication> publish_video(rtc::engine::MediaPublishSpec spec) {
     guard_media_callbacks(spec);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaPublication>>(
-        "publish:" + id, [&] { return engine_->publish_video(std::move(spec)); });
+        "publish:" + id, [&](auto completion) {
+          return engine_->publish_video(std::move(spec), std::move(completion));
+        });
   }
 
   Result<rtc::engine::MediaPublication> publish_audio(rtc::engine::MediaPublishSpec spec) {
     guard_media_callbacks(spec);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaPublication>>(
-        "publish:" + id, [&] { return engine_->publish_audio(std::move(spec)); });
+        "publish:" + id, [&](auto completion) {
+          return engine_->publish_audio(std::move(spec), std::move(completion));
+        });
   }
 
   Result<rtc::engine::MediaSubscription> subscribe_media(rtc::engine::MediaSubscribeSpec spec) {
     guard_media_callbacks(spec.output);
     const auto id = spec.track.id;
     return observer_->template wait<Result<rtc::engine::MediaSubscription>>(
-        "subscribe:" + id, [&] { return engine_->subscribe_media(std::move(spec)); });
+        "subscribe:" + id, [&](auto completion) {
+          return engine_->subscribe_media(std::move(spec), std::move(completion));
+        });
   }
 
   ErrorCode enable_media(rtc::AudioOutputOptions options = {}) {
@@ -398,8 +341,10 @@ class BlockingEngine {
   auto create_shared_input(rtc::TrackDescriptor format, rtc::engine::MediaInput input) {
     const auto id = format.id;
     return observer_->template wait<Result<std::shared_ptr<rtc::engine::SharedMediaInput>>>(
-        "input:" + id,
-        [&] { return engine_->create_shared_input(std::move(format), std::move(input)); });
+        "input:" + id, [&](auto completion) {
+          return engine_->create_shared_input(std::move(format), std::move(input),
+                                              std::move(completion));
+        });
   }
 
   auto snapshot() const {
@@ -460,71 +405,80 @@ class BlockingEngine {
     template <class... Args>
     Result<rtc::TrackId> publish(rtc::TrackDescriptor d, Args&&... args) {
       const auto id = d.id;
-      return owner_.observer_->template wait<Result<rtc::TrackId>>("publish:" + id, [&] {
-        return graph_.publish(std::move(d), std::forward<Args>(args)...);
-      });
+      return owner_.observer_->template wait<Result<rtc::TrackId>>(
+          "publish:" + id, [&](auto completion) {
+            return graph_.publish(std::move(d), std::forward<Args>(args)..., std::move(completion));
+          });
     }
 
     template <class... Args>
     Result<rtc::TrackId> subscribe(rtc::TrackDescriptor d, Args&&... args) {
       const auto id = d.id;
-      return owner_.observer_->template wait<Result<rtc::TrackId>>("subscribe:" + id, [&] {
-        return graph_.subscribe(std::move(d), std::forward<Args>(args)...);
-      });
+      return owner_.observer_->template wait<Result<rtc::TrackId>>(
+          "subscribe:" + id, [&](auto completion) {
+            return graph_.subscribe(std::move(d), std::forward<Args>(args)...,
+                                    std::move(completion));
+          });
     }
 
     template <class Factory>
     Result<rtc::TrackId> publish_graph(rtc::TrackDescriptor d, Factory factory) {
       const auto id = d.id;
-      return owner_.observer_->template wait<Result<rtc::TrackId>>("publish:" + id, [&] {
-        return graph_.publish_graph(std::move(d),
-                                    [factory = std::move(factory)](auto node) mutable {
-                                      BridgeCallbackScope scope;
-                                      auto spec = factory(std::move(node));
-                                      if (spec.activate) {
-                                        auto hook = std::move(spec.activate);
-                                        spec.activate = [hook = std::move(hook)] {
-                                          BridgeCallbackScope scope;
-                                          hook();
-                                        };
-                                      }
-                                      if (spec.quiesce) {
-                                        auto hook = std::move(spec.quiesce);
-                                        spec.quiesce = [hook = std::move(hook)] {
-                                          BridgeCallbackScope scope;
-                                          hook();
-                                        };
-                                      }
-                                      return spec;
-                                    });
-      });
+      return owner_.observer_->template wait<Result<rtc::TrackId>>(
+          "publish:" + id, [&](auto completion) {
+            return graph_.publish_graph(
+                std::move(d),
+                [factory = std::move(factory)](auto node) mutable {
+                  BridgeCallbackScope scope;
+                  auto spec = factory(std::move(node));
+                  if (spec.activate) {
+                    auto hook = std::move(spec.activate);
+                    spec.activate = [hook = std::move(hook)] {
+                      BridgeCallbackScope scope;
+                      hook();
+                    };
+                  }
+                  if (spec.quiesce) {
+                    auto hook = std::move(spec.quiesce);
+                    spec.quiesce = [hook = std::move(hook)] {
+                      BridgeCallbackScope scope;
+                      hook();
+                    };
+                  }
+                  return spec;
+                },
+                std::move(completion));
+          });
     }
 
     template <class Factory>
     Result<rtc::TrackId> subscribe_graph(rtc::TrackDescriptor d, Factory factory) {
       const auto id = d.id;
-      return owner_.observer_->template wait<Result<rtc::TrackId>>("subscribe:" + id, [&] {
-        return graph_.subscribe_graph(std::move(d),
-                                      [factory = std::move(factory)](auto node) mutable {
-                                        BridgeCallbackScope scope;
-                                        auto spec = factory(std::move(node));
-                                        if (spec.activate) {
-                                          auto hook = std::move(spec.activate);
-                                          spec.activate = [hook = std::move(hook)] {
-                                            BridgeCallbackScope scope;
-                                            hook();
-                                          };
-                                        }
-                                        if (spec.quiesce) {
-                                          auto hook = std::move(spec.quiesce);
-                                          spec.quiesce = [hook = std::move(hook)] {
-                                            BridgeCallbackScope scope;
-                                            hook();
-                                          };
-                                        }
-                                        return spec;
-                                      });
-      });
+      return owner_.observer_->template wait<Result<rtc::TrackId>>(
+          "subscribe:" + id, [&](auto completion) {
+            return graph_.subscribe_graph(
+                std::move(d),
+                [factory = std::move(factory)](auto node) mutable {
+                  BridgeCallbackScope scope;
+                  auto spec = factory(std::move(node));
+                  if (spec.activate) {
+                    auto hook = std::move(spec.activate);
+                    spec.activate = [hook = std::move(hook)] {
+                      BridgeCallbackScope scope;
+                      hook();
+                    };
+                  }
+                  if (spec.quiesce) {
+                    auto hook = std::move(spec.quiesce);
+                    spec.quiesce = [hook = std::move(hook)] {
+                      BridgeCallbackScope scope;
+                      hook();
+                    };
+                  }
+                  return spec;
+                },
+                std::move(completion));
+          });
     }
 
    private:

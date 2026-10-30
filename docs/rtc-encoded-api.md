@@ -1,4 +1,4 @@
-> RtcEngine、RoomEngine 和 RtcGraphApi 的控制接口返回异步受理状态，实际结果通过房间、发布、订阅 observer 通知；详见 [observer 异步控制](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
+> RtcEngine、RoomEngine 和 RtcGraphApi 的控制接口返回异步受理状态，单次结果通过调用时传入的 Completion 返回，持续事件由 Observer 通知；详见 [异步控制契约](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
 
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)。自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
@@ -41,9 +41,9 @@ bool selected = false;  // 只在串行通知队列访问。
 room->set_room_observer(room_observer);
 room->set_publication_observer(publication_observer);
 room->set_subscription_observer(subscription_observer);
-require_result(room->join(options));  // 仅受理。
-// on_join_completed 成功后可发布；on_publish_completed 返回 PublishedTrack。
-// 离开完成通过 on_leave_completed 通知。
+require_result(room->join(options, on_join));  // 仅受理。
+// on_join 成功后可发布；publish(descriptor, on_published) 返回受理码。
+// on_published 接收 Result<shared_ptr<PublishedTrack>>；leave(on_left) 通知离开结果。
 
 ```
 
@@ -53,7 +53,7 @@ require_result(room->join(options));  // 仅受理。
 
 ### 独立订阅需求
 
-`TrackDescriptor::receive_demand` 是初始需求。订阅成功后，使用 `SubscribedTrack::set_demand`，或通过 backend/engine 的 `set_receive_demand(id, demand)` 更新。每次完整替换配置，省略字段恢复默认值。
+`TrackDescriptor::receive_demand` 是初始需求。订阅成功后，使用 `SubscribedTrack::set_demand`，或通过 backend/engine 的 `set_receive_demand(id, demand, on_updated)` 更新。每次完整替换配置，省略字段恢复默认值。
 
 ```cpp
 ReceiveDemand demand;
@@ -88,26 +88,26 @@ SubscriptionPermissions policy;
 policy.all_participants = false;
 policy.participants = {{"viewer", false, {"camera-main", "screen-main"}}};
 options.subscription_permissions = policy;
-require_result(room->join(options));
+require_result(room->join(options, on_join));
 // 随后发布 camera-main / screen-main；无需预先知道服务端 SID。
 ```
 
-运行中用 `room->set_subscription_permissions(policy)` 完整替换策略。`all_participants=true` 允许全部成员，不能同时提供成员列表；`all_tracks=true` 允许指定 identity 的全部轨道，不能再指定 track_ids。false 加空成员列表拒绝全部订阅。最多 64 个成员、每个成员 128 个轨道 ID、总文本 32,000 字节，拒绝重复 identity/ID 和非法 UTF-8。
+运行中用 `room->set_subscription_permissions(policy, on_updated)` 完整替换策略。`all_participants=true` 允许全部成员，不能同时提供成员列表；`all_tracks=true` 允许指定 identity 的全部轨道，不能再指定 track_ids。false 加空成员列表拒绝全部订阅。最多 64 个成员、每个成员 128 个轨道 ID、总文本 32,000 字节，拒绝重复 identity/ID 和非法 UTF-8。
 
-`on_subscription_permissions_completed` 的成功结果表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
+权限设置完成回调 的成功结果表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
 
 订阅方通过 `subscription_permission_changed` 事件的 `permission` 读取 publisher participant SID、track SID 和 allowed。该通知可以在订阅尚未绑定时到达；待完成的 subscribe 操作仍受 operation_timeout 限制，授权及时恢复可继续完成，超时后需要重新 subscribe。运行中撤销与重新授权由服务器驱动转发变化；已绑定句柄不因权限提示自动销毁。权限通知带房间 epoch，旧会话事件不会混入当前会话。
 
 ### 修改自己的成员信息
 
-使用 `RoomEngine::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；只在服务端 ACK 后通过 `on_participant_update_completed` 通知成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `ErrorCode::permission_denied`。
+使用 `RoomEngine::update_local_participant(ParticipantUpdate, Completion<void>, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；只在服务端 ACK 后通过 成员更新完成回调 通知成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `ErrorCode::permission_denied`。
 
 ```cpp
 livekit::sdk::rtc::ParticipantUpdate update;
 update.name = "演示者";
 update.metadata = R"({"role":"presenter"})";
 update.attributes = {{"language", "zh"}, {"obsolete-key", ""}};
-require_result(room->update_local_participant(std::move(update)));
+require_result(room->update_local_participant(std::move(update), on_updated));
 ```
 
 空名称/元数据遵循 LiveKit 线协议语义，表示保持原值；空属性值删除该键，未包含的键保持原值。ACK 和本地/远端成员快照是独立观测，应用通过 `session_changed` 读取随后更新的状态。

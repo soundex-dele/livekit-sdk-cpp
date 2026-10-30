@@ -9,7 +9,9 @@ T require_result(Result<T> result) {
   if (!result) {
     throw SDKError(result.failure_record());
   }
-  return *std::move(result);
+  if constexpr (!std::is_void_v<T>) {
+    return *std::move(result);
+  }
 }
 
 // Legacy application supervisors still use exceptions locally. Engine calls

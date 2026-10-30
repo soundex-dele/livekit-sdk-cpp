@@ -174,8 +174,12 @@ void switching() {
   const auto old_sid = engine.publication("first").server_sid;
   wire->peer("h264");
   until([&] {
+    // Transport publish records intent before ACK and graph installation. Wait
+    // for both replacements and the policy transaction, then inspect mute state.
     return wire->codec("first", Codec::h264) && wire->codec("muted", Codec::h264) &&
-           engine.publication("first").consumed >= 3;
+           engine.publication("first").consumed >= 3 &&
+           engine.publication("muted").state == TrackState::ready &&
+           !engine.raw().video_codec_policy().transitioning;
   });
   check(first.track->snapshot().transport.state == TrackState::closed,
         "Old publication handle remained live");

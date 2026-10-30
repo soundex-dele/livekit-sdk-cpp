@@ -1,97 +1,80 @@
-# Android JNI 结果转换示例
+# Android JNI 完成回调与持续 Observer
 
-当前仓库没有 Android 构建模块。本文是接入示例与边界约定，不是已经编译或在 Android 设备验收的绑定实现。
+当前仓库没有 Android 构建模块。本文是绑定设计与示意代码，不是已编译或已在 Android 设备验收的实现。
+C++ 接口以 [Completion/Observer 契约](rtc-observers.md) 为准。
 
-## C++ 与 Android 的职责
+## Java 接口
 
-C++ 无数据控制操作返回 `ErrorCode`；可能失败的有值操作返回 `Result<T>`。JNI 负责把后者转换成 Kotlin/Java 对象，不向 Java 暴露 C++ 模板、对象地址或错误码输出指针。同步 SDK 控制仍在调用线程执行。
-
-| C++ 接口 | Android 表达 |
-| --- | --- |
-| `ErrorCode close()` | `Int`，零表示成功 |
-| `Result<TrackId> publish(...)` | `PublishResult`，成功包含 trackId，失败包含 code/message |
-| `Result<std::unique_ptr<RtcEngine>>` | 注册到 native 句柄表，返回不透明的 Long 令牌及失败结果 |
-| `FailureInfo` | 按需要复制 code、message、id、domain、retryable、backend_reason 与 context |
-
-值结果在 JNI 转换之前一直保留完整 `FailureInfo`。业务失败通过结果返回；Java 对象分配失败等 JVM 异常保留为 Java 异常。不要用空 trackId 同时表示失败和合法值。
-
-## Kotlin 调用示例
-
-```kotlin
-package com.example.rtc
-
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-
-// 示例值是绑定层协议，不是 C++ enum 的 ordinal。
-object RtcCode {
-    const val OK = 0
-    const val TIMEOUT = 1002
-    const val PERMISSION_DENIED = 1004
-    const val INVALID_ARGUMENT = 1013
-    const val INTERNAL_ERROR = 1099
+```java
+interface Completion<T> {
+    void onComplete(T value, RtcError error);
 }
 
-data class PublishResult(
-    val code: Int,
-    val trackId: String?,
-    val message: String?
-)
-
-object NativeRtc {
-    // 库加载、NativeTrackDescriptor 和句柄创建由 Android 项目实现。
-    external fun publish(handle: Long, descriptor: NativeTrackDescriptor): PublishResult
-    external fun close(handle: Long): Int
-}
-
-suspend fun publishTrack(handle: Long, descriptor: NativeTrackDescriptor): PublishResult =
-    withContext(Dispatchers.IO) {
-        NativeRtc.publish(handle, descriptor)
-    }
+// 返回受理错误码；0 为已受理，最终结果走 completion。
+static native int nativeJoin(long engine, RoomOptions options, Completion<Void> completion);
+static native int nativePublishMedia(long engine, MediaConfig config,
+                                    Completion<MediaPublication> completion);
+static native int nativeClose(long engine, Completion<Void> completion);
+static native void nativeRelease(long engine);
 ```
 
-调用方先判断 `code == RtcCode.OK`，成功时再读取非空 `trackId`；失败时展示 `message`。结果类和 native 方法需要配套 R8/ProGuard keep 规则，避免 JNI 构造函数或注册名称被改写。
+受理失败不调用 completion；已受理操作在原生串行通知线程调用一次 completion。
+close 允许不提供 completion，不依赖已注册 Observer。持续房间和轨道事件单独注册 Observer，
+不会再通过 Observer 派发 join/publish 等单次结果。没有操作句柄或请求 ID 映射表。
+Java 包装层可以将受理失败也转成回调，但必须仅在非零返回时转换，避免重复完成。
 
-## JNI 入口示例
+## JNI 入口结构
 
-下列辅助函数由 Android 项目实现，并不是 SDK 已提供的函数：
-
-- `acquire_engine(handle)`：从线程安全句柄表取得 `shared_ptr<RtcEngine>`，让引擎在本次调用结束前保持存活；无效或已释放令牌转换为 `stale_handle`。
-- `read_descriptor(env, descriptor)`：读取 Java 字段、复制成原生 `TrackDescriptor`，校验参数；失败时设置 Java 异常或抛出 SDKError。
-- `make_publish_result(...) noexcept`：构造 `(ILjava/lang/String;Ljava/lang/String;)V` 的 Java 结果对象；失败返回 nullptr，并保证已有 Java 异常挂起。复制字符串内容，不保存原生字符串指针。
-- `report_native_exception(env) noexcept`：仅在尚无 Java 异常时设置 Java 异常；包括内存分配失败在内，不能再让 C++ 异常逃出。
+以下 JniCompletion、acquire_engine、read_config、report_native_exception 是绑定层需要实现的辅助类型，
+不是 SDK 已提供的函数。句柄表返回受管引用，不能将 Long 直接强转为可删除的裸指针。
 
 ```cpp
-extern "C" JNIEXPORT jobject JNICALL
-Java_com_example_rtc_NativeRtc_publish(JNIEnv* env, jobject, jlong handle,
-                                     jobject descriptor) {
+jint native_publish_media(JNIEnv* env, jclass, jlong handle,
+                          jobject config, jobject callback) {
   try {
     auto engine = acquire_engine(handle);
-    auto native_descriptor = read_descriptor(env, descriptor);
-    if (env->ExceptionCheck()) {
-      return nullptr;
-    }
-    auto result = engine->publish(std::move(native_descriptor));
-    if (!result) {
-      const auto& error = result.error();
-      return make_publish_result(env, android_error_code(error.code),
-                                 nullptr, &error.message);
-    }
-    return make_publish_result(env, 0, &*result, nullptr);
-  } catch (const livekit::sdk::SDKError& error) {
-    if (env->ExceptionCheck()) {
-      return nullptr;
-    }
-    return make_publish_result(env, android_error_code(error.code()),
-                               nullptr, &error.failure()->message);
+    auto spec = read_config(env, config);
+    if (env->ExceptionCheck()) return 0;  // JVM 将传播挂起异常，返回值不被消费。
+    auto completion = JniCompletion::create(env, callback);  // NewGlobalRef
+    if (env->ExceptionCheck()) return 0;
+    auto code = engine->publish_media(std::move(spec),
+        [completion](Result<MediaPublication> result) {
+          completion->complete(std::move(result));
+        });
+    return android_error_code(code);
   } catch (...) {
-    report_native_exception(env);
-    return nullptr;
+    return report_native_exception(env);  // 不允许 C++ 异常跨 JNI；保留已有 JVM 异常。
   }
 }
 ```
 
-无返回数据的 JNI 控制入口同样取得引擎存活引用、检查挂起异常，并捕获所有 C++ 异常；正常返回 `android_error_code(engine->close())`。`close` 只关闭会话；释放句柄表令牌应使用单独的 `release` 接口，拒绝新调用并让已开始的调用自然完成。不能直接把 `jlong` 强转成裸指针后删除。
+- JniCompletion 保存 JavaVM 和 GlobalRef，不保存跨线程复用的 JNIEnv。
+- complete 获取当前线程 JNIEnv，必要时 AttachCurrentThread。只有自行附加的线程才由桥接层 detach。
+- Result<T>/Result<void> 转换成独立 Java 结果对象，保留 code、message、domain、failure id 和上下文。
+  不向 Java 暴露 C++ 模板或临时内存地址。MediaPublication 中的原生对象使用独立受管句柄。
+- 受理失败时本地 completion 引用释放；成功后 SDK 持有其捕获，完成任务释放时 DeleteGlobalRef。
+  取消、关闭、分配失败和通知任务销毁路径都须释放引用，不能因界面销毁提前释放仍可能使用的引用。
+- Java 回调抛异常时，在该异步线程记录并处理挂起异常，不能重试回调或带着异常继续 JNI 调用。
+- nativeRelease 先从句柄表撤销访问，再在释放线程等待已有调用并完成最终析构。
+  受管对象的最终 deleter 也必须使用释放线程，不能让最后一个引用在 SDK 通知线程触发同步析构。
+
+## Java Executor 和协程
+
+Java 包装层可以选择 UI 或后台 Executor：
+
+```java
+return nativePublishMedia(handle, config, (value, error) -> {
+    executor.execute(() -> completion.onComplete(value, error));
+});
+```
+
+Executor 拒绝任务时必须报告绑定层派发失败并释放结果句柄；不要切换到原生控制线程补发。
+需要严格顺序时使用串行 Executor。原生 close 完成不代表此前转发的 UI 任务已经执行，
+界面层可使用自己的会话代次丢弃过期结果。
+
+原生回调中可以提交下一次异步请求或 close，不得等待 SDK 工作、同步等待 UI 或直接销毁 Engine。
+JNI release 必须非阻塞转交给释放线程。Kotlin suspend 包装可使用 suspendCancellableCoroutine；
+协程取消只取消业务等待，不代表远端操作已经撤销，仍由原生终态回调释放桥接资源。
 
 ## 固定错误码映射
 
@@ -119,17 +102,19 @@ jint android_error_code(livekit::sdk::ErrorCode code) noexcept {
     case ErrorCode::callback_failed: return 1015;
     case ErrorCode::invalid_thread: return 1016;
     case ErrorCode::invalid_state: return 1017;
+    case ErrorCode::busy: return 1018;
     case ErrorCode::internal_error: return 1099;
   }
   return 1099;
 }
 ```
 
-## 线程、字符串和生命周期
+## 字符串、类加载和验证
 
-- `publish/join/close` 可能等待协议确认或资源清理，使用后台 dispatcher，不能阻塞 Android 主线程，也不能在 SDK 媒体或通知回调中重入控制。
-- 取消 Kotlin 协程不等于取消正在执行的 JNI 调用。`withContext(Dispatchers.IO)` 只切换执行线程；调用期间仍要保留引擎，不能因协程取消销毁 native 对象。
-- `JNIEnv*` 只属于当前线程。缓存 JavaVM，原生回调线程 attach 后取得自己的 JNIEnv；跨线程保存 Java 对象要用 GlobalRef，按明确的订阅生命周期释放。
-- `FailureInfo.message` 和 TrackId 是原生字符串。一般 UTF-8 不等于 JNI Modified UTF-8；中文、emoji、内嵌 NUL 应解码为 UTF-16，再使用 `NewString`。从 Java 传入时同样明确 UTF-16/UTF-8 转换与字段长度限制。
-- 检查 JNI 分配、字段读取及对象构造的挂起异常；及时释放局部引用。缓存的 jclass 使用 GlobalRef，并由 Android 应用类加载器正确初始化。
-- 实际 Android 接入应验证成功值、完整错误元数据、超时、无效句柄、并发 release、协程取消、非 ASCII 字符串及 R8 构建。当前 C++ 无窗口测试不代表这些 JNI/设备路径已通过验收。
+一般 UTF-8 不等于 JNI Modified UTF-8。原生字符串转换为 UTF-16 后使用 NewString，覆盖中文、emoji
+和内嵌 NUL；Java 输入同样明确 UTF-16/UTF-8 转换及长度上限。缓存的 jclass 使用 GlobalRef，
+在正确的应用 ClassLoader 上初始化，并配套 R8/ProGuard keep 规则。
+
+Android 接入需要独立验证：受理失败、成功值、完整错误、回调先于 native 方法返回、回调内 close、
+并发 release、GlobalRef 回收、Executor 拒绝、协程取消、回调异常、非 ASCII 字符串及 R8 构建。
+C++ 无窗口测试不能替代这些绑定和设备验证。

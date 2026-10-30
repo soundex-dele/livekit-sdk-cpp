@@ -86,4 +86,45 @@ class [[nodiscard]] Result {
   std::variant<T, std::shared_ptr<const FailureInfo>> state_;
 };
 
+// A completed operation without a value. Success has no failure record.
+template <>
+class [[nodiscard]] Result<void> {
+ public:
+  static Result success() {
+    return Result(nullptr);
+  }
+
+  static Result failure(std::shared_ptr<const FailureInfo> error) {
+    assert(error);
+    return Result(std::move(error));
+  }
+
+  bool has_value() const noexcept {
+    return !failure_;
+  }
+
+  explicit operator bool() const noexcept {
+    return has_value();
+  }
+
+  const FailureInfo* error_if() const noexcept {
+    return failure_.get();
+  }
+
+  const FailureInfo& error() const {
+    assert(failure_);
+    return *failure_;
+  }
+
+  const std::shared_ptr<const FailureInfo>& failure_record() const {
+    assert(failure_);
+    return failure_;
+  }
+
+ private:
+  explicit Result(std::shared_ptr<const FailureInfo> error) : failure_(std::move(error)) {}
+
+  std::shared_ptr<const FailureInfo> failure_;
+};
+
 }  // namespace livekit::sdk

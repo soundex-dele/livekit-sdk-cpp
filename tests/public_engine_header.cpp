@@ -14,16 +14,14 @@ static_assert(std::is_same_v<decltype(std::declval<SubscribedTrack&>().set_deman
 static_assert(std::is_same_v<decltype(std::declval<SubscribedTrack&>().close()), ErrorCode>);
 static_assert(
     std::is_same_v<decltype(std::declval<const engine::MediaTrack&>().check()), ErrorCode>);
-static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().join({})), ErrorCode>);
-static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().publish({})),
-                             ErrorCode>);
+static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().join({}, {})), ErrorCode>);
+static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().publish({}, {})), ErrorCode>);
 static_assert(
-    std::is_same_v<decltype(std::declval<engine::RtcEngine&>().publish({})), ErrorCode>);
-static_assert(std::is_same_v<decltype(std::declval<engine::RtcEngine&>().publish_media({})),
-                             ErrorCode>);
+    std::is_same_v<decltype(std::declval<engine::RtcEngine&>().publish({}, {})), ErrorCode>);
+static_assert(
+    std::is_same_v<decltype(std::declval<engine::RtcEngine&>().publish_media({}, {})), ErrorCode>);
 
-static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().subscribe({})),
-                             ErrorCode>);
+static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().subscribe({}, {})), ErrorCode>);
 static_assert(std::is_same_v<decltype(std::declval<const RoomView&>().services()),
                              Result<std::shared_ptr<RoomServices>>>);
 static_assert(std::is_same_v<decltype(engine::create_livekit_engine()),

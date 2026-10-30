@@ -4,6 +4,7 @@
 #include "engines/rtc/media_graph_contract.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "backends/rtc/async_control.hpp"
+#include "backends/rtc/lifecycle_executor.hpp"
 #include <memory>
 #include <thread>
 #include <atomic>
@@ -18,9 +19,18 @@ struct RtcEngine::Impl {
   ErrorCode detach(TrackGraphRegistry::RetiredGraphs) const;
   Result<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
   Result<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  AsyncResult<Result<TrackId>> publish_graph_async(TrackDescriptor, PublishGraphFactory,
+                                                   bool managed = false);
+  AsyncResult<Result<TrackId>> subscribe_graph_async(TrackDescriptor, SubscribeGraphFactory);
+  Result<TrackId> finish_publish_graph(TrackDescriptor, PublishGraphFactory,
+                                       std::shared_ptr<PublishedTrack>);
+  Result<TrackId> finish_subscribe_graph(TrackDescriptor, SubscribeGraphFactory,
+                                         std::shared_ptr<SubscribedTrack>);
   Result<TrackId> publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> = {});
   Result<TrackId> subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode>);
   Result<MediaPublication> start_media_locked(MediaPublishSpec);
+  AsyncResult<Result<MediaPublication>> start_media_async(MediaPublishSpec,
+                                                          std::optional<MediaKind> = {});
   void reconcile_video_codec_policy();
   void notify_video_codec_policy();
   void reset_video_codec_policy(std::optional<RoomVideoCodecPolicy> = {});
@@ -71,6 +81,7 @@ struct RtcEngine::Impl {
   std::atomic<bool> has_media{false};
   std::shared_ptr<detail::SessionControl> control;
   std::unique_ptr<RoomEngine> room;
+  detail::LifecycleExecutor lifecycle;
   std::unique_ptr<TrackGraphRegistry> graphs;
   std::unique_ptr<MediaResources> media_resources;
   std::unique_ptr<MediaGraphBuilder> media;

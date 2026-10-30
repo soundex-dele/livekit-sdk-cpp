@@ -166,13 +166,13 @@ void RtcEngine::Impl::reconcile_video_codec_policy() {
       const auto removed = room->unpublish_locked(spec.track.id);
       if (removed != ErrorCode::ok) {
         auto result = detail::operation_result(removed, "codec_policy.unpublish");
-        fail(result.failure);
-        room->post_notification(
-            [observer = publication_observer.get(), id = spec.track.id, failure = result.failure] {
-              if (auto target = observer.lock()) {
-                target->on_video_codec_republished(id, Result<MediaPublication>::failure(failure));
-              }
-            });
+        fail(result.failure_record());
+        room->post_notification([observer = publication_observer.get(), id = spec.track.id,
+                                 failure = result.failure_record()] {
+          if (auto target = observer.lock()) {
+            target->on_video_codec_republished(id, Result<MediaPublication>::failure(failure));
+          }
+        });
         continue;
       }
       replacements.push_back(std::move(spec));
@@ -188,7 +188,7 @@ void RtcEngine::Impl::reconcile_video_codec_policy() {
     update.attributes[kVideoH264LatchAttribute] = h264 ? "1" : "0";
     const auto result = room->update_local_participant_locked(std::move(update));
     if (result != ErrorCode::ok) {
-      fail(detail::operation_result(result, "codec_policy.advertise").failure);
+      fail(detail::operation_result(result, "codec_policy.advertise").failure_record());
     }
     changed = true;
   }

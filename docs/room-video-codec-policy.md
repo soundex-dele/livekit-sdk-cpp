@@ -12,7 +12,7 @@ options.url = url;
 options.token = token;
 options.signal_protocol = 15;
 options.video_codec_policy = RoomVideoCodecPolicy{.can_decode_h265 = true};
-engine.join(options);  // 按普通 RoomObserver 契约等待完成。
+engine.join(options, on_join);  // on_join 接收 Result<void>，不要在通知线程等待。
 ```
 
 仅支持 H264 的客户端设置 `can_decode_h265 = false`。该选项声明本机真实能力，不会为设备增加编解码器。参与者必须能解码 H264，视频发布端必须能编码 H264。普通 `RoomEngine` 不拥有媒体图，会明确拒绝此选项；请使用 `RtcEngine`。

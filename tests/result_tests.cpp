@@ -12,6 +12,14 @@ void check(bool value) {
 }
 
 int main() {
+  auto done = Result<void>::success();
+  check(done.has_value() && !done.error_if());
+  auto void_error = describe_failure(std::make_exception_ptr(
+      SDKError(ErrorDomain::protocol, ErrorCode::timeout, "completion timeout")));
+  auto failed_void = Result<void>::failure(void_error);
+  check(!failed_void && failed_void.error_if() == void_error.get());
+  check(failed_void.failure_record() == void_error &&
+        failed_void.error().code == ErrorCode::timeout);
   auto empty = rtc::detail::control_boundary([] {});
   static_assert(std::is_same_v<decltype(empty), ErrorCode>);
   check(empty == ErrorCode::ok);

@@ -7,9 +7,20 @@
 namespace livekit::sdk::rtc::detail {
 // Scoped on every user callback and RTC worker. Never acquire an operation lock there.
 inline thread_local unsigned callback_depth = 0;
+inline thread_local unsigned worker_depth = 0;
 inline thread_local const void* active_session = nullptr;
 inline thread_local std::shared_ptr<const FailureInfo> control_failure;
 class AsyncControl;
+
+struct WorkerScope {
+  WorkerScope() {
+    ++worker_depth;
+  }
+
+  ~WorkerScope() {
+    --worker_depth;
+  }
+};
 
 struct CallbackScope {
   CallbackScope() {

@@ -70,11 +70,9 @@ RtcEngine::Impl::Impl(std::unique_ptr<RoomEngine> value)
   room->set_publication_observer(publication_events);
   room->set_subscription_observer(subscription_events);
   graphs = std::make_unique<TrackGraphRegistry>();
-  control->async->set_maintenance([this] {
-    const auto result = execute([this] { reconcile_video_codec_policy(); }, true);
-    if (result != ErrorCode::ok) {
-      throw SDKError(ErrorDomain::lifecycle, result, "RTC failed graph reclamation failed");
-    }
+  control->async->set_async_maintenance([this] {
+    return lifecycle.submit(
+        [this] { return execute([this] { reconcile_video_codec_policy(); }, true); });
   });
   graphs->set_reap_handler([weak = std::weak_ptr<detail::AsyncControl>(control->async)] {
     if (auto queue = weak.lock()) {
@@ -99,6 +97,7 @@ RtcEngine::Impl::Impl(std::unique_ptr<RoomEngine> value)
 
 RtcEngine::Impl::~Impl() {
   control->async->shutdown();
+  lifecycle.shutdown();
   control->async->set_maintenance({});
   // Applications must join all callers before destroying the facade.
   try {
@@ -155,7 +154,18 @@ Result<TrackId> RtcEngine::Impl::publish_graph(TrackDescriptor descriptor,
     if (!ready) {
       return Result<TrackId>::failure(ready.failure_record());
     }
-    auto endpoint = *ready;
+    return finish_publish_graph(std::move(descriptor), std::move(factory), *ready);
+  });
+}
+
+Result<TrackId> RtcEngine::Impl::finish_publish_graph(TrackDescriptor descriptor,
+                                                      PublishGraphFactory factory,
+                                                      std::shared_ptr<PublishedTrack> endpoint) {
+  return detail::control_boundary([&]() -> Result<TrackId> {
+    if (control->interrupted) {
+      (void)endpoint->close_locked();
+      return detail::failure_result<TrackId>(ErrorCode::cancelled, "RTC graph creation cancelled");
+    }
     std::shared_ptr<nodes::RtcPublishNode> node;
     std::shared_ptr<PublishPipeline> graph;
     TrackGraphSpec prepared;
@@ -207,7 +217,18 @@ Result<TrackId> RtcEngine::Impl::subscribe_graph(TrackDescriptor descriptor,
     if (!ready) {
       return Result<TrackId>::failure(ready.failure_record());
     }
-    auto endpoint = *ready;
+    return finish_subscribe_graph(std::move(descriptor), std::move(factory), *ready);
+  });
+}
+
+Result<TrackId> RtcEngine::Impl::finish_subscribe_graph(TrackDescriptor descriptor,
+                                                        SubscribeGraphFactory factory,
+                                                        std::shared_ptr<SubscribedTrack> endpoint) {
+  return detail::control_boundary([&]() -> Result<TrackId> {
+    if (control->interrupted) {
+      (void)endpoint->close_locked();
+      return detail::failure_result<TrackId>(ErrorCode::cancelled, "RTC graph creation cancelled");
+    }
     std::shared_ptr<nodes::RtcSubscribeNode> node;
     std::shared_ptr<SubscribePipeline> graph;
     TrackGraphSpec prepared;
@@ -270,6 +291,126 @@ Result<TrackId> RtcEngine::Impl::subscribe(TrackDescriptor descriptor,
   });
 }
 
+namespace {
+template <class T>
+AsyncResult<T> settled(T value) {
+  CompletionSource<T> source;
+  auto result = source.get_result();
+  source.set_value(std::move(value));
+  return result;
+}
+}  // namespace
+
+AsyncResult<Result<TrackId>> RtcEngine::Impl::publish_graph_async(TrackDescriptor descriptor,
+                                                                  PublishGraphFactory factory,
+                                                                  bool managed) {
+  if (!factory) {
+    return settled(detail::failure_result<TrackId>(ErrorCode::invalid_argument,
+                                                   "RTC engine requires a graph factory"));
+  }
+  if (codec_policy && descriptor.kind == MediaKind::video &&
+      ((descriptor.format.codec != Codec::h264 && descriptor.format.codec != Codec::h265) ||
+       (!managed && descriptor.format.codec != Codec::h264))) {
+    return settled(detail::failure_result<TrackId>(
+        ErrorCode::unsupported,
+        "Room codec policy requires managed H264/H265 media; encoded graphs must use H264"));
+  }
+  auto pending = room->publish_async(descriptor);
+  return std::move(pending).then(
+      lifecycle.dispatcher(),
+      [this, descriptor = std::move(descriptor), factory = std::move(factory),
+       managed](AsyncResult<Result<std::shared_ptr<PublishedTrack>>> ready) mutable {
+        auto result = ready.get();
+        if (!result) {
+          return Result<TrackId>::failure(result.failure_record());
+        }
+        return execute([&] {
+          auto previous = std::exchange(building_media, managed);
+          auto completed = finish_publish_graph(std::move(descriptor), std::move(factory), *result);
+          building_media = previous;
+          return completed;
+        });
+      });
+}
+
+AsyncResult<Result<TrackId>> RtcEngine::Impl::subscribe_graph_async(TrackDescriptor descriptor,
+                                                                    SubscribeGraphFactory factory) {
+  if (!factory) {
+    return settled(detail::failure_result<TrackId>(ErrorCode::invalid_argument,
+                                                   "RTC engine requires a graph factory"));
+  }
+  auto pending = room->subscribe_async(descriptor);
+  return std::move(pending).then(
+      lifecycle.dispatcher(),
+      [this, descriptor = std::move(descriptor), factory = std::move(factory)](
+          AsyncResult<Result<std::shared_ptr<SubscribedTrack>>> ready) mutable {
+        auto result = ready.get();
+        if (!result) {
+          return Result<TrackId>::failure(result.failure_record());
+        }
+        return execute([&] {
+          return finish_subscribe_graph(std::move(descriptor), std::move(factory), *result);
+        });
+      });
+}
+
+AsyncResult<Result<MediaPublication>> RtcEngine::Impl::start_media_async(
+    MediaPublishSpec spec, std::optional<MediaKind> expected) {
+  auto validated = execute([&]() -> Result<void> {
+    if (expected && spec.track.kind != *expected) {
+      return detail::failure_result<void>(
+          ErrorCode::invalid_argument, "Publication kind does not match the requested media API");
+    }
+    if (!media) {
+      return detail::failure_result<void>(ErrorCode::unsupported,
+                                          "RTC media module is not enabled");
+    }
+    reconcile_video_codec_policy();
+    if (codec_policy) {
+      const auto snapshot = room->snapshot();
+      if (snapshot.state != ConnectionState::connected || !snapshot.session) {
+        return detail::failure_result<void>(ErrorCode::invalid_state,
+                                            "Codec policy requires a current roster");
+      }
+      bool h264;
+      {
+        std::lock_guard lock(policy_mutex);
+        h264 = policy_status.h264_latched;
+      }
+      if (h264) {
+        use_h264(spec);
+      }
+    }
+    return Result<void>::success();
+  });
+  if (!validated) {
+    return settled(Result<MediaPublication>::failure(validated.failure_record()));
+  }
+  auto recipe = spec;
+  auto track = std::make_shared<std::shared_ptr<MediaTrack>>();
+  auto descriptor = spec.track;
+  auto pending = publish_graph_async(
+      std::move(descriptor),
+      [this, spec = std::move(spec), track](auto node) mutable {
+        auto prepared = media->build_publish(std::move(spec), std::move(node));
+        *track = std::move(prepared.track);
+        return std::move(prepared.graph);
+      },
+      true);
+  return std::move(pending).then(
+      lifecycle.dispatcher(),
+      [this, recipe = std::move(recipe), track](AsyncResult<Result<TrackId>> ready) mutable {
+        auto result = ready.get();
+        if (!result) {
+          return Result<MediaPublication>::failure(result.failure_record());
+        }
+        if (codec_policy && recipe.track.kind == MediaKind::video) {
+          media_publications.insert_or_assign(*result, std::move(recipe));
+        }
+        return Result<MediaPublication>::success({*result, std::move(*track)});
+      });
+}
+
 bool RtcEngine::media_enabled() const {
   return impl_->has_media;
 }
@@ -279,198 +420,201 @@ VideoCodecPolicySnapshot RtcEngine::video_codec_policy() const {
   return impl_->policy_status;
 }
 
-ErrorCode RtcEngine::join(RoomOptions options) {
+ErrorCode RtcEngine::join(RoomOptions options, Completion<void> completion) {
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "room.join",
         [this, options = std::move(options)]() mutable {
-          return impl_->execute([state = impl_.get(), options = std::move(options)]() mutable {
-            const auto connection = state->room->snapshot().state;
-            if (connection != ConnectionState::disconnected &&
-                connection != ConnectionState::closed && connection != ConnectionState::failed) {
-              return ErrorCode::invalid_state;
-            }
-            if (connection == ConnectionState::failed || connection == ConnectionState::closed) {
-              auto cleaned = state->clear_tracks();
-              if (cleaned != ErrorCode::ok) {
-                return cleaned;
+          return impl_->lifecycle.submit([state = impl_.get(),
+                                          options = std::move(options)]() mutable {
+            auto prepared = state->execute([&] {
+              const auto connection = state->room->snapshot().state;
+              if (connection != ConnectionState::disconnected &&
+                  connection != ConnectionState::closed && connection != ConnectionState::failed) {
+                return ErrorCode::invalid_state;
               }
+              if (connection == ConnectionState::failed || connection == ConnectionState::closed) {
+                auto cleaned = state->clear_tracks();
+                if (cleaned != ErrorCode::ok) {
+                  return cleaned;
+                }
+              }
+              state->reset_video_codec_policy(options.video_codec_policy);
+              options.video_codec_policy.reset();
+              return ErrorCode::ok;
+            });
+            if (prepared != ErrorCode::ok) {
+              throw SDKError(detail::operation_result(prepared, "join.prepare").failure_record());
             }
-            state->reset_video_codec_policy(options.video_codec_policy);
-            options.video_codec_policy.reset();
-            auto joined = state->room->join_locked(std::move(options));
-            if (joined != ErrorCode::ok) {
-              return joined;
-            }
-            if (state->codec_policy && !state->room->snapshot().session) {
-              (void)state->room->leave_locked();
-              throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
-                             "Room codec policy requires participant snapshots");
-            }
-            state->reconcile_video_codec_policy();
-            std::shared_ptr<const FailureInfo> failure;
-            {
-              std::lock_guard lock(state->policy_mutex);
-              failure = state->policy_status.failure;
-            }
-            if (failure) {
-              (void)state->room->leave_locked();
-              detail::control_failure = failure;
-              return failure->code;
-            }
-            return ErrorCode::ok;
+            auto pending = state->room->join_async(std::move(options));
+            return std::move(pending).then(
+                state->lifecycle.dispatcher(), [state](AsyncResult<ErrorCode> ready) {
+                  auto joined = ready.get();
+                  if (joined != ErrorCode::ok) {
+                    return joined;
+                  }
+                  auto result = state->execute([&] {
+                    if (state->codec_policy && !state->room->snapshot().session) {
+                      (void)state->room->leave_locked();
+                      throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
+                                     "Room codec policy requires participant snapshots");
+                    }
+                    state->reconcile_video_codec_policy();
+                    std::shared_ptr<const FailureInfo> failure;
+                    {
+                      std::lock_guard lock(state->policy_mutex);
+                      failure = state->policy_status.failure;
+                    }
+                    if (failure) {
+                      (void)state->room->leave_locked();
+                      throw SDKError(failure);
+                    }
+                    return ErrorCode::ok;
+                  });
+                  if (result != ErrorCode::ok) {
+                    throw SDKError(
+                        detail::operation_result(result, "join.finalize").failure_record());
+                  }
+                  return result;
+                });
           });
         },
-        impl_->room_observer.get(),
-        [](auto& observer, auto result) { observer.on_join_completed(std::move(result)); });
+        std::move(completion));
   });
 }
 
-ErrorCode RtcEngine::leave() {
+ErrorCode RtcEngine::leave(Completion<void> completion) {
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "room.leave",
         [this]() mutable {
-          return impl_->execute([state = impl_.get()] {
-            auto graphs = state->clear_tracks();
-            auto left = state->room->leave_locked();
-            state->reset_video_codec_policy();
-            return graphs == ErrorCode::ok ? left : graphs;
+          return impl_->lifecycle.submit([this]() mutable {
+            return impl_->execute([state = impl_.get()] {
+              auto graphs = state->clear_tracks();
+              auto left = state->room->leave_locked();
+              state->reset_video_codec_policy();
+              return graphs == ErrorCode::ok ? left : graphs;
+            });
           });
         },
-        impl_->room_observer.get(),
-        [](auto& observer, auto result) { observer.on_leave_completed(std::move(result)); }, true,
-        false);
+        std::move(completion), true, false);
   });
 }
 
-ErrorCode RtcEngine::close() {
+ErrorCode RtcEngine::close(Completion<void> completion) {
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "room.close",
         [this]() mutable {
-          return impl_->execute(
-              [state = impl_.get()] {
-                if (state->closed) {
-                  return ErrorCode::ok;
-                }
-                state->control->closed = true;
-                auto graphs = state->clear_tracks();
-                auto left = state->room->leave_locked();
-                state->reset_video_codec_policy();
-                state->closed = graphs == ErrorCode::ok && left == ErrorCode::ok;
-                return graphs == ErrorCode::ok ? left : graphs;
-              },
-              true);
-        },
-        impl_->room_observer.get(),
-        [](auto& observer, auto result) { observer.on_close_completed(std::move(result)); }, true,
-        true);
-  });
-}
-
-Result<MediaPublication> RtcEngine::start_media(MediaPublishSpec spec,
-                                                std::optional<MediaKind> expected) {
-  return impl_->execute([&]() -> Result<MediaPublication> {
-    if (expected && spec.track.kind != *expected) {
-      return detail::failure_result<MediaPublication>(
-          ErrorCode::invalid_argument, "Publication kind does not match the requested media API");
-    }
-    if (!impl_->media) {
-      return detail::failure_result<MediaPublication>(ErrorCode::unsupported,
-                                                      "RTC media module is not enabled");
-    }
-    impl_->reconcile_video_codec_policy();
-    return impl_->start_media_locked(std::move(spec));
-  });
-}
-
-ErrorCode RtcEngine::publish_media(MediaPublishSpec spec) {
-  const auto track_id = spec.track.id;
-  return detail::control_boundary([&] {
-    return impl_->control->async->submit(
-        "publication.publish" + std::string(":") + track_id,
-        [this, spec = std::move(spec)]() mutable { return start_media(std::move(spec)); },
-        impl_->publication_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_media_publish_completed(track_id, std::move(result));
-        });
-  });
-}
-
-ErrorCode RtcEngine::publish_video(MediaPublishSpec spec) {
-  const auto track_id = spec.track.id;
-  return detail::control_boundary([&] {
-    return impl_->control->async->submit(
-        "publication.publish" + std::string(":") + track_id,
-        [this, spec = std::move(spec)]() mutable {
-          return start_media(std::move(spec), MediaKind::video);
-        },
-        impl_->publication_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_media_publish_completed(track_id, std::move(result));
-        });
-  });
-}
-
-ErrorCode RtcEngine::publish_audio(MediaPublishSpec spec) {
-  const auto track_id = spec.track.id;
-  return detail::control_boundary([&] {
-    return impl_->control->async->submit(
-        "publication.publish" + std::string(":") + track_id,
-        [this, spec = std::move(spec)]() mutable {
-          return start_media(std::move(spec), MediaKind::audio);
-        },
-        impl_->publication_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_media_publish_completed(track_id, std::move(result));
-        });
-  });
-}
-
-ErrorCode RtcEngine::subscribe_media(MediaSubscribeSpec spec) {
-  const auto track_id = spec.track.id;
-  return detail::control_boundary([&] {
-    return impl_->control->async->submit(
-        "subscription.subscribe" + std::string(":") + track_id,
-        [this, spec = std::move(spec)]() mutable {
-          return impl_->execute([&]() -> Result<MediaSubscription> {
-            if (!impl_->media) {
-              return detail::failure_result<MediaSubscription>(ErrorCode::unsupported,
-                                                               "RTC media module is not enabled");
-            }
-            auto& builder = *impl_->media;
-            std::shared_ptr<MediaTrack> track;
-            auto ready = impl_->subscribe_graph(spec.track, [&](auto node) {
-              auto prepared = builder.build_subscribe(std::move(spec), std::move(node));
-              track = std::move(prepared.track);
-              return std::move(prepared.graph);
-            });
-            if (!ready) {
-              return Result<MediaSubscription>::failure(ready.failure_record());
-            }
-            return Result<MediaSubscription>::success({*ready, std::move(track)});
+          return impl_->lifecycle.submit([this]() mutable {
+            return impl_->execute(
+                [state = impl_.get()] {
+                  if (state->closed) {
+                    return ErrorCode::ok;
+                  }
+                  state->control->closed = true;
+                  auto graphs = state->clear_tracks();
+                  auto left = state->room->leave_locked();
+                  state->reset_video_codec_policy();
+                  state->closed = graphs == ErrorCode::ok && left == ErrorCode::ok;
+                  return graphs == ErrorCode::ok ? left : graphs;
+                },
+                true);
           });
         },
-        impl_->subscription_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_media_subscribe_completed(track_id, std::move(result));
-        });
+        std::move(completion), true, true);
   });
 }
 
-ErrorCode RtcEngine::create_shared_input(TrackDescriptor format, MediaInput input) {
+ErrorCode RtcEngine::publish_media(MediaPublishSpec spec, Completion<MediaPublication> completion) {
+  const auto track_id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, spec = std::move(spec)]() mutable {
+          return impl_->lifecycle.submit([this, spec = std::move(spec)]() mutable {
+            return impl_->start_media_async(std::move(spec));
+          });
+        },
+        std::move(completion));
+  });
+}
+
+ErrorCode RtcEngine::publish_video(MediaPublishSpec spec, Completion<MediaPublication> completion) {
+  const auto track_id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, spec = std::move(spec)]() mutable {
+          return impl_->lifecycle.submit([this, spec = std::move(spec)]() mutable {
+            return impl_->start_media_async(std::move(spec), MediaKind::video);
+          });
+        },
+        std::move(completion));
+  });
+}
+
+ErrorCode RtcEngine::publish_audio(MediaPublishSpec spec, Completion<MediaPublication> completion) {
+  const auto track_id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, spec = std::move(spec)]() mutable {
+          return impl_->lifecycle.submit([this, spec = std::move(spec)]() mutable {
+            return impl_->start_media_async(std::move(spec), MediaKind::audio);
+          });
+        },
+        std::move(completion));
+  });
+}
+
+ErrorCode RtcEngine::subscribe_media(MediaSubscribeSpec spec,
+                                     Completion<MediaSubscription> completion) {
+  const auto id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "subscription.subscribe:" + id,
+        [this, spec = std::move(spec)]() mutable {
+          return impl_->lifecycle.submit([this, spec = std::move(spec)]() mutable {
+            if (!impl_->has_media.load()) {
+              return settled(detail::failure_result<MediaSubscription>(
+                  ErrorCode::unsupported, "RTC media module is not enabled"));
+            }
+            auto track = std::make_shared<std::shared_ptr<MediaTrack>>();
+            auto descriptor = spec.track;
+            auto pending = impl_->subscribe_graph_async(
+                std::move(descriptor), [this, spec = std::move(spec), track](auto node) mutable {
+                  auto prepared = impl_->media->build_subscribe(std::move(spec), std::move(node));
+                  *track = std::move(prepared.track);
+                  return std::move(prepared.graph);
+                });
+            return std::move(pending).then(
+                impl_->lifecycle.dispatcher(), [track](AsyncResult<Result<TrackId>> ready) {
+                  auto result = ready.get();
+                  if (!result) {
+                    return Result<MediaSubscription>::failure(result.failure_record());
+                  }
+                  return Result<MediaSubscription>::success({*result, std::move(*track)});
+                });
+          });
+        },
+        std::move(completion));
+  });
+}
+
+ErrorCode RtcEngine::create_shared_input(TrackDescriptor format, MediaInput input,
+                                         Completion<std::shared_ptr<SharedMediaInput>> completion) {
   const auto id = format.id;
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "publication.input:" + id,
         [this, format = std::move(format), input = std::move(input)]() mutable {
-          return create_shared_input_impl(std::move(format), std::move(input));
+          return impl_->lifecycle.submit(
+              [this, format = std::move(format), input = std::move(input)]() mutable {
+                return create_shared_input_impl(std::move(format), std::move(input));
+              });
         },
-        impl_->publication_observer.get(),
-        [id](auto& observer, auto result) {
-          observer.on_shared_input_created(id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
@@ -486,18 +630,18 @@ Result<std::shared_ptr<SharedMediaInput>> RtcEngine::create_shared_input_impl(
   });
 }
 
-ErrorCode RtcEngine::publish(TrackDescriptor descriptor) {
+ErrorCode RtcEngine::publish(TrackDescriptor descriptor, Completion<TrackId> completion) {
   const auto track_id = descriptor.id;
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "publication.publish" + std::string(":") + track_id,
         [this, descriptor = std::move(descriptor)]() mutable {
-          return impl_->execute([&] { return impl_->publish(std::move(descriptor)); });
+          return impl_->lifecycle.submit([this, descriptor = std::move(descriptor)]() mutable {
+            return impl_->publish_graph_async(std::move(descriptor),
+                                              [](auto) { return TrackGraphSpec{}; });
+          });
         },
-        impl_->publication_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_publish_completed(track_id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
@@ -506,148 +650,160 @@ RtcGraphApi RtcEngine::graph() {
 }
 
 ErrorCode RtcGraphApi::publish(TrackDescriptor descriptor,
-                               std::shared_ptr<graphflow::core::GraphNode> sink) {
+                               std::shared_ptr<graphflow::core::GraphNode> sink,
+                               Completion<TrackId> completion) {
   const auto track_id = descriptor.id;
   auto* engine = engine_;
   return detail::control_boundary([&] {
     return engine->impl_->control->async->submit(
         "publication.publish:" + track_id,
         [engine, descriptor = std::move(descriptor), sink = std::move(sink)]() mutable {
-          return engine->impl_->execute(
-              [&] { return engine->impl_->publish(std::move(descriptor), std::move(sink)); });
+          return engine->impl_->lifecycle.submit(
+              [engine, descriptor = std::move(descriptor), sink = std::move(sink)]() mutable {
+                return engine->impl_->publish_graph_async(std::move(descriptor), [sink](auto node) {
+                  TrackGraphSpec spec;
+                  if (sink) {
+                    spec.nodes.push_back(sink);
+                    spec.connections.push_back(
+                        TrackGraphSpec::connect<nodes::SenderFeedbackEvent>(node, sink));
+                  }
+                  return spec;
+                });
+              });
         },
-        engine->impl_->publication_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_publish_completed(track_id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
 ErrorCode RtcGraphApi::subscribe(TrackDescriptor descriptor,
-                                 std::shared_ptr<graphflow::core::GraphNode> consumer) {
+                                 std::shared_ptr<graphflow::core::GraphNode> consumer,
+                                 Completion<TrackId> completion) {
   const auto track_id = descriptor.id;
   auto* engine = engine_;
   return detail::control_boundary([&] {
     return engine->impl_->control->async->submit(
         "subscription.subscribe:" + track_id,
         [engine, descriptor = std::move(descriptor), consumer = std::move(consumer)]() mutable {
-          return engine->impl_->execute(
-              [&] { return engine->impl_->subscribe(std::move(descriptor), std::move(consumer)); });
+          return engine->impl_->lifecycle.submit([engine, descriptor = std::move(descriptor),
+                                                  consumer = std::move(consumer)]() mutable {
+            if (!consumer) {
+              return settled(detail::failure_result<TrackId>(
+                  ErrorCode::invalid_argument, "RTC subscription requires a consumer"));
+            }
+            return engine->impl_->subscribe_graph_async(
+                std::move(descriptor), [consumer](auto node) {
+                  TrackGraphSpec spec;
+                  spec.nodes.push_back(consumer);
+                  spec.connections.push_back(
+                      TrackGraphSpec::connect<nodes::EncodedFrameEvent>(node, consumer));
+                  return spec;
+                });
+          });
         },
-        engine->impl_->subscription_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_subscribe_completed(track_id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
-ErrorCode RtcGraphApi::publish_graph(TrackDescriptor descriptor, PublishGraphFactory factory) {
+ErrorCode RtcGraphApi::publish_graph(TrackDescriptor descriptor, PublishGraphFactory factory,
+                                     Completion<TrackId> completion) {
   const auto track_id = descriptor.id;
   auto* engine = engine_;
   return detail::control_boundary([&] {
     return engine->impl_->control->async->submit(
         "publication.publish:" + track_id,
         [engine, descriptor = std::move(descriptor), factory = std::move(factory)]() mutable {
-          return engine->impl_->execute([&] {
-            return engine->impl_->publish_graph(std::move(descriptor), std::move(factory));
+          return engine->impl_->lifecycle.submit([engine, descriptor = std::move(descriptor),
+                                                  factory = std::move(factory)]() mutable {
+            return engine->impl_->publish_graph_async(std::move(descriptor), std::move(factory));
           });
         },
-        engine->impl_->publication_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_publish_completed(track_id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
-ErrorCode RtcGraphApi::subscribe_graph(TrackDescriptor descriptor, SubscribeGraphFactory factory) {
+ErrorCode RtcGraphApi::subscribe_graph(TrackDescriptor descriptor, SubscribeGraphFactory factory,
+                                       Completion<TrackId> completion) {
   const auto track_id = descriptor.id;
   auto* engine = engine_;
   return detail::control_boundary([&] {
     return engine->impl_->control->async->submit(
         "subscription.subscribe:" + track_id,
         [engine, descriptor = std::move(descriptor), factory = std::move(factory)]() mutable {
-          return engine->impl_->execute([&] {
-            return engine->impl_->subscribe_graph(std::move(descriptor), std::move(factory));
+          return engine->impl_->lifecycle.submit([engine, descriptor = std::move(descriptor),
+                                                  factory = std::move(factory)]() mutable {
+            return engine->impl_->subscribe_graph_async(std::move(descriptor), std::move(factory));
           });
         },
-        engine->impl_->subscription_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_subscribe_completed(track_id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
-ErrorCode RtcEngine::unpublish(const TrackId& id) {
+ErrorCode RtcEngine::unpublish(const TrackId& id, Completion<void> completion) {
   const auto track_id = id;
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "publication.remove" + std::string(":") + track_id,
         [this, id]() mutable {
-          return impl_->execute([state = impl_.get(), id] {
-            state->media_publications.erase(id);
-            auto retired = state->graphs->take(id, true);
-            // Keep graph leases alive until the native remove operation completes.
-            return state->room->unpublish_locked(id);
+          return impl_->lifecycle.submit([this, id]() mutable {
+            impl_->media_publications.erase(id);
+            auto retired =
+                std::make_shared<TrackGraphRegistry::RetiredGraphs>(impl_->graphs->take(id, true));
+            auto pending = impl_->room->unpublish_async(id);
+            return std::move(pending).then(
+                impl_->lifecycle.dispatcher(),
+                [retired](AsyncResult<ErrorCode> ready) { return ready.get(); });
           });
         },
-        impl_->publication_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_unpublish_completed(track_id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
-ErrorCode RtcEngine::unsubscribe(const TrackId& id) {
+ErrorCode RtcEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
   const auto track_id = id;
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "subscription.remove" + std::string(":") + track_id,
         [this, id]() mutable {
-          return impl_->execute([state = impl_.get(), id] {
-            auto retired = state->graphs->take(id, false);
-            // Keep graph leases alive until the native remove operation completes.
-            return state->room->unsubscribe_locked(id);
+          return impl_->lifecycle.submit([this, id]() mutable {
+            auto retired =
+                std::make_shared<TrackGraphRegistry::RetiredGraphs>(impl_->graphs->take(id, false));
+            auto pending = impl_->room->unsubscribe_async(id);
+            return std::move(pending).then(
+                impl_->lifecycle.dispatcher(),
+                [retired](AsyncResult<ErrorCode> ready) { return ready.get(); });
           });
         },
-        impl_->subscription_observer.get(),
-        [track_id](auto& observer, auto result) {
-          observer.on_unsubscribe_completed(track_id, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
-ErrorCode RtcEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
+ErrorCode RtcEngine::set_muted(const TrackId& id, bool muted, Completion<void> completion,
+                               ControlOptions options) {
   const auto track_id = id;
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "publication.mute" + std::string(":") + track_id,
         [this, id, muted, options]() mutable {
-          return impl_->execute([state = impl_.get(), id, muted, options] {
-            return state->room->set_muted_locked(id, muted, options);
+          return impl_->lifecycle.submit([this, id, muted, options]() mutable {
+            return impl_->room->set_muted_async(id, muted, options);
           });
         },
-        impl_->publication_observer.get(),
-        [track_id, muted](auto& observer, auto result) {
-          observer.on_muted_completed(track_id, muted, std::move(result));
-        });
+        std::move(completion));
   });
 }
 
 ErrorCode RtcEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
-                                        ControlOptions options) {
+                                        Completion<void> completion, ControlOptions options) {
   const auto track_id = id;
   return detail::control_boundary([&] {
     return impl_->control->async->submit(
         "subscription.demand" + std::string(":") + track_id,
         [this, id, demand, options]() mutable {
-          return impl_->execute([state = impl_.get(), id, demand, options] {
-            return state->room->set_receive_demand_locked(id, demand, options);
+          return impl_->lifecycle.submit([this, id, demand, options]() mutable {
+            return impl_->room->set_receive_demand_async(id, demand, options);
           });
         },
-        impl_->subscription_observer.get(),
-        [track_id, demand](auto& observer, auto result) {
-          observer.on_receive_demand_completed(track_id, demand, std::move(result));
-        });
+        std::move(completion));
   });
 }
 

@@ -2,7 +2,7 @@
 
 当前分层、帧契约与迁移说明见 [架构说明](docs/architecture.md)。最新的 [源节点分发与任务队列设计](docs/source-driven-runtime.md) 已移除 RtcEngine/pipeline 的 poll 接口。
 
-RTC 控制采用有界异步队列。RtcEngine、RoomEngine 和 RtcGraphApi 立即返回 `ErrorCode` 受理状态，实际结果由上层实现的房间、发布、订阅 observer 分别接收；无 RequestId 或逐调用完成回调。leave/close 可中断协议等待。接口与迁移说明见 [observer 异步控制](docs/rtc-observers.md)。
+RTC 控制采用有界异步队列。RtcEngine、RoomEngine 和 RtcGraphApi 立即返回 `ErrorCode` 受理状态，单次结果由每次调用传入的 Completion 接收，房间、发布、订阅 Observer 仅接收持续事件；无 OperationHandle 或 RequestId。leave/close 可中断协议等待。接口与迁移说明见 [observer 异步控制](docs/rtc-observers.md)。
 
 C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 
@@ -39,7 +39,7 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 轨道以稳定本地 TrackId 路由，服务端 SID 是当前会话绑定。每轨拥有独立队列、预算、反馈和关闭屏障。停止一条轨道不退出房间。已有编码帧可直接写入 PublishedTrack；SubscribedTrack::read() 返回拥有数据的完整编码帧。
 
-RtcEngine 与 RoomEngine 共用控制 worker，独立串行通知队列派发 observer。发布与订阅完成通知携带 `Result<T>`，房间控制通知携带 `OperationResult`。媒体源、编解码和设备输出保留各自有界线程；RoomServices 的数据/RPC/流接口保持独立。UI 使用不可变快照，并将 observer 通知转发到自身线程。
+RtcEngine 与 RoomEngine 共用控制 worker，独立生命周期序列执行媒体启停，串行通知队列派发 Completion 和 Observer。单次结果统一为 `Result<T>` / `Result<void>`。媒体源、编解码和设备输出保留各自有界线程；RoomServices 的数据/RPC/流接口保持独立。UI 使用不可变快照，并将 observer 通知转发到自身线程。
 
 ## RTC 后端目录
 

@@ -10,9 +10,9 @@ namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
 
 // Single-room facade. Network/track controls enqueue work and return admission
-// status, never the operation result. Register observers before submitting.
+// status, never the operation result. Pass a completion for each operation.
 // Same-object/same-kind duplicates return busy. Completion is delivered once per
-// accepted request to its original observer (if alive). See observer.hpp for
+// accepted request to its completion. See completion.hpp for
 // threading/lifetime rules. leave/close interrupt and cancel pending work.
 // Stop application callers before destruction; never destroy from a callback.
 class RtcEngine final {
@@ -28,25 +28,29 @@ class RtcEngine final {
   bool media_enabled() const;
   // Thread-safe local policy observation; not a room-wide transition ACK.
   VideoCodecPolicySnapshot video_codec_policy() const;
-  ErrorCode join(RoomOptions);
+  [[nodiscard]] ErrorCode join(RoomOptions, Completion<void> completion);
   // Cancels preceding requests, then quiesces graphs before leaving.
-  ErrorCode leave();
+  [[nodiscard]] ErrorCode leave(Completion<void> completion = {});
   // Terminal. Further submissions return session_closed.
-  ErrorCode close();
+  [[nodiscard]] ErrorCode close(Completion<void> completion = {});
 
-  ErrorCode publish_media(MediaPublishSpec);
-  ErrorCode publish_video(MediaPublishSpec);
-  ErrorCode publish_audio(MediaPublishSpec);
-  ErrorCode subscribe_media(MediaSubscribeSpec);
-  ErrorCode create_shared_input(TrackDescriptor, MediaInput);
+  [[nodiscard]] ErrorCode publish_media(MediaPublishSpec, Completion<MediaPublication> completion);
+  [[nodiscard]] ErrorCode publish_video(MediaPublishSpec, Completion<MediaPublication> completion);
+  [[nodiscard]] ErrorCode publish_audio(MediaPublishSpec, Completion<MediaPublication> completion);
+  [[nodiscard]] ErrorCode subscribe_media(MediaSubscribeSpec,
+                                          Completion<MediaSubscription> completion);
+  [[nodiscard]] ErrorCode create_shared_input(
+      TrackDescriptor, MediaInput, Completion<std::shared_ptr<SharedMediaInput>> completion);
 
   // Encoded publication. Advanced graph composition requires graph_api.hpp.
-  ErrorCode publish(TrackDescriptor);
+  [[nodiscard]] ErrorCode publish(TrackDescriptor, Completion<TrackId> completion);
   RtcGraphApi graph();
-  ErrorCode unpublish(const TrackId&);
-  ErrorCode unsubscribe(const TrackId&);
-  ErrorCode set_muted(const TrackId&, bool, ControlOptions = {});
-  ErrorCode set_receive_demand(const TrackId&, ReceiveDemand, ControlOptions = {});
+  [[nodiscard]] ErrorCode unpublish(const TrackId&, Completion<void> completion);
+  [[nodiscard]] ErrorCode unsubscribe(const TrackId&, Completion<void> completion);
+  [[nodiscard]] ErrorCode set_muted(const TrackId&, bool, Completion<void> completion,
+                                    ControlOptions = {});
+  [[nodiscard]] ErrorCode set_receive_demand(const TrackId&, ReceiveDemand,
+                                             Completion<void> completion, ControlOptions = {});
   // Producer threads may write; closed/absent publications return WriteStatus::closed.
   WriteStatus write(const TrackId&, EncodedFrame);
   TrackSnapshot publication(const TrackId&) const;
@@ -62,7 +66,6 @@ class RtcEngine final {
 
  private:
   friend class RtcGraphApi;
-  Result<MediaPublication> start_media(MediaPublishSpec, std::optional<MediaKind> expected = {});
   Result<std::shared_ptr<SharedMediaInput>> create_shared_input_impl(TrackDescriptor, MediaInput);
   struct Impl;
   std::unique_ptr<Impl> impl_;

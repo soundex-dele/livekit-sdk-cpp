@@ -77,7 +77,8 @@ void eventually(F predicate, const char* message) {
 void completion_dispatch_failure_contract() {
   using livekit::sdk::ErrorCode;
   // Exercise queue rejection, silent task destruction and observer exceptions.
-  for (int mode = 0; mode < 3; ++mode) {
+  for (int scenario = 0; scenario < 6; ++scenario) {
+    const int mode = scenario % 3;
     SessionControl control;
     std::atomic<int> dispatched{0}, failures{0}, completed{0};
     auto observer = std::make_shared<int>(0);
@@ -94,9 +95,23 @@ void completion_dispatch_failure_contract() {
         },
         [] {}, [&](auto) { ++failures; });
     const auto submit = [&] {
+      if (scenario >= 3) {
+        return queue.submit(
+            "same-key",
+            [] {
+              livekit::sdk::CompletionSource<ErrorCode> source;
+              auto pending = source.get_result();
+              source.set_value(ErrorCode::ok);
+              return pending;
+            },
+            [&](auto) {
+              ++completed;
+              throw std::runtime_error("observer failure");
+            });
+      }
       return queue.submit(
-          "same-key", [] { return ErrorCode::ok; }, std::weak_ptr(observer),
-          [&](auto&, auto) {
+          "same-key", [] { return ErrorCode::ok; },
+          [&](auto) {
             ++completed;
             throw std::runtime_error("observer failure");
           });
@@ -124,8 +139,7 @@ void completion_lease_reuse_contract() {
       },
       [] {});
   const auto submit = [&] {
-    return queue.submit(
-        "reused", [] { return ErrorCode::ok; }, std::weak_ptr(observer), [](auto&, auto) {});
+    return queue.submit("reused", [] { return ErrorCode::ok; }, [](auto) {});
   };
   const auto take = [&] {
     AsyncControl::Task result;
@@ -153,6 +167,145 @@ void completion_lease_reuse_contract() {
   queue.shutdown();
 }
 
+void deferred_control_lanes_contract() {
+  using livekit::sdk::CompletionSource;
+  using livekit::sdk::ErrorCode;
+  SessionControl control;
+  auto observer = std::make_shared<int>(0);
+  std::atomic<bool> started{false}, independent{false}, same_lane{false}, completed{false};
+  std::atomic<bool> wrong_thread{false};
+  std::thread::id worker;
+  AsyncControl queue(control, [](auto task) { task(); }, [] {});
+  // Sources outlive their initiation lambdas and settle before queue destruction,
+  // including assertion unwinding; no test failure can strand the queue.
+  CompletionSource<ErrorCode> delayed;
+  check(queue.submit(
+            "publication.publish:a",
+            [&] {
+              worker = std::this_thread::get_id();
+              started = true;
+              return delayed.get_result();
+            },
+            [&](auto result) {
+              if (std::this_thread::get_id() != worker) {
+                wrong_thread = true;
+              }
+              completed = result.has_value();
+            }) == ErrorCode::ok,
+        "Deferred publication rejected");
+  eventually([&] { return started.load(); }, "Deferred initiation missing");
+  check(queue.submit(
+            "publication.mute:a",
+            [&] {
+              same_lane = true;
+              return ErrorCode::ok;
+            },
+            [](auto) {}) == ErrorCode::ok,
+        "Same-track operation rejected");
+  check(queue.submit(
+            "publication.publish:b",
+            [&] {
+              if (std::this_thread::get_id() != worker) {
+                wrong_thread = true;
+              }
+              independent = true;
+              return ErrorCode::ok;
+            },
+            [](auto) {}) == ErrorCode::ok,
+        "Independent operation rejected");
+  eventually([&] { return independent.load(); }, "Slow ACK blocked an independent lane");
+  check(!same_lane && !completed, "Same-track work passed an unsettled operation");
+  check(queue.submit(
+            "publication.publish:a", [] { return ErrorCode::ok; }, [](auto) {}) == ErrorCode::busy,
+        "Deferred operation lost its admission identity");
+  delayed.set_value(ErrorCode::ok);
+  eventually([&] { return same_lane.load() && completed.load(); },
+             "Deferred settlement did not release its lane");
+  queue.shutdown();
+  check(!wrong_thread, "Deferred completion escaped the control worker");
+}
+
+void deferred_control_fence_contract() {
+  using livekit::sdk::CompletionSource;
+  using livekit::sdk::ErrorCode;
+  SessionControl control;
+  auto observer = std::make_shared<int>(0);
+  std::atomic<bool> joining{false}, published{false}, left{false};
+  std::atomic<int> cancelled{0};
+  AsyncControl queue(control, [](auto task) { task(); }, [] {});
+  CompletionSource<ErrorCode> join;
+  check(queue.submit(
+            "room.join",
+            [&] {
+              joining = true;
+              return join.get_result();
+            },
+            [](auto) {}) == ErrorCode::ok,
+        "Deferred join rejected");
+  eventually([&] { return joining.load(); }, "Join did not initiate");
+  check(queue.submit(
+            "publication.publish:a",
+            [&] {
+              published = true;
+              return ErrorCode::ok;
+            },
+            [&](auto result) {
+              if (!result && result.error().code == ErrorCode::cancelled) {
+                ++cancelled;
+              }
+            }) == ErrorCode::ok,
+        "Post-join command rejected");
+  check(queue.submit(
+            "room.leave",
+            [&] {
+              left = true;
+              return ErrorCode::ok;
+            },
+            [](auto) {}, true) == ErrorCode::ok,
+        "Leave barrier rejected");
+  check(control.interrupted && !published && !left, "Join fence or cancellation barrier failed");
+  join.set_value(ErrorCode::cancelled);
+  eventually([&] { return left.load(); }, "Leave did not drain active deferred operation");
+  queue.shutdown();
+  check(!published && cancelled == 1, "Queued command ran through a cancellation barrier");
+}
+
+void deferred_control_failure_contract() {
+  using livekit::sdk::CompletionSource;
+  using livekit::sdk::ErrorCode;
+  SessionControl control;
+  auto observer = std::make_shared<int>(0);
+  std::atomic<int> started{0}, completed{0}, failures{0};
+  std::atomic<bool> wrong_failure{false};
+  AsyncControl queue(control, [](auto task) { task(); }, [] {}, [&](auto) { ++failures; });
+  CompletionSource<ErrorCode> first, second;
+  const auto submit = [&](const char* key, auto& source, ErrorCode expected) {
+    return queue.submit(
+        key,
+        [&] {
+          ++started;
+          return source.get_result();
+        },
+        [&, expected](auto result) {
+          if (result || result.error().code != expected) {
+            wrong_failure = true;
+          }
+          ++completed;
+        });
+  };
+  check(submit("publication.mute:a", first, ErrorCode::invalid_argument) == ErrorCode::ok &&
+            submit("publication.mute:b", second, ErrorCode::timeout) == ErrorCode::ok,
+        "Concurrent failure controls rejected");
+  eventually([&] { return started == 2; }, "Deferred controls did not overlap");
+  second.set_exception(std::make_exception_ptr(livekit::sdk::SDKError(
+      livekit::sdk::ErrorDomain::protocol, ErrorCode::timeout, "second timeout")));
+  first.set_exception(std::make_exception_ptr(livekit::sdk::SDKError(
+      livekit::sdk::ErrorDomain::protocol, ErrorCode::invalid_argument, "first rejected")));
+  eventually([&] { return completed == 2; }, "Deferred failures did not complete");
+  queue.shutdown();
+  check(!wrong_failure && failures == 0, "Concurrent deferred failures lost their diagnostics");
+}
+
 void maintenance_capacity_contract() {
   using livekit::sdk::ErrorCode;
   SessionControl control;
@@ -174,7 +327,7 @@ void maintenance_capacity_contract() {
               released.wait();
               return ErrorCode::ok;
             },
-            std::weak_ptr(observer), [](auto&, auto) {}) == ErrorCode::ok,
+            [](auto) {}) == ErrorCode::ok,
         "First request rejected");
   get(started.get_future());
   for (int i = 0; i < 127; ++i) {
@@ -187,7 +340,7 @@ void maintenance_capacity_contract() {
                 ++following;
                 return ErrorCode::ok;
               },
-              std::weak_ptr(observer), [](auto&, auto) {}) == ErrorCode::ok,
+              [](auto) {}) == ErrorCode::ok,
           "Queue filled prematurely");
   }
   for (int i = 0; i < 1000; ++i) {
@@ -246,6 +399,7 @@ struct Harness {
   std::set<TrackId> send_failures;
   bool confirm = true, connect = true;
   bool defer_removal = false;
+  std::shared_future<void> stop_gate;
   std::vector<RoomTransport::Removed> removal_completions;
   int starts = 0, stops = 0;
   std::thread::id owner, publishing_thread, subscribing_thread, removing_thread, stopping_thread;
@@ -361,9 +515,16 @@ class FakeTransport : public RoomTransport {
   }
 
   void stop() noexcept override {
-    std::lock_guard lock(h->mutex);
-    h->stopping_thread = std::this_thread::get_id();
-    ++h->stops;
+    std::shared_future<void> gate;
+    {
+      std::lock_guard lock(h->mutex);
+      h->stopping_thread = std::this_thread::get_id();
+      ++h->stops;
+      gate = h->stop_gate;
+    }
+    if (gate.valid()) {
+      gate.wait();
+    }
   }
 
  private:
@@ -507,10 +668,9 @@ void asynchronous_detachment() {
       "Removal missing");
   auto repeated = async_control([&] { return room.unpublish("reused"); });
   auto muted = async_control([&] { return peer->set_muted(true); });
-  check(first.wait_for(20ms) == std::future_status::timeout &&
-            repeated.wait_for(20ms) == std::future_status::timeout &&
-            muted.wait_for(20ms) == std::future_status::timeout,
-        "Control bypassed detachment barrier");
+  const bool retained = first.wait_for(20ms) == std::future_status::timeout &&
+                        repeated.wait_for(20ms) == std::future_status::timeout;
+  const bool independent = muted.wait_for(2s) == std::future_status::ready;
   {
     std::lock_guard lock(h->mutex);
     h->removal_completions.front()({});
@@ -519,6 +679,8 @@ void asynchronous_detachment() {
   get(std::move(first));
   get(std::move(repeated));
   get(std::move(muted));
+  check(retained, "Same-endpoint close bypassed detachment barrier");
+  check(independent, "Native detach blocked another endpoint's synchronous mute");
   auto replacement = get(room.publish(video("reused")));
   get(original->close());
   check(replacement->snapshot().state == TrackState::ready, "Old handle closed replacement");
@@ -2592,20 +2754,20 @@ struct RoomProbe final : RoomObserver {
   std::function<void()> after_join;
   std::shared_ptr<const livekit::sdk::FailureInfo> failure;
 
-  void on_join_completed(const OperationResult& result) override {
-    failure = result.failure;
-    log->add("join", result.code);
+  void on_join_completed(const Result<void>& result) {
+    failure = result ? nullptr : result.failure_record();
+    log->add("join", (result ? livekit::sdk::ErrorCode::ok : result.error().code));
     if (result && after_join) {
       after_join();
     }
   }
 
-  void on_leave_completed(const OperationResult& r) override {
-    log->add("leave", r.code);
+  void on_leave_completed(const Result<void>& r) {
+    log->add("leave", (r ? livekit::sdk::ErrorCode::ok : r.error().code));
   }
 
-  void on_close_completed(const OperationResult& r) override {
-    log->add("close", r.code);
+  void on_close_completed(const Result<void>& r) {
+    log->add("close", (r ? livekit::sdk::ErrorCode::ok : r.error().code));
   }
 };
 
@@ -2615,29 +2777,197 @@ struct PublicationProbe final : PublicationObserver {
   std::shared_ptr<ObserverLog> log;
   std::shared_ptr<PublishedTrack> track;
 
-  void on_publish_completed(const TrackId& id, Result<std::shared_ptr<PublishedTrack>> r) override {
+  void on_publish_completed(const TrackId& id, Result<std::shared_ptr<PublishedTrack>> r) {
     if (r) {
       track = *r;
     }
     log->add("publish:" + id, r ? livekit::sdk::ErrorCode::ok : r.error().code);
   }
 
-  void on_unpublish_completed(const TrackId& id, const OperationResult& r) override {
-    log->add("remove:" + id, r.code);
+  void on_muted_completed(const TrackId& id, bool, const Result<void>& r) {
+    log->add("mute:" + id, (r ? livekit::sdk::ErrorCode::ok : r.error().code));
+  }
+
+  void on_unpublish_completed(const TrackId& id, const Result<void>& r) {
+    log->add("remove:" + id, (r ? livekit::sdk::ErrorCode::ok : r.error().code));
   }
 };
+
+struct SubscriptionProbe final : SubscriptionObserver {
+  explicit SubscriptionProbe(std::shared_ptr<ObserverLog> log) : log(std::move(log)) {}
+
+  std::shared_ptr<ObserverLog> log;
+
+  void on_subscribe_completed(const TrackId& id, Result<std::shared_ptr<SubscribedTrack>> r) {
+    log->add("subscribe:" + id, r ? livekit::sdk::ErrorCode::ok : r.error().code);
+  }
+};
+
+template <class Probe>
+auto completed(std::shared_ptr<Probe> probe, const std::string& operation, TrackId id = {}) {
+  return [probe = std::move(probe), operation, id](auto result) {
+    if constexpr (std::is_same_v<Probe, RoomProbe>) {
+      if (operation == "join")
+        probe->on_join_completed(result);
+      else if (operation == "leave")
+        probe->on_leave_completed(result);
+      else
+        probe->on_close_completed(result);
+    } else if constexpr (std::is_same_v<Probe, SubscriptionProbe>) {
+      probe->on_subscribe_completed(id, std::move(result));
+    } else if constexpr (std::is_same_v<decltype(result), Result<void>>) {
+      probe->log->add(operation + ":" + id,
+                      result ? livekit::sdk::ErrorCode::ok : result.error().code);
+    } else {
+      probe->on_publish_completed(id, std::move(result));
+    }
+  };
+}
+
+template <class Engine = RoomEngine, class Publication = PublicationProbe>
+void room_independent_protocol_contract() {
+  using livekit::sdk::ErrorCode;
+  auto h = std::make_shared<Harness>();
+  auto log = std::make_shared<ObserverLog>();
+  auto room_probe = std::make_shared<RoomProbe>(log);
+  auto publication = std::make_shared<Publication>(log);
+  auto subscription = std::make_shared<SubscriptionProbe>(log);
+  Engine room([h] { return std::make_unique<FakeTransport>(h); });
+  room.set_room_observer(room_probe);
+  room.set_publication_observer(publication);
+  if constexpr (std::is_same_v<Engine, RoomEngine>) {
+    room.set_subscription_observer(subscription);
+  }
+  auto opts = options();
+  opts.operation_timeout = 10s;
+  check(room.join(opts, completed(room_probe, "join")) == ErrorCode::ok &&
+            log->take("join") == ErrorCode::ok,
+        "Join failed");
+  {
+    std::lock_guard lock(h->mutex);
+    h->confirm = false;
+  }
+  check(room.publish(video("slow"), completed(publication, "publish", (video("slow")).id)) ==
+            ErrorCode::ok,
+        "Slow publication rejected");
+  check(room.set_muted("slow", true, completed(publication, "mute", "slow")) == ErrorCode::ok,
+        "Same-lane mute rejected");
+  check(room.publish(video("fast"), completed(publication, "publish", (video("fast")).id)) ==
+            ErrorCode::ok,
+        "Independent publication rejected");
+  BindingToken slow, fast;
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        if (h->published.size() != 2) {
+          return false;
+        }
+        slow = h->published[0];
+        fast = h->published[1];
+        return true;
+      },
+      "Slow publication ACK blocked another publication");
+  h->push({TransportEventKind::published, fast, "fast-sid"});
+  check(log->take("publish:fast") == ErrorCode::ok, "Independent publish did not finish first");
+  check(room.set_muted("fast", true, completed(publication, "mute", "fast")) == ErrorCode::ok,
+        "Independent mute rejected");
+  check(log->take("mute:fast") == ErrorCode::ok, "Slow publication blocked another track's mute");
+  {
+    std::lock_guard lock(h->mutex);
+    check(h->mutes.size() == 1 && h->mutes[0].binding.id == "fast",
+          "Same-track mute ran before publication settled");
+    h->confirm = true;
+  }
+  if constexpr (std::is_same_v<Engine, RoomEngine>) {
+    check(room.subscribe(video("receive"), completed(subscription, "subscribe", "receive")) ==
+                  ErrorCode::ok &&
+              log->take("subscribe:receive") == ErrorCode::ok,
+          "Slow publication blocked subscription");
+  }
+  h->push({TransportEventKind::published, slow, "slow-sid"});
+  check(log->take("publish:slow") == ErrorCode::ok && log->take("mute:slow") == ErrorCode::ok,
+        "Same-track order did not resume after ACK");
+  {
+    std::lock_guard lock(h->mutex);
+    h->defer_removal = true;
+  }
+  check(room.unpublish("slow", completed(publication, "remove", "slow")) == ErrorCode::ok,
+        "Delayed removal rejected");
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->removal_completions.size() == 1;
+      },
+      "Native removal did not start");
+  check(room.publish(video("slow"), completed(publication, "publish", (video("slow")).id)) ==
+            ErrorCode::ok,
+        "Replacement publication rejected");
+  check(room.publish(video("independent"), completed(publication, "publish",
+                                                     (video("independent")).id)) == ErrorCode::ok &&
+            log->take("publish:independent") == ErrorCode::ok,
+        "Native detachment blocked unrelated publication");
+  RoomTransport::Removed removed;
+  {
+    std::lock_guard lock(h->mutex);
+    check(h->published.size() == 3, "Replacement passed the native detach barrier");
+    removed = std::move(h->removal_completions[0]);
+  }
+  removed({});
+  check(log->take("remove:slow") == ErrorCode::ok && log->take("publish:slow") == ErrorCode::ok,
+        "Native detach did not resume same-track replacement");
+  {
+    std::lock_guard lock(h->mutex);
+    h->confirm = false;
+  }
+  check(room.publish(video("cancel-a"),
+                     completed(publication, "publish", (video("cancel-a")).id)) == ErrorCode::ok &&
+            room.publish(video("cancel-b"), completed(publication, "publish",
+                                                      (video("cancel-b")).id)) == ErrorCode::ok,
+        "Concurrent cancellation rejected");
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->published.size() == 6;
+      },
+      "Cancellation fixture did not start both protocol waits");
+  // Destruction of the promise also opens the gate during assertion unwinding.
+  std::promise<void> release_stop;
+  {
+    std::lock_guard lock(h->mutex);
+    h->stop_gate = release_stop.get_future().share();
+  }
+  check(room.close(completed(room_probe, "close")) == ErrorCode::ok, "Close barrier rejected");
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->stops == 1;
+      },
+      "Close did not enter the native stop barrier");
+  bool premature = false;
+  {
+    std::lock_guard lock(log->mutex);
+    premature = !log->values.empty();
+  }
+  release_stop.set_value();
+  check(!premature, "Cancellation completed before native stop finished");
+  check(log->take("publish:cancel-a") == ErrorCode::cancelled &&
+            log->take("publish:cancel-b") == ErrorCode::cancelled &&
+            log->take("close") == ErrorCode::ok,
+        "Close did not drain concurrent protocol waits");
+}
+
 #ifdef LIVEKIT_TEST_RTC_NODES
 struct RtcPublicationProbe final : engine::PublicationObserver {
   explicit RtcPublicationProbe(std::shared_ptr<ObserverLog> log) : log(std::move(log)) {}
 
   std::shared_ptr<ObserverLog> log;
 
-  void on_publish_completed(const TrackId& id, Result<TrackId> r) override {
+  void on_publish_completed(const TrackId& id, Result<TrackId> r) {
     log->add("publish:" + id, r ? livekit::sdk::ErrorCode::ok : r.error().code);
   }
 
-  void on_unpublish_completed(const TrackId& id, const OperationResult& r) override {
-    log->add("remove:" + id, r.code);
+  void on_unpublish_completed(const TrackId& id, const Result<void>& r) {
+    log->add("remove:" + id, (r ? livekit::sdk::ErrorCode::ok : r.error().code));
   }
 };
 #endif
@@ -2651,24 +2981,29 @@ void observer_control_contract() {
   auto room = std::make_shared<RoomProbe>(log);
   auto publication = std::make_shared<Publication>(log);
   Engine engine([h] { return std::make_unique<FakeTransport>(h); });
-  check(engine.join(options()) == ErrorCode::invalid_state, "Request without observer accepted");
+  check(engine.join(options(), {}) == ErrorCode::invalid_argument,
+        "Request without completion accepted");
   engine.set_room_observer(room);
   engine.set_publication_observer(publication);
   auto opts = options();
   opts.operation_timeout = 10s;
   const auto started = SteadyClock::now();
-  check(engine.join(opts) == ErrorCode::ok, "Join admission failed");
+  check(engine.join(opts, completed(room, "join")) == ErrorCode::ok, "Join admission failed");
   check(SteadyClock::now() - started < 250ms, "Join waited for the network");
-  check(engine.join(opts) == ErrorCode::busy, "Duplicate join accepted");
+  check(engine.join(opts, completed(room, "join")) == ErrorCode::busy, "Duplicate join accepted");
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
         return h->starts == 1;
       },
       "Join not dispatched");
-  check(engine.publish(video("cancelled")) == ErrorCode::ok, "Queued publication rejected");
-  check(engine.publish(video("cancelled")) == ErrorCode::busy, "Duplicate publication accepted");
-  check(engine.leave() == ErrorCode::ok, "Leave admission failed");
+  check(engine.publish(video("cancelled"),
+                       completed(publication, "publish", (video("cancelled")).id)) == ErrorCode::ok,
+        "Queued publication rejected");
+  check(engine.publish(video("cancelled"), completed(publication, "publish",
+                                                     (video("cancelled")).id)) == ErrorCode::busy,
+        "Duplicate publication accepted");
+  check(engine.leave(completed(room, "leave")) == ErrorCode::ok, "Leave admission failed");
   check(log->take("join") == ErrorCode::cancelled, "Leave did not interrupt join");
   check(log->take("publish:cancelled") == ErrorCode::cancelled, "Queued request lost cancellation");
   check(log->take("leave") == ErrorCode::ok, "Leave did not finish");
@@ -2678,18 +3013,25 @@ void observer_control_contract() {
     h->connect = true;
   }
   std::atomic<ErrorCode> admission{ErrorCode::internal_error};
-  room->after_join = [&] { admission = engine.publish(video("from-observer")); };
-  check(engine.join(opts) == ErrorCode::ok, "Rejoin rejected");
+  room->after_join = [&] {
+    admission = engine.publish(video("from-observer"),
+                               completed(publication, "publish", (video("from-observer")).id));
+  };
+  check(engine.join(opts, completed(room, "join")) == ErrorCode::ok, "Rejoin rejected");
   check(log->take("join") == ErrorCode::ok, "Rejoin failed");
   check(log->take("publish:from-observer") == ErrorCode::ok && admission == ErrorCode::ok,
         "Observer could not submit the next operation");
-  check(engine.unpublish("from-observer") == ErrorCode::ok, "Unpublish rejected");
+  check(engine.unpublish("from-observer", completed(publication, "remove", "from-observer")) ==
+            ErrorCode::ok,
+        "Unpublish rejected");
   check(log->take("remove:from-observer") == ErrorCode::ok, "Unpublish completion missing");
   {
     std::lock_guard lock(h->mutex);
     h->confirm = false;
   }
-  check(engine.publish(video("late")) == ErrorCode::ok, "Delayed publish rejected");
+  check(engine.publish(video("late"), completed(publication, "publish", (video("late")).id)) ==
+            ErrorCode::ok,
+        "Delayed publish rejected");
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -2711,12 +3053,17 @@ void observer_control_contract() {
     std::lock_guard lock(replacement_log->mutex);
     check(replacement_log->values.empty(), "Replacement received an old result");
   }
-  check(engine.publish(video("expired")) == ErrorCode::ok, "Expiring observer request rejected");
+  check(engine.publish(video("expired"),
+                       completed(publication, "publish", (video("expired")).id)) == ErrorCode::ok,
+        "Expiring observer request rejected");
   replacement.reset();
-  check(engine.close() == ErrorCode::ok, "Close rejected");
+  check(engine.close(completed(room, "close")) == ErrorCode::ok, "Close rejected");
+  check(log->take("publish:expired") == ErrorCode::cancelled,
+        "Observer destruction lost completion");
   check(log->take("close") == ErrorCode::ok, "Close did not complete after observer destruction");
-  check(engine.join(opts) == ErrorCode::session_closed, "Closed engine accepted control");
-  check(engine.close() == ErrorCode::session_closed,
+  check(engine.join(opts, completed(room, "join")) == ErrorCode::session_closed,
+        "Closed engine accepted control");
+  check(engine.close(completed(room, "close")) == ErrorCode::session_closed,
         "Repeated close accepted without a completion");
   {
     std::lock_guard lock(log->mutex);
@@ -2738,15 +3085,20 @@ void observer_capacity_and_destruction(bool close_first) {
   room->set_publication_observer(publication);
   auto opts = options();
   opts.operation_timeout = 10s;
-  check(room->join(opts) == ErrorCode::ok, "Join rejected");
+  check(room->join(opts, completed(observer, "join")) == ErrorCode::ok, "Join rejected");
   for (int i = 0; i < 127; ++i) {
-    check(room->publish(video("queued-" + std::to_string(i))) == ErrorCode::ok,
+    check(room->publish(video("queued-" + std::to_string(i)),
+                        completed(publication, "publish",
+                                  (video("queued-" + std::to_string(i))).id)) == ErrorCode::ok,
           "Queue filled prematurely");
   }
-  check(room->publish(video("overflow")) == ErrorCode::resource_exhausted,
-        "Unbounded command queue");
+  check(
+      room->publish(video("overflow"), completed(publication, "publish", (video("overflow")).id)) ==
+          ErrorCode::resource_exhausted,
+      "Unbounded command queue");
   if (close_first) {
-    check(room->close() == ErrorCode::ok, "Full queue prevented close admission");
+    check(room->close(completed(observer, "close")) == ErrorCode::ok,
+          "Full queue prevented close admission");
     check(log->take("close") == ErrorCode::ok, "Reserved close slot did not complete");
   }
   // Destruction cancels both active and queued work and drains all completions.
@@ -2771,12 +3123,91 @@ void observer_structured_failure() {
       "backend unavailable", false, 503});
   RoomEngine room([failure]() -> std::unique_ptr<RoomTransport> { throw SDKError(failure); });
   room.set_room_observer(observer);
-  check(room.join(options()) == ErrorCode::ok, "Backend failure confused admission with completion");
+  check(room.join(options(), completed(observer, "join")) == ErrorCode::ok,
+        "Backend failure confused admission with completion");
   check(log->take("join") == ErrorCode::unsupported, "Observer lost backend code");
   check(observer->failure && observer->failure->id == failure->id &&
             observer->failure->backend_reason == 503 &&
             observer->failure->domain == ErrorDomain::transport,
         "Void completion lost structured failure details");
+}
+
+template <class Engine>
+void completion_thread_contract() {
+  using livekit::sdk::ErrorCode;
+  auto h = std::make_shared<Harness>();
+  std::promise<Result<void>> closed;
+  std::atomic<bool> callback_thread{false};
+  std::atomic<ErrorCode> close_admission{ErrorCode::internal_error};
+  // No observer is registered. Per-operation callbacks own their context.
+  Engine engine([h] { return std::make_unique<FakeTransport>(h); });
+  auto token = std::make_shared<int>(42);
+  std::weak_ptr<int> retained = token;
+  check(engine.join(options(),
+                    [&, token](Result<void> result) {
+                      callback_thread = is_callback_thread() && *token == 42;
+                      if (!result) {
+                        closed.set_value(std::move(result));
+                        return;
+                      }
+                      close_admission = engine.close(
+                          [&](Result<void> done) { closed.set_value(std::move(done)); });
+                    }) == ErrorCode::ok,
+        "Join required an observer");
+  token.reset();
+  get(closed.get_future());
+  check(callback_thread && close_admission == ErrorCode::ok,
+        "Completion could not close asynchronously from its notification thread");
+  eventually([&] { return retained.expired(); }, "Delivered completion retained its capture");
+  check(engine.close() == ErrorCode::session_closed, "Repeated close accepted");
+  Engine unused([h] { return std::make_unique<FakeTransport>(h); });
+  check(unused.close() == ErrorCode::ok, "Close without callback or observer rejected");
+}
+
+void completion_blocks_only_notifications() {
+  using livekit::sdk::ErrorCode;
+  auto h = std::make_shared<Harness>();
+  std::promise<void> entered, release;
+  auto gate = release.get_future().share();
+  std::promise<Result<void>> closed;
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  check(room.join(options(),
+                  [&](Result<void> result) {
+                    entered.set_value();
+                    gate.wait();  // Simulate a slow callback; it does not wait for any SDK result.
+                  }) == ErrorCode::ok,
+        "Join rejected");
+  get(entered.get_future());
+  check(room.close([&](Result<void> result) { closed.set_value(std::move(result)); }) ==
+            ErrorCode::ok,
+        "Close from another thread rejected");
+  bool stopped = false;
+  const auto deadline = SteadyClock::now() + 2s;
+  while (!stopped && SteadyClock::now() < deadline) {
+    {
+      std::lock_guard lock(h->mutex);
+      stopped = h->stops != 0;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  release.set_value();
+  check(stopped, "Resource shutdown waited for the user notification callback");
+  get(closed.get_future());
+}
+
+void blocking_bridge_rejects_completion_waits() {
+  using livekit::sdk::ErrorCode;
+  auto h = std::make_shared<Harness>();
+  std::promise<ErrorCode> rejected;
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
+  check(room.raw().join(options(), [&](Result<void>) { rejected.set_value(room.leave()); }) ==
+            ErrorCode::ok,
+        "Join rejected");
+  auto result = rejected.get_future();
+  check(
+      result.wait_for(2s) == std::future_status::ready && result.get() == ErrorCode::invalid_thread,
+      "Blocking bridge waited inside a raw completion");
+  get(room.close());
 }
 
 // Every protocol completion is driven independently of the operation lock.
@@ -2910,8 +3341,8 @@ void caller_thread_contract() {
         "Subscribe did not execute on the control worker");
   check(room.unpublish("direct") == ErrorCode::ok && h->removing_thread == h->owner,
         "Remove did not execute on the control worker");
-  check(room.leave() == ErrorCode::ok && h->stopping_thread == h->owner,
-        "Leave did not execute on the control worker");
+  check(room.leave() == ErrorCode::ok && h->stopping_thread != caller,
+        "Leave stopped resources on the application thread");
   livekit::sdk::app_support::BlockingRoom invalid(
       livekit::sdk::app_support::BlockingRoom::TransportFactory{});
   check(invalid.join({}) == ErrorCode::invalid_argument,
@@ -3004,12 +3435,21 @@ int main() {
     completion_dispatch_failure_contract();
     completion_lease_reuse_contract();
     maintenance_capacity_contract();
+    deferred_control_lanes_contract();
+    deferred_control_fence_contract();
+    deferred_control_failure_contract();
     observer_control_contract<RoomEngine, PublicationProbe>();
     observer_capacity_and_destruction(false);
     observer_capacity_and_destruction(true);
     observer_structured_failure();
+    completion_thread_contract<RoomEngine>();
+    completion_blocks_only_notifications();
+    blocking_bridge_rejects_completion_waits();
+    room_independent_protocol_contract<>();
 #ifdef LIVEKIT_TEST_RTC_NODES
     observer_control_contract<engine::RtcEngine, RtcPublicationProbe>();
+    completion_thread_contract<engine::RtcEngine>();
+    room_independent_protocol_contract<engine::RtcEngine, RtcPublicationProbe>();
 #endif
     caller_thread_contract();
     serialized_join_leave();
