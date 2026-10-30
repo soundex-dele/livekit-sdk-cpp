@@ -295,32 +295,6 @@ struct MediaTrack::State {
 };
 
 MediaTrackSnapshot MediaTrack::snapshot() const {
-  if (pending_) {
-    std::shared_ptr<MediaTrack> track;
-    std::exception_ptr failure;
-    MediaTrackSnapshot result;
-    {
-      std::lock_guard lock(pending_->mutex);
-      track = pending_->track;
-      failure = pending_->failure;
-      result.transport.id = pending_->descriptor.id;
-    }
-    if (track) {
-      result = track->snapshot();
-    }
-    if (failure) {
-      result.transport.state = TrackState::failed;
-      result.transport.failure = describe_failure(failure);
-      try {
-        std::rethrow_exception(failure);
-      } catch (const std::exception& error) {
-        result.transport.error = error.what();
-      } catch (...) {
-        result.transport.error = "Media operation failed";
-      }
-    }
-    return result;
-  }
   const auto& s = *state_;
   std::lock_guard lock(s.mutex);
   MediaTrackSnapshot result;
@@ -390,24 +364,8 @@ MediaTrackSnapshot MediaTrack::snapshot() const {
   return result;
 }
 
-void MediaTrack::throw_if_failed() const {
-  if (pending_) {
-    std::shared_ptr<MediaTrack> track;
-    std::exception_ptr failure;
-    {
-      std::lock_guard lock(pending_->mutex);
-      track = pending_->track;
-      failure = pending_->failure;
-    }
-    if (failure) {
-      std::rethrow_exception(failure);
-    }
-    if (track) {
-      track->throw_if_failed();
-    }
-    return;
-  }
-  state_->check();
+Result<void> MediaTrack::check() const {
+  return detail::control_boundary([&] { state_->check(); });
 }
 
 RtcMediaEngine::RtcMediaEngine(RtcPipelineEngine& engine, AudioOutputOptions options)
@@ -419,9 +377,9 @@ RtcMediaEngine::RtcMediaEngine(RtcPipelineEngine& engine, AudioOutputOptions opt
       }())),
       engine_(&engine) {}
 
-AsyncResult<void> RtcEngine::enable_media(AudioOutputOptions options) {
-  return impl_->submit([state = impl_.get(), options = std::move(options)]() mutable {
-    state->require_owner();
+Result<void> RtcEngine::enable_media(AudioOutputOptions options) {
+  return impl_->execute([state = impl_.get(), options = std::move(options)]() mutable {
+    state->require_open();
     if (state->media || state->room->snapshot().state != ConnectionState::disconnected) {
       throw std::logic_error("Install media once before joining a room");
     }
@@ -438,7 +396,7 @@ RtcPipelineEngine::FailureCleanup RtcMediaEngine::failure_cleanup(
   };
 }
 
-MediaOperation RtcMediaEngine::publish_media(MediaPublishSpec spec) {
+Result<MediaPublication> RtcMediaEngine::publish_media(MediaPublishSpec spec) {
   validate_output(spec.track.kind, spec.preview);
   if (!spec.input.echo_reference) {
     spec.input.echo_reference = echo_reference_;
@@ -529,10 +487,14 @@ MediaOperation RtcMediaEngine::publish_media(MediaPublishSpec spec) {
         return graph;
       },
       failure_cleanup(state));
-  return {std::move(ready), std::shared_ptr<MediaTrack>(new MediaTrack(std::move(state)))};
+  if (!ready) {
+    return Result<MediaPublication>::failure(ready.failure_record());
+  }
+  return Result<MediaPublication>::success(
+      {*ready, std::shared_ptr<MediaTrack>(new MediaTrack(std::move(state)))});
 }
 
-MediaOperation RtcMediaEngine::subscribe_media(MediaSubscribeSpec spec) {
+Result<MediaSubscription> RtcMediaEngine::subscribe_media(MediaSubscribeSpec spec) {
   validate_output(spec.track.kind, spec.output);
   if (spec.presentation_delay.count() < 0 ||
       spec.presentation_delay > std::chrono::milliseconds(500)) {
@@ -587,7 +549,11 @@ MediaOperation RtcMediaEngine::subscribe_media(MediaSubscribeSpec spec) {
         return graph;
       },
       failure_cleanup(state));
-  return {std::move(ready), std::shared_ptr<MediaTrack>(new MediaTrack(std::move(state)))};
+  if (!ready) {
+    return Result<MediaSubscription>::failure(ready.failure_record());
+  }
+  return Result<MediaSubscription>::success(
+      {*ready, std::shared_ptr<MediaTrack>(new MediaTrack(std::move(state)))});
 }
 
 std::shared_ptr<SharedMediaInput> RtcMediaEngine::create_shared_input(TrackDescriptor format,

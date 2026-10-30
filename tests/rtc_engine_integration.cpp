@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/graph_api.hpp"
@@ -17,13 +19,7 @@ void check(bool ok, const char* message) {
 
 template <class Future>
 auto await(engine::RtcEngine& engine, Future future) {
-  const auto deadline = SteadyClock::now() + 15s;
-  while (future.wait_for(0ms) != std::future_status::ready) {
-    check(SteadyClock::now() < deadline, "Engine operation timed out");
-
-    std::this_thread::sleep_for(1ms);
-  }
-  return future.get();
+  return require_result(std::move(future));
 }
 
 class Consumer : public graphflow::core::GraphNode {
@@ -32,12 +28,28 @@ class Consumer : public graphflow::core::GraphNode {
       : GraphNode("verify", nullptr), expected_(std::move(expected)) {}
 
   std::atomic<int> frames{0};
+  std::atomic<bool> closing{false};
 
  protected:
   bool doInit() override {
     subscribe<nodes::EncodedFrameEvent>([this](const auto& event) {
-      check(std::ranges::equal(event.frame.buffer.bytes(), expected_),
-            "Engine routed incorrect encoded payload");
+      const auto bytes = event.frame.buffer.bytes();
+      if (!std::ranges::equal(bytes, expected_)) {
+        // LiveKit downtrack shutdown sends these exact Opus/VP8 flush frames.
+        // Permit them only after teardown starts; never count them as delivery.
+        static const std::vector<uint8_t> blank = {0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x08, 0x00,
+                                                   0x08, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+                                                   0x85, 0x84, 0x88, 0x02, 0x02, 0x00, 0x0c, 0x0d,
+                                                   0x60, 0x00, 0xfe, 0xff, 0xab, 0x50, 0x80};
+        const bool silence =
+            expected_.size() == 3 && bytes.size() == 80 && bytes[0] == 0xf8 && bytes[1] == 0xff &&
+            bytes[2] == 0xfe &&
+            std::all_of(bytes.begin() + 3, bytes.end(), [](auto byte) { return byte == 0; });
+        if (closing && (silence || (expected_.size() > 3 && std::ranges::equal(bytes, blank)))) {
+          return;
+        }
+        throw std::runtime_error("Engine routed incorrect encoded payload");
+      }
       ++frames;
     });
     return true;
@@ -50,7 +62,8 @@ class Consumer : public graphflow::core::GraphNode {
 
 int main() {
   try {
-    auto tx = engine::create_livekit_engine(), rx = engine::create_livekit_engine();
+    auto tx = require_result(engine::create_livekit_engine()),
+         rx = require_result(engine::create_livekit_engine());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
     livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
     LiveKitRoomOptions options;
@@ -62,7 +75,7 @@ int main() {
     await(*rx, rx->join(options));
     std::vector<TrackDescriptor> descriptors;
     std::vector<std::vector<uint8_t>> payloads;
-    std::vector<livekit::sdk::AsyncResult<TrackId>> publishing;
+    std::vector<livekit::sdk::Result<TrackId>> publishing;
     for (int i = 0; i < 4; ++i) {
       TrackDescriptor d;
       d.id = d.name = "graph-" + std::to_string(i);
@@ -80,7 +93,7 @@ int main() {
     for (auto& future : publishing)
       await(*tx, std::move(future));
     std::vector<std::shared_ptr<Consumer>> sinks(4);
-    std::vector<livekit::sdk::AsyncResult<TrackId>> subscribing;
+    std::vector<livekit::sdk::Result<TrackId>> subscribing;
     const auto discovered_by = SteadyClock::now() + 10s;
     while (subscribing.size() < 4) {
       check(SteadyClock::now() < discovered_by, "Engine remote discovery timed out");
@@ -135,15 +148,19 @@ int main() {
     run({1, 3});
     // Reuse the same facade with fresh native transport and service state.
     const auto previous_epoch = tx->room().snapshot().epoch;
-    auto old_services = tx->room().services();
-    tx->leave().get();
-    rx->leave().get();
+    auto old_services = require_result(tx->room().services());
+    for (auto& sink : sinks) {
+      sink->closing = true;
+    }
+    require_result(tx->leave());
+    require_result(rx->leave());
     options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
     await(*tx, tx->join(options));
     options.token = std::getenv("LIVEKIT_SUBSCRIBE_TOKEN");
     await(*rx, rx->join(options));
     check(tx->room().snapshot().epoch > previous_epoch, "Native rejoin reused its epoch");
-    check(old_services != tx->room().services(), "Native rejoin reused closed room services");
+    check(old_services != require_result(tx->room().services()),
+          "Native rejoin reused closed room services");
     bool old_service_closed = false;
     try {
       old_services->send_data({1}).get();
@@ -151,7 +168,7 @@ int main() {
       old_service_closed = true;
     }
     check(old_service_closed, "Old room services affected the new join");
-    tx->room().services()->send_data({2}).get();
+    require_result(tx->room().services())->send_data({2}).get();
     await(*tx, tx->publish(descriptors[3]));
     const auto rejoined_by = SteadyClock::now() + 10s;
     bool subscribed_again = false;
@@ -169,9 +186,10 @@ int main() {
       subscribed_again = true;
     }
     run({3});
-    // close() quiesces graph delivery immediately; its future only awaits backend.
-    tx->close().get();
-    rx->close().get();
+    // close() returns after graph delivery and native detachment barriers.
+    sinks[3]->closing = true;
+    require_result(tx->close());
+    require_result(rx->close());
     std::cout << "{\"engineMultiGraph\":true,\"encodedMedia\":true,\"independentClose\":true,"
                  "\"leaveRejoin\":true,\"serviceIsolation\":true,\"noMediaPoll\":true}\n";
     return 0;

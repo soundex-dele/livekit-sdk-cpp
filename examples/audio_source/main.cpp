@@ -1,3 +1,5 @@
+#include "../../support/rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/engine.hpp>
@@ -15,12 +17,12 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto engine = engine::create_livekit_engine({});
+    auto engine = require_result(engine::create_livekit_engine({}));
     livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
     LiveKitRoomOptions options;
     options.url = argv[1];
     options.token = argv[2];
-    engine->join(options).get();
+    require_result(engine->join(options));
     TrackDescriptor descriptor;
     descriptor.id = descriptor.name = "application-audio";
     descriptor.kind = MediaKind::audio;
@@ -40,12 +42,8 @@ int main(int argc, char** argv) {
     engine::MediaPublishSpec config;
     config.track = descriptor;
     config.input = input;
-    auto operation = engine->publish_audio(std::move(config));
-    auto publication = std::move(operation.ready);
-    while (publication.wait_for(0ms) != std::future_status::ready) {
-      std::this_thread::sleep_for(1ms);
-    }
-    const auto id = publication.get();
+    auto operation = require_result(engine->publish_audio(std::move(config)));
+    const auto id = operation.id;
     const auto start = SteadyClock::now();
     for (uint64_t block = 0; block < 1000; ++block) {
       if (input.audio_source) {
@@ -61,8 +59,8 @@ int main(int argc, char** argv) {
         throw std::runtime_error(failure->message);
       std::this_thread::sleep_until(start + (block + 1) * 10ms);
     }
-    engine->unpublish(id).get();
-    engine->close().get();
+    require_result(engine->unpublish(id));
+    require_result(engine->close());
     const auto stats = *operation.track->snapshot().audio;
     // Local codec completion is not a remote delivery acknowledgement.
     std::cout << "Encoded packets: " << stats.completed << ", dropped work items: " << stats.dropped

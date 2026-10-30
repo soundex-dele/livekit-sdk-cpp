@@ -1,5 +1,6 @@
 #include "livekit/rtc/subscribe_node.hpp"
 #include <stdexcept>
+#include "backends/rtc/control_context.hpp"
 
 namespace livekit::sdk::rtc::nodes {
 RtcSubscribeNode::RtcSubscribeNode(std::string name, std::shared_ptr<SubscribedTrack> track)
@@ -11,7 +12,7 @@ RtcSubscribeNode::RtcSubscribeNode(std::string name, std::shared_ptr<SubscribedT
 bool RtcSubscribeNode::doInit() {
   subscribe<KeyframeRequestEvent>([this](const auto&) {
     if (active_)
-      track_->request_keyframe();
+      track_->request_keyframe_async();
   });
   return true;
 }
@@ -37,6 +38,7 @@ void RtcSubscribeNode::activate() {
     return;
   }
   worker_ = std::jthread([this](std::stop_token stop) {
+    detail::CallbackScope worker_scope;
     try {
       while (!stop.stop_requested()) {
         auto item = track_->wait_frame(stop);
@@ -87,6 +89,6 @@ void RtcSubscribeNode::throw_if_failed() const {
 
 void RtcSubscribeNode::doStop() {
   quiesce();
-  track_->close();
+  // Endpoint teardown belongs to the serialized pipeline controller.
 }
 }  // namespace livekit::sdk::rtc::nodes

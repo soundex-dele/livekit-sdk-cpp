@@ -2,6 +2,7 @@
 // Build-tree application/test helper, not an installed SDK API. SDK events are
 // callbacks; these existing applications marshal them to their session loop.
 #include "livekit/rtc/engine.hpp"
+#include "rtc_result.hpp"
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -43,19 +44,19 @@ class RtcEventMailbox {
       }
     };
     if constexpr (std::is_same_v<Engine, rtc::RoomEngine>) {
-      engine.set_event_handler(event);
+      require_result(engine.set_event_handler(event));
     } else {
-      engine.set_callbacks({event, [weak](const auto& failure) {
-                              if (auto state = weak.lock()) {
-                                std::lock_guard lock(state->mutex);
-                                if (state->failures.size() >= 256) {
-                                  state->overflow = true;
-                                } else {
-                                  state->failures.push_back(failure);
-                                }
-                                state->changed.notify_all();
-                              }
-                            }});
+      require_result(engine.set_callbacks({event, [weak](const auto& failure) {
+                                             if (auto state = weak.lock()) {
+                                               std::lock_guard lock(state->mutex);
+                                               if (state->failures.size() >= 256) {
+                                                 state->overflow = true;
+                                               } else {
+                                                 state->failures.push_back(failure);
+                                               }
+                                               state->changed.notify_all();
+                                             }
+                                           }}));
     }
   }
 

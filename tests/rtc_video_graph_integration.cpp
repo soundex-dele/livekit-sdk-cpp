@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/graph_api.hpp"
@@ -19,13 +21,7 @@ void check(bool ok, const char* message) {
 
 template <class Future>
 auto await(engine::RtcEngine& engine, Future future) {
-  const auto deadline = SteadyClock::now() + 15s;
-  while (future.wait_for(0ms) != std::future_status::ready) {
-    check(SteadyClock::now() < deadline, "Media graph operation timed out");
-
-    std::this_thread::sleep_for(1ms);
-  }
-  return future.get();
+  return require_result(std::move(future));
 }
 
 class Verify : public graphflow::core::GraphNode {
@@ -60,7 +56,8 @@ int main() {
   try {
     const auto kind = std::getenv("LIVEKIT_MEDIA_ENCRYPTION");
     const bool encrypted = kind && std::string(kind) == "1";
-    auto tx = engine::create_livekit_engine(), rx = engine::create_livekit_engine();
+    auto tx = require_result(engine::create_livekit_engine()),
+         rx = require_result(engine::create_livekit_engine());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
     livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
     LiveKitRoomOptions opts;
@@ -172,8 +169,8 @@ int main() {
     await(*tx, tx->unpublish("video-0"));
     await(*rx, rx->unsubscribe("receive-0"));
     run(1);
-    tx->close().get();
-    rx->close().get();
+    require_result(tx->close());
+    require_result(rx->close());
     for (auto source : sources)
       check(!source->stats().attached, "Input source lease survived graph close");
     for (auto node : inputs)

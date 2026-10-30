@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/async_result.hpp"
+#include "livekit/result.hpp"
 #include <mutex>
 #include "livekit/media_core/frame_view.hpp"
 #include "livekit/rtc/audio_processing.hpp"
@@ -128,43 +128,25 @@ struct MediaTrackSnapshot {
 class MediaTrack {
  public:
   MediaTrackSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> check() const;
 
  private:
   friend class RtcMediaEngine;
   friend class RtcEngine;
   struct State;
 
-  struct Pending {
-    mutable std::mutex mutex;
-    TrackDescriptor descriptor;
-    std::shared_ptr<MediaTrack> track;
-    std::exception_ptr failure;
-  };
-
-  explicit MediaTrack(TrackDescriptor descriptor) : pending_(std::make_shared<Pending>()) {
-    pending_->descriptor = std::move(descriptor);
-  }
-
-  void bind_pending(std::shared_ptr<MediaTrack> track) {
-    std::lock_guard lock(pending_->mutex);
-    pending_->track = std::move(track);
-  }
-
-  void fail_pending(std::exception_ptr failure) {
-    std::lock_guard lock(pending_->mutex);
-    pending_->failure = std::move(failure);
-  }
-
-  std::shared_ptr<Pending> pending_;
-
   explicit MediaTrack(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
   std::shared_ptr<State> state_;
 };
 
-struct MediaOperation {
-  AsyncResult<TrackId> ready;
+struct MediaPublication {
+  TrackId id;
+  std::shared_ptr<MediaTrack> track;
+};
+
+struct MediaSubscription {
+  TrackId id;
   std::shared_ptr<MediaTrack> track;
 };
 

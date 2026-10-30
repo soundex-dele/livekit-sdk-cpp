@@ -4,29 +4,21 @@ This supersedes the manual-poll execution contract in the earlier architecture
 refactor record. RtcEngine, RtcPipelineEngine and per-track pipeline poll APIs
 are removed, without compatibility wrappers.
 
-- Control: owned utoolkit TaskQueue, bounded API admission, backend completion
-  notifications, serialized graph construction/teardown, automatic futures.
-- Notifications: RoomEngine::set_event_handler and RtcEngine::set_callbacks;
-  no engine next_event/next_failure APIs. Serial notification TaskQueue is separate
-  from control/media. Replacement/removal fences old invocations; self-removal
-  invalidates queued old graph failures. Callbacks may call control methods,
-  must return promptly, must not destroy the engine, and must not throw.
-  Throwing callbacks are disabled and fail the room. Register before join and
-  serialize registration calls. Borrowed event arguments last only for the call.
-- Applications/tests with existing session loops use a non-installed bounded
-  mailbox in support/; it receives callbacks and owns its event copies.
-- Data: subscription node worker blocks on the existing bounded endpoint queue;
-  publishes synchronously into GraphEngine on the source thread.
-- Feedback: publication node worker waits for revision/epoch changes; initial
-  feedback is delivered before producer activation.
-- Lifecycle: stop/cancel/join source workers before stopping downstream nodes;
-  errors cross thread boundaries as stored exceptions and graph failure records.
-- Monitoring: delayed health-only tasks, no timer-driven media or graph creation.
-- Optional RtcExecutor: task-queue command adapter with command metrics; no engine
-  polling. Its generic std::future adapter checks readiness only while pending.
+- Control: synchronous Result on application workers, serialized by one room operation lock.
+  No engine control TaskQueue, executor adapter or public completion callbacks.
+- Room state: existing jthread, bounded command/event mailbox and deadline index.
+  Private completion records wake condition-variable waiters; background paths never take the operation lock.
+- Notifications: existing serial TaskQueue; controls in callbacks fail before locking.
+  Replacing/removing callbacks fences old invocations. Callbacks must return promptly.
+- Data: subscription nodes block on bounded endpoint queues and publish on source workers.
+- Feedback: publication workers wait for revision/epoch changes and deliver initial feedback before activation.
+- Failure: nodes actively report errors. The next control operation reaps failed graphs;
+  no delayed health polling, public pending media handle or control queue remains.
+- Lifecycle: leave/close wait for preceding operations, then join producers, stop graphs,
+  wait for detachment and fence notifications. Protocol timeout excludes lock waiting.
 
-Custom GraphFlow nodes must record asynchronous processing errors and expose
-them through check_health; GraphFlow EventBus catches raw subscriber exceptions.
+The current verification record is [RTC synchronous Result validation](rtc-sync-result-validation-20261029.md).
+The results below describe the earlier runtime migration, not this refactor's acceptance.
 
 The task_queue dependency is usable without the full GraphFlow build. Its
 Windows macros are target-local, duplicate addition is guarded, and Event::set /

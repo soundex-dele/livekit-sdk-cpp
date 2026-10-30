@@ -3,6 +3,7 @@
 #include "livekit/rtc/frame_view.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
+#include "backends/rtc/control_context.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -63,6 +64,7 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
   };
 
   void deliver(const Sample& sample) {
+    detail::CallbackScope callback_scope;
     if (auto video = std::get_if<nodes::VideoFrameEvent>(&sample)) {
       if (output_.video) {
         output_.video({video->pixels, video->timestamp, video->epoch, video->captured,

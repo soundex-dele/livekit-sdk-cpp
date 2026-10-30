@@ -1,10 +1,12 @@
+> RTC 控制同步返回 `Result<T>`。示例中的 `require_result` 是应用错误边界辅助函数（仓库示例位于 `support/rtc_result.hpp`），在失败时转交应用已有异常处理；它不是 SDK API。库调用方也可直接 `if (!result) { report(result.error()); }`，成功用 `*result` / `result->` 取值。所有阻塞控制在应用工作线程调用，通知/媒体回调与图 hook 禁止重入。协议超时不包括等待操作锁的时间。详见 [验证记录](rtc-sync-result-validation-20261029.md)。
+
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)，自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
 # 统一 RTC 引擎与配置式媒体 API
 
 普通媒体会话使用 `livekit/rtc/engine.hpp`，链接 `LiveKit::RTCMediaEngine`。`RtcEngine` 是统一公开入口，拥有一个 `RoomEngine`、内部 `RtcPipelineEngine` 和可选的内部 `RtcMediaEngine`。应用 Session 负责业务状态、配置和 UI 数据交接；媒体模块创建采集、编解码、输出节点，流水线模块管理每轨 GraphEngine，房间模块管理成员、信令、发布订阅端点及数据服务。内部模块借用顶层拥有的对象，不反向持有 RtcEngine。
 
-RtcEngine 使用 PImpl：公开类仅持有 `std::unique_ptr<Impl>`，控制任务队列、关闭状态、房间、流水线、可选媒体模块和 RoomView 均封装在私有实现中。析构在实现文件定义，继续保证先停止图与回调，再释放媒体和房间；媒体模块保持可选链接。
+RtcEngine 使用 PImpl：公开类仅持有 `std::unique_ptr<Impl>`，会话操作锁、关闭状态、房间、流水线、可选媒体模块和 RoomView 均封装在私有实现中。析构在实现文件定义，继续保证先停止图与回调，再释放媒体和房间；媒体模块保持可选链接。
 
 `RoomSession` 和公开的 `RtcMediaEngine` 已移除，无兼容接口。配置和媒体句柄位于 `media_config.hpp`，由 `engine.hpp` 包含。高级图接口需包含 `rtc/graph_api.hpp`，通过 `engine.graph().publish_graph` / `subscribe_graph` 使用。
 
@@ -14,11 +16,11 @@ RtcEngine 使用 PImpl：公开类仅持有 `std::unique_ptr<Impl>`，控制任�
 
 ```cpp
 using namespace livekit::sdk::rtc;
-auto engine = engine::create_livekit_engine(AudioOutputOptions{});
+auto engine = require_result(engine::create_livekit_engine(AudioOutputOptions{}));
 LiveKitRoomOptions room;
 room.url = url;
 room.token = token;
-engine->join(room).get();
+require_result(engine->join(room));
 
 engine::MediaPublishSpec config;
 config.track.id = "camera";
@@ -30,8 +32,8 @@ config.input.fps = 30;
 config.preview.video = [](const engine::VideoSample& frame) {
   // 把 frame.pixels 交给应用的有界最新帧队列；UI 在线程所属位置呈现。
 };
-auto publication = engine->publish_video(config);
-publication.ready.get();  // 引擎任务队列自动完成建图，无需轮询。
+auto publication = require_result(engine->publish_video(config));
+// publish_video 已完成端点确认、建图和启动。
 // publication.track->snapshot() 提供状态、计数和图拓扑。
 ```
 
@@ -58,7 +60,7 @@ publication.ready.get();  // 引擎任务队列自动完成建图，无需轮询
 engine::MediaInput camera;
 camera.capture = livekit::sdk::CaptureKind::camera;
 camera.fps = 30;
-auto shared = engine->create_shared_input(config.track, camera);
+auto shared = require_result(engine->create_shared_input(config.track, camera));
 
 auto first = config;
 first.track.id = "camera-main";
@@ -77,10 +79,10 @@ auto b = engine->publish_video(second);
 
 ## 线程与生命周期
 
-- 控制与建图由引擎拥有的 utoolkit/task_queue 串行执行，应用可从不同线程提交控制并等待 ready；已移除 poll。销毁前必须停止其他线程继续使用引擎。
-- 房间事件和图错误通过 `set_callbacks` 在独立的串行通知任务队列回调。可调用控制接口，不能在回调内销毁 engine；回调应及时返回。替换/清空回调会等待旧调用返回，注册操作需由应用串行化。
+- 控制与建图在调用线程执行，通过同一会话操作锁串行化，同步返回 Result。UI 使用已有应用工作线程调用；销毁前必须停止并等待所有在途调用。
+- 房间事件和图错误通过 `set_callbacks` 在独立的串行通知任务队列回调。回调内控制调用在加锁前返回 invalid_thread，不能在回调内销毁 engine 或等待控制完成。替换/清空回调同样属于同步控制，会等待旧调用返回。
 - 普通像素/PCM 回调在每个输出的独立有界调度线程上运行；慢回调仅丢弃本分支积压。回调必须最终返回，不得等待引擎关闭；关闭会等待正在执行的回调。
-- MediaTrack 句柄可供快照读取。保留句柄不会让已关闭图继续工作；异步创建失败记录到快照并可通过 throw_if_failed 查询。
+- MediaTrack 句柄可供快照读取。保留句柄不会让已关闭图继续工作；创建失败通过 Result 返回；运行期故障记录到快照并可通过 check() 查询，后续控制或关闭负责回收失败图。
 - 关闭先停止生产者、等待编解码及输出，再拆除图。完成后应用可释放回调目标；录制会完成文件头。关闭房间会关闭全部轨道。
 - `engine.graph().publish_graph` / `subscribe_graph` 是自定义图的高级入口；普通 Session 不需要传入 GraphNode 或 graph factory。
 
@@ -96,15 +98,15 @@ engine->set_callbacks({
   .on_event = [](const rtc::RoomEvent& event) { /* 更新业务状态或投递到 UI */ },
   .on_failure = [](const auto& failure) { /* 记录轨道 ID、方向和错误 */ }
 }); // 在首次 join 前注册；参数引用只在回调期间有效。
-engine->leave().get();  // 先停止媒体图并完成关闭屏障，再退出房间。
-engine->join(other_room).get();  // 新适配器、新 epoch，可复用同一个引擎。
-engine->close().get();  // 永久关闭；重复 close 安全，之后不能 join。
+require_result(engine->leave());  // 先停止媒体图并完成关闭屏障，再退出房间。
+require_result(engine->join(other_room));  // 新适配器、新 epoch，可复用同一个引擎。
+require_result(engine->close());  // 永久关闭；重复 close 安全，之后不能 join。
 ```
 
 `room()` 返回借用的 `const RoomView&`，有效期到引擎销毁；只开放快照、成员更新、订阅权限和房间服务，不开放 join、leave、端点发布和销毁。轨道生命周期操作统一通过 RtcEngine。RoomEngine 仍可单独用于不需要图的纯编码传输。
 
 RoomEngine 保留连接状态机、成员快照、期望轨道注册表和实际端点绑定。底层 RoomTransport 恢复网络连接，RoomEngine 恢复期望发布订阅；不得在两个层级重复重放。重入房间创建全新适配器与房间服务，旧服务句柄保持关闭，旧端点不能影响新绑定。用户需要重新取得 `services()` 并注册新会话的 RPC/流处理器。
 
-leave 会取消尚未完成的媒体/图操作并停止当前房间全部图；共享采集源的其他房间消费者仍可运行。保留的媒体句柄只提供历史状态。媒体操作成功表示端点确认且图已经启动；图构建或启动失败会撤销已创建端点。
+leave 等待正在执行的媒体/图操作结束，再停止当前房间全部图；共享采集源的其他房间消费者仍可运行。保留的媒体句柄只提供历史状态。媒体操作成功表示端点确认且图已经启动；图构建或启动失败会撤销已创建端点。
 
-只有 `create_livekit_engine(AudioOutputOptions{})` 或首次 join 前调用 `enable_media()` 才装配媒体模块。无参数工厂创建编码模式引擎，链接 `LiveKit::RTCEngine` 即可；未启用媒体时调用配置式媒体接口返回 `unsupported` 异常。两种模式都使用同一个 RtcEngine 类型，纯传输构建不需要媒体设备或编解码实现。
+只有 `create_livekit_engine(AudioOutputOptions{})` 或首次 join 前调用 `enable_media()` 才装配媒体模块。无参数工厂创建编码模式引擎，链接 `LiveKit::RTCEngine` 即可；未启用媒体时调用配置式媒体接口返回包含 `unsupported` 的失败 Result。两种模式都使用同一个 RtcEngine 类型，纯传输构建不需要媒体设备或编解码实现。

@@ -19,47 +19,39 @@ GraphFlow engine; applications using the facade link RTCMediaEngine.
 
 ## Execution
 
-RtcEngine owns a serial `vi::TaskQueue` from GraphFlow's `utoolkit/task_queue`.
-Public control calls marshal short commands onto that queue. Endpoint completion
-notifications schedule graph construction; callers may await returned futures
-without driving any loop. There is no RtcEngine or pipeline `poll` API.
+RTC control calls execute on the calling application worker, serialized by one
+non-recursive operation mutex owned by RoomEngineState. The lock covers protocol
+waits and teardown. Private `*_locked` paths reuse ownership without relocking.
+There is no engine control TaskQueue or RtcExecutor. The existing room jthread,
+command mailbox, transport threads, notification queue and media workers remain.
 
-Room events use `RoomEngine::set_event_handler`; the facade exposes
-`RtcEngine::set_callbacks` for room events and graph failures. There are no engine
-`next_event` or `next_failure` methods. Notifications execute on a separate serial
-TaskQueue and may issue engine controls. Callbacks must return promptly, must not
-destroy the engine, and must not throw. Replacement/removal fences old calls;
-registration must be serialized by the application. Callback arguments are
-borrowed for that invocation. Session loops may marshal callback copies into
-application-owned bounded mailboxes.
+Controls and factories return `Result<T>` / `Result<void>`; failure records retain
+their correlation ID through results, events and snapshots. Media operations
+return a completed MediaPublication/MediaSubscription with an id and track.
+`MediaTrack::check()` reports a completed Result. Player keeps its independent
+AsyncResult API; native SDP/statistics use internal futures with completion signals,
+without polling or a public asynchronous RTC API.
 
-Each RTC subscription source owns a worker blocked on its bounded endpoint queue.
-Incoming packets wake that worker, which publishes graph events. Publication
-feedback uses a separate node worker waiting on endpoint epoch/revision changes.
-Neither worker dispatches on transport or control threads. An idle/suspended
-source blocks until data, rebind, cancellation or terminal state. One slow source
-consumer cannot occupy another track's worker or the room transport thread.
+The room loop owns protocol state, deadlines, epochs and incarnation checks.
+A private operation record uses a mutex/condition variable and exactly-once Result
+completion. Waiting releases its state lock while retaining the operation lock.
+Backend completion, failure and detachment paths never acquire the operation lock.
+Join, leave, close and track controls wait for preceding operations; protocol timeouts
+start after acquiring the lock. Close is terminal and idempotent, not a cancellation
+channel. Destructor callers must first join all outstanding member calls.
 
-Graph start is two phase: start every node, deliver initial sender feedback on its
-worker, then activate capture; subscription ingress starts after downstream
-activation. Close cancels and joins ingress/feedback workers before quiescing
-codecs and outputs, stopping the graph and detaching transport. No registry lock
-is held while joining workers. Custom graph hooks run on the engine task queue;
-`TrackGraphSpec::check_health` replaces the old poll hook. A 20 ms delayed task
-checks node failures only; it never receives frames, emits feedback or builds
-graphs. Media callbacks and graph hooks must not synchronously wait for lifecycle work.
+Room and graph notifications run on the existing serial notification queue.
+Callbacks, graph factories/hooks and SDK media workers reject control reentry
+before acquiring the operation lock (`invalid_thread`), including nested sessions.
+Applications post requests to their own worker and never wait for that worker from
+a callback. Clearing callbacks fences prior invocations. Callback arguments are borrowed.
 
-The SDK bounds control admission to 1024 queued calls and coalesces backend
-completion notifications. Task closures capture exceptions into futures or the
-control failure state because the underlying task queue does not catch them.
-Destruction unregisters notifications, executes the teardown barrier and joins the
-task queue before destroying state referenced by delayed tasks.
-
-RtcExecutor is now an optional bounded command/future adapter using the same task
-queue library; it is not required for engine progress. Its diagnostics count
-started/completed commands and command duration. Standard futures have no generic
-continuation API, so this adapter uses delayed readiness checks only while a
-returned future is outstanding; it does not drive the engine.
+Graphs start nodes, activate initial sender feedback, then start producers.
+Teardown closes admission, quiesces source/codec/output workers, stops GraphEngine,
+and waits for native detachment. It never holds a registry/state lock while joining.
+Failures immediately report to the endpoint and notification path; failed graphs
+are reclaimed on the next serialized control or close. Reporting retains at most
+one entry per graph and closed graphs disable retained failure reporters.
 
 Application media callbacks retain their separate bounded output dispatchers.
 Slow callbacks discard only their own backlog. They must eventually return:
@@ -82,7 +74,7 @@ unpublish. Frame timing is separate from storage, so reconnect retags a branch's
 new input without modifying a buffer shared by another room. Shared audio keeps
 the source sample clock, including gaps, rather than recomputing RTP time from
 callback arrival. Invalid shared queue limits fail synchronously without attaching
-a consumer; graph startup failures are reported by the operation's ready future.
+a consumer; graph startup failures are reported by the operation's Result.
 
 ## Audio and synchronization
 
@@ -135,9 +127,9 @@ be reported separately; this document is not a device-acceptance claim.
    `engine.graph().subscribe/publish_graph/subscribe_graph`. Plain encoded
    `engine.publish(descriptor)` remains on the ordinary facade.
 3. Remove all RtcEngine/pipeline poll calls and receive-frame poll budgets.
-   Futures now progress autonomously. Use RtcExecutor only when an application
-   needs an additional bounded command/future adapter. Rename graph `poll` hooks
-   to `check_health`; these hooks must only check health. Replace engine event/failure
+   Controls now complete synchronously. Use an application worker when the UI
+   must remain responsive. Nodes actively report failures; failed graphs are reclaimed
+   on the next control operation or close. Replace engine event/failure
    reads with `set_callbacks`, or `RoomEngine::set_event_handler` for backend-only use.
 4. Media callbacks now run on per-output dispatchers. Retaining immutable frames
    is safe; callbacks must not wait for lifecycle completion.

@@ -1,3 +1,4 @@
+#include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "media_graph/raw_frame_queue.hpp"
 #include "media_nodes/capture/audio_processor.hpp"
@@ -641,7 +642,10 @@ void MediaInputNode::activate() {
     impl_->microphone_reporter = true;
   }
   impl_->stats.active = true;
-  impl_->worker = std::jthread([this](std::stop_token cancel) { impl_->run(cancel); });
+  impl_->worker = std::jthread([this](std::stop_token cancel) {
+    detail::CallbackScope worker_scope;
+    impl_->run(cancel);
+  });
 }
 
 void MediaInputNode::quiesce() {

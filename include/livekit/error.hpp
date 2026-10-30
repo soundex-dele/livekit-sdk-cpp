@@ -25,6 +25,8 @@ enum class ErrorCode {
   invalid_argument,
   processing_failed,
   callback_failed,
+  invalid_thread,
+  invalid_state,
   internal_error
 };
 
@@ -104,6 +106,9 @@ inline std::shared_ptr<const FailureInfo> describe_failure(
     result = *error.failure();
   } catch (const std::invalid_argument& error) {
     result.code = ErrorCode::invalid_argument;
+    result.message = error.what();
+  } catch (const std::logic_error& error) {
+    result.code = ErrorCode::invalid_state;
     result.message = error.what();
   } catch (const std::exception& error) {
     result.message = error.what();

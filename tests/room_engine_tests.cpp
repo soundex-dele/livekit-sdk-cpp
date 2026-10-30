@@ -1,4 +1,5 @@
 #include "rtc_event_mailbox.hpp"
+#include "rtc_result.hpp"
 #ifndef LIVEKIT_TEST_RTC_NODES
 #include "utoolkit/task_queue/event.h"
 #include "utoolkit/task_queue/task_queue.h"
@@ -20,8 +21,8 @@
 #include "engines/rtc/pipeline_engine.hpp"
 #endif
 
-using livekit::sdk::AsyncResult;
-using livekit::sdk::CompletionSource;
+using livekit::sdk::Result;
+
 using namespace livekit::sdk::rtc;
 using namespace livekit::sdk::rtc::detail;
 using namespace std::chrono_literals;
@@ -33,18 +34,26 @@ void check(bool value, const char* message) {
 }
 
 template <class T>
-T get(std::future<T> future) {
-  check(future.wait_for(2s) == std::future_status::ready, "Asynchronous operation hung");
-  if constexpr (std::is_void_v<T>)
-    future.get();
-  else
-    return future.get();
+T get(Result<T> result) {
+  return livekit::sdk::app_support::require_result(std::move(result));
 }
 
 template <class T>
-T get(AsyncResult<T> result) {
-  check(result.wait_for(2s) == std::future_status::ready, "Asynchronous operation hung");
-  return result.get();
+auto get(std::future<T> future) {
+  check(future.wait_for(2s) == std::future_status::ready, "Operation hung");
+  if constexpr (requires(T value) {
+                  value.has_value();
+                  value.error();
+                }) {
+    return get(future.get());
+  } else {
+    return future.get();
+  }
+}
+
+template <class F>
+auto async_control(F fn) {
+  return std::async(std::launch::async, std::move(fn));
 }
 
 template <class F>
@@ -104,7 +113,7 @@ struct Harness {
   std::set<TrackId> send_failures;
   bool confirm = true, connect = true;
   bool defer_removal = false;
-  std::vector<std::shared_ptr<CompletionSource<void>>> removal_completions;
+  std::vector<RoomTransport::Removed> removal_completions;
   int starts = 0, stops = 0;
   std::thread::id owner;
 
@@ -165,18 +174,14 @@ class FakeTransport : public RoomTransport {
     h->signal();
   }
 
-  AsyncResult<void> remove(const BindingToken& b, bool) override {
+  void remove(const BindingToken& b, bool, Removed completed = {}) override {
     std::lock_guard lock(h->mutex);
     h->removed.push_back(b);
     if (h->defer_removal) {
-      auto completion = std::make_shared<CompletionSource<void>>();
-      auto result = completion->get_result();
-      h->removal_completions.push_back(std::move(completion));
-      return result;
+      h->removal_completions.push_back(std::move(completed));
+    } else if (completed) {
+      completed({});
     }
-    CompletionSource<void> done;
-    done.set_value();
-    return done.get_result();
   }
 
   SendResult send(const BindingToken& b, const EncodedFrame& f) override {
@@ -357,55 +362,49 @@ void asynchronous_detachment() {
     std::lock_guard lock(h->mutex);
     h->defer_removal = true;
   }
-  auto first = original->close();
-  auto repeated = room.unpublish("reused");
+  auto first = async_control([&] { return original->close(); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
         return h->removal_completions.size() == 1;
       },
-      "Removal was not submitted");
-  // This must finish while the first native detachment is deliberately blocked.
-  get(peer->set_muted(true));
-  check(first.wait_for(0ms) == std::future_status::timeout &&
-            repeated.wait_for(0ms) == std::future_status::timeout,
-        "Close completed before native detachment");
-  auto replacement = get(room.publish(video("reused")));
-  auto old_handle = original->close();
-  get(peer->set_muted(false));  // Fence the repeated handle close on the controller.
-  check(old_handle.wait_for(0ms) == std::future_status::timeout,
-        "Old handle bypassed its outstanding detachment");
+      "Removal missing");
+  auto repeated = async_control([&] { return room.unpublish("reused"); });
+  auto muted = async_control([&] { return peer->set_muted(true); });
+  check(first.wait_for(20ms) == std::future_status::timeout &&
+            repeated.wait_for(20ms) == std::future_status::timeout &&
+            muted.wait_for(20ms) == std::future_status::timeout,
+        "Control bypassed detachment barrier");
   {
     std::lock_guard lock(h->mutex);
-    h->removal_completions.front()->set_value();
+    h->removal_completions.front()({});
+    h->defer_removal = false;
   }
   get(std::move(first));
   get(std::move(repeated));
-  get(std::move(old_handle));
-  check(replacement->snapshot().state == TrackState::ready,
-        "Old detachment closed the replacement track");
-  auto failed = peer->close();
+  get(std::move(muted));
+  auto replacement = get(room.publish(video("reused")));
+  get(original->close());
+  check(replacement->snapshot().state == TrackState::ready, "Old handle closed replacement");
+  {
+    std::lock_guard lock(h->mutex);
+    h->defer_removal = true;
+  }
+  auto failed = async_control([&] { return peer->close(); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
         return h->removal_completions.size() == 2;
       },
-      "Second removal was not submitted");
+      "Removal missing");
   {
     std::lock_guard lock(h->mutex);
-    h->removal_completions.back()->set_exception(
-        std::make_exception_ptr(std::runtime_error("detachment failed")));
+    h->removal_completions.back()(std::make_exception_ptr(std::runtime_error("detachment failed")));
+    h->defer_removal = false;
   }
-  bool rejected = false;
-  try {
-    get(std::move(failed));
-  } catch (const std::runtime_error& error) {
-    rejected = std::string(error.what()) == "detachment failed";
-  }
-  check(rejected, "Native detachment failure was lost");
-  auto closing = replacement->close();
+  auto result = failed.get();
+  check(!result && result.error().message == "detachment failed", "Lost detachment failure");
   get(room.leave());
-  get(std::move(closing));  // stop() supplies the barrier for unfinished removals.
 }
 
 void bounded_event_admission() {
@@ -450,7 +449,8 @@ void permission_controls() {
     check(h->initial_permissions && !h->initial_permissions->all_participants,
           "Initial permission lost");
   }
-  auto update = room.set_subscription_permissions({false, {{"viewer", true, {}}}});
+  auto update = async_control(
+      [&] { return room.set_subscription_permissions({false, {{"viewer", true, {}}}}); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -477,7 +477,7 @@ void permission_controls() {
     bool failed = false;
     try {
       get(room.set_subscription_permissions(policy));
-    } catch (const std::invalid_argument&) {
+    } catch (const livekit::sdk::SDKError&) {
       failed = true;
     }
     check(failed, "Invalid subscription policy accepted");
@@ -491,7 +491,7 @@ void permission_controls() {
     failed = e.code() == livekit::sdk::ErrorCode::cancelled;
   }
   check(failed, "Pre-dispatch permission cancellation lost");
-  auto interrupted = room.set_subscription_permissions({});
+  auto interrupted = async_control([&] { return room.set_subscription_permissions({}); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -585,7 +585,7 @@ void statistics_events() {
   bool rejected = false;
   try {
     get(invalid.join(bad));
-  } catch (const std::invalid_argument&) {
+  } catch (const livekit::sdk::SDKError&) {
     rejected = true;
   }
   check(rejected, "Unbounded statistics frequency admitted");
@@ -623,7 +623,7 @@ void receive_demand_controls() {
   wanted.height = 180;
   wanted.fps = 15;
   wanted.priority = 1;
-  auto update = a->set_demand(wanted);
+  auto update = async_control([&] { return a->set_demand(wanted); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -637,7 +637,7 @@ void receive_demand_controls() {
   check(a->snapshot().receive_demand == wanted && b->snapshot().receive_demand == ReceiveDemand{},
         "Demand changed sibling");
   check(a->descriptor().receive_demand.disabled, "Mutable demand changed immutable descriptor");
-  auto rejected = a->set_demand({});
+  auto rejected = async_control([&] { return a->set_demand({}); });
   complete(1, livekit::sdk::ErrorCode::request_failed);
   bool failed = false;
   try {
@@ -652,7 +652,7 @@ void receive_demand_controls() {
   failed = false;
   try {
     get(a->set_demand(bad));
-  } catch (const std::invalid_argument&) {
+  } catch (const livekit::sdk::SDKError&) {
     failed = true;
   }
   check(failed, "Invalid demand accepted");
@@ -661,7 +661,7 @@ void receive_demand_controls() {
   failed = false;
   try {
     get(a->set_demand(bad));
-  } catch (const std::invalid_argument&) {
+  } catch (const livekit::sdk::SDKError&) {
     failed = true;
   }
   check(failed, "Incomplete receive dimensions accepted");
@@ -675,7 +675,7 @@ void receive_demand_controls() {
   failed = false;
   try {
     get(audio_track->set_demand(wanted));
-  } catch (const std::invalid_argument&) {
+  } catch (const livekit::sdk::SDKError&) {
     failed = true;
   }
   check(failed, "Video demand accepted for audio");
@@ -688,7 +688,7 @@ void receive_demand_controls() {
     failed = e.code() == livekit::sdk::ErrorCode::cancelled;
   }
   check(failed, "Pre-dispatch cancellation lost");
-  auto pending = a->set_demand({});
+  auto pending = async_control([&] { return a->set_demand({}); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -716,7 +716,7 @@ void receive_demand_controls() {
                       }),
           "Rejoin did not use last submitted demand");
   }
-  auto fresh = room.set_receive_demand("receive", wanted);
+  auto fresh = async_control([&] { return room.set_receive_demand("receive", wanted); });
   complete(3);
   get(std::move(fresh));
   get(a->close());
@@ -758,7 +758,7 @@ void publication_sources() {
     bool rejected = false;
     try {
       get(room.publish(d));
-    } catch (const std::invalid_argument&) {
+    } catch (const livekit::sdk::SDKError&) {
       rejected = true;
     }
     check(rejected, "Invalid video publication source accepted");
@@ -774,7 +774,7 @@ void publication_sources() {
     bool rejected = false;
     try {
       get(room.publish(d));
-    } catch (const std::invalid_argument&) {
+    } catch (const livekit::sdk::SDKError&) {
       rejected = true;
     }
     check(rejected, "Invalid audio publication source accepted");
@@ -937,19 +937,23 @@ void room_callback_contract() {
   auto released = release.get_future().share();
   std::atomic<int> callbacks{0};
   const auto caller = std::this_thread::get_id();
-  room.set_event_handler([&](const RoomEvent& event) {
+  get(room.set_event_handler([&](const RoomEvent& event) {
     ++callbacks;
     check(std::this_thread::get_id() != caller, "Room callback ran on the caller");
     if (event.kind == RoomEventKind::connected) {
-      get(room.publish(video("callback-publication")));
+      auto rejected = room.publish(video("callback-publication"));
+      check(!rejected && rejected.error().code == livekit::sdk::ErrorCode::invalid_thread,
+            "Callback control was accepted");
+      entered.set_value();
+      check(released.wait_for(2s) == std::future_status::ready, "Callback release timed out");
     } else if (event.kind == RoomEventKind::track_ready) {
       entered.set_value();
       check(released.wait_for(2s) == std::future_status::ready, "Callback release timed out");
     }
-  });
+  }));
   get(room.join(options()));
   get(std::move(entered_future));
-  auto removed = std::async(std::launch::async, [&] { room.set_event_handler({}); });
+  auto removed = std::async(std::launch::async, [&] { get(room.set_event_handler({})); });
   check(removed.wait_for(30ms) == std::future_status::timeout,
         "Handler removal did not fence an in-flight callback");
   release.set_value();
@@ -957,10 +961,11 @@ void room_callback_contract() {
   const auto before = callbacks.load();
   get(room.leave());
   check(callbacks == before, "Callback ran after removal completed");
-  room.set_event_handler([](const RoomEvent&) { throw std::runtime_error("callback failure"); });
+  get(room.set_event_handler(
+      [](const RoomEvent&) { throw std::runtime_error("callback failure"); }));
   eventually([&] { return room.snapshot().state == ConnectionState::failed; },
              "Throwing callback escaped the task queue boundary");
-  room.set_event_handler({});
+  get(room.set_event_handler({}));
 }
 
 void mute_event_overflow() {
@@ -971,7 +976,7 @@ void mute_event_overflow() {
   opts.max_events = 1;
   get(room.join(opts));
   check(bool(room_events.take_event(1s)), "Missing connected event");
-  room.set_event_handler({});
+  get(room.set_event_handler({}));
   auto track = get(room.publish(video("event-capacity")));
   bool rejected = false;
   try {
@@ -1016,7 +1021,7 @@ void participant_controls() {
     event.error = "synthetic rejection";
     h->push(std::move(event));
   };
-  const auto rejects = [&](AsyncResult<void> result, ErrorCode code) {
+  const auto rejects = [&](auto result, ErrorCode code) {
     bool rejected = false;
     try {
       get(std::move(result));
@@ -1025,35 +1030,40 @@ void participant_controls() {
     }
     check(rejected, "Control failed with wrong outcome");
   };
-  auto first = room.update_local_participant({"name", "metadata", {{"a", "b"}}});
+  auto first = async_control(
+      [&] { return room.update_local_participant({"name", "metadata", {{"a", "b"}}}); });
   auto sent = request(0);
   check(first.wait_for(0ms) != std::future_status::ready && sent.update.attributes.at("a") == "b",
         "Control completed before ACK or lost fields");
   respond(sent);
   get(std::move(first));
-  auto forbidden = room.update_local_participant({"denied", {}, {}});
+  auto forbidden = async_control([&] { return room.update_local_participant({"denied", {}, {}}); });
   respond(request(1), ErrorCode::permission_denied);
   rejects(std::move(forbidden), ErrorCode::permission_denied);
-  auto expires = room.update_local_participant({"expires", {}, {}}, {100ms});
+  auto expires =
+      async_control([&] { return room.update_local_participant({"expires", {}, {}}, {100ms}); });
   auto expired = request(2);
   rejects(std::move(expires), ErrorCode::outcome_unknown);
   respond(expired);  // Late ACK must not resolve a later operation.
   std::stop_source cancellation;
-  auto cancelled =
-      room.update_local_participant({"cancel", {}, {}}, {1s, cancellation.get_token()});
+  auto cancelled = async_control([&] {
+    return room.update_local_participant({"cancel", {}, {}}, {1s, cancellation.get_token()});
+  });
   request(3);
   cancellation.request_stop();
   rejects(std::move(cancelled), ErrorCode::outcome_unknown);
   rejects(room.update_local_participant({"cancel before", {}, {}}, {1s, cancellation.get_token()}),
           ErrorCode::cancelled);
-  auto interrupted = room.update_local_participant({"old generation", {}, {}});
+  auto interrupted =
+      async_control([&] { return room.update_local_participant({"old generation", {}, {}}); });
   auto old = request(4);
   h->push({TransportEventKind::interrupted});
   rejects(std::move(interrupted), ErrorCode::outcome_unknown);
   h->push({TransportEventKind::connected});
   eventually([&] { return room.snapshot().state == ConnectionState::connected; },
              "Control recovery did not connect");
-  auto replacement = room.update_local_participant({"new generation", {}, {}});
+  auto replacement =
+      async_control([&] { return room.update_local_participant({"new generation", {}, {}}); });
   auto current = request(5);
   check(current.epoch != old.epoch && current.id > old.id, "Control identity reused after rejoin");
   auto stale = current;
@@ -1071,19 +1081,20 @@ void participant_controls() {
         "Wrong-epoch ACK resolved new operation");
   respond(current);
   get(std::move(replacement));
-  std::vector<AsyncResult<void>> full;
-  for (int i = 0; i < 128; ++i)
-    full.push_back(room.update_local_participant({"queued", {}, {}}, {5s}));
-  request(133);
-  rejects(room.update_local_participant({"overflow", {}, {}}), ErrorCode::resource_exhausted);
-  get(room.leave());
-  for (auto& pending : full)
-    rejects(std::move(pending), ErrorCode::outcome_unknown);
+  auto queued =
+      async_control([&] { return room.update_local_participant({"queued", {}, {}}, {200ms}); });
+  auto queued_request = request(6);
+  auto leaving = async_control([&] { return room.leave(); });
+  check(leaving.wait_for(20ms) == std::future_status::timeout,
+        "Leave preempted participant update");
+  respond(queued_request);
+  get(std::move(queued));
+  get(std::move(leaving));
   rejects(room.update_local_participant({"closed", {}, {}}), ErrorCode::session_closed);
   bool invalid = false;
   try {
     get(room.update_local_participant({std::string("\xc0\x80", 2), {}, {}}));
-  } catch (const std::invalid_argument&) {
+  } catch (const livekit::sdk::SDKError&) {
     invalid = true;
   }
   check(invalid, "Invalid UTF8 update accepted");
@@ -1381,7 +1392,7 @@ void cancel_pending_and_isolate_failure() {
     std::lock_guard lock(h->mutex);
     h->confirm = false;
   }
-  auto pending = room.publish(video("pending"));
+  auto pending = async_control([&] { return room.publish(video("pending")); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -1718,23 +1729,26 @@ void engine_callback_contract() {
   auto failed_future = failed.get_future();
   std::thread::id callback_thread;
   auto fault = std::make_shared<graphflow::core::GraphNode>("fault", nullptr);
-  engine.set_callbacks({[&](const RoomEvent& event) {
-                          if (event.kind == RoomEventKind::connected) {
-                            callback_thread = std::this_thread::get_id();
-                            get(engine.publish(video("callback-control")));
-                            connected.set_value();
-                          }
-                        },
-                        [&](const engine::RtcEngine::GraphFailure& failure) {
-                          check(std::this_thread::get_id() == callback_thread,
-                                "Engine notifications did not share a serial queue");
-                          check(failure.id == "failed-graph" && failure.publication &&
-                                    failure.message == "node failure",
-                                "Graph failure callback lost details");
-                          get(engine.unpublish("callback-control"));
-                          engine.set_callbacks({});  // Self-removal must not wait on its own queue.
-                          failed.set_value();
-                        }});
+  get(engine.set_callbacks(
+      {[&](const RoomEvent& event) {
+         if (event.kind == RoomEventKind::connected) {
+           callback_thread = std::this_thread::get_id();
+           auto rejected = engine.publish(video("callback-control"));
+           check(!rejected && rejected.error().code == livekit::sdk::ErrorCode::invalid_thread,
+                 "Callback control accepted");
+           connected.set_value();
+         }
+       },
+       [&](const engine::RtcEngine::GraphFailure& failure) {
+         check(std::this_thread::get_id() == callback_thread,
+               "Engine notifications did not share a serial queue");
+         check(failure.id == "failed-graph" && failure.publication &&
+                   failure.message == "node failure",
+               "Graph failure callback lost details");
+         check(!engine.unpublish("callback-control"), "Failure callback control accepted");
+         check(!engine.set_callbacks({}), "Callback registration reentry accepted");
+         failed.set_value();
+       }}));
   get(engine.join(options()));
   get(std::move(connected_future));
   check(callback_thread != std::this_thread::get_id(), "Callback ran on caller thread");
@@ -1745,7 +1759,7 @@ void engine_callback_contract() {
   }));
   fault->reportFailure(std::make_exception_ptr(std::runtime_error("node failure")));
   get(std::move(failed_future));
-  engine.set_callbacks({});
+  get(engine.set_callbacks({}));
   get(engine.close());
 }
 
@@ -1755,17 +1769,17 @@ void active_failure_correlation_contract() {
   std::promise<std::shared_ptr<const livekit::sdk::FailureInfo>> graph_report, room_report;
   auto graph_result = graph_report.get_future(), room_result = room_report.get_future();
   std::atomic<size_t> notifications{0};
-  engine.set_callbacks({[&](const RoomEvent& event) {
-                          if (event.kind == RoomEventKind::track_failed &&
-                              event.track_id == "fault") {
-                            room_report.set_value(event.failure);
-                          }
-                        },
-                        [&](const engine::RtcEngine::GraphFailure& failure) {
-                          if (++notifications == 1) {
-                            graph_report.set_value(failure.failure);
-                          }
-                        }});
+  get(engine.set_callbacks({[&](const RoomEvent& event) {
+                              if (event.kind == RoomEventKind::track_failed &&
+                                  event.track_id == "fault") {
+                                room_report.set_value(event.failure);
+                              }
+                            },
+                            [&](const engine::RtcEngine::GraphFailure& failure) {
+                              if (++notifications == 1) {
+                                graph_report.set_value(failure.failure);
+                              }
+                            }}));
   get(engine.join(options()));
   auto node = std::make_shared<graphflow::core::GraphNode>("codec.failure", nullptr);
   std::shared_ptr<PublishedTrack> endpoint;
@@ -1791,16 +1805,21 @@ void active_failure_correlation_contract() {
             graph->id == snapshot.failure->id && graph->context.node == "codec.failure" &&
             snapshot.state == TrackState::failed && notifications == 1,
         "Failure was duplicated or lost correlation across graph, room and track");
-  auto closed = endpoint->close();
+  auto closed = async_control([&] { return endpoint->close(); });
   // A later room operation fences close admission without releasing the native
   // detachment. Source failure must not bypass the normal teardown barrier.
-  get(engine.publish(video("failure-fence")));
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->removal_completions.size() == 1;
+      },
+      "Failed removal missing");
   check(closed.wait_for(0ms) == std::future_status::timeout,
         "Failed graph close bypassed its native detachment barrier");
   {
     std::lock_guard lock(h->mutex);
     check(h->removal_completions.size() == 1, "Failed graph detached more than once");
-    h->removal_completions.front()->set_value();
+    h->removal_completions.front()({});
     h->defer_removal = false;
   }
   get(std::move(closed));
@@ -1820,7 +1839,7 @@ void active_failure_correlation_contract() {
   check(engine.publication("reused-fault").state == TrackState::ready && notifications == 1,
         "Old graph failure destroyed or reported against a replacement track");
   get(engine.close());
-  engine.set_callbacks({});
+  get(engine.set_callbacks({}));
 }
 
 void engine_contract() {
@@ -1828,10 +1847,11 @@ void engine_contract() {
   engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox engine_events(engine);
   get(engine.join(options()));
-  auto first = engine.publish(video("first"));
-  auto second = engine.publish(video("second"));
+  auto first = async_control([&] { return engine.publish(video("first")); });
+  auto second = async_control([&] { return engine.publish(video("second")); });
   auto consumer = std::make_shared<FrameConsumer>();
-  auto incoming = engine.graph().subscribe(video("incoming"), consumer);
+  auto incoming =
+      async_control([&] { return engine.graph().subscribe(video("incoming"), consumer); });
   eventually(
       [&] {
 
@@ -1840,7 +1860,8 @@ void engine_contract() {
                incoming.wait_for(0ms) == std::future_status::ready;
       },
       "Engine did not complete asynchronous graph preparation");
-  check(first.get() == "first" && second.get() == "second" && incoming.get() == "incoming",
+  check(get(std::move(first)) == "first" && get(std::move(second)) == "second" &&
+            get(std::move(incoming)) == "incoming",
         "Engine graph identity mismatch");
   check(engine.write("first", frame(engine.publication("first").epoch, 1)) == WriteStatus::accepted,
         "Engine source did not reach publish node");
@@ -1853,7 +1874,7 @@ void engine_contract() {
     std::lock_guard lock(h->mutex);
     h->confirm = false;
   }
-  auto cancelled = engine.publish(video("cancel"));
+  auto cancelled = async_control([&] { return engine.publish(video("cancel")); });
   get(engine.unpublish("cancel"));
   bool rejected = false;
   try {
@@ -1931,28 +1952,31 @@ void composed_graph_contract() {
   std::atomic<int> activations{0}, quiescences{0};
   bool teardown_while_running = false;
   std::shared_ptr<GraphProducer> producer;
-  auto publication = engine.graph().publish_graph(video("composed"), [&](auto sink) {
-    check(sink->track()->snapshot().state == TrackState::ready, "Graph factory ran before ACK");
-    producer = std::make_shared<GraphProducer>();
-    auto relay = std::make_shared<GraphRelay>();
-    engine::TrackGraphSpec spec;
-    spec.nodes = {relay, producer};
-    spec.connections = {engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(producer, relay),
-                        engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(relay, sink)};
-    spec.activate = [&, relay, sink] {
-      check(producer->state() == graphflow::core::LifecycleState::Running &&
-                relay->state() == graphflow::core::LifecycleState::Running &&
-                sink->state() == graphflow::core::LifecycleState::Running,
-            "Producer activated before full graph start");
-      ++activations;
-      producer->emit(frame(sink->track()->snapshot().epoch, 1));
-    };
-    spec.quiesce = [&, sink] {
-      ++quiescences;
-      teardown_while_running = producer->state() == graphflow::core::LifecycleState::Running &&
-                               sink->track()->snapshot().state == TrackState::ready;
-    };
-    return spec;
+  auto publication = async_control([&] {
+    return engine.graph().publish_graph(video("composed"), [&](auto sink) {
+      check(sink->track()->snapshot().state == TrackState::ready, "Graph factory ran before ACK");
+      producer = std::make_shared<GraphProducer>();
+      auto relay = std::make_shared<GraphRelay>();
+      engine::TrackGraphSpec spec;
+      spec.nodes = {relay, producer};
+      spec.connections = {
+          engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(producer, relay),
+          engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(relay, sink)};
+      spec.activate = [&, relay, sink] {
+        check(producer->state() == graphflow::core::LifecycleState::Running &&
+                  relay->state() == graphflow::core::LifecycleState::Running &&
+                  sink->state() == graphflow::core::LifecycleState::Running,
+              "Producer activated before full graph start");
+        ++activations;
+        producer->emit(frame(sink->track()->snapshot().epoch, 1));
+      };
+      spec.quiesce = [&, sink] {
+        ++quiescences;
+        teardown_while_running = producer->state() == graphflow::core::LifecycleState::Running &&
+                                 sink->track()->snapshot().state == TrackState::ready;
+      };
+      return spec;
+    });
   });
   eventually(
       [&] {
@@ -1960,7 +1984,8 @@ void composed_graph_contract() {
         return publication.wait_for(0ms) == std::future_status::ready;
       },
       "Composed graph never started");
-  check(publication.get() == "composed" && activations == 1, "Composed graph lifecycle failed");
+  check(get(std::move(publication)) == "composed" && activations == 1,
+        "Composed graph lifecycle failed");
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -1968,14 +1993,16 @@ void composed_graph_contract() {
       },
       "Composed graph edges did not reach transport");
   auto consumer = std::make_shared<FrameConsumer>();
-  auto subscription = engine.graph().subscribe_graph(video("receive-composed"), [consumer](
-                                                                                    auto source) {
-    auto relay = std::make_shared<GraphRelay>();
-    engine::TrackGraphSpec spec;
-    spec.nodes = {consumer, relay};
-    spec.connections = {engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(source, relay),
-                        engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(relay, consumer)};
-    return spec;
+  auto subscription = async_control([&] {
+    return engine.graph().subscribe_graph(video("receive-composed"), [consumer](auto source) {
+      auto relay = std::make_shared<GraphRelay>();
+      engine::TrackGraphSpec spec;
+      spec.nodes = {consumer, relay};
+      spec.connections = {
+          engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(source, relay),
+          engine::TrackGraphSpec::connect<nodes::EncodedFrameEvent>(relay, consumer)};
+      return spec;
+    });
   });
   eventually(
       [&] {
@@ -1983,7 +2010,7 @@ void composed_graph_contract() {
         return subscription.wait_for(0ms) == std::future_status::ready;
       },
       "Composed subscription never started");
-  subscription.get();
+  get(std::move(subscription));
   BindingToken binding;
   {
     std::lock_guard lock(h->mutex);
@@ -1997,11 +2024,13 @@ void composed_graph_contract() {
   check(quiescences == 1 && teardown_while_running, "Graph stop preceded producer quiescence");
   check(engine.room().snapshot().state == ConnectionState::connected,
         "Graph close left shared room");
-  auto failing = engine.graph().publish_graph(video("failure"), [&](auto) {
-    engine::TrackGraphSpec spec;
-    spec.activate = [] { throw std::runtime_error("source activation failed"); };
-    spec.quiesce = [&] { ++quiescences; };
-    return spec;
+  auto failing = async_control([&] {
+    return engine.graph().publish_graph(video("failure"), [&](auto) {
+      engine::TrackGraphSpec spec;
+      spec.activate = [] { throw std::runtime_error("source activation failed"); };
+      spec.quiesce = [&] { ++quiescences; };
+      return spec;
+    });
   });
   eventually(
       [&] {
@@ -2011,7 +2040,7 @@ void composed_graph_contract() {
       "Activation failure unresolved");
   bool rejected = false;
   try {
-    failing.get();
+    get(std::move(failing));
   } catch (...) {
     rejected = true;
   }
@@ -2076,7 +2105,7 @@ void facade_lifecycle_contract() {
   check(!rtc.media_enabled(), "Encoded facade unexpectedly installed media");
   bool unsupported = false;
   try {
-    rtc.publish_media({});
+    get(rtc.publish_media({}));
   } catch (const livekit::sdk::SDKError& error) {
     unsupported = error.code() == livekit::sdk::ErrorCode::unsupported;
   }
@@ -2086,7 +2115,7 @@ void facade_lifecycle_contract() {
     std::lock_guard lock(h->mutex);
     h->confirm = false;
   }
-  auto pending = rtc.publish(video("pending"));
+  auto pending = async_control([&] { return rtc.publish(video("pending")); });
   get(rtc.leave());
   bool cancelled = false;
   try {
@@ -2100,14 +2129,14 @@ void facade_lifecycle_contract() {
     std::lock_guard lock(h->mutex);
     h->confirm = true;
   }
-  auto active = rtc.publish(video("pending"));
+  auto active = async_control([&] { return rtc.publish(video("pending")); });
   eventually(
       [&] {
 
         return active.wait_for(0ms) == std::future_status::ready;
       },
       "Facade failed to publish after rejoin");
-  check(active.get() == "pending", "Rejoined graph has wrong identity");
+  check(get(std::move(active)) == "pending", "Rejoined graph has wrong identity");
   std::exception_ptr cross_thread_failure;
   std::thread other([&] {
     try {
@@ -2128,11 +2157,137 @@ void facade_lifecycle_contract() {
         "Terminal facade still accepts frames");
   bool closed = false;
   try {
-    rtc.join(options());
+    get(rtc.join(options()));
   } catch (const livekit::sdk::SDKError& error) {
     closed = error.code() == livekit::sdk::ErrorCode::session_closed;
   }
   check(closed, "Terminal close allowed another join");
+}
+#endif
+
+// Every protocol completion is driven independently of the operation lock.
+void serialized_join_leave() {
+  for (int outcome = 0; outcome < 3; ++outcome) {
+    auto h = std::make_shared<Harness>();
+    h->connect = false;
+    RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+    auto opts = options();
+    opts.operation_timeout = 180ms;
+    auto joining = async_control([&] { return room.join(opts); });
+    eventually(
+        [&] {
+          std::lock_guard lock(h->mutex);
+          return h->starts == 1;
+        },
+        "Join not started");
+    auto leaving = async_control([&] { return room.leave(); });
+    check(leaving.wait_for(25ms) == std::future_status::timeout, "Leave preempted join");
+    {
+      std::lock_guard lock(h->mutex);
+      check(h->stops == 0, "Leave stopped an in-flight join");
+    }
+    if (outcome == 0) {
+      h->push({TransportEventKind::connected});
+    }
+    if (outcome == 1) {
+      TransportEvent failure{TransportEventKind::terminal_error};
+      failure.error = "join rejected";
+      h->push(std::move(failure));
+    }
+    auto result = joining.get();
+    check(bool(result) == (outcome == 0), "Wrong join result");
+    if (outcome == 2) {
+      check(result.error().code == livekit::sdk::ErrorCode::timeout, "Join deadline lost");
+    }
+    get(std::move(leaving));
+    check(room.snapshot().state == ConnectionState::closed, "Leave did not complete");
+    {
+      std::lock_guard lock(h->mutex);
+      h->connect = true;
+    }
+    get(room.join(opts));
+    get(room.leave());
+  }
+}
+
+void queued_timeout_starts_after_lock() {
+  auto h = std::make_shared<Harness>();
+  h->connect = false;
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  auto opts = options();
+  opts.operation_timeout = 500ms;
+  opts.signal_protocol = 15;
+  auto joining = async_control([&] { return room.join(opts); });
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->starts == 1;
+      },
+      "Join not started");
+  auto update =
+      async_control([&] { return room.update_local_participant({"queued", {}, {}}, {60ms}); });
+  check(update.wait_for(90ms) == std::future_status::timeout,
+        "Queued deadline started before admission");
+  {
+    std::lock_guard lock(h->mutex);
+    check(h->updates.empty(), "Control overlapped join");
+  }
+  h->push({TransportEventKind::connected});
+  get(std::move(joining));
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->updates.size() == 1;
+      },
+      "Queued control missing");
+  ParticipantUpdateRequest request;
+  {
+    std::lock_guard lock(h->mutex);
+    request = h->updates.front();
+  }
+  TransportEvent response{TransportEventKind::control_completed, {{}, request.epoch}};
+  response.operation_id = request.id;
+  h->push(response);
+  get(std::move(update));
+}
+
+#ifdef LIVEKIT_TEST_RTC_NODES
+void close_waits_and_factory_reentry() {
+  auto h = std::make_shared<Harness>();
+  h->connect = false;
+  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  auto joining = async_control([&] { return rtc.join(options()); });
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->starts == 1;
+      },
+      "Join not started");
+  auto closing = async_control([&] { return rtc.close(); });
+  check(closing.wait_for(30ms) == std::future_status::timeout, "Close preempted join");
+  h->push({TransportEventKind::connected});
+  get(std::move(joining));
+  get(std::move(closing));
+  check(!rtc.join(options()), "Terminal engine accepted join");
+  get(rtc.close());
+  engine::RtcEngine other([h] { return std::make_unique<FakeTransport>(h); });
+  {
+    std::lock_guard lock(h->mutex);
+    h->connect = true;
+  }
+  get(other.join(options()));
+  bool invoked = false;
+  get(other.graph().publish_graph(video("reentry"), [&](auto) {
+    invoked = true;
+    check(!other.leave() && !other.room().update_local_participant({}),
+          "Factory reentered control");
+    check(!rtc.close(), "Factory nested another session");
+    engine::TrackGraphSpec spec;
+    spec.activate = [&] { check(!other.close(), "Hook reentered control"); };
+    return spec;
+  }));
+  check(invoked, "Factory did not execute");
+  get(other.close());
 }
 #endif
 
@@ -2144,7 +2299,7 @@ void typed_join_failure() {
   LiveKitRoomOptions options;
   options.url = "ws://test";
   options.token = "test";
-  auto joining = room.join(options);
+  auto joining = async_control([&] { return room.join(options); });
   eventually(
       [&] {
         std::lock_guard lock(h->mutex);
@@ -2173,10 +2328,13 @@ void typed_join_failure() {
 
 int main() {
   try {
+    serialized_join_leave();
+    queued_timeout_starts_after_lock();
     asynchronous_detachment();
     bounded_event_admission();
 #ifdef LIVEKIT_TEST_RTC_NODES
     std::cout << "facade lifecycle" << std::endl;
+    close_waits_and_factory_reentry();
     facade_lifecycle_contract();
     std::cout << "pipeline lifecycle" << std::endl;
     pipeline_contract();

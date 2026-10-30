@@ -15,12 +15,21 @@ std::exception_ptr failure(webrtc::RTCError error) {
 
 template <class T>
 struct Completion {
-  CompletionSource<T> promise;
+  std::promise<T> promise;
+  std::function<void()> completed;
+
+  void notify() {
+    if (completed) {
+      completed();
+    }
+  }
   std::atomic<bool> settled{false};
 
   void reject(std::exception_ptr error) {
-    if (!settled.exchange(true))
+    if (!settled.exchange(true)) {
       promise.set_exception(std::move(error));
+      notify();
+    }
   }
 
   ~Completion() {
@@ -37,8 +46,10 @@ class SetRemote : public webrtc::SetSessionDescriptionObserver {
   Completion<void> completion;
 
   void OnSuccess() override {
-    if (!completion.settled.exchange(true))
+    if (!completion.settled.exchange(true)) {
       completion.promise.set_value();
+      completion.notify();
+    }
   }
 
   void OnFailure(webrtc::RTCError error) override {
@@ -68,8 +79,10 @@ class StatisticsObserver : public webrtc::RTCStatsCollectorCallback {
           throw std::runtime_error("Native statistics report exceeds 1 MiB");
       }
       result.json += ']';
-      if (!completion.settled.exchange(true))
+      if (!completion.settled.exchange(true)) {
         completion.promise.set_value(std::move(result));
+        completion.notify();
+      }
     } catch (...) {
       completion.reject(std::current_exception());
     }
@@ -82,8 +95,10 @@ class SetLocal : public webrtc::SetSessionDescriptionObserver {
       : completion_(std::move(completion)), description_(std::move(description)) {}
 
   void OnSuccess() override {
-    if (!completion_->settled.exchange(true))
+    if (!completion_->settled.exchange(true)) {
       completion_->promise.set_value(std::move(description_));
+      completion_->notify();
+    }
   }
 
   void OnFailure(webrtc::RTCError error) override {
@@ -197,9 +212,10 @@ NativePeer::~NativePeer() {
   close();
 }
 
-AsyncResult<TransportStatistics> NativePeer::statistics() {
+std::future<TransportStatistics> NativePeer::statistics(std::function<void()> completed) {
   auto observer = webrtc::make_ref_counted<StatisticsObserver>();
-  auto result = observer->completion.promise.get_result();
+  observer->completion.completed = std::move(completed);
+  auto result = observer->completion.promise.get_future();
   runtime_.signaling->BlockingCall([&] {
     if (pc)
       pc->GetStats(observer.get());
@@ -233,9 +249,11 @@ void NativePeer::close() {
   connected = false;
 }
 
-AsyncResult<NativeDescription> NativePeer::create_local(bool offer, bool ice_restart) {
+std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_restart,
+                                                        std::function<void()> completed) {
   auto completion = std::make_shared<Completion<NativeDescription>>();
-  auto future = completion->promise.get_result();
+  completion->completed = std::move(completed);
+  auto future = completion->promise.get_future();
   if (!pc) {
     completion->reject(std::make_exception_ptr(std::runtime_error("Native peer is closed")));
     return future;
@@ -263,10 +281,12 @@ AsyncResult<NativeDescription> NativePeer::create_local(bool offer, bool ice_res
   return future;
 }
 
-AsyncResult<void> NativePeer::set_remote(NativeDescription description,
-                                         std::map<std::string, std::string> mid_to_track) {
+std::future<void> NativePeer::set_remote(NativeDescription description,
+                                         std::map<std::string, std::string> mid_to_track,
+                                         std::function<void()> completed) {
   auto observer = webrtc::make_ref_counted<SetRemote>();
-  auto future = observer->completion.promise.get_result();
+  observer->completion.completed = std::move(completed);
+  auto future = observer->completion.promise.get_future();
   webrtc::SdpParseError error;
   auto native = webrtc::CreateSessionDescription(description.type, description.sdp, &error);
   if (!pc || !native) {

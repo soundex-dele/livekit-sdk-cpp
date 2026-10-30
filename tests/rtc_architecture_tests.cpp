@@ -1,4 +1,6 @@
-#include "livekit/rtc/executor.hpp"
+#include "livekit/rtc/engine.hpp"
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "livekit/rtc/graph_api.hpp"
 #include "livekit/rtc/frame_view.hpp"
 #include "livekit/media_core/frame.hpp"
@@ -58,10 +60,10 @@ class LocalTransport final : public detail::RoomTransport {
     wakeup_->signal();
   }
 
-  livekit::sdk::AsyncResult<void> remove(const detail::BindingToken&, bool) override {
-    livekit::sdk::CompletionSource<void> done;
-    done.set_value();
-    return done.get_result();
+  void remove(const detail::BindingToken&, bool, Removed completed = {}) override {
+    if (completed) {
+      completed({});
+    }
   }
 
   detail::SendResult send(const detail::BindingToken&, const EncodedFrame&) override {
@@ -76,39 +78,18 @@ class LocalTransport final : public detail::RoomTransport {
   std::vector<detail::TransportEvent> events_;
 };
 
-void automatic_executor() {
-  RtcExecutor executor([] {
-    return std::make_unique<RtcEngine>([] { return std::make_unique<LocalTransport>(); });
-  });
-  // A custom backend needs neither LiveKit credentials nor protocol options.
-  executor.submit([](auto& engine) { return engine.join(RoomOptions{}); }).get();
+void synchronous_engine() {
+  RtcEngine engine([] { return std::make_unique<LocalTransport>(); });
+  RoomOptions options;
+  options.operation_timeout = 100ms;
+  require_result(engine.join(options));
   auto descriptor = rtc_audio_test::descriptor("active");
-  const auto id =
-      executor.submit([descriptor](auto& engine) { return engine.publish(descriptor); }).get();
-  check(id == descriptor.id, "Automatic driver did not complete graph creation");
-  check(executor.snapshot().commands_started > 0, "Executor failed to execute commands");
-  executor.submit([](auto& engine) { return engine.leave(); }).get();
-  executor.submit([](auto& engine) { return engine.join(RoomOptions{}); }).get();
-  descriptor.id = "pending";
-  auto pending = executor.submit([descriptor](auto& engine) { return engine.publish(descriptor); });
-  executor.shutdown();
-  check(pending.wait_for(0ms) == std::future_status::ready,
-        "Shutdown left an unresolved operation");
-  bool rejected = false;
-  try {
-    pending.get();
-  } catch (...) {
-    rejected = true;
-  }
-  check(rejected, "Shutdown unexpectedly completed an unacknowledged publication");
-  auto late = executor.submit([](auto&) { return 42; });
-  rejected = false;
-  try {
-    late.get();
-  } catch (...) {
-    rejected = true;
-  }
-  check(rejected && !executor.snapshot().running, "Stopped executor accepted work");
+  check(require_result(engine.publish(descriptor)) == descriptor.id, "Graph identity changed");
+  auto pending = engine.publish(rtc_audio_test::descriptor("pending"));
+  check(!pending && pending.error().code == livekit::sdk::ErrorCode::timeout,
+        "Missing publication timeout");
+  require_result(engine.close());
+  check(!engine.publish(descriptor), "Closed engine accepted publication");
 }
 
 void shared_storage_and_clock() {
@@ -400,7 +381,7 @@ void echo_convergence() {
 
 int main() {
   try {
-    automatic_executor();
+    synchronous_engine();
     shared_storage_and_clock();
     callback_isolation();
     active_output_failure();

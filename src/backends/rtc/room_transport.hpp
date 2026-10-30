@@ -1,5 +1,4 @@
 #pragma once
-#include "livekit/async_result.hpp"
 
 #include "livekit/rtc/types.hpp"
 #include "livekit/error.hpp"
@@ -137,7 +136,8 @@ class RoomTransport {
                          std::shared_ptr<QueueBudget>) = 0;
   // Completion fences native detachment, not a server ACK. Do not wait on the
   // controller: other tracks and control requests must continue to progress.
-  virtual AsyncResult<void> remove(const BindingToken&, bool publication) = 0;
+  using Removed = std::function<void(std::exception_ptr)>;
+  virtual void remove(const BindingToken&, bool publication, Removed = {}) = 0;
   // would_block requires a later writable event for this exact binding when
   // native capacity returns. Merely waking the room is not a track notification.
   virtual SendResult send(const BindingToken&, const EncodedFrame&) = 0;

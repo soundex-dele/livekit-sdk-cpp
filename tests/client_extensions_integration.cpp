@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/livekit.hpp>
@@ -17,6 +19,11 @@ namespace {
 void check(bool ok, const char* message) {
   if (!ok)
     throw std::runtime_error(message);
+}
+
+template <class T>
+auto await(livekit::sdk::Result<T> result) {
+  return require_result(std::move(result));
 }
 
 template <class Future>
@@ -86,9 +93,9 @@ int main(int argc, char** argv) {
       f << vectors;
     }
     const bool media_mode = mode == "encoded" || mode == "media-e2ee";
-    auto room = create_livekit_room();
+    auto room = require_result(create_livekit_room());
     livekit::sdk::app_support::RtcEventMailbox room_events(*room);
-    auto services = room->services();
+    auto services = require_result(room->services());
     auto text = std::make_shared<std::promise<std::string>>();
     auto binary = std::make_shared<std::promise<std::vector<uint8_t>>>();
     auto text_result = text->get_future();

@@ -1,3 +1,4 @@
+#include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
 #include "backends/webrtc/pcm_resampler.hpp"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
@@ -604,6 +605,7 @@ bool AudioCodecNode::doStart() {
   std::promise<void> started;
   auto result = started.get_future();
   impl_->worker = std::jthread([this, started = std::move(started)](std::stop_token stop) mutable {
+    detail::CallbackScope worker_scope;
     impl_->run(stop, std::move(started));
   });
   try {

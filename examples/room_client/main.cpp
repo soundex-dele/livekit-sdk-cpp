@@ -1,3 +1,5 @@
+#include "../../support/rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/graph_api.hpp"
 #include "livekit/rtc/livekit.hpp"
@@ -12,7 +14,7 @@ using namespace std::chrono_literals;
 namespace {
 template <class Future>
 auto complete(rtc::engine::RtcEngine&, Future future) {
-  return future.get();
+  return require_result(std::move(future));
 }
 
 class EncodedConsumer : public graphflow::core::GraphNode {
@@ -47,7 +49,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto engine = rtc::engine::create_livekit_engine();
+    auto engine = require_result(rtc::engine::create_livekit_engine());
     livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
     rtc::LiveKitRoomOptions options;
     options.url = argv[1];
@@ -58,7 +60,6 @@ int main(int argc, char** argv) {
     const auto duration = std::chrono::seconds(argc > 3 ? std::stoi(argv[3]) : 10);
     std::vector<rtc::TrackId> tracks;
     std::vector<std::shared_ptr<EncodedConsumer>> consumers;
-    std::vector<livekit::sdk::AsyncResult<rtc::TrackId>> subscriptions;
     if (publishing)
       for (int i = 0; i < 2; ++i) {
         rtc::TrackDescriptor descriptor;
@@ -77,16 +78,9 @@ int main(int argc, char** argv) {
           throw std::runtime_error(event->message);
         if (!publishing && event->kind == rtc::RoomEventKind::remote_track_added) {
           auto sink = std::make_shared<EncodedConsumer>(event->descriptor->name);
-          subscriptions.push_back(engine->graph().subscribe(*event->descriptor, sink));
+          require_result(engine->graph().subscribe(*event->descriptor, sink));
           consumers.push_back(std::move(sink));
         }
-      }
-      for (auto it = subscriptions.begin(); it != subscriptions.end();) {
-        if (it->wait_for(0ms) == std::future_status::ready) {
-          it->get();
-          it = subscriptions.erase(it);
-        } else
-          ++it;
       }
       for (const auto& id : tracks) {
         rtc::EncodedFrame frame;
@@ -106,7 +100,7 @@ int main(int argc, char** argv) {
         std::cerr << failure->id << ": " << failure->message << '\n';
       std::this_thread::sleep_for(20ms);
     }
-    engine->close().get();
+    require_result(engine->close());
     for (const auto& sink : consumers)
       std::cout << "Received " << sink->frames << " encoded frames, " << sink->bytes << " bytes\n";
     return 0;

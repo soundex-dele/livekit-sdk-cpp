@@ -440,7 +440,11 @@ void audio_loopback() {
 void pending_native_close() {
   native::TransportRuntime runtime;
   native::NativePeer peer(runtime, PC::RTCConfiguration{});
-  auto statistics = peer.statistics();
+  std::promise<void> statistics_notified;
+  auto notification = statistics_notified.get_future();
+  auto statistics = peer.statistics([&] { statistics_notified.set_value(); });
+  check(notification.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+        "Native statistics completion did not notify its event loop");
   ready(statistics);
   const auto report = statistics.get();
   check(report.timestamp_us > 0 && report.json.starts_with('[') && report.json.ends_with(']') &&

@@ -51,13 +51,16 @@ class PublishPipeline {
   WriteStatus write(EncodedFrame);
   std::exception_ptr failure() const;
   void notify_failure(std::exception_ptr);  // Owner sequence only, before close.
-  AsyncResult<void> close();
+  Result<void> close();
 
   const nodes::RtcPublishNode& node() const {
     return *sink_;
   }
 
  private:
+  friend class RtcPipelineEngine;
+  void start_locked();
+  Result<void> close_locked();
   class Input;
   std::mutex mutex_;
   std::shared_ptr<Input> input_;
@@ -79,13 +82,16 @@ class SubscribePipeline {
   void start();
   std::exception_ptr failure() const;
   void notify_failure(std::exception_ptr);  // Owner sequence only, before close.
-  AsyncResult<void> close();
+  Result<void> close();
 
   const nodes::RtcSubscribeNode& node() const {
     return *source_;
   }
 
  private:
+  friend class RtcPipelineEngine;
+  void start_locked();
+  Result<void> close_locked();
   std::mutex mutex_;
   std::shared_ptr<nodes::RtcSubscribeNode> source_;
   TrackGraphSpec extension_;

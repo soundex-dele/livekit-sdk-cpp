@@ -1,3 +1,5 @@
+#include "../../support/rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "livekit/rtc/engine.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include <chrono>
@@ -13,7 +15,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto engine = create_livekit_engine(AudioOutputOptions{});
+    auto engine = require_result(create_livekit_engine(AudioOutputOptions{}));
     engine->set_callbacks({.on_event =
                                [](const RoomEvent& event) {
                                  if (event.kind == RoomEventKind::failed) {
@@ -27,7 +29,7 @@ int main(int argc, char** argv) {
     LiveKitRoomOptions options;
     options.url = argv[1];
     options.token = argv[2];
-    engine->join(options).get();
+    require_result(engine->join(options));
     MediaPublishSpec spec;
     spec.track.id = "generated-audio";
     spec.track.kind = MediaKind::audio;
@@ -35,12 +37,12 @@ int main(int argc, char** argv) {
     spec.track.format.clock_rate = 48000;
     spec.track.format.channels = 1;
     spec.input.generated = true;
-    auto operation = engine->publish_audio(spec);
-    operation.ready.get();  // Backend completion schedules graph startup automatically.
+    auto operation = require_result(engine->publish_audio(spec));
+    // The endpoint and graph are ready when publish_audio returns.
     std::this_thread::sleep_for(std::chrono::seconds(5));
     const auto snapshot = operation.track->snapshot();
     std::cout << "published frames: " << snapshot.frames << '\n';
-    engine->close().get();
+    require_result(engine->close());
     engine->set_callbacks({});
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

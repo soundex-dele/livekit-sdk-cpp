@@ -415,7 +415,7 @@ static void dynacast_case(const std::string& url, const std::string& codec,
 }
 
 static void transport_reject_case(const std::string& url, Json& report) {
-  auto room = transport::create_livekit_room();
+  auto room = require_result(transport::create_livekit_room());
   livekit::sdk::app_support::RtcEventMailbox room_events(*room);
   transport::LiveKitRoomOptions options;
   options.url = url;
@@ -426,7 +426,8 @@ static void transport_reject_case(const std::string& url, Json& report) {
   require(test_transport != MediaTransport::automatic, "negative test requires strict transport");
   bool joined = false, connected = false;
   const auto start = Clock::now();
-  auto joining = room->join(options);
+  auto joining =
+      std::async(std::launch::async, [&] { return require_result(room->join(options)); });
   while (joining.wait_for(0ms) != std::future_status::ready) {
     if (auto event = room_events.take_event(10ms)) {
       joined |= event->kind == transport::RoomEventKind::session_changed;

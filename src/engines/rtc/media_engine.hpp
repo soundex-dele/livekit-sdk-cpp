@@ -13,8 +13,8 @@ namespace livekit::sdk::rtc::engine {
 class RtcMediaEngine final : public MediaModule {
  public:
   explicit RtcMediaEngine(RtcPipelineEngine&, AudioOutputOptions);
-  MediaOperation publish_media(MediaPublishSpec) override;
-  MediaOperation subscribe_media(MediaSubscribeSpec) override;
+  Result<MediaPublication> publish_media(MediaPublishSpec) override;
+  Result<MediaSubscription> subscribe_media(MediaSubscribeSpec) override;
   std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput) override;
 
  private:

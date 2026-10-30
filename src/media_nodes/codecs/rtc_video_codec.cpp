@@ -1,3 +1,4 @@
+#include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "api/environment/environment_factory.h"
 #include "api/video/i420_buffer.h"
@@ -551,6 +552,7 @@ bool VideoCodecNode::doStart() {
   std::promise<void> ready;
   auto result = ready.get_future();
   impl_->worker = std::jthread([this, ready = std::move(ready)](std::stop_token stop) mutable {
+    detail::CallbackScope worker_scope;
     impl_->run(stop, std::move(ready));
   });
   try {

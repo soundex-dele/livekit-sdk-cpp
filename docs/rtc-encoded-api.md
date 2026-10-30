@@ -1,3 +1,5 @@
+> RTC 控制同步返回 `Result<T>`。示例中的 `require_result` 是应用错误边界辅助函数（仓库示例位于 `support/rtc_result.hpp`），在失败时转交应用已有异常处理；它不是 SDK API。库调用方也可直接 `if (!result) { report(result.error()); }`，成功用 `*result` / `result->` 取值。所有阻塞控制在应用工作线程调用，通知/媒体回调与图 hook 禁止重入。协议超时不包括等待操作锁的时间。详见 [验证记录](rtc-sync-result-validation-20261029.md)。
+
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)。自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
 # 编码媒体 RTC API
@@ -28,7 +30,7 @@
 using namespace livekit::sdk::rtc;
 using namespace std::chrono_literals;
 
-auto room = create_livekit_room();
+auto room = require_result(create_livekit_room());
 LiveKitRoomOptions options;
 options.url = url;
 options.token = token;
@@ -41,18 +43,18 @@ room->set_event_handler([&](const RoomEvent& event) {
     discovered.set_value(*event.descriptor);
   }
 });
-room->join(options).get();
+require_result(room->join(options));
 auto descriptor = discovered.get_future().get();
 room->set_event_handler({});  // 等待正在执行的回调返回。
 descriptor.id = "camera-input";
-auto track = room->subscribe(descriptor).get();
+auto track = require_result(room->subscribe(descriptor));
 auto received = track->read(100ms);  // 媒体读取不占用通知队列。
 if (received.status == ReadStatus::frame) {
   auto frame = std::move(*received.frame);
   // frame.buffer.bytes() 是完整 Opus/VP8/H26x 编码数据。
 }
-track->close().get();
-room->leave().get();
+require_result(track->close());
+require_result(room->leave());
 ```
 
 发现事件里的 `remote_sid` 是订阅选择器，不能省略或当作可重用的本地 ID。相同远端 SID 只创建一个后端订阅；需要多个消费者时，在媒体图内分流。
@@ -68,14 +70,14 @@ ReceiveDemand demand;
 demand.width = 640; demand.height = 360;
 demand.fps = 30;
 demand.priority = 1; // 1 最高；0 由服务器安排。
-track->set_demand(demand).get();
+require_result(track->set_demand(demand));
 demand.disabled = true;
-track->set_demand(demand).get(); // 只暂停这条订阅的服务器转发。
+require_result(track->set_demand(demand)); // 只暂停这条订阅的服务器转发。
 ```
 
 宽高都为零时使用 `quality`（默认 high）；指定尺寸时宽高必须都大于零。音频只支持 disabled 和 priority。尺寸上限 16384、帧率上限 240。服务器按可用层及带宽选择转发，目标尺寸/帧率不是输出保证，也不触发转码。该控制不停止本地解码/渲染节点；已有缓冲和网络在途数据仍可交付，`read()` 不因此返回 suspended。
 
-future 成功表示原生适配器已提交信令，协议没有该操作的服务器 ACK。`snapshot().receive_demand` 保存最后成功完成的本地提交值，descriptor 保留初始配置；重入按 snapshot 恢复。取消、超时或断线后的未知结果不替换该恢复值，服务器可能已收到请求，应用可重新提交所需配置。控制共用 128 个待处理操作上限，支持 `ControlOptions`；旧订阅句柄不能控制同名替代订阅。
+Result 成功表示原生适配器已提交信令，协议没有该操作的服务器 ACK。`snapshot().receive_demand` 保存最后成功完成的本地提交值，descriptor 保留初始配置；重入按 snapshot 恢复。取消、超时或断线后的未知结果不替换该恢复值，服务器可能已收到请求，应用可重新提交所需配置。内部控制邮箱保留 128 项容量上限；公共控制按会话锁串行执行，支持 `ControlOptions`；旧订阅句柄不能控制同名替代订阅。
 
 ## 房间与成员快照
 
@@ -96,31 +98,31 @@ SubscriptionPermissions policy;
 policy.all_participants = false;
 policy.participants = {{"viewer", false, {"camera-main", "screen-main"}}};
 options.subscription_permissions = policy;
-room->join(options).get();
+require_result(room->join(options));
 // 随后发布 camera-main / screen-main；无需预先知道服务端 SID。
 ```
 
 运行中用 `room->set_subscription_permissions(policy)` 完整替换策略。`all_participants=true` 允许全部成员，不能同时提供成员列表；`all_tracks=true` 允许指定 identity 的全部轨道，不能再指定 track_ids。false 加空成员列表拒绝全部订阅。最多 64 个成员、每个成员 128 个轨道 ID、总文本 32,000 字节，拒绝重复 identity/ID 和非法 UTF-8。
 
-成功 future 表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
+成功 Result 表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
 
-订阅方通过 `subscription_permission_changed` 事件的 `permission` 读取 publisher participant SID、track SID 和 allowed。该通知可以在订阅尚未绑定时到达；等待中的 subscribe future 仍受 operation_timeout 限制，授权及时恢复可继续完成，超时后需要重新 subscribe。运行中撤销与重新授权由服务器驱动转发变化；已绑定句柄不因权限提示自动销毁。权限通知带房间 epoch，旧会话事件不会混入当前会话。
+订阅方通过 `subscription_permission_changed` 事件的 `permission` 读取 publisher participant SID、track SID 和 allowed。该通知可以在订阅尚未绑定时到达；阻塞等待中的 subscribe 调用 仍受 operation_timeout 限制，授权及时恢复可继续完成，超时后需要重新 subscribe。运行中撤销与重新授权由服务器驱动转发变化；已绑定句柄不因权限提示自动销毁。权限通知带房间 epoch，旧会话事件不会混入当前会话。
 
 ### 修改自己的成员信息
 
-使用 `RoomEngine::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；future 只在服务端 ACK 后成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `SDKError`，错误码为 `permission_denied`。
+使用 `RoomEngine::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；Result 只在服务端 ACK 后成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回失败 Result，错误码为 `permission_denied`。
 
 ```cpp
 livekit::sdk::rtc::ParticipantUpdate update;
 update.name = "演示者";
 update.metadata = R"({"role":"presenter"})";
 update.attributes = {{"language", "zh"}, {"obsolete-key", ""}};
-room->update_local_participant(std::move(update)).get();
+require_result(room->update_local_participant(std::move(update)));
 ```
 
 空名称/元数据遵循 LiveKit 线协议语义，表示保持原值；空属性值删除该键，未包含的键保持原值。ACK 和本地/远端成员快照是独立观测，应用通过 `session_changed` 读取随后更新的状态。
 
-默认超时使用房间的 `operation_timeout`；`ControlOptions` 可指定不超过五分钟的超时与停止令牌。请求在派发前取消/过期会明确失败；派发后取消、超时或中断可能已经改变服务器状态，返回 `outcome_unknown`，不会自动重放。重连后的调用使用新 epoch 和未复用的请求 ID，迟到 ACK 不能完成新操作。每次更新最多 64 KiB，最多 128 个待确认操作。更新不会自动持久化为下一次入会的身份配置。
+默认超时使用房间的 `operation_timeout`；`ControlOptions` 可指定不超过五分钟的超时与停止令牌。请求在派发前取消/过期会明确失败；派发后取消、超时或中断可能已经改变服务器状态，返回 `outcome_unknown`，不会自动重放。重连后的调用使用新 epoch 和未复用的请求 ID，迟到 ACK 不能完成新操作。每次更新最多 64 KiB，内部待确认记录上限为 128 项，公共调用由操作锁串行准入。更新不会自动持久化为下一次入会的身份配置。
 
 ## 发布与多流
 
@@ -130,7 +132,7 @@ room->update_local_participant(std::move(update)).get();
 
 `MediaInputOptions` 必须恰好选择一种输入：`generated=true` 生成测试画面/音调、`input` 指定文件/URL、`capture` 指定 camera/screen，或设置 `video_source` / `audio_source` / `encoded_source`。文件/URL 在上层启动外部 FFmpeg 解码；`ffmpeg` 指定可执行文件，`loop` 只对文件输入有效。输入探测 `probe_media()` 和应用输入队列已移到独立 MediaInputs 库，不需要旧 SDK。
 
-图中需要将发布节点的 `SenderFeedbackEvent` 同时连接到输入节点和编码节点。factory 返回的 `activate` 调用输入节点 `activate()`，`quiesce` 先停止输入再停止编码器，`check_health` 调用两者的 `throw_if_failed()`。这保证下游就绪后才开始生产，关闭时先等待源退出，再拆除下游。
+图中需要将发布节点的 `SenderFeedbackEvent` 同时连接到输入节点和编码节点。factory 返回的 `activate` 调用输入节点 `activate()`，`quiesce` 先停止输入再停止编码器，节点主动上报故障，后续控制或关闭负责回收失败图。这保证下游就绪后才开始生产，关闭时先等待源退出，再拆除下游。
 
 应用视频源使用固定 I420 尺寸，须匹配 descriptor；设备视频会转换为正向 I420 并缩放至发布尺寸。应用 PCM 以原始采样率交付完整 10 ms 块，使用 48 kHz 媒体时间戳，重采样由后续 Opus 节点负责。编码源保留载荷并展开 32 位 RTP 时间戳，Opus 透传无需生成 PCM 或依赖音频编码时钟。每个应用源只能被一个活动输入节点消费，`quiesce()` 会释放这一占用，即使调用方还持有节点用于读取统计。
 
@@ -144,7 +146,7 @@ room->update_local_participant(std::move(update)).get();
 
 `try_write()` 区分接受、背压、需要关键帧、旧 epoch、未就绪、关闭和无效帧。它表示有界队列准入，不是远端接收确认。重连或丢帧后，视频生产方应根据反馈生成新的关键帧。
 
-`unpublish(id)` / `unsubscribe(id)` 也可取消等待确认的操作。成功完成的关闭 future 表示本地传输已解绑；服务端协商可以稍后完成。
+`unpublish(id)` / `unsubscribe(id)` 等待先前发布或订阅完成、失败或超时后才执行，不抢占等待确认的操作。成功的关闭 Result 表示图与本地传输解绑屏障已完成；服务端协商可以稍后完成。
 
 当前原生适配器支持多条独立音视频轨道，每轨一个 encoding。单轨 simulcast/SVC 暂未实现，会明确拒绝。多轨与单轨多编码层是不同能力。
 
@@ -154,7 +156,7 @@ room->update_local_participant(std::move(update)).get();
 
 静音立即关闭端点输入准入并清空待发帧，随后在原生发送器中使已排队的旧代次失效。`try_write()` 在静音期间返回 `not_ready`。恢复后，视频必须从关键帧开始；本地静音意图会作为新发布配置随完整重入恢复。已越过原生发送检查或进入网络协议栈的包、重传及 SFU 填充帧无法撤回，不能用“接收端完全没有 RTP”判断静音是否生效。
 
-静音 future 成功表示本地原生门控已应用并且信令已提交，**不表示服务端 ACK**，当前 MuteTrackRequest 协议没有独立请求 ID。房间快照里的本地静音标记也包含本地提交状态；远端快照来自服务端公告。超时/取消后的结果可能未知，不自动重放；已关闭的旧轨道句柄不能控制同名新轨道。服务端的 mute 命令会更新原生门控及对应端点。
+静音 Result 成功表示本地原生门控已应用并且信令已提交，**不表示服务端 ACK**，当前 MuteTrackRequest 协议没有独立请求 ID。房间快照里的本地静音标记也包含本地提交状态；远端快照来自服务端公告。超时/取消后的结果可能未知，不自动重放；已关闭的旧轨道句柄不能控制同名新轨道。服务端的 mute 命令会更新原生门控及对应端点。
 
 `SenderFeedback::media_generation` 在静音边界变化，即便静音和恢复被合并到同一次反馈通知也不会丢失边界。实际音视频 codec 节点据此清理旧输入和编码积累，停止接收非活动流的原始帧，恢复时重建正确的编码连续性。外部生产者同样应清理自己的缓存，并尽量提供 `EncodedFrame::captured`；端点会拒绝采集时间早于最近静音边界的旧帧。发布节点的反馈线程等待端点变化并自动送达媒体节点。
 
@@ -164,7 +166,7 @@ room->update_local_participant(std::move(update)).get();
 
 `engine::create_livekit_engine()` 创建真实 LiveKit 后端。`publish()` 为轨道创建发布 sink 图，`engine.graph().subscribe(descriptor, consumer)` 创建订阅 source 图（需包含 `rtc/graph_api.hpp`），consumer 接收 `nodes::EncodedFrameEvent`。
 
-Engine 的建图与关闭在内置 utoolkit/task_queue 上串行执行，应用无需轮询，可直接等待发布/订阅 future。订阅源节点和发送反馈各自在节点工作线程等待通知并分发图事件；`write()` 可由生产媒体的线程调用。
+Engine 的建图与关闭在调用线程持会话操作锁串行执行；返回 Result 时端点和图已经就绪。订阅源节点和发送反馈各自在节点工作线程等待通知并分发图事件；`write()` 可由生产媒体的线程调用。
 
 各轨道具有独立队列和图生命周期。房间总预算随载荷在端点、原生发送、原生接收队列间转交，不重复扣额度；读出到应用后，应用自行负责后续内存限制。此预算统计 SDK 管理的待处理访问单元，不包含网络协议栈的 RTP 重传缓存、操作系统 socket 缓冲区或应用保留的帧。
 
@@ -174,16 +176,16 @@ Engine 的建图与关闭在内置 utoolkit/task_queue 上串行执行，应用�
 
 ### 组合媒体图
 
-`engine.graph().publish_graph(descriptor, factory)` 和 `engine.graph().subscribe_graph(descriptor, factory)` 在端点确认后、engine 的控制任务队列中调用 factory。factory 收到对应的 RTC 节点，返回 `TrackGraphSpec`：新建的媒体节点、类型化连接、可选的 `activate`、`quiesce` 和 `check_health`。它们与 RTC 节点属于同一张每轨 GraphEngine 图。
+`engine.graph().publish_graph(descriptor, factory)` 和 `engine.graph().subscribe_graph(descriptor, factory)` 在端点确认后、持会话操作锁的调用线程上调用 factory。factory 收到对应的 RTC 节点，返回 `TrackGraphSpec`：新建的媒体节点、类型化连接、可选的 `activate`、`quiesce` 和 `on_failure`。它们与 RTC 节点属于同一张每轨 GraphEngine 图。
 
 - `activate` 在所有节点启动、初始发送反馈送达之后执行，适合启动采集线程。
 - `quiesce` 必须不抛异常，并在返回前关闭准入、等待生产者/编解码 worker 结束。engine 在停止图内节点之前调用它，部分激活失败也会调用。
-- `check_health` 由延迟健康检查任务调用，工作量必须有界；耗时编解码由节点自己的有界 worker 执行。
+- 节点主动报告故障；后台只更新失败并通知，下次控制操作或关闭时回收图。`on_failure` 不得重入控制。
 - factory 不能复用其他图已初始化的节点；每条流的编码器、解码器和输入队列独立。控制回调不能重入 engine 的图生命周期操作。
 
 可选的 `nodes::VideoCodecNode` 在编码模式下接收拥有 I420 像素的 `VideoFrameEvent` 和 `SenderFeedbackEvent`，输出 `EncodedFrameEvent`；解码模式反向转换，并通过 `KeyframeRequestEvent` 请求恢复帧。将后者连回订阅节点即可触发限频 PLI。媒体节点不创建 Room 或 PeerConnection。
 
-默认每轨编解码准入队列最多 2 帧、32 MiB、250 ms，超限后丢弃旧队列并恢复关键帧；编解码库内部缓冲不计入此准入队列。每个节点拥有独立 worker。下游回调在该 worker 上执行，耗时渲染或业务处理应转交给应用有界队列。`snapshot()` 提供准入、完成、丢弃、队列及错误信息；将 `throw_if_failed()` 接入图的 `check_health` 可让 engine 隔离失败轨道。
+默认每轨编解码准入队列最多 2 帧、32 MiB、250 ms，超限后丢弃旧队列并恢复关键帧；编解码库内部缓冲不计入此准入队列。每个节点拥有独立 worker。下游回调在该 worker 上执行，耗时渲染或业务处理应转交给应用有界队列。`snapshot()` 提供准入、完成、丢弃、队列及错误信息；节点主动报告故障，媒体句柄通过 `check()` 返回失败 Result。
 
 `VideoFrameEvent::timestamp` 保留 90 kHz 媒体时间，`epoch` 在原始帧准入时确定。重连时不能把尚未编码的旧帧改成新 epoch。发布端需使用 `quiesce` 先停止输入生产者，再调用编码节点的 `quiesce()`；接收端同样等待解码节点结束后才释放输出消费者。完整示例见 `examples/video_source/main.cpp` 和 `examples/video_stream/main.cpp`。
 
@@ -197,7 +199,7 @@ Engine 的建图与关闭在内置 utoolkit/task_queue 上串行执行，应用�
 
 `AudioFrameEvent::timestamp` 始终使用 48 kHz 时钟，10 ms 输入递增 480，与输入 PCM 采样率无关。`epoch` 在原始数据准入时固定。旧 epoch、过载、超时或时间戳缺口会丢弃/重置相关积累，避免跨代次拼包。裸解码保留时间戳缺口，通过 `discontinuity` 标记边界。设置 `AudioCodecOptions::jitter_buffer=true` 启用 NetEq 乱序缓冲、PLC 和 10 ms 输出节拍；普通媒体订阅默认开启。混音和音画同步由其他节点完成。
 
-默认准入队列上限为 25 项、256 KiB、250 ms。解码消费者在 codec worker 上执行，业务处理应移交应用有界队列。`audio_stream` 示例使用最多 128 块、512 KiB 的应用队列；`audio_source` 示例按 10 ms 节拍向 `PcmAudioSource` 提交 44.1 kHz 浮点正弦波，由 `MediaInputNode` 接入编码器。图关闭时使用 `quiesce` 等待编解码 worker，使用 `check_health` 调用 `throw_if_failed()` 传播轨道错误。
+默认准入队列上限为 25 项、256 KiB、250 ms。解码消费者在 codec worker 上执行，业务处理应移交应用有界队列。`audio_stream` 示例使用最多 128 块、512 KiB 的应用队列；`audio_source` 示例按 10 ms 节拍向 `PcmAudioSource` 提交 44.1 kHz 浮点正弦波，由 `MediaInputNode` 接入编码器。图关闭时使用 `quiesce` 等待编解码 worker，节点主动上报轨道错误，由后续控制或关闭完成资源回收。
 
 ### 输入节点与麦克风
 
@@ -228,7 +230,7 @@ auto output = std::make_shared<nodes::AudioOutputNode>("speaker", descriptor.id,
 // subscribe_source --EncodedFrameEvent--> decoder --AudioFrameEvent--> output
 ```
 
-每个输出节点在图启动时打开独立轨道队列，第一条轨道启动物理设备，最后一条关闭后停止设备。图的 `quiesce` 先等待解码器退出，再调用输出节点的 `quiesce()`。关闭一条订阅只清理该轨道；旧输出句柄不能影响后来创建的同名轨道。将 `output->throw_if_failed()` 放入图的 `check_health`，设备错误才会传到 engine。
+每个输出节点在图启动时打开独立轨道队列，第一条轨道启动物理设备，最后一条关闭后停止设备。图的 `quiesce` 先等待解码器退出，再调用输出节点的 `quiesce()`。关闭一条订阅只清理该轨道；旧输出句柄不能影响后来创建的同名轨道。设备错误通过节点的故障报告到达引擎。
 
 输出接受 48 kHz PCM16 单/双声道，帧长度 2.5–120 ms。默认最多 32 轨、每轨 250 ms 队列、首帧预缓冲 40 ms。设备按 10 ms 拉取，共享混音后饱和到 PCM16，再适配设备的采样率/声道数。渲染回调遇到队列锁竞争输出静音并推进设备时钟，不阻塞等待生产者。每轨媒体时间戳独立锚定设备时钟；缺口填静音，重叠/迟到帧丢弃，队列超限或超过延迟上限的时间跳变只清理并重新锚定对应轨道。
 
@@ -240,7 +242,7 @@ auto output = std::make_shared<nodes::AudioOutputNode>("speaker", descriptor.id,
 
 ## 数据服务与加密
 
-`room->services()` 返回共享会话的数据服务句柄，提供可靠/不可靠消息、DTMF、转写、RPC、文本/文件流和 DataTrack。这些功能使用后端原生数据通道，不依赖编解码或 GraphEngine。用 `set_event_handler()` 接收数据事件，回调运行在房间串行通知队列；注销或替换会等待旧调用结束，支持回调自行注销。回调抛异常会停止交付并以同一 FailureInfo 报告房间故障。RPC/流处理器运行在有界服务执行器上，不运行在原生网络回调中。
+`room->services()` 返回 `Result<std::shared_ptr<RoomServices>>`，成功值是共享会话的数据服务句柄，提供可靠/不可靠消息、DTMF、转写、RPC、文本/文件流和 DataTrack。这些功能使用后端原生数据通道，不依赖编解码或 GraphEngine。用 `set_event_handler()` 接收数据事件，回调运行在房间串行通知队列；注销或替换会等待旧调用结束，支持回调自行注销。回调抛异常会停止交付并以同一 FailureInfo 报告房间故障。RPC/流处理器运行在有界服务执行器上，不运行在原生网络回调中。
 
 用户数据发送/接收队列各限制为 256 条、4 MiB；单次编码前的数据包最多 15,000 字节，大内容使用流或 DataTrack。发送 future 表示本地提交，不表示对端业务已消费。会话关闭会拒绝待处理发送；断线取消当前 RPC/流请求并重建 DataTrack 绑定，处理器注册保留。保留的服务句柄不会悬空，但会话关闭后不能继续发送。
 

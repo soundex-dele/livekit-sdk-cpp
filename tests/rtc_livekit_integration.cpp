@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/livekit.hpp"
@@ -18,6 +20,11 @@ uint64_t sfu_silence_frames = 0;
 void check(bool ok, const char* message) {
   if (!ok)
     throw std::runtime_error(message);
+}
+
+template <class T>
+auto await(livekit::sdk::Result<T> result) {
+  return require_result(std::move(result));
 }
 
 template <class Future>
@@ -192,7 +199,8 @@ void verify_receive_pause(const std::vector<std::shared_ptr<PublishedTrack>>& tx
 
 int main() {
   try {
-    auto publisher = create_livekit_room(), subscriber = create_livekit_room();
+    auto publisher = require_result(create_livekit_room()),
+         subscriber = require_result(create_livekit_room());
     livekit::sdk::app_support::RtcEventMailbox subscriber_events(*subscriber);
     livekit::sdk::app_support::RtcEventMailbox publisher_events(*publisher);
     LiveKitRoomOptions options;
@@ -330,7 +338,8 @@ int main() {
       rx.push_back(await(subscriber->subscribe(remote[i])));
       std::cerr << "subscribed " << remote[i].name << '\n';
     }
-    auto pending_denied = subscriber->subscribe(remote[3]);
+    auto pending_denied = std::async(
+        std::launch::async, [&] { return require_result(subscriber->subscribe(remote[3])); });
     auto permission_change = [&](bool allowed) {
       const auto deadline = SteadyClock::now() + 5s;
       while (SteadyClock::now() < deadline) {
@@ -433,18 +442,10 @@ int main() {
     await(tx[0]->close());
     await(tx[2]->close());
     transmit(tx, rx, {1, 3}, sequence);
-    auto pending = publisher->publish(descriptor(5));
+    auto withdrawn = await(publisher->publish(descriptor(5)));
     await(publisher->unpublish("stream-5"));
-    check(pending.wait_for(5s) == std::future_status::ready, "Cancelled publish unresolved");
-    std::shared_ptr<PublishedTrack> cancelled;
-    try {
-      cancelled = pending.get();
-    } catch (const std::exception&) {
-    }
-    if (cancelled)
-      check(cancelled->snapshot().state == TrackState::closed,
-            "Cancelled publication remained live");
-    check(publisher->snapshot().publications == 2, "Cancelled publication retained intent");
+    check(withdrawn->snapshot().state == TrackState::closed, "Unpublish returned before closure");
+    check(publisher->snapshot().publications == 2, "Unpublish retained intent");
     transmit(tx, rx, {1, 3}, sequence);
     await(publisher->leave());
     check(!publisher->snapshot().session && local->local.identity == "publisher",
@@ -457,7 +458,7 @@ int main() {
         "Departed participant remained in roster");
     await(subscriber->leave());
     std::cout << "{\"multiTrack\":true,\"resubscribe\":true,\"independentClose\":true,"
-                 "\"cancelPending\":true,\"sessionRoster\":true,\"participantControl\":true,"
+                 "\"serializedRemoval\":true,\"sessionRoster\":true,\"participantControl\":true,"
                  "\"muteControl\":true,\"publicationSources\":true,\"receiveDemand\":true,"
                  "\"subscriptionPermissions\":true,\"sfuSilenceFrames\":"
               << sfu_silence_frames << "}\n";

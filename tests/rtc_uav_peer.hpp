@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "livekit/rtc/graph_api.hpp"
 #include "livekit/rtc/livekit.hpp"
 #pragma once
@@ -35,7 +37,7 @@ struct Peer {
         [this, url, identity, started = std::move(started)](std::stop_token stop) mutable {
           bool announced = false;
           try {
-            engine_ = transport::engine::create_livekit_engine();
+            engine_ = require_result(transport::engine::create_livekit_engine());
             engine_events_.attach(*engine_);
             transport::LiveKitRoomOptions options;
             options.url = url;
@@ -71,7 +73,7 @@ struct Peer {
           }
           if (engine_)
             try {
-              engine_->close().get();
+              require_result(engine_->close());
             } catch (...) {
               std::lock_guard lock(mutex_);
               if (!failure_)
@@ -197,7 +199,7 @@ struct Peer {
 
   std::future<void> unpublish(const std::string& id) {
     return command<void>([this, id] {
-      engine_->unpublish(id).get();
+      require_result(engine_->unpublish(id));
       outgoing_.erase(id);
       publications = outgoing_.size();
     });
@@ -212,11 +214,8 @@ struct Peer {
           d = known_.at(id);
         }
         subscribe(d);
-        await(std::move(pending_.at(id)));
-        pending_.erase(id);
       } else {
-        engine_->unsubscribe(id).get();
-        pending_.erase(id);
+        require_result(engine_->unsubscribe(id));
         std::lock_guard lock(mutex_);
         active_.erase(id);
       }
@@ -274,14 +273,7 @@ struct Peer {
 
   template <class Future>
   auto await(Future future) {
-    const auto deadline = Clock::now() + 15s;
-    while (future.wait_for(0ms) != std::future_status::ready) {
-      require(!stopping_.load() && Clock::now() < deadline,
-              "Test operation cancelled or timed out");
-
-      std::this_thread::sleep_for(1ms);
-    }
-    return future.get();
+    return require_result(std::move(future));
   }
 
   template <class T, class F>
@@ -311,7 +303,7 @@ struct Peer {
   }
 
   void subscribe(const transport::TrackDescriptor& d) {
-    pending_[d.id] = engine_->graph().subscribe_graph(d, [this, d](auto source) {
+    require_result(engine_->graph().subscribe_graph(d, [this, d](auto source) {
       auto output = std::make_shared<Observe>(*this, d.remote_sid);
       const auto build = [&]<class Codec, class Event>(std::shared_ptr<Codec> codec) {
         TrackGraph graph;
@@ -332,7 +324,8 @@ struct Peer {
       return build
           .template operator()<transport::nodes::AudioCodecNode, transport::nodes::AudioFrameEvent>(
               std::make_shared<transport::nodes::AudioCodecNode>("decoder", d, false));
-    });
+    }));
+
     std::lock_guard lock(mutex_);
     active_.insert(d.id);
   }
@@ -353,8 +346,7 @@ struct Peer {
       }
       if (event->kind == transport::RoomEventKind::remote_track_removed ||
           event->kind == transport::RoomEventKind::track_removed) {
-        engine_->unsubscribe(event->track_id).get();
-        pending_.erase(event->track_id);
+        require_result(engine_->unsubscribe(event->track_id));
         std::lock_guard lock(mutex_);
         known_.erase(event->track_id);
         active_.erase(event->track_id);
@@ -377,12 +369,6 @@ struct Peer {
         }
       }
     }
-    for (auto it = pending_.begin(); it != pending_.end();)
-      if (it->second.wait_for(0ms) == std::future_status::ready) {
-        it->second.get();
-        it = pending_.erase(it);
-      } else
-        ++it;
     for (const auto& [id, track] : outgoing_) {
       auto feedback = engine_->feedback(id);
       bool enabled = false;
@@ -404,7 +390,6 @@ struct Peer {
   std::map<std::string, transport::TrackDescriptor> known_;
   std::set<std::string> active_;
   std::map<std::string, TestTrack> outgoing_;
-  std::map<std::string, livekit::sdk::AsyncResult<transport::TrackId>> pending_;
   std::unique_ptr<transport::engine::RtcEngine> engine_;
   livekit::sdk::app_support::RtcEventMailbox engine_events_;
   std::exception_ptr failure_;

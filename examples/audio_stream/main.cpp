@@ -1,3 +1,5 @@
+#include "../../support/rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include <livekit/rtc/engine.hpp>
@@ -59,13 +61,12 @@ int main(int argc, char** argv) {
     if (!url || !token)
       throw std::runtime_error("Set LIVEKIT_URL and a room-join LIVEKIT_TOKEN");
     ApplicationQueue queue;  // Outlives the engine and its decoder workers.
-    auto engine = engine::create_livekit_engine({});
+    auto engine = require_result(engine::create_livekit_engine({}));
     livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
     LiveKitRoomOptions options;
     options.url = url;
     options.token = token;
-    engine->join(options).get();
-    std::vector<livekit::sdk::AsyncResult<TrackId>> pending;
+    require_result(engine->join(options));
     std::map<TrackId, uint64_t> samples;
     size_t blocks = 0;
     const auto deadline = SteadyClock::now() + 30s;
@@ -80,17 +81,9 @@ int main(int argc, char** argv) {
         config.output.audio = [&queue, id = descriptor.id](const auto& frame) {
           queue.push(id, frame);
         };
-        auto operation = engine->subscribe_media(std::move(config));
-        pending.push_back(std::move(operation.ready));
+        auto operation = require_result(engine->subscribe_media(std::move(config)));
       }
 
-      for (auto it = pending.begin(); it != pending.end();) {
-        if (it->wait_for(0ms) == std::future_status::ready) {
-          it->get();
-          it = pending.erase(it);
-        } else
-          ++it;
-      }
       if (auto failure = engine_events.take_failure())
         throw std::runtime_error(failure->message);
       // Slow application work happens here, outside decoder/native callbacks.
@@ -101,7 +94,7 @@ int main(int argc, char** argv) {
         ++blocks;
       }
     }
-    engine->close().get();
+    require_result(engine->close());
     for (const auto& [track, count] : samples)
       std::cout << track << " samples/channel=" << count << '\n';
     std::cout << "application_dropped_blocks=" << queue.dropped << '\n';

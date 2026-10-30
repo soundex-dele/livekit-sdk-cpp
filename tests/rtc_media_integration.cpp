@@ -1,5 +1,7 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
-#include "livekit/rtc/executor.hpp"
+#include "livekit/rtc/engine.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include <array>
 #include <cstdlib>
@@ -20,8 +22,7 @@ void check(bool condition, const char* message) {
 
 template <class Future>
 auto await(Future future) {
-  check(future.wait_for(20s) == std::future_status::ready, "Automatic media operation timed out");
-  return future.get();
+  return require_result(std::move(future));
 }
 
 struct Observation {
@@ -37,17 +38,17 @@ int main() {
   try {
     std::mutex mutex;
     std::array<Observation, 2> observed;
-    auto tx = create_livekit_executor(AudioOutputOptions{});
-    auto rx = create_livekit_executor(AudioOutputOptions{});
+    auto tx = require_result(create_livekit_engine(AudioOutputOptions{}));
+    auto rx = require_result(create_livekit_engine(AudioOutputOptions{}));
     livekit::sdk::app_support::RtcEventMailbox rx_events;
-    await(rx->submit([&](auto& engine) { rx_events.attach(engine); }));
+    rx_events.attach(*rx);
     LiveKitRoomOptions options;
     options.url = std::getenv("LIVEKIT_URL");
     options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
     options.reconnect.enabled = false;
-    await(tx->submit([options](auto& engine) { return engine.join(options); }));
+    await(tx->join(options));
     options.token = std::getenv("LIVEKIT_SUBSCRIBE_TOKEN");
-    await(rx->submit([options](auto& engine) { return engine.join(options); }));
+    await(rx->join(options));
     std::array<std::shared_ptr<MediaTrack>, 2> publications, subscriptions;
     for (size_t i = 0; i < 2; ++i) {
       MediaPublishSpec spec;
@@ -60,9 +61,7 @@ int main() {
       spec.track.format.width = 64;
       spec.track.format.height = 48;
       spec.input.generated = true;
-      auto operation =
-          await(tx->submit([spec](auto& engine) { return engine.publish_media(spec); }));
-      await(std::move(operation.ready));
+      auto operation = await(tx->publish_media(spec));
       publications[i] = operation.track;
     }
     const auto deadline = SteadyClock::now() + 20s;
@@ -98,17 +97,15 @@ int main() {
         }
         observation.retained = frame;
       };
-      auto operation =
-          await(rx->submit([spec](auto& engine) { return engine.subscribe_media(spec); }));
-      await(std::move(operation.ready));
+      auto operation = await(rx->subscribe_media(spec));
       subscriptions[i] = operation.track;
     }
     while (true) {
       for (const auto& track : publications) {
-        track->throw_if_failed();
+        require_result(track->check());
       }
       for (const auto& track : subscriptions) {
-        track->throw_if_failed();
+        require_result(track->check());
       }
       {
         std::lock_guard lock(mutex);
@@ -130,19 +127,20 @@ int main() {
       check(SteadyClock::now() < deadline, "Missing timed audio/video through SFU");
       std::this_thread::sleep_for(10ms);
     }
-    check(tx->snapshot().commands_started && rx->snapshot().commands_started,
-          "Command task queues did not run");
-    await(tx->submit([](auto& engine) { return engine.leave(); }));
-    await(rx->submit([](auto& engine) { return engine.leave(); }));
-    tx->shutdown();
-    rx->shutdown();
+    check(tx->room().snapshot().state == ConnectionState::connected &&
+              rx->room().snapshot().state == ConnectionState::connected,
+          "Room not connected");
+    await(tx->leave());
+    await(rx->leave());
+    require_result(tx->close());
+    require_result(rx->close());
     for (const auto& observation : observed) {
       check(observation.retained->owner && !observation.retained->planes[0].empty(),
             "Frame storage did not survive shutdown");
       const auto first = observation.retained->planes[0][0];
       (void)first;
     }
-    std::cout << "{\"ordinaryMedia\":true,\"automaticExecutor\":true,\"netEq10ms\":true,"
+    std::cout << "{\"ordinaryMedia\":true,\"synchronousControl\":true,\"netEq10ms\":true,"
                  "\"senderClock\":true,\"avPresentation\":true,\"retainedFrames\":true}\n";
     return 0;
   } catch (const std::exception& error) {

@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/graph_api.hpp"
@@ -20,13 +22,7 @@ void check(bool ok, const char* message) {
 
 template <class Future>
 auto await(engine::RtcEngine& engine, Future future) {
-  const auto deadline = SteadyClock::now() + 15s;
-  while (future.wait_for(0ms) != std::future_status::ready) {
-    check(SteadyClock::now() < deadline, "Audio graph operation timed out");
-
-    std::this_thread::sleep_for(1ms);
-  }
-  return future.get();
+  return require_result(std::move(future));
 }
 
 class Source : public graphflow::core::GraphNode {
@@ -108,7 +104,8 @@ int main() {
   try {
     const auto encrypted_env = std::getenv("LIVEKIT_MEDIA_ENCRYPTION");
     const bool encrypted = encrypted_env && std::string(encrypted_env) == "1";
-    auto tx = engine::create_livekit_engine(), rx = engine::create_livekit_engine();
+    auto tx = require_result(engine::create_livekit_engine()),
+         rx = require_result(engine::create_livekit_engine());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
     livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
     LiveKitRoomOptions options;
@@ -209,8 +206,8 @@ int main() {
     check(device->starts == 1 && device->stops == 0 && playout->snapshot().tracks == 1,
           "Independent subscription close stopped shared device");
     run(1);
-    tx->close().get();
-    rx->close().get();
+    require_result(tx->close());
+    require_result(rx->close());
     check(device->stops == 1 && playout->snapshot().tracks == 0,
           "Final subscription close retained device");
     for (auto node : encoders) {

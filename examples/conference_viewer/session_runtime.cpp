@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
 #include "session.hpp"
 #include <livekit/rtc/engine.hpp>
@@ -12,7 +14,6 @@ using Json = sdk::Json;
 struct Track {
   TrackDescriptor descriptor;
   bool publication = false, ready = false;
-  livekit::sdk::AsyncResult<TrackId> pending;
   std::shared_ptr<engine::MediaTrack> media;
 
   std::string sid() const {
@@ -21,7 +22,7 @@ struct Track {
 
   void check() const {
     if (media)
-      media->throw_if_failed();
+      require_result(media->check());
   }
 
   std::map<std::string, uint64_t> metric_ids;
@@ -95,7 +96,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
       };
       try {
         std::map<TrackId, std::shared_ptr<Track>> tracks;
-        auto engine = engine::create_livekit_engine({});
+        auto engine = require_result(engine::create_livekit_engine({}));
         livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
         const auto report = [&](const Json& event) {
           {
@@ -107,15 +108,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
             options.log_sink(event);
         };
         // Only the supervisor owns engine control. Codec callbacks only replace an owned frame.
-        const auto await = [&](auto& future) {
-          while (future.wait_for(0ms) != std::future_status::ready) {
-            if (stop.stop_requested())
-              throw std::runtime_error("Session cancelled");
-
-            std::this_thread::sleep_for(5ms);
-          }
-          return future.get();
-        };
+        const auto await = [&](auto& result) { return require_result(std::move(result)); };
         options.connection.subscribe = false;
         options.connection.subscribe_tracks.clear();
         options.connection.stats_interval = 1000ms;
@@ -155,15 +148,14 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
           engine::MediaPublishSpec config;
           config.track = d;
           config.input = input;
-          auto operation = engine->publish_media(std::move(config));
+          auto operation = require_result(engine->publish_media(std::move(config)));
           track->media = std::move(operation.track);
-          track->pending = std::move(operation.ready);
+          track->ready = true;
           tracks.emplace(d.id, track);
           return track;
         };
         for (const auto& media : options.media) {
           auto track = publish(media);
-          await(track->pending);
           track->ready = true;
         }
         const auto subscribe = [&](TrackDescriptor descriptor) {
@@ -185,9 +177,9 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
           else {
             config.output.playout = options.audio_playout;
           }
-          auto operation = engine->subscribe_media(std::move(config));
+          auto operation = require_result(engine->subscribe_media(std::move(config)));
           track->media = std::move(operation.track);
-          track->pending = std::move(operation.ready);
+          track->ready = true;
           tracks.emplace(descriptor.id, std::move(track));
         };
         auto next_stats = SteadyClock::now();
@@ -243,12 +235,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
             if (it != tracks.end())
               throw std::runtime_error("Track " + failure->id + ": " + failure->message);
           }
-          for (auto& [id, track] : tracks)
-            if (track->pending.valid() &&
-                track->pending.wait_for(0ms) == std::future_status::ready) {
-              track->pending.get();
-              track->ready = true;
-            }
+
           std::optional<VideoCommand> command;
           {
             std::lock_guard lock(mutex_);
@@ -263,7 +250,6 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
                 spec.demo = true;
                 auto track = publish(spec);
                 adding = track->descriptor.id;
-                await(track->pending);
                 track->ready = true;
               } else {
                 const auto found =
@@ -280,7 +266,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
               failure = redact(e.what());
               if (!adding.empty()) {
                 try {
-                  engine->unpublish(adding).get();
+                  require_result(engine->unpublish(adding));
                 } catch (...) {
                 }
                 tracks.erase(adding);
@@ -345,7 +331,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
           }
           std::this_thread::sleep_for(5ms);
         }
-        engine->close().get();
+        require_result(engine->close());
         for (const auto& [id, track] : tracks)
           track->check();
       } catch (const std::exception& e) {

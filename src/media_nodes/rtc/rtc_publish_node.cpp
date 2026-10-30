@@ -1,5 +1,6 @@
 #include "livekit/rtc/publish_node.hpp"
 #include <stdexcept>
+#include "backends/rtc/control_context.hpp"
 
 namespace livekit::sdk::rtc::nodes {
 RtcPublishNode::RtcPublishNode(std::string name, std::shared_ptr<PublishedTrack> track)
@@ -45,6 +46,7 @@ void RtcPublishNode::activate() {
   std::promise<void> initial;
   auto ready = initial.get_future();
   worker_ = std::jthread([this, initial = std::move(initial)](std::stop_token stop) mutable {
+    detail::CallbackScope worker_scope;
     bool initialized = false;
     try {
       Epoch epoch = 0;
@@ -114,6 +116,6 @@ void RtcPublishNode::throw_if_failed() const {
 void RtcPublishNode::doStop() {
   quiesce();
   // Local graph stop never waits for native signaling.
-  track_->close();
+  // Endpoint teardown belongs to the serialized pipeline controller.
 }
 }  // namespace livekit::sdk::rtc::nodes

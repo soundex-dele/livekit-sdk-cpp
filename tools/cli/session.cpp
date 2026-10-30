@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "data_event_mailbox.hpp"
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
@@ -64,13 +66,12 @@ class Output final {
 struct Track {
   TrackDescriptor descriptor;
   bool publication = false, closing = false, reported = false, ready = false;
-  livekit::sdk::AsyncResult<TrackId> pending;
   std::shared_ptr<engine::MediaTrack> media;
   std::shared_ptr<Output> output;
 
   void check() const {
     if (media)
-      media->throw_if_failed();
+      require_result(media->check());
   }
 
   Json summary() const {
@@ -127,9 +128,11 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
   std::map<TrackId, std::shared_ptr<Track>> tracks;
   auto display =
       options.video_playout ? std::make_shared<lk::VideoPlayout>(display_events) : nullptr;
-  auto engine = engine::create_livekit_engine({});  // Destroy before consumers/display.
+  auto engine =
+      require_result(engine::create_livekit_engine({}));  // Destroy before consumers/display.
   livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
-  livekit::sdk::app_support::DataEventMailbox data_events(engine->room().services());
+  livekit::sdk::app_support::DataEventMailbox data_events(
+      require_result(engine->room().services()));
   LiveKitRoomOptions room;
   room.url = options.url;
   room.token = options.token;
@@ -138,15 +141,11 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
   room.stats_interval = std::chrono::milliseconds(options.stats_interval_ms);
   // Subscriptions are explicit graph operations; server auto-subscribe stays off.
   auto joining = engine->join(room);
-  while (joining.wait_for(0ms) != std::future_status::ready) {
-    if (stop.stop_requested()) {
-      engine->close().get();
-      return;
-    }
-
-    std::this_thread::sleep_for(5ms);
+  require_result(std::move(joining));
+  if (stop.stop_requested()) {
+    require_result(engine->close());
+    return;
   }
-  joining.get();
   report({{"event", "joined"}, {"room", options.room}});
   const auto joined = engine->room().snapshot().session;
   if (!joined || joined->room.name != options.room)
@@ -189,17 +188,17 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
     engine::MediaPublishSpec config;
     config.track = d;
     config.input = input;
-    auto operation = engine->publish_media(std::move(config));
+    auto operation = require_result(engine->publish_media(std::move(config)));
     track->media = std::move(operation.track);
-    track->pending = std::move(operation.ready);
+    track->ready = true;
     tracks.emplace(d.id, std::move(track));
   }
   std::optional<std::future<void>> sending;
   if (!options.publish_data.empty()) {
     DataSendOptions data;
     data.topic = options.topic;
-    sending = engine->room().services()->send_data(
-        {options.publish_data.begin(), options.publish_data.end()}, data);
+    sending = require_result(engine->room().services())
+                  ->send_data({options.publish_data.begin(), options.publish_data.end()}, data);
   }
   const auto start = SteadyClock::now();
   auto next_stats = start;
@@ -223,9 +222,9 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
     }
     if (d.kind == MediaKind::audio)
       config.output.playout = options.audio_playout;
-    auto operation = engine->subscribe_media(std::move(config));
+    auto operation = require_result(engine->subscribe_media(std::move(config)));
     track->media = std::move(operation.track);
-    track->pending = std::move(operation.ready);
+    track->ready = true;
     tracks.emplace(d.id, std::move(track));
   };
   try {
@@ -241,7 +240,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
             found->second->closing = true;
             auto removing = found->second->publication ? engine->unpublish(found->first)
                                                        : engine->unsubscribe(found->first);
-            removing.get();
+            require_result(std::move(removing));
           }
           report(
               {{"event", "track-removed"}, {"track", event->track_id}, {"reason", event->message}});
@@ -249,7 +248,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
           auto found = tracks.find(event->track_id);
           if (found != tracks.end() && !found->second->publication) {
             found->second->closing = true;
-            engine->unsubscribe(found->first).get();
+            require_result(engine->unsubscribe(found->first));
           }
         } else if (event->kind == RoomEventKind::failed || event->kind == RoomEventKind::closed)
           throw std::runtime_error(event->message.empty() ? "Room disconnected" : event->message);
@@ -278,20 +277,6 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
       bool publications_ready = true, inputs_finished = !media.empty();
       for (auto it = tracks.begin(); it != tracks.end();) {
         auto& track = *it->second;
-        if (track.pending.valid() && track.pending.wait_for(0ms) == std::future_status::ready) {
-          if (track.closing) {
-            try {
-              track.pending.get();
-            } catch (...) {
-            }
-          } else {
-            track.pending.get();
-            track.ready = true;
-            report({{"event", track.publication ? "published" : "subscribed"},
-                    {"track", track.publication ? track.media->snapshot().transport.server_sid
-                                                : track.descriptor.remote_sid}});
-          }
-        }
         if (track.publication) {
           publications_ready &= track.ready;
           inputs_finished &=
@@ -342,7 +327,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
       }
       std::this_thread::sleep_for(5ms);
     }
-    engine->close().get();
+    require_result(engine->close());
     for (const auto& [id, track] : tracks) {
       track->check();
       report(track->summary());
@@ -353,7 +338,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
     display_events.dispatch();
     display_events.rethrow();
   } catch (...) {
-    engine->close().get();
+    require_result(engine->close());
     throw;
   }
 }

@@ -1,3 +1,5 @@
+#include "rtc_result.hpp"
+using livekit::sdk::app_support::require_result;
 #include "data_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "livekit/rtc/livekit.hpp"
@@ -14,6 +16,11 @@ namespace {
 void check(bool ok, const char* message) {
   if (!ok)
     throw std::runtime_error(message);
+}
+
+template <class T>
+auto await(livekit::sdk::Result<T> result) {
+  return require_result(std::move(result));
 }
 
 template <class T>
@@ -42,8 +49,8 @@ void eventually(F test) {
 int main() {
   try {
     const bool encrypted = env("LIVEKIT_DATA_ENCRYPTION") == "1";
-    auto tx = create_livekit_room(), rx = create_livekit_room();
-    auto sending = tx->services(), receiving = rx->services();
+    auto tx = require_result(create_livekit_room()), rx = require_result(create_livekit_room());
+    auto sending = require_result(tx->services()), receiving = require_result(rx->services());
     app_support::DataEventMailbox data_events(receiving);
     receiving->register_rpc("echo", [](RpcInvocation call, RpcCompletion complete) {
       check(call.caller_identity == "publisher", "RPC caller identity lost");

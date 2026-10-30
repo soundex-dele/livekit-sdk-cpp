@@ -2,7 +2,7 @@
 #include "backends/webrtc/encoded_receiver.hpp"
 #include "backends/webrtc/transport_runtime.hpp"
 #include "api/rtp_transceiver_interface.h"
-#include "livekit/async_result.hpp"
+#include <functional>
 #include <deque>
 #include <future>
 #include <map>
@@ -52,10 +52,12 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   NativePeer(const NativePeer&) = delete;
   NativePeer& operator=(const NativePeer&) = delete;
 
-  AsyncResult<NativeDescription> create_local(bool offer, bool ice_restart = false);
-  AsyncResult<TransportStatistics> statistics();
-  AsyncResult<void> set_remote(NativeDescription description,
-                               std::map<std::string, std::string> mid_to_track = {});
+  std::future<NativeDescription> create_local(bool offer, bool ice_restart = false,
+                                              std::function<void()> completed = {});
+  std::future<TransportStatistics> statistics(std::function<void()> completed = {});
+  std::future<void> set_remote(NativeDescription description,
+                               std::map<std::string, std::string> mid_to_track = {},
+                               std::function<void()> completed = {});
   // Call when offer/answer negotiation is stable to bind reused/preallocated receivers.
   void refresh_receivers();
   void add_ice(const NativeIceCandidate& candidate);
