@@ -49,6 +49,17 @@ RoomView 的参与者/权限控制也通过 RoomObserver 完成。GraphApi 使�
 GraphEngine 媒体流水线不变。leave/close 通过独立的中断标记与 wakeup 唤醒等待，
 不会排在一个无法中断的网络等待之后。
 
+轨道图故障或端点终止会唤醒控制 worker 自动回收图，不再要求应用提交下一次控制请求。
+回收请求合并到一个独立调度位，不占用 128 个用户请求槽；在当前操作结束后优先于普通
+排队操作执行，leave/close 优先。回收期间仍保留图资源直到原生端点解绑完成；析构会
+中断正在等待解绑的回收任务。该机制不改变协议操作串行执行的约定，也不能抢占正在
+执行的网络等待、构图或设备停止。
+
+完成通知通过 RAII 凭证管理请求标识和队列容量。通知执行、observer 抛异常或投递任务
+被销毁时都只归还一次，旧通知的销毁不会移除同标识的新请求。底层通知投递发生异常
+（例如内存分配失败）时，房间记录故障；无法投递的完成通知不保证送达，但不会留下
+永久占用的请求槽或导致析构永远等待。不会改到控制线程直接调用 observer 来补发通知。
+
 `examples/automatic_session/main.cpp` 展示分别实现房间和发布 observer 的调用方法。
 现有 CLI、后台会话循环和老测试通过非安装的 `support/rtc_blocking_bridge.hpp` 消费 observer
 结果，以保留它们原本的顺序工作流；它不是 SDK 公共 API，也不应从 UI、媒体或通知线程调用。
@@ -74,3 +85,21 @@ GraphEngine 媒体流水线不变。leave/close 通过独立的中断标记与 w
   `out/rtc-observer-app-build.log`；补充契约测试构建见 `out/rtc-observer-final-tests-build.log`。
 
 以上是自动化编译、无窗口和合成媒体验证；未进行真实摄像头、麦克风、扬声器或设备人工验收。
+
+## 通知与自动回收优化复验（2026-10-30）
+
+- 后端独立配置的后端、流水线测试目标编译通过，相关 CTest 3/3 通过。
+- Windows Release 下重新编译相关测试目标，最终 CTest 5/5 通过：`rtc_backend`、
+  `rtc_pipelines`、`rtc_dependency_boundaries`、`rtc_architecture`、`rtc_media_engine`。
+- 新增回归覆盖投递抛异常、通知任务丢弃、observer 抛异常、同标识复用、满载时合并
+  回收请求、发布/订阅图自动回收、服务端撤销及等待原生解绑期间析构退出。
+- 取消测试使用较长协议超时，同时保留两秒取消完成断言，避免构建负载使协议超时
+  抢先发生；媒体测试补齐回调重入及退房重入的阶段标签。
+- 媒体回归曾在阻塞适配器的回调重入用例超时。使用当前工作区的媒体回调保护后，
+  该用例及最终五项回归全部通过。
+- 构建日志位于聚合仓库 `out/rtc-engine-optimization-core-build.log`、
+  `out/rtc-engine-optimization-build.log`、`out/rtc-engine-optimization-media-build.log`
+  和 `out/rtc-engine-optimization-final-tests-build.log`。
+
+这轮没有重跑真实 SFU 集成或实际设备人工验收。协议操作仍串行执行；自动回收调度
+不会消除正在执行的协议等待造成的队头阻塞。

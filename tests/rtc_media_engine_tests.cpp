@@ -472,7 +472,9 @@ int main() {
   try {
     std::cout << "multi_track" << std::endl;
     multi_track();
+    std::cout << "media_callback_reentry" << std::endl;
     media_callback_reentry();
+    std::cout << "media_leave_and_rejoin" << std::endl;
     media_leave_and_rejoin();
     std::cout << "cancelled_and_failed_sources" << std::endl;
     cancelled_and_failed_sources();

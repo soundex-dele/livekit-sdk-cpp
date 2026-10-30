@@ -2787,7 +2787,9 @@ void serialized_join_leave() {
     livekit::sdk::app_support::BlockingRoom room(
         [h] { return std::make_unique<FakeTransport>(h); });
     auto opts = options();
-    opts.operation_timeout = 180ms;
+    // Verify cancellation before the protocol timeout, even under build load.
+    // The separate two-second assertion still catches a non-interruptible join.
+    opts.operation_timeout = 10s;
     auto joining = async_control([&] { return room.join(opts); });
     eventually(
         [&] {
