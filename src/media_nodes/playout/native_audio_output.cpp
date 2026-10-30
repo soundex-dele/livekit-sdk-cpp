@@ -158,7 +158,9 @@ class NativeAudioOutput final : public AudioOutputDriver {
           require(adm_->SetPlayoutDevice(*options.device_index), "select audio output device");
         } else {
 #ifdef _WIN32
-          require(adm_->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultCommunicationDevice),
+          // Match the system's default playback destination. The communications
+          // endpoint can be a different headset or HDMI monitor with no speakers.
+          require(adm_->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice),
                   "select default audio output device");
 #else
           require(adm_->SetPlayoutDevice(uint16_t(0)), "select default audio output device");

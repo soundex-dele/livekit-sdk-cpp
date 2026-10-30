@@ -9,6 +9,8 @@ namespace livekit::sdk::rtc {
 class AudioRenderReference;
 
 struct AudioOutputOptions {
+  // Unset selects the system default playback device (Windows eConsole),
+  // rather than the separate default communications endpoint.
   std::optional<uint16_t> device_index;
   size_t max_tracks = 32;
   std::shared_ptr<AudioRenderReference> echo_reference;
