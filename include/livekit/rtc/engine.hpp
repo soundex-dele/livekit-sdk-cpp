@@ -8,7 +8,10 @@
 namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
 
-// Single-room facade. Completed Result values are returned on the calling thread.
+// Single-room facade. Controls execute synchronously on the calling thread.
+// Operations return ErrorCode::ok on success. Creation returns an empty ID,
+// null pointer or empty media handle on failure; optional error is always set.
+// Backend exceptions are translated to error codes at the control boundary.
 // Controls share a session control context with the room, including protocol waits.
 // Call from application workers, never from notifications/media callbacks or hooks.
 // Stop and join all callers before destruction; close does not preempt an operation.
@@ -21,27 +24,28 @@ class RtcEngine final {
   RtcEngine& operator=(const RtcEngine&) = delete;
 
   // Links LiveKit::RTCMediaEngine. Call before join; repeated installation is rejected.
-  Result<void> enable_media(AudioOutputOptions = {});
+  ErrorCode enable_media(AudioOutputOptions = {});
   bool media_enabled() const;
-  Result<void> join(RoomOptions);
+  ErrorCode join(RoomOptions);
   // Waits for preceding operations, then quiesces graphs before leaving.
-  Result<void> leave();
+  ErrorCode leave();
   // Terminal and idempotent. Rejects subsequent control operations.
-  Result<void> close();
+  ErrorCode close();
 
-  Result<MediaPublication> publish_media(MediaPublishSpec);
-  Result<MediaPublication> publish_video(MediaPublishSpec);
-  Result<MediaPublication> publish_audio(MediaPublishSpec);
-  Result<MediaSubscription> subscribe_media(MediaSubscribeSpec);
-  Result<std::shared_ptr<SharedMediaInput>> create_shared_input(TrackDescriptor, MediaInput);
+  MediaPublication publish_media(MediaPublishSpec, ErrorCode* error = nullptr);
+  MediaPublication publish_video(MediaPublishSpec, ErrorCode* error = nullptr);
+  MediaPublication publish_audio(MediaPublishSpec, ErrorCode* error = nullptr);
+  MediaSubscription subscribe_media(MediaSubscribeSpec, ErrorCode* error = nullptr);
+  std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput,
+                                                        ErrorCode* error = nullptr);
 
   // Encoded publication. Advanced graph composition requires graph_api.hpp.
-  Result<TrackId> publish(TrackDescriptor);
+  TrackId publish(TrackDescriptor, ErrorCode* error = nullptr);
   RtcGraphApi graph();
-  Result<void> unpublish(const TrackId&);
-  Result<void> unsubscribe(const TrackId&);
-  Result<void> set_muted(const TrackId&, bool, ControlOptions = {});
-  Result<void> set_receive_demand(const TrackId&, ReceiveDemand, ControlOptions = {});
+  ErrorCode unpublish(const TrackId&);
+  ErrorCode unsubscribe(const TrackId&);
+  ErrorCode set_muted(const TrackId&, bool, ControlOptions = {});
+  ErrorCode set_receive_demand(const TrackId&, ReceiveDemand, ControlOptions = {});
   // Producer threads may write; closed/absent publications return WriteStatus::closed.
   WriteStatus write(const TrackId&, EncodedFrame);
   TrackSnapshot publication(const TrackId&) const;
@@ -66,7 +70,7 @@ class RtcEngine final {
   // Synchronous control and destruction from a callback are forbidden.
   // Serialize registration calls. Callback arguments are borrowed for the call.
   // Callbacks must return promptly; throwing disables them and fails the room.
-  Result<void> set_callbacks(Callbacks);
+  ErrorCode set_callbacks(Callbacks);
 
   // Borrowed view valid until engine destruction. No room/track teardown escape hatch.
   const RoomView& room() const;
@@ -80,6 +84,6 @@ class RtcEngine final {
 
 // Encoded-only factory links LiveKit::RTCEngine; overload with audio options
 // installs media support and links LiveKit::RTCMediaEngine.
-Result<std::unique_ptr<RtcEngine>> create_livekit_engine();
-Result<std::unique_ptr<RtcEngine>> create_livekit_engine(AudioOutputOptions);
+std::unique_ptr<RtcEngine> create_livekit_engine(ErrorCode* error = nullptr);
+std::unique_ptr<RtcEngine> create_livekit_engine(AudioOutputOptions, ErrorCode* error = nullptr);
 }  // namespace livekit::sdk::rtc::engine

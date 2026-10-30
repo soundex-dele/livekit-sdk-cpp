@@ -365,7 +365,7 @@ MediaTrackSnapshot MediaTrack::snapshot() const {
   return result;
 }
 
-Result<void> MediaTrack::check() const {
+ErrorCode MediaTrack::check() const {
   return detail::control_boundary([&] { state_->check(); });
 }
 

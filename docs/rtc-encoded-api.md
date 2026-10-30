@@ -1,4 +1,4 @@
-> RTC 控制同步返回 `Result<T>`。示例中的 `require_result` 是应用错误边界辅助函数（仓库示例位于 `support/rtc_result.hpp`），在失败时转交应用已有异常处理；它不是 SDK API。库调用方也可直接 `if (!result) { report(result.error()); }`，成功用 `*result` / `result->` 取值。所有阻塞控制在应用工作线程调用，通知/媒体回调与图 hook 禁止重入。协议超时不包括等待操作锁的时间。详见 [验证记录](rtc-sync-result-validation-20261029.md)。
+> `RtcEngine`、`RoomEngine` 和 `RtcGraphApi` 在调用线程同步执行。操作返回 `ErrorCode`（成功为 `ok`），创建接口直接返回对象、ID 或媒体句柄；失败为空值，可通过可选的 `ErrorCode*` 获取原因。引擎边界将后端异常转成错误码，不使用 promise/future 或控制命令队列。`require_result` 仅是仓库旧应用的异常处理适配器，不属于 SDK API。轨道控制、流水线关闭与 `MediaTrack::check()` 同样直接返回 `ErrorCode`。通知/媒体回调与图 hook 禁止重入同步控制。
 
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)。自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
@@ -104,13 +104,13 @@ require_result(room->join(options));
 
 运行中用 `room->set_subscription_permissions(policy)` 完整替换策略。`all_participants=true` 允许全部成员，不能同时提供成员列表；`all_tracks=true` 允许指定 identity 的全部轨道，不能再指定 track_ids。false 加空成员列表拒绝全部订阅。最多 64 个成员、每个成员 128 个轨道 ID、总文本 32,000 字节，拒绝重复 identity/ID 和非法 UTF-8。
 
-成功 Result 表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
+`ErrorCode::ok` 表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
 
 订阅方通过 `subscription_permission_changed` 事件的 `permission` 读取 publisher participant SID、track SID 和 allowed。该通知可以在订阅尚未绑定时到达；阻塞等待中的 subscribe 调用 仍受 operation_timeout 限制，授权及时恢复可继续完成，超时后需要重新 subscribe。运行中撤销与重新授权由服务器驱动转发变化；已绑定句柄不因权限提示自动销毁。权限通知带房间 epoch，旧会话事件不会混入当前会话。
 
 ### 修改自己的成员信息
 
-使用 `RoomEngine::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；Result 只在服务端 ACK 后成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回失败 Result，错误码为 `permission_denied`。
+使用 `RoomEngine::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；只在服务端 ACK 后返回 `ErrorCode::ok`，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `ErrorCode::permission_denied`。
 
 ```cpp
 livekit::sdk::rtc::ParticipantUpdate update;
@@ -146,7 +146,7 @@ require_result(room->update_local_participant(std::move(update)));
 
 `try_write()` 区分接受、背压、需要关键帧、旧 epoch、未就绪、关闭和无效帧。它表示有界队列准入，不是远端接收确认。重连或丢帧后，视频生产方应根据反馈生成新的关键帧。
 
-`unpublish(id)` / `unsubscribe(id)` 等待先前发布或订阅完成、失败或超时后才执行，不抢占等待确认的操作。成功的关闭 Result 表示图与本地传输解绑屏障已完成；服务端协商可以稍后完成。
+`unpublish(id)` / `unsubscribe(id)` 等待先前发布或订阅完成、失败或超时后才执行，不抢占等待确认的操作。关闭成功表示图与本地传输解绑屏障已完成；服务端协商可以稍后完成。
 
 当前原生适配器支持多条独立音视频轨道，每轨一个 encoding。单轨 simulcast/SVC 暂未实现，会明确拒绝。多轨与单轨多编码层是不同能力。
 
@@ -156,7 +156,7 @@ require_result(room->update_local_participant(std::move(update)));
 
 静音立即关闭端点输入准入并清空待发帧，随后在原生发送器中使已排队的旧代次失效。`try_write()` 在静音期间返回 `not_ready`。恢复后，视频必须从关键帧开始；本地静音意图会作为新发布配置随完整重入恢复。已越过原生发送检查或进入网络协议栈的包、重传及 SFU 填充帧无法撤回，不能用“接收端完全没有 RTP”判断静音是否生效。
 
-静音 Result 成功表示本地原生门控已应用并且信令已提交，**不表示服务端 ACK**，当前 MuteTrackRequest 协议没有独立请求 ID。房间快照里的本地静音标记也包含本地提交状态；远端快照来自服务端公告。超时/取消后的结果可能未知，不自动重放；已关闭的旧轨道句柄不能控制同名新轨道。服务端的 mute 命令会更新原生门控及对应端点。
+静音返回 `ErrorCode::ok` 表示本地原生门控已应用并且信令已提交，**不表示服务端 ACK**，当前 MuteTrackRequest 协议没有独立请求 ID。房间快照里的本地静音标记也包含本地提交状态；远端快照来自服务端公告。超时/取消后的结果可能未知，不自动重放；已关闭的旧轨道句柄不能控制同名新轨道。服务端的 mute 命令会更新原生门控及对应端点。
 
 `SenderFeedback::media_generation` 在静音边界变化，即便静音和恢复被合并到同一次反馈通知也不会丢失边界。实际音视频 codec 节点据此清理旧输入和编码积累，停止接收非活动流的原始帧，恢复时重建正确的编码连续性。外部生产者同样应清理自己的缓存，并尽量提供 `EncodedFrame::captured`；端点会拒绝采集时间早于最近静音边界的旧帧。发布节点的反馈线程等待端点变化并自动送达媒体节点。
 
@@ -166,7 +166,7 @@ require_result(room->update_local_participant(std::move(update)));
 
 `engine::create_livekit_engine()` 创建真实 LiveKit 后端。`publish()` 为轨道创建发布 sink 图，`engine.graph().subscribe(descriptor, consumer)` 创建订阅 source 图（需包含 `rtc/graph_api.hpp`），consumer 接收 `nodes::EncodedFrameEvent`。
 
-Engine 的建图与关闭在调用线程持会话操作锁串行执行；返回 Result 时端点和图已经就绪。订阅源节点和发送反馈各自在节点工作线程等待通知并分发图事件；`write()` 可由生产媒体的线程调用。
+Engine 的建图与关闭在调用线程持会话操作锁串行执行；返回非空值时端点和图已经就绪。订阅源节点和发送反馈各自在节点工作线程等待通知并分发图事件；`write()` 可由生产媒体的线程调用。
 
 各轨道具有独立队列和图生命周期。房间总预算随载荷在端点、原生发送、原生接收队列间转交，不重复扣额度；读出到应用后，应用自行负责后续内存限制。此预算统计 SDK 管理的待处理访问单元，不包含网络协议栈的 RTP 重传缓存、操作系统 socket 缓冲区或应用保留的帧。
 

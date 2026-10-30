@@ -10,6 +10,7 @@
 namespace livekit::sdk {
 enum class ErrorDomain { signaling, transport, protocol, lifecycle, media, data };
 enum class ErrorCode {
+  ok = 0,
   connection_lost,
   timeout,
   cancelled,

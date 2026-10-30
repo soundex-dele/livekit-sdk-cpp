@@ -86,11 +86,11 @@ void synchronous_engine() {
   require_result(engine.join(options));
   auto descriptor = rtc_audio_test::descriptor("active");
   check(require_result(engine.publish(descriptor)) == descriptor.id, "Graph identity changed");
-  auto pending = engine.publish(rtc_audio_test::descriptor("pending"));
-  check(!pending && pending.error().code == livekit::sdk::ErrorCode::timeout,
-        "Missing publication timeout");
+  livekit::sdk::ErrorCode code;
+  auto pending = engine.publish(rtc_audio_test::descriptor("pending"), &code);
+  check(pending.empty() && code == livekit::sdk::ErrorCode::timeout, "Missing publication timeout");
   require_result(engine.close());
-  check(!engine.publish(descriptor), "Closed engine accepted publication");
+  check(engine.publish(descriptor).empty(), "Closed engine accepted publication");
 }
 
 void independent_builder_contract() {
@@ -119,6 +119,17 @@ void independent_builder_contract() {
   const auto snapshot = publication.track->snapshot();
   check(snapshot.input && snapshot.input->emitted == 0,
         "Builder started media before graph installation");
+  check(publication.track->check() == livekit::sdk::ErrorCode::ok &&
+            subscription.track->check() == livekit::sdk::ErrorCode::ok,
+        "Healthy media track returned a failure code");
+  const auto failure = std::make_exception_ptr(
+      livekit::sdk::SDKError(livekit::sdk::ErrorDomain::media,
+                             livekit::sdk::ErrorCode::processing_failed, "media contract failure"));
+  publication.graph.on_failure(failure);
+  subscription.graph.on_failure(failure);
+  check(publication.track->check() == livekit::sdk::ErrorCode::processing_failed &&
+            subscription.track->check() == livekit::sdk::ErrorCode::processing_failed,
+        "Media track lost the reported failure code");
   publication.graph.quiesce();
   subscription.graph.quiesce();
   check(endpoint->snapshot().state == TrackState::ready &&

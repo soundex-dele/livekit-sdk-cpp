@@ -1,4 +1,4 @@
-> RTC 控制同步返回 `Result<T>`。示例中的 `require_result` 是应用错误边界辅助函数（仓库示例位于 `support/rtc_result.hpp`），在失败时转交应用已有异常处理；它不是 SDK API。库调用方也可直接 `if (!result) { report(result.error()); }`，成功用 `*result` / `result->` 取值。所有阻塞控制在应用工作线程调用，通知/媒体回调与图 hook 禁止重入。协议超时不包括等待操作锁的时间。详见 [验证记录](rtc-sync-result-validation-20261029.md)。
+> `RtcEngine`、`RoomEngine` 和 `RtcGraphApi` 在调用线程同步执行。操作返回 `ErrorCode`（成功为 `ok`），创建接口直接返回对象、ID 或媒体句柄；失败为空值，可通过可选的 `ErrorCode*` 获取原因。引擎边界将后端异常转成错误码，不使用 promise/future 或控制命令队列。`require_result` 仅是仓库旧应用的异常处理适配器，不属于 SDK API。轨道控制、流水线关闭与 `MediaTrack::check()` 同样直接返回 `ErrorCode`。通知/媒体回调与图 hook 禁止重入同步控制。
 
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)，自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
@@ -79,10 +79,10 @@ auto b = engine->publish_video(second);
 
 ## 线程与生命周期
 
-- 控制与建图在调用线程执行，通过同一会话操作锁串行化，同步返回 Result。UI 使用已有应用工作线程调用；销毁前必须停止并等待所有在途调用。
+- 控制与建图在调用线程执行，通过同一会话操作锁串行化，同步返回错误码或具体值。UI 使用已有应用工作线程调用；销毁前必须停止并等待所有在途调用。
 - 房间事件和图错误通过 `set_callbacks` 在独立的串行通知任务队列回调。回调内控制调用在加锁前返回 invalid_thread，不能在回调内销毁 engine 或等待控制完成。替换/清空回调同样属于同步控制，会等待旧调用返回。
 - 普通像素/PCM 回调在每个输出的独立有界调度线程上运行；慢回调仅丢弃本分支积压。回调必须最终返回，不得等待引擎关闭；关闭会等待正在执行的回调。
-- MediaTrack 句柄可供快照读取。保留句柄不会让已关闭图继续工作；创建失败通过 Result 返回；运行期故障记录到快照并可通过 check() 查询，后续控制或关闭负责回收失败图。
+- MediaTrack 句柄可供快照读取。保留句柄不会让已关闭图继续工作；创建失败返回空句柄，并可通过可选参数返回错误码；运行期故障记录到快照并可通过 check() 查询，后续控制或关闭负责回收失败图。
 - 关闭先停止生产者、等待编解码及输出，再拆除图。完成后应用可释放回调目标；录制会完成文件头。关闭房间会关闭全部轨道。
 - `engine.graph().publish_graph` / `subscribe_graph` 是自定义图的高级入口；普通 Session 不需要传入 GraphNode 或 graph factory。
 
@@ -109,4 +109,4 @@ RoomEngine 保留连接状态机、成员快照、期望轨道注册表和实际
 
 leave 等待正在执行的媒体/图操作结束，再停止当前房间全部图；共享采集源的其他房间消费者仍可运行。保留的媒体句柄只提供历史状态。媒体操作成功表示端点确认且图已经启动；图构建或启动失败会撤销已创建端点。
 
-只有 `create_livekit_engine(AudioOutputOptions{})` 或首次 join 前调用 `enable_media()` 才装配媒体模块。无参数工厂创建编码模式引擎，链接 `LiveKit::RTCEngine` 即可；未启用媒体时调用配置式媒体接口返回包含 `unsupported` 的失败 Result。两种模式都使用同一个 RtcEngine 类型，纯传输构建不需要媒体设备或编解码实现。
+只有 `create_livekit_engine(AudioOutputOptions{})` 或首次 join 前调用 `enable_media()` 才装配媒体模块。无参数工厂创建编码模式引擎，链接 `LiveKit::RTCEngine` 即可；未启用媒体时调用配置式媒体接口返回空句柄，并通过可选参数返回 `unsupported`。两种模式都使用同一个 RtcEngine 类型，纯传输构建不需要媒体设备或编解码实现。

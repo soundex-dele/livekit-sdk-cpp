@@ -1,9 +1,9 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/rtc/track_endpoint.hpp"
 
 #include "livekit/rtc/types.hpp"
 #include "livekit/rtc/room_services.hpp"
-#include <future>
 #include <functional>
 #include <stop_token>
 #include <memory>
@@ -11,6 +11,11 @@
 #include <utility>
 
 namespace livekit::sdk::rtc {
+// Controls execute on the calling thread, including protocol ACK waits. Backend
+// events and media are serviced in the background when no control is running.
+// Operations return ErrorCode::ok; creation/access returns nullptr on failure
+// and always sets the optional error output. Backend exceptions do not escape.
+// Invalid/null transport factories are reported by join().
 // Transport-only room session. The private adapter is injected so the same state
 // machine can be tested without network, devices or codecs. The native factory
 // provides this adapter; callers do not implement GraphEngine or WebRTC objects.
@@ -23,55 +28,57 @@ class RoomEngine {
   RoomEngine(const RoomEngine&) = delete;
   RoomEngine& operator=(const RoomEngine&) = delete;
 
-  Result<void> join(RoomOptions options);
-  Result<std::shared_ptr<PublishedTrack>> publish(TrackDescriptor descriptor);
-  Result<std::shared_ptr<SubscribedTrack>> subscribe(TrackDescriptor remote_track);
+  ErrorCode join(RoomOptions options);
+  std::shared_ptr<PublishedTrack> publish(TrackDescriptor descriptor, ErrorCode* error = nullptr);
+  std::shared_ptr<SubscribedTrack> subscribe(TrackDescriptor remote_track,
+                                             ErrorCode* error = nullptr);
   // Waits for the preceding operation, including publication/subscription ACK.
-  Result<void> unpublish(const TrackId& id);
-  Result<void> unsubscribe(const TrackId& id);
-  Result<void> set_muted(const TrackId& id, bool muted, ControlOptions = {});
-  Result<void> set_receive_demand(const TrackId& id, ReceiveDemand, ControlOptions = {});
+  ErrorCode unpublish(const TrackId& id);
+  ErrorCode unsubscribe(const TrackId& id);
+  ErrorCode set_muted(const TrackId& id, bool muted, ControlOptions = {});
+  ErrorCode set_receive_demand(const TrackId& id, ReceiveDemand, ControlOptions = {});
   // Replaces the publisher's allowlist. Success means signaling submission,
   // not server acknowledgement. Native policy intent survives rejoin even if
   // an interrupted submission has an unknown outcome.
-  Result<void> set_subscription_permissions(SubscriptionPermissions, ControlOptions = {});
+  ErrorCode set_subscription_permissions(SubscriptionPermissions, ControlOptions = {});
   // Requires signaling protocol 15+. Resolves only on the server's ACK, not
   // after a local send. A dispatched operation interrupted/cancelled/timed out
   // can have an unknown outcome and is never automatically replayed.
-  Result<void> update_local_participant(ParticipantUpdate, ControlOptions = {});
-  Result<void> leave();
+  ErrorCode update_local_participant(ParticipantUpdate, ControlOptions = {});
+  ErrorCode leave();
   RoomSnapshot snapshot() const;
-  Result<std::shared_ptr<RoomServices>> services() const;
+  std::shared_ptr<RoomServices> services(ErrorCode* error = nullptr) const;
   // Events run serially on the notification task queue, never the transport
   // worker. Register before join. Replacement/removal fences previous callbacks.
   // Callbacks must not issue synchronous control requests, destroy the engine or throw.
   // Serialize registration calls; event references are borrowed for the call.
   // Return promptly. A thrown exception disables the handler and fails the room.
-  Result<void> set_event_handler(std::function<void(const RoomEvent&)>);
+  ErrorCode set_event_handler(std::function<void(const RoomEvent&)>);
 
  private:
   friend class engine::RtcEngine;
   RoomEngine(TransportFactory, std::shared_ptr<detail::SessionControl>);
   std::shared_ptr<detail::SessionControl> control() const;
-  Result<void> join_locked(RoomOptions options);
+  ErrorCode join_locked(RoomOptions options);
   Result<std::shared_ptr<PublishedTrack>> publish_locked(TrackDescriptor descriptor);
   Result<std::shared_ptr<SubscribedTrack>> subscribe_locked(TrackDescriptor remote_track);
   // Waits for the preceding operation, including publication/subscription ACK.
-  Result<void> unpublish_locked(const TrackId& id);
-  Result<void> unsubscribe_locked(const TrackId& id);
-  Result<void> set_muted_locked(const TrackId& id, bool muted, ControlOptions = {});
-  Result<void> set_receive_demand_locked(const TrackId& id, ReceiveDemand, ControlOptions = {});
+  ErrorCode unpublish_locked(const TrackId& id);
+  ErrorCode unsubscribe_locked(const TrackId& id);
+  ErrorCode set_muted_locked(const TrackId& id, bool muted, ControlOptions = {});
+  ErrorCode set_receive_demand_locked(const TrackId& id, ReceiveDemand, ControlOptions = {});
   // Replaces the publisher's allowlist. Success means signaling submission,
   // not server acknowledgement. Native policy intent survives rejoin even if
   // an interrupted submission has an unknown outcome.
-  Result<void> set_subscription_permissions_locked(SubscriptionPermissions, ControlOptions = {});
+  ErrorCode set_subscription_permissions_locked(SubscriptionPermissions, ControlOptions = {});
   // Requires signaling protocol 15+. Resolves only on the server's ACK, not
   // after a local send. A dispatched operation interrupted/cancelled/timed out
   // can have an unknown outcome and is never automatically replayed.
-  Result<void> update_local_participant_locked(ParticipantUpdate, ControlOptions = {});
-  Result<void> leave_locked();
+  ErrorCode update_local_participant_locked(ParticipantUpdate, ControlOptions = {});
+  ErrorCode leave_locked();
   void set_event_handler_locked(std::function<void(const RoomEvent&)>);
   void post_notification(std::function<void()>);
+  void notification_failed();
   std::shared_ptr<detail::RoomEngineState> state_;
 };
 
@@ -84,17 +91,16 @@ class RoomView {
     return room_->snapshot();
   }
 
-  Result<std::shared_ptr<RoomServices>> services() const {
-    return room_->services();
+  std::shared_ptr<RoomServices> services(ErrorCode* error = nullptr) const {
+    return room_->services(error);
   }
 
-  Result<void> update_local_participant(ParticipantUpdate update,
-                                        ControlOptions options = {}) const {
+  ErrorCode update_local_participant(ParticipantUpdate update, ControlOptions options = {}) const {
     return room_->update_local_participant(std::move(update), options);
   }
 
-  Result<void> set_subscription_permissions(SubscriptionPermissions policy,
-                                            ControlOptions options = {}) const {
+  ErrorCode set_subscription_permissions(SubscriptionPermissions policy,
+                                         ControlOptions options = {}) const {
     return room_->set_subscription_permissions(std::move(policy), options);
   }
 

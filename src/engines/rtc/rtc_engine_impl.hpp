@@ -13,25 +13,44 @@ namespace livekit::sdk::rtc::engine {
 struct RtcEngine::Impl {
   explicit Impl(std::unique_ptr<RoomEngine>);
   ~Impl();
-  void require_open() const;
-  MediaGraphBuilder& require_media() const;
-  Result<void> clear_tracks();
-  Result<void> detach(TrackGraphRegistry::RetiredGraphs) const;
+  ErrorCode clear_tracks();
+  ErrorCode detach(TrackGraphRegistry::RetiredGraphs) const;
   Result<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
   Result<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
   Result<TrackId> publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> = {});
   Result<TrackId> subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode>);
 
   template <class Function>
-  auto execute(Function function) const {
-    return detail::control_boundary([&] {
-      detail::OperationGuard guard(*control);
-      auto retired = graphs->take_failed();
-      auto detached = detach(std::move(retired));
-      if (!detached) {
-        throw SDKError(detached.failure_record());
+  auto execute(Function function, bool allow_closed = false) const {
+    using Value = std::invoke_result_t<Function>;
+    using Return = std::conditional_t<std::is_void_v<Value>, ErrorCode, Value>;
+    const auto fail = [](ErrorCode code, std::string message) -> Return {
+      if constexpr (std::is_same_v<Return, ErrorCode>) {
+        return code;
+      } else {
+        return Return::failure(std::make_shared<FailureInfo>(
+            FailureInfo{next_failure_id(), ErrorDomain::lifecycle, code, std::move(message)}));
       }
-      return function();
+    };
+    return detail::control_boundary([&]() -> Return {
+      if (detail::callback_depth || detail::active_session) {
+        return fail(ErrorCode::invalid_thread,
+                    "RTC control cannot be called from callbacks or nested sessions");
+      }
+      detail::OperationGuard guard(*control);
+      if (control->closed && !allow_closed) {
+        return fail(ErrorCode::session_closed, "RTC engine closed");
+      }
+      auto detached = detach(graphs->take_failed());
+      if (detached != ErrorCode::ok) {
+        return fail(detached, "RTC track detachment failed");
+      }
+      if constexpr (std::is_void_v<Value>) {
+        function();
+        return ErrorCode::ok;
+      } else {
+        return function();
+      }
     });
   }
 

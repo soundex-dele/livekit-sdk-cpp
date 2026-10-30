@@ -19,12 +19,12 @@ void check(bool ok, const char* message) {
 }
 
 template <class T>
-auto await(livekit::sdk::Result<T> result) {
+auto await(T result) {
   return require_result(std::move(result));
 }
 
 template <class T>
-auto await(T future) {
+auto await(std::future<T> future) {
   check(future.wait_for(15s) == std::future_status::ready, "Data operation timed out");
   return future.get();
 }

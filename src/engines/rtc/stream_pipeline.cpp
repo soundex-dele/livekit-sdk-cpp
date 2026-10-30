@@ -242,7 +242,7 @@ void PublishPipeline::notify_failure(std::exception_ptr failure) {
   }
 }
 
-Result<void> PublishPipeline::close() {
+ErrorCode PublishPipeline::close() {
   return detail::control_boundary([&] {
     auto control = sink_->track()->operation_control();
     detail::OperationGuard guard(*control);
@@ -250,7 +250,7 @@ Result<void> PublishPipeline::close() {
   });
 }
 
-Result<void> PublishPipeline::close_locked() {
+ErrorCode PublishPipeline::close_locked() {
   observation_->active = false;
   bool stop = false;
   {
@@ -268,7 +268,7 @@ Result<void> PublishPipeline::close_locked() {
     quiesce(extension_);
     graph_.stop();
   }
-  return owns_endpoint_ ? sink_->track()->close_locked() : Result<void>::success();
+  return owns_endpoint_ ? sink_->track()->close_locked() : ErrorCode::ok;
 }
 
 SubscribePipeline::SubscribePipeline(std::shared_ptr<SubscribedTrack> track,
@@ -385,7 +385,7 @@ void SubscribePipeline::notify_failure(std::exception_ptr failure) {
   }
 }
 
-Result<void> SubscribePipeline::close() {
+ErrorCode SubscribePipeline::close() {
   return detail::control_boundary([&] {
     auto control = source_->track()->operation_control();
     detail::OperationGuard guard(*control);
@@ -393,7 +393,7 @@ Result<void> SubscribePipeline::close() {
   });
 }
 
-Result<void> SubscribePipeline::close_locked() {
+ErrorCode SubscribePipeline::close_locked() {
   observation_->active = false;
   bool stop = false;
   {
@@ -411,6 +411,6 @@ Result<void> SubscribePipeline::close_locked() {
     quiesce(extension_);
     graph_.stop();
   }
-  return owns_endpoint_ ? source_->track()->close_locked() : Result<void>::success();
+  return owns_endpoint_ ? source_->track()->close_locked() : ErrorCode::ok;
 }
 }  // namespace livekit::sdk::rtc::engine

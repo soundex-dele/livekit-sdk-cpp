@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/result.hpp"
+#include "livekit/error.hpp"
 #include <mutex>
 #include "livekit/media_core/frame_view.hpp"
 #include "livekit/rtc/audio_processing.hpp"
@@ -10,7 +10,6 @@
 #include "livekit/rtc/audio_output_options.hpp"
 #include <filesystem>
 #include <functional>
-#include <future>
 
 namespace livekit::sdk::rtc::engine {
 // Configuration and application-owned sources, never graph nodes. A microphone
@@ -128,7 +127,8 @@ struct MediaTrackSnapshot {
 class MediaTrack {
  public:
   MediaTrackSnapshot snapshot() const;
-  Result<void> check() const;
+  // Returns ErrorCode::ok while healthy; detailed failures remain in the snapshot.
+  [[nodiscard]] ErrorCode check() const;
 
  private:
   friend class RtcMediaGraphBuilder;

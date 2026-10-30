@@ -4,14 +4,15 @@
 
 namespace livekit::sdk::rtc::engine {
 // Explicit opt-in to GraphFlow types. Borrowed access shares the engine's track
-// registry and serial task-queue contract; it must not outlive the engine.
+// registry and synchronous control contract; it must not outlive the engine.
 class RtcGraphApi final {
  public:
-  Result<TrackId> publish(TrackDescriptor,
-                          std::shared_ptr<graphflow::core::GraphNode> feedback_sink = {});
-  Result<TrackId> subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> consumer);
-  Result<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
-  Result<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  TrackId publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> feedback_sink = {},
+                  ErrorCode* error = nullptr);
+  TrackId subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> consumer,
+                    ErrorCode* error = nullptr);
+  TrackId publish_graph(TrackDescriptor, PublishGraphFactory, ErrorCode* error = nullptr);
+  TrackId subscribe_graph(TrackDescriptor, SubscribeGraphFactory, ErrorCode* error = nullptr);
 
  private:
   friend class RtcEngine;

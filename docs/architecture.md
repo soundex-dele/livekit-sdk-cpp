@@ -22,20 +22,21 @@ GraphFlow engine; applications using the facade link RTCMediaEngine.
 RTC control calls execute on the calling application worker, serialized by one
 non-recursive operation mutex owned by RoomEngineState. The lock covers protocol
 waits and teardown. Private `*_locked` paths reuse ownership without relocking.
-There is no engine control TaskQueue or RtcExecutor. The existing room jthread,
-command mailbox, transport threads, notification queue and media workers remain.
+There is no engine control TaskQueue, command mailbox or RtcExecutor.
 
-Controls and factories return `Result<T>` / `Result<void>`; failure records retain
-their correlation ID through results, events and snapshots. Media operations
-return a completed MediaPublication/MediaSubscription with an id and track.
-`MediaTrack::check()` reports a completed Result. Player keeps its independent
-AsyncResult API; native SDP/statistics use internal futures with completion signals,
-without polling or a public asynchronous RTC API.
+RtcEngine, RoomEngine and RtcGraphApi return ErrorCode or concrete values.
+Creation failure returns an empty ID, null pointer or empty media handle; the
+optional ErrorCode output is always assigned. Backend exceptions are caught at
+the boundary. Detailed runtime failures retain their correlation ID in events
+and snapshots. Track controls, pipeline close and MediaTrack::check() return ErrorCode.
+RoomServices, Player and native SDP/statistics retain their independent APIs.
 
-The room loop owns protocol state, deadlines, epochs and incarnation checks.
-A private operation record uses a mutex/condition variable and exactly-once Result
-completion. Waiting releases its state lock while retaining the operation lock.
-Backend completion, failure and detachment paths never acquire the operation lock.
+The caller acquires the controller mutex, submits directly to the adapter and
+pumps events/deadlines until its stack-owned operation completes. No promise,
+future, heap-shared completion record or cross-thread result handoff is used.
+The background worker acquires the same mutex for idle media/event processing
+and recovery; adapters therefore require serialization, not thread affinity.
+Native completion callbacks only queue events and signal the wake source.
 Join, leave, close and track controls wait for preceding operations; protocol timeouts
 start after acquiring the lock. Close is terminal and idempotent, not a cancellation
 channel. Destructor callers must first join all outstanding member calls.
@@ -74,7 +75,7 @@ unpublish. Frame timing is separate from storage, so reconnect retags a branch's
 new input without modifying a buffer shared by another room. Shared audio keeps
 the source sample clock, including gaps, rather than recomputing RTP time from
 callback arrival. Invalid shared queue limits fail synchronously without attaching
-a consumer; graph startup failures are reported by the operation's Result.
+a consumer; graph startup failures return an empty media handle and an optional error code.
 
 ## Audio and synchronization
 

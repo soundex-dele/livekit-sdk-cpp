@@ -22,12 +22,12 @@ void check(bool ok, const char* message) {
 }
 
 template <class T>
-auto await(livekit::sdk::Result<T> result) {
+auto await(T result) {
   return require_result(std::move(result));
 }
 
-template <class Future>
-auto await(Future future) {
+template <class T>
+auto await(std::future<T> future) {
   check(future.wait_for(20s) == std::future_status::ready, "RTC operation timed out");
   return future.get();
 }

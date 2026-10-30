@@ -187,16 +187,18 @@ WriteStatus TrackGraphRegistry::write(const TrackId& id, EncodedFrame frame) {
 TrackSnapshot TrackGraphRegistry::publication(const TrackId& id) const {
   std::lock_guard lock(mutex_);
   auto it = publications_.find(id);
-  if (it == publications_.end())
-    throw std::out_of_range("Unknown RTC engine publication");
+  if (it == publications_.end()) {
+    return {};
+  }
   return it->second->node().track()->snapshot();
 }
 
 SenderFeedback TrackGraphRegistry::feedback(const TrackId& id) const {
   std::lock_guard lock(mutex_);
   auto it = publications_.find(id);
-  if (it == publications_.end())
-    throw std::out_of_range("Unknown RTC engine publication");
+  if (it == publications_.end()) {
+    return {};
+  }
   return it->second->node().track()->feedback();
 }
 

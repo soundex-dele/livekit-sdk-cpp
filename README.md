@@ -2,7 +2,7 @@
 
 当前分层、帧契约与迁移说明见 [架构说明](docs/architecture.md)。最新的 [源节点分发与任务队列设计](docs/source-driven-runtime.md) 已移除 RtcEngine/pipeline 的 poll 接口。
 
-已实现的 [RTC 同步控制与 Result 重构方案](docs/rtc-sync-result-refactor-20261029.md) 采用操作锁串行化、调用线程执行和同步 Result，不引入控制任务队列；入会与离会互相等待，不抢占打断。验证记录见 [实施验证](docs/rtc-sync-result-validation-20261029.md)。
+RTC 控制采用操作锁串行化，在调用线程直接执行并返回错误码或具体值；RoomEngine 等待协议确认时由调用线程处理事件，无控制命令队列或 promise/future。入会与离会互相等待，不抢占打断。接口说明见 [同步控制](docs/rtc-direct-control.md)。
 
 C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 
@@ -37,18 +37,18 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 轨道以稳定本地 TrackId 路由，服务端 SID 是当前会话绑定。每轨拥有独立队列、预算、反馈和关闭屏障。停止一条轨道不退出房间。已有编码帧可直接写入 PublishedTrack；SubscribedTrack::read() 返回拥有数据的完整编码帧。
 
-RtcEngine 在调用线程上通过共享会话操作锁串行处理控制与建图，返回完成的 Result，不再提供 poll()/next_event()/next_failure()，房间事件和图错误通过 set_callbacks() 通知；源节点在自己的线程上等待并分发媒体与反馈；采集、编解码及设备输出放在各自有界工作线程。RoomServices 在同一 backend 上提供可靠/不可靠数据、RPC、文本/字节流、DataTrack、DTMF、转写及加密。UI 使用不可变快照。
+RtcEngine 在调用线程上通过共享会话操作锁串行处理控制与建图，返回错误码或具体值，不再提供 poll()/next_event()/next_failure()，房间事件和图错误通过 set_callbacks() 通知；源节点在自己的线程上等待并分发媒体与反馈；采集、编解码及设备输出放在各自有界工作线程。RoomServices 在同一 backend 上提供可靠/不可靠数据、RPC、文本/字节流、DataTrack、DTMF、转写及加密。UI 使用不可变快照。
 
 ## RTC 后端目录
 
 公共房间控制器为 `rtc::RoomEngine`，头文件为 `livekit/rtc/room_engine.hpp`。
 `RtcEngine` 持有会话，`RoomEngine` 通过内部 `RoomTransport` 接口使用具体适配器。
-`create_livekit_room()` 返回 `Result<std::unique_ptr<RoomEngine>>`。
+`create_livekit_room()` 返回 `std::unique_ptr<RoomEngine>`，失败返回空指针。
 
 ```text
 src/backends/
 ├── rtc/
-│   ├── room_engine.cpp       # 房间生命周期、轨道、事件和操作队列
+│   ├── room_engine.cpp       # 房间生命周期、轨道、事件和同步控制
 │   ├── room_transport.hpp     # 内部适配接口
 │   ├── endpoint.cpp
 │   ├── queue_budget.hpp

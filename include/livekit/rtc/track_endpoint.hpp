@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/result.hpp"
+#include "livekit/error.hpp"
 #include "livekit/rtc/types.hpp"
 #include <memory>
 #include <optional>
@@ -29,6 +29,7 @@ struct ControlOptions {
   std::stop_token stop;
 };
 
+// Synchronous controls return ErrorCode::ok on success; failures return a nonzero code.
 class PublishedTrack {
  public:
   const TrackDescriptor& descriptor() const;
@@ -41,9 +42,9 @@ class PublishedTrack {
   WriteStatus try_write(EncodedFrame frame);
   // Local gate plus signaling submission, not a server ACK. Already transmitted
   // packets cannot be retracted. Muting does not unpublish the track.
-  Result<void> set_muted(bool muted, ControlOptions = {});
+  [[nodiscard]] ErrorCode set_muted(bool muted, ControlOptions = {});
   // Completes after local transport detachment; it does not disconnect the room.
-  Result<void> close();
+  [[nodiscard]] ErrorCode close();
 
  private:
   friend class RoomEngine;
@@ -51,13 +52,14 @@ class PublishedTrack {
   friend class engine::TrackGraphRegistry;
   friend class engine::PublishPipeline;
   std::shared_ptr<detail::SessionControl> operation_control() const;
-  Result<void> close_locked();
+  [[nodiscard]] ErrorCode close_locked();
   void report_failure(std::exception_ptr);
   PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
   std::shared_ptr<detail::Endpoint> endpoint_;
   std::weak_ptr<detail::RoomEngineState> session_;
 };
 
+// Synchronous controls return ErrorCode::ok on success; failures return a nonzero code.
 class SubscribedTrack {
  public:
   const TrackDescriptor& descriptor() const;
@@ -67,11 +69,11 @@ class SubscribedTrack {
   // returns on media, cancellation, failure or close. No timeout polling.
   ReadResult wait_frame(std::stop_token stop = {});
   // Sends a rate-limited PLI independently of incoming media arrival.
-  Result<void> request_keyframe();
+  [[nodiscard]] ErrorCode request_keyframe();
   // SFU forwarding demand, not a local decoder/device gate. Success means
   // signaling submission; in-flight media can still arrive. Full replacement.
-  Result<void> set_demand(ReceiveDemand, ControlOptions = {});
-  Result<void> close();
+  [[nodiscard]] ErrorCode set_demand(ReceiveDemand, ControlOptions = {});
+  [[nodiscard]] ErrorCode close();
 
  private:
   friend class RoomEngine;
@@ -81,7 +83,7 @@ class SubscribedTrack {
   friend class nodes::RtcSubscribeNode;
   void request_keyframe_async();
   std::shared_ptr<detail::SessionControl> operation_control() const;
-  Result<void> close_locked();
+  [[nodiscard]] ErrorCode close_locked();
   void report_failure(std::exception_ptr);
   SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
   std::shared_ptr<detail::Endpoint> endpoint_;

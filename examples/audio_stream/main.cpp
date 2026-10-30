@@ -61,7 +61,8 @@ int main(int argc, char** argv) {
     if (!url || !token)
       throw std::runtime_error("Set LIVEKIT_URL and a room-join LIVEKIT_TOKEN");
     ApplicationQueue queue;  // Outlives the engine and its decoder workers.
-    auto engine = require_result(engine::create_livekit_engine({}));
+    auto engine =
+        require_result(engine::create_livekit_engine(livekit::sdk::rtc::AudioOutputOptions{}));
     livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
     LiveKitRoomOptions options;
     options.url = url;

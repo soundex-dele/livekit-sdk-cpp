@@ -75,7 +75,7 @@ int main() {
     await(*rx, rx->join(options));
     std::vector<TrackDescriptor> descriptors;
     std::vector<std::vector<uint8_t>> payloads;
-    std::vector<livekit::sdk::Result<TrackId>> publishing;
+    std::vector<TrackId> publishing;
     for (int i = 0; i < 4; ++i) {
       TrackDescriptor d;
       d.id = d.name = "graph-" + std::to_string(i);
@@ -93,7 +93,7 @@ int main() {
     for (auto& future : publishing)
       await(*tx, std::move(future));
     std::vector<std::shared_ptr<Consumer>> sinks(4);
-    std::vector<livekit::sdk::Result<TrackId>> subscribing;
+    std::vector<TrackId> subscribing;
     const auto discovered_by = SteadyClock::now() + 10s;
     while (subscribing.size() < 4) {
       check(SteadyClock::now() < discovered_by, "Engine remote discovery timed out");

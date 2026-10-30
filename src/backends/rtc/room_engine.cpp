@@ -1,7 +1,6 @@
 #include "livekit/rtc/room_engine.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/control_context.hpp"
-#include "backends/rtc/operation_record.hpp"
 #include "backends/rtc/bounded_events.hpp"
 #include "backends/rtc/subscription_policy.hpp"
 #include "livekit/error.hpp"
@@ -22,26 +21,57 @@ std::exception_ptr error(std::string message, ErrorCode code = ErrorCode::sessio
   return std::make_exception_ptr(SDKError(ErrorDomain::lifecycle, code, std::move(message)));
 }
 
-template <class T>
-Result<T> rejected(std::exception_ptr failure) {
-  return Result<T>::failure(describe_failure(failure));
-}
 }  // namespace
+
+// Stack-owned state for a synchronous protocol wait. Only the calling thread
+// accesses it while pumping transport events under the controller mutex.
+template <class T>
+struct PendingOperation {
+  using Return = std::conditional_t<std::is_void_v<T>, ErrorCode, Result<T>>;
+  std::optional<Return> result;
+
+  template <class... Args>
+  void succeed(Args&&... args) {
+    if (!result) {
+      if constexpr (std::is_void_v<T>) {
+        result.emplace(ErrorCode::ok);
+      } else {
+        result.emplace(Result<T>::success(std::forward<Args>(args)...));
+      }
+    }
+  }
+
+  void fail(std::exception_ptr failure) {
+    if (!result) {
+      if constexpr (std::is_void_v<T>) {
+        result.emplace(describe_failure(failure)->code);
+      } else {
+        result.emplace(Result<T>::failure(describe_failure(failure)));
+      }
+    }
+  }
+};
 
 struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   RoomEngineState(RoomEngine::TransportFactory factory, std::shared_ptr<SessionControl> context)
       : transport_factory(std::move(factory)), control(std::move(context)) {
-    if (!transport_factory) {
-      throw std::invalid_argument("RTC room requires a transport factory");
-    }
-    transport = transport_factory();
-    if (!transport)
-      throw std::invalid_argument("RTC room requires a transport");
-    transport->attach_wakeup(wakeup);
-    services = transport->services();
     notifications = vi::TaskQueue::create("rtc.room.notifications");
     notification_dispatch.bind(*notifications);
-    attach_service_notifications(*transport);
+    service_failure = std::make_shared<ServiceFailure>();
+    try {
+      if (transport_factory) {
+        transport = transport_factory();
+      }
+      if (transport) {
+        transport->attach_wakeup(wakeup);
+        services = transport->services();
+        attach_service_notifications(*transport);
+      }
+    } catch (...) {
+      initialization_failure = std::current_exception();
+      services.reset();
+      transport.reset();
+    }
     worker = std::jthread([this](std::stop_token stop) {
       CallbackScope worker_scope;
       run(stop);
@@ -55,11 +85,6 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     notifications.reset();
   }
 
-  struct Command {
-    std::function<void()> run;
-    std::function<void(std::exception_ptr)> cancel;
-  };
-
   struct Entry {
     std::shared_ptr<Endpoint> endpoint;
     SteadyClock::time_point deadline;
@@ -69,7 +94,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
 
   struct Removal {
     std::shared_ptr<Endpoint> endpoint;
-    std::vector<std::shared_ptr<OperationRecord<void>>> waiters;
+    PendingOperation<void>* waiting = nullptr;
   };
 
   using Key = std::pair<bool, TrackId>;
@@ -77,18 +102,18 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   using WorkKey = std::pair<WorkKind, uint64_t>;
   RoomEngine::TransportFactory transport_factory;
   std::unique_ptr<RoomTransport> transport;
+  std::exception_ptr initialization_failure;
   std::shared_ptr<RoomServices> services;
   std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup =
       std::make_shared<livekit::sdk::detail::WakeEvent>();
   std::shared_ptr<livekit::sdk::detail::ReadySet<WorkKey>> ready_work =
       std::make_shared<livekit::sdk::detail::ReadySet<WorkKey>>(wakeup, 1024 + 128);
   std::jthread worker;
+  std::mutex controller_mutex;
   std::shared_ptr<SessionControl> control;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
-  std::deque<Command> commands;
-  // At most one report per registered graph. Separate admission ensures a full
-  // user command queue cannot suppress terminal graph failure notifications.
+  // At most one report per registered graph, independent of room event capacity.
   std::map<std::shared_ptr<Endpoint>, std::exception_ptr> graph_failures;
   std::map<std::shared_ptr<Endpoint>, std::exception_ptr> completed_removals;
   std::deque<RoomEvent> events;
@@ -126,7 +151,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       std::lock_guard lock(service_failure->mutex);
       error = std::exchange(service_failure->cause, {});
     }
-    if (error && connection != ConnectionState::closed && connection != ConnectionState::failed) {
+    if (error && connection != ConnectionState::failed &&
+        (connection != ConnectionState::closed ||
+         describe_failure(error)->code == ErrorCode::callback_failed)) {
       stop_all(ConnectionState::failed, describe_failure(error)->message, error);
     }
   }
@@ -140,10 +167,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
         std::lock_guard lock(mutex);
         event_handler = {};
       }
-      post({[this] {
-              stop_all(ConnectionState::failed, "RTC event callback threw; handler disabled");
-            },
-            [](auto) {}});
+      std::lock_guard failure_lock(service_failure->mutex);
+      service_failure->cause =
+          error("RTC event callback threw; handler disabled", ErrorCode::callback_failed);
+      wakeup->signal();
     } catch (...) {
       // The queue boundary must not propagate callback/dispatch exceptions.
     }
@@ -192,7 +219,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       });
     } catch (...) {
       notification_scheduled = false;
-      throw;
+      std::lock_guard failure_lock(service_failure->mutex);
+      service_failure->cause = std::current_exception();
+      wakeup->signal();
     }
   }
 
@@ -202,15 +231,19 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       event_handler = std::move(handler);
       schedule_events_locked();
     }
-    notifications->postSyncTask([] {});
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return !notification_scheduled && extra_notifications == 0; });
   }
 
   void post_notification(std::function<void()> callback) {
     {
       std::lock_guard lock(mutex);
       if (extra_notifications >= 256) {
-        throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
-                       "RTC notification task queue exhausted");
+        std::lock_guard failure_lock(service_failure->mutex);
+        service_failure->cause =
+            error("RTC notification task queue exhausted", ErrorCode::resource_exhausted);
+        wakeup->signal();
+        return;
       }
       ++extra_notifications;
     }
@@ -229,7 +262,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     } catch (...) {
       std::lock_guard lock(mutex);
       --extra_notifications;
-      throw;
+      std::lock_guard failure_lock(service_failure->mutex);
+      service_failure->cause = std::current_exception();
+      wakeup->signal();
     }
   }
 
@@ -247,12 +282,11 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   size_t publication_count = 0, subscription_count = 0;
   uint64_t tracks_serviced = 0, controller_wakeups = 0;
   std::vector<Removal> removals;  // Controller-owned native detachment barriers.
-  size_t removal_waiters = 0;
-  std::shared_ptr<OperationRecord<void>> joining;
+  PendingOperation<void>* joining = nullptr;
   SteadyClock::time_point join_deadline{};
 
   struct PendingControl {
-    std::shared_ptr<OperationRecord<void>> promise;
+    PendingOperation<void>* pending;
     Epoch epoch;
     SteadyClock::time_point deadline;
     std::stop_token stop;
@@ -263,7 +297,8 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   uint32_t next_control = 0;
   std::map<uint32_t, PendingControl> controls;
 
-  void add_control(uint32_t id, PendingControl control) {
+  bool add_control(uint32_t id, PendingControl control) {
+    auto* pending = control.pending;
     const WorkKey key{WorkKind::control, id};
     auto signal = ready_work->watch(key);
     try {
@@ -271,10 +306,12 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
           control.stop, [signal] { signal->signal(); });
       deadlines.set(key, control.deadline);
       controls.emplace(id, std::move(control));
+      return true;
     } catch (...) {
       deadlines.erase(key);
       ready_work->forget(key);
-      throw;
+      pending->fail(std::current_exception());
+      return false;
     }
   }
 
@@ -297,7 +334,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     for (const auto& [id, pending] : controls) {
       deadlines.erase({WorkKind::control, id});
       ready_work->forget({WorkKind::control, id});
-      pending.promise->fail(
+      pending.pending->fail(
           error("RTC control interrupted; remote outcome is unknown", ErrorCode::outcome_unknown));
     }
     controls.clear();
@@ -314,22 +351,26 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       worker.join();
   }
 
-  bool post(Command command) {
-    std::exception_ptr failure;
-    {
-      std::lock_guard lock(mutex);
-      if (shutting_down)
-        failure = error("RTC room was destroyed");
-      else if (commands.size() >= 1024)
-        failure = error("RTC control queue exhausted", ErrorCode::resource_exhausted);
-      else {
-        commands.push_back(std::move(command));
-        wakeup->signal();
-        return true;
+  template <class Function, class T>
+  void run_request(Function&& request, PendingOperation<T>& operation) {
+    try {
+      request();
+    } catch (...) {
+      operation.fail(std::current_exception());
+    }
+  }
+
+  template <class T>
+  auto wait(PendingOperation<T>& operation) {
+    while (!operation.result) {
+      const auto observed = wakeup->revision();
+      pump();
+      if (!operation.result) {
+        wakeup->wait(observed, {}, next_deadline());
       }
     }
-    command.cancel(failure);
-    return false;
+    wakeup->signal();  // Let background media servicing resume after the caller unlocks.
+    return std::move(*operation.result);
   }
 
   void report_failure(std::shared_ptr<Endpoint> endpoint, std::exception_ptr failure) {
@@ -345,7 +386,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     std::lock_guard lock(mutex);
     status.state = connection;
     status.epoch = epoch;
-    status.capabilities = transport->capabilities();
+    status.capabilities = transport ? transport->capabilities() : BackendCapabilities{};
     if (connection == ConnectionState::closed || connection == ConnectionState::failed ||
         (status.session && status.session->epoch != epoch))
       status.session.reset();
@@ -361,7 +402,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     changed.notify_all();
   }
 
-  void emit(RoomEvent event) {
+  bool emit(RoomEvent event, bool fatal_overflow = true) {
     std::lock_guard lock(mutex);
     const auto result = enqueue_event(
         events, std::move(event), options.max_events, RoomEventKind::statistics,
@@ -373,14 +414,20 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
                  });
         });
     if (result == EventAdmission::overflow) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
-                     "RTC room event queue exhausted");
+      if (fatal_overflow) {
+        std::lock_guard failure_lock(service_failure->mutex);
+        service_failure->cause =
+            error("RTC room event queue exhausted", ErrorCode::resource_exhausted);
+        wakeup->signal();
+      }
+      return false;
     }
     if (result != EventAdmission::queued) {
-      return;
+      return true;
     }
     schedule_events_locked();
     changed.notify_all();
+    return true;
   }
 
   void stop_all(ConnectionState state, const std::string& message,
@@ -390,7 +437,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     const auto failure =
         normalized_failure(cause ? cause : error(message), {"room", {}, {}, epoch});
     const auto info = describe_failure(failure);
-    auto joining_result = std::move(joining);
+    auto joining_result = std::exchange(joining, nullptr);
     for (auto& [key, entry] : tracks) {
       entry.endpoint->finish(
           state == ConnectionState::failed ? TrackState::failed : TrackState::closed, message,
@@ -405,7 +452,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     publication_count = subscription_count = 0;
     deadlines.clear();
     ready_work->clear();
-    transport->stop();
+    if (transport) {
+      transport->stop();
+    }
     // stop() is the final native barrier, including removals queued at shutdown.
     finish_all_removals();
     refresh(state == ConnectionState::failed ? message : "");
@@ -470,15 +519,19 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
 
   void add(std::shared_ptr<Endpoint> endpoint, std::function<void(std::exception_ptr)> completion) {
     if (connection != ConnectionState::connecting && connection != ConnectionState::connected &&
-        connection != ConnectionState::reconnecting)
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed,
-                     "Join the RTC room before adding tracks");
+        connection != ConnectionState::reconnecting) {
+      completion(error("Join the RTC room before adding tracks", ErrorCode::session_closed));
+      return;
+    }
     const Key key{endpoint->publication, endpoint->descriptor.id};
-    if (tracks.contains(key))
-      throw std::invalid_argument("Duplicate RTC track id");
-    if (tracks.size() >= options.max_tracks)
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
-                     "RTC room track limit exceeded");
+    if (tracks.contains(key)) {
+      completion(error("Duplicate RTC track id", ErrorCode::invalid_argument));
+      return;
+    }
+    if (tracks.size() >= options.max_tracks) {
+      completion(error("RTC room track limit exceeded", ErrorCode::resource_exhausted));
+      return;
+    }
     auto [it, inserted] = tracks.emplace(
         key,
         Entry{endpoint, SteadyClock::now() + options.operation_timeout, std::move(completion)});
@@ -490,106 +543,139 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       deadlines.set({WorkKind::track, incarnation}, it->second.deadline);
       if (connection == ConnectionState::connected)
         dispatch(it->second);
+      refresh();
     } catch (...) {
+      auto failed = std::move(it->second.completion);
       erase_track(it);
-      throw;
+      failed(std::current_exception());
+      return;
     }
-    refresh();
   }
 
   std::shared_ptr<Endpoint> make_endpoint(TrackDescriptor descriptor, bool publication) {
-    if (!budget)
-      throw std::logic_error("Join the RTC room before adding tracks");
+    if (!budget) {
+      return {};
+    }
     validate_descriptor(descriptor, budget->limit, publication);
     BindingToken binding{descriptor.id, epoch, ++next_incarnation, publication};
     auto endpoint = std::make_shared<Endpoint>(std::move(descriptor), std::move(binding), budget);
     return endpoint;
   }
 
-  Result<void> set_muted(TrackId id, bool muted, ControlOptions opts,
-                         std::shared_ptr<Endpoint> expected = {}) {
-    auto promise = std::make_shared<OperationRecord<void>>();
+  ErrorCode set_muted(TrackId id, bool muted, ControlOptions opts,
+                      std::shared_ptr<Endpoint> expected = {}) {
+    std::lock_guard controller_lock(controller_mutex);
+    PendingOperation<void> operation;
+    auto* pending = &operation;
     const auto submitted = SteadyClock::now();
-    post({[this, id = std::move(id), muted, opts, expected, promise, submitted] {
-            if (opts.timeout.count() < 0 || opts.timeout > std::chrono::minutes(5))
-              throw std::invalid_argument("Invalid mute timeout");
-            if (opts.stop.stop_requested())
-              std::rethrow_exception(error("Mute cancelled before dispatch", ErrorCode::cancelled));
-            const auto deadline =
-                submitted + (opts.timeout.count() ? opts.timeout : options.operation_timeout);
-            if (SteadyClock::now() >= deadline)
-              std::rethrow_exception(error("Mute expired before dispatch", ErrorCode::timeout));
-            const auto it = tracks.find({true, id});
-            if (connection != ConnectionState::connected || it == tracks.end() ||
-                (expected && expected != it->second.endpoint) ||
-                it->second.endpoint->snapshot().state != TrackState::ready)
-              std::rethrow_exception(
-                  error("Publication is not ready for mute control", ErrorCode::stale_handle));
-            if (controls.size() >= 128 || next_control == std::numeric_limits<uint32_t>::max())
-              std::rethrow_exception(
-                  error("RTC control capacity exhausted", ErrorCode::resource_exhausted));
-            const auto endpoint = it->second.endpoint;
-            const auto previous = endpoint->snapshot().muted;
-            endpoint->set_muted(muted);  // Gate application admission before native dispatch.
-            const auto operation = ++next_control;
-            try {
-              // Reserve the notification before dispatch. If it cannot be queued,
-              // no native operation or pending promise may survive command rejection.
-              emit({RoomEventKind::track_mute_changed, id, {}, epoch, {}});
-              add_control(operation, PendingControl{promise, epoch, deadline, opts.stop});
-              transport->set_muted({operation, endpoint->binding(), muted, deadline, opts.stop});
-            } catch (...) {
-              erase_control(operation);
+    run_request(
+        [&] {
+          if (opts.timeout.count() < 0 || opts.timeout > std::chrono::minutes(5)) {
+            pending->fail(detail::error("Invalid mute timeout", ErrorCode::invalid_argument));
+            return;
+          }
+          if (opts.stop.stop_requested()) {
+            pending->fail(error("Mute cancelled before dispatch", ErrorCode::cancelled));
+            return;
+          }
+          const auto deadline =
+              submitted + (opts.timeout.count() ? opts.timeout : options.operation_timeout);
+          if (SteadyClock::now() >= deadline) {
+            pending->fail(error("Mute expired before dispatch", ErrorCode::timeout));
+            return;
+          }
+          const auto it = tracks.find({true, id});
+          if (connection != ConnectionState::connected || it == tracks.end() ||
+              (expected && expected != it->second.endpoint) ||
+              it->second.endpoint->snapshot().state != TrackState::ready) {
+            pending->fail(
+                error("Publication is not ready for mute control", ErrorCode::stale_handle));
+            return;
+          }
+          if (controls.size() >= 128 || next_control == std::numeric_limits<uint32_t>::max()) {
+            pending->fail(error("RTC control capacity exhausted", ErrorCode::resource_exhausted));
+            return;
+          }
+          const auto endpoint = it->second.endpoint;
+          const auto previous = endpoint->snapshot().muted;
+          endpoint->set_muted(muted);  // Gate application admission before native dispatch.
+          const auto operation = ++next_control;
+          try {
+            // Reserve the notification before dispatch. If it cannot be queued,
+            // no native operation may survive request rejection.
+            if (!emit({RoomEventKind::track_mute_changed, id, {}, epoch, {}}, false) ||
+                !add_control(operation, PendingControl{pending, epoch, deadline, opts.stop})) {
               endpoint->set_muted(previous);
-              throw;
+              pending->fail(
+                  error("RTC mute notification admission failed", ErrorCode::resource_exhausted));
+              return;
             }
-          },
-          [promise](auto failure) { promise->fail(failure); }});
-    return promise->await_completion();
+            transport->set_muted({operation, endpoint->binding(), muted, deadline, opts.stop});
+          } catch (...) {
+            erase_control(operation);
+            endpoint->set_muted(previous);
+            pending->fail(std::current_exception());
+          }
+        },
+        operation);
+    return wait(operation);
   }
 
-  Result<void> set_receive_demand(TrackId id, ReceiveDemand demand, ControlOptions opts,
-                                  std::shared_ptr<Endpoint> expected = {}) {
-    auto promise = std::make_shared<OperationRecord<void>>();
+  ErrorCode set_receive_demand(TrackId id, ReceiveDemand demand, ControlOptions opts,
+                               std::shared_ptr<Endpoint> expected = {}) {
+    std::lock_guard controller_lock(controller_mutex);
+    PendingOperation<void> operation;
+    auto* pending = &operation;
     const auto submitted = SteadyClock::now();
-    post({[this, id = std::move(id), demand, opts, expected, promise, submitted] {
-            if (opts.timeout.count() < 0 || opts.timeout > std::chrono::minutes(5))
-              throw std::invalid_argument("Invalid receive demand timeout");
-            if (opts.stop.stop_requested())
-              std::rethrow_exception(
-                  error("Receive demand cancelled before dispatch", ErrorCode::cancelled));
-            const auto deadline =
-                submitted + (opts.timeout.count() ? opts.timeout : options.operation_timeout);
-            if (SteadyClock::now() >= deadline)
-              std::rethrow_exception(
-                  error("Receive demand expired before dispatch", ErrorCode::timeout));
-            const auto it = tracks.find({false, id});
-            if (connection != ConnectionState::connected || it == tracks.end() ||
-                (expected && expected != it->second.endpoint) ||
-                it->second.endpoint->snapshot().state != TrackState::ready)
-              std::rethrow_exception(
-                  error("Subscription is not ready for receive demand", ErrorCode::stale_handle));
-            validate_receive_demand(demand, it->second.endpoint->descriptor.kind);
-            if (controls.size() >= 128 || next_control == std::numeric_limits<uint32_t>::max())
-              std::rethrow_exception(
-                  error("RTC control capacity exhausted", ErrorCode::resource_exhausted));
-            const auto endpoint = it->second.endpoint;
-            const auto binding = endpoint->binding();
-            const auto operation = ++next_control;
-            add_control(operation, PendingControl{promise, epoch, deadline, opts.stop,
-                                                  [endpoint, binding, demand] {
-                                                    if (endpoint->matches(binding))
-                                                      endpoint->set_receive_demand(demand);
-                                                  }});
-            try {
-              transport->set_receive_demand({operation, binding, demand, deadline, opts.stop});
-            } catch (...) {
-              erase_control(operation);
-              throw;
-            }
-          },
-          [promise](auto failure) { promise->fail(failure); }});
-    return promise->await_completion();
+    run_request(
+        [&] {
+          if (opts.timeout.count() < 0 || opts.timeout > std::chrono::minutes(5)) {
+            pending->fail(
+                detail::error("Invalid receive demand timeout", ErrorCode::invalid_argument));
+            return;
+          }
+          if (opts.stop.stop_requested()) {
+            pending->fail(error("Receive demand cancelled before dispatch", ErrorCode::cancelled));
+            return;
+          }
+          const auto deadline =
+              submitted + (opts.timeout.count() ? opts.timeout : options.operation_timeout);
+          if (SteadyClock::now() >= deadline) {
+            pending->fail(error("Receive demand expired before dispatch", ErrorCode::timeout));
+            return;
+          }
+          const auto it = tracks.find({false, id});
+          if (connection != ConnectionState::connected || it == tracks.end() ||
+              (expected && expected != it->second.endpoint) ||
+              it->second.endpoint->snapshot().state != TrackState::ready) {
+            pending->fail(
+                error("Subscription is not ready for receive demand", ErrorCode::stale_handle));
+            return;
+          }
+          validate_receive_demand(demand, it->second.endpoint->descriptor.kind);
+          if (controls.size() >= 128 || next_control == std::numeric_limits<uint32_t>::max()) {
+            pending->fail(error("RTC control capacity exhausted", ErrorCode::resource_exhausted));
+            return;
+          }
+          const auto endpoint = it->second.endpoint;
+          const auto binding = endpoint->binding();
+          const auto operation = ++next_control;
+          if (!add_control(operation, PendingControl{pending, epoch, deadline, opts.stop,
+                                                     [endpoint, binding, demand] {
+                                                       if (endpoint->matches(binding))
+                                                         endpoint->set_receive_demand(demand);
+                                                     }})) {
+            return;
+          }
+          try {
+            transport->set_receive_demand({operation, binding, demand, deadline, opts.stop});
+          } catch (...) {
+            erase_control(operation);
+            pending->fail(std::current_exception());
+          }
+        },
+        operation);
+    return wait(operation);
   }
 
   void finish_removal(const std::shared_ptr<Endpoint>& endpoint, std::exception_ptr failure = {}) {
@@ -598,14 +684,13 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     if (it == removals.end()) {
       return;  // The room stop barrier already settled this incarnation.
     }
-    auto waiters = std::move(it->waiters);
-    removal_waiters -= waiters.size();
+    auto* waiting = it->waiting;
     removals.erase(it);
-    for (auto& waiter : waiters) {
+    if (waiting) {
       if (failure) {
-        waiter->fail(failure);
+        waiting->fail(failure);
       } else {
-        waiter->succeed();
+        waiting->succeed();
       }
     }
   }
@@ -616,11 +701,12 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     }
   }
 
-  void close_entry(std::map<Key, Entry>::iterator it,
-                   const std::shared_ptr<OperationRecord<void>>& promise) {
-    if (removals.size() >= 1024 || removal_waiters >= 1024) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
-                     "RTC detachment queue exhausted");
+  void close_entry(std::map<Key, Entry>::iterator it, PendingOperation<void>* pending) {
+    if (removals.size() >= 1024) {
+      if (pending) {
+        pending->fail(error("RTC detachment queue exhausted", ErrorCode::resource_exhausted));
+      }
+      return;
     }
     auto entry = it->second;
     erase_track(it);  // Remove intent before detachment or a late publication ACK.
@@ -629,35 +715,37 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       entry.completion(error("RTC track operation cancelled", ErrorCode::cancelled));
     }
     refresh();
-    detach_endpoint(entry.endpoint, promise);
+    detach_endpoint(entry.endpoint, pending);
   }
 
   void detach_endpoint(const std::shared_ptr<Endpoint>& endpoint,
-                       std::shared_ptr<OperationRecord<void>> promise = {}) {
-    if (removals.size() >= 1024 || (promise && removal_waiters >= 1024)) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
-                     "RTC detachment queue exhausted");
+                       PendingOperation<void>* pending = {}) {
+    if (removals.size() >= 1024) {
+      if (pending) {
+        pending->fail(error("RTC detachment queue exhausted", ErrorCode::resource_exhausted));
+      }
+      return;
     }
-    removals.push_back({endpoint, {}});
-    if (promise) {
-      removals.back().waiters.push_back(std::move(promise));
-      ++removal_waiters;
-    }
+    removals.push_back({endpoint, pending});
     auto weak = weak_from_this();
-    transport->remove(endpoint->binding(), endpoint->publication,
-                      [weak, endpoint](std::exception_ptr failure) {
-                        if (auto state = weak.lock()) {
-                          std::lock_guard lock(state->mutex);
-                          if (!state->shutting_down) {
-                            state->completed_removals.emplace(endpoint, failure);
-                            state->wakeup->signal();
+    try {
+      transport->remove(endpoint->binding(), endpoint->publication,
+                        [weak, endpoint](std::exception_ptr failure) {
+                          if (auto state = weak.lock()) {
+                            std::lock_guard lock(state->mutex);
+                            if (!state->shutting_down) {
+                              state->completed_removals.emplace(endpoint, failure);
+                              state->wakeup->signal();
+                            }
                           }
-                        }
-                      });
+                        });
+    } catch (...) {
+      finish_removal(endpoint, std::current_exception());
+    }
   }
 
   void wait_removal(const std::shared_ptr<Endpoint>& endpoint, const TrackId& id, bool publication,
-                    const std::shared_ptr<OperationRecord<void>>& promise) {
+                    PendingOperation<void>* pending) {
     // An endpoint handle targets its exact incarnation. An ID-only repeated close
     // targets the most recent detachment of that ID, never an older incarnation.
     auto it = std::find_if(removals.rbegin(), removals.rend(), [&](const auto& removal) {
@@ -666,63 +754,71 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
                             removal.endpoint->publication == publication;
     });
     if (it == removals.rend()) {
-      promise->succeed();
+      pending->succeed();
       return;
     }
-    if (removal_waiters >= 1024) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
-                     "RTC detachment waiters exhausted");
-    }
-    it->waiters.push_back(promise);
-    ++removal_waiters;
+    it->waiting = pending;
   }
 
-  Result<void> close_track(const std::shared_ptr<Endpoint>& endpoint) {
-    auto promise = std::make_shared<OperationRecord<void>>();
-    post({[this, endpoint, promise] {
-            const auto binding = endpoint->binding();
-            auto it = tracks.find({binding.publication, binding.id});
-            if (it != tracks.end() && it->second.endpoint == endpoint) {
-              close_entry(it, promise);
-            } else {
-              wait_removal(endpoint, binding.id, binding.publication, promise);
-            }
-          },
-          [promise](auto failure) { promise->fail(failure); }});
-    return promise->await_completion();
+  ErrorCode close_track(const std::shared_ptr<Endpoint>& endpoint) {
+    std::lock_guard controller_lock(controller_mutex);
+    PendingOperation<void> operation;
+    auto* pending = &operation;
+    run_request(
+        [&] {
+          const auto binding = endpoint->binding();
+          auto it = tracks.find({binding.publication, binding.id});
+          if (it != tracks.end() && it->second.endpoint == endpoint) {
+            close_entry(it, pending);
+          } else {
+            wait_removal(endpoint, binding.id, binding.publication, pending);
+          }
+        },
+        operation);
+    return wait(operation);
   }
 
-  Result<void> close_id(const TrackId& id, bool publication) {
-    auto promise = std::make_shared<OperationRecord<void>>();
-    post({[this, id, publication, promise] {
-            auto it = tracks.find({publication, id});
-            if (it != tracks.end()) {
-              close_entry(it, promise);
-            } else {
-              wait_removal({}, id, publication, promise);
-            }
-          },
-          [promise](auto failure) { promise->fail(failure); }});
-    return promise->await_completion();
+  ErrorCode close_id(const TrackId& id, bool publication) {
+    std::lock_guard controller_lock(controller_mutex);
+    PendingOperation<void> operation;
+    auto* pending = &operation;
+    run_request(
+        [&] {
+          auto it = tracks.find({publication, id});
+          if (it != tracks.end()) {
+            close_entry(it, pending);
+          } else {
+            wait_removal({}, id, publication, pending);
+          }
+        },
+        operation);
+    return wait(operation);
   }
 
-  Result<void> request_keyframe(const std::shared_ptr<Endpoint>& endpoint) {
-    auto promise = std::make_shared<OperationRecord<void>>();
-    post({[this, endpoint, promise] {
-            const auto binding = endpoint->binding();
-            auto it = tracks.find({false, binding.id});
-            if (it == tracks.end() || it->second.endpoint != endpoint ||
-                endpoint->snapshot().state != TrackState::ready)
-              throw SDKError(ErrorDomain::lifecycle, ErrorCode::stale_handle,
-                             "RTC subscription is not ready");
-            if (endpoint->descriptor.kind != MediaKind::video)
-              throw std::invalid_argument("Audio has no keyframe request");
-            endpoint->require_keyframe();
-            send_pli(it->second);
-            promise->succeed();
-          },
-          [promise](auto failure) { promise->fail(failure); }});
-    return promise->await_completion();
+  ErrorCode request_keyframe(const std::shared_ptr<Endpoint>& endpoint) {
+    std::lock_guard controller_lock(controller_mutex);
+    PendingOperation<void> operation;
+    auto* pending = &operation;
+    run_request(
+        [&] {
+          const auto binding = endpoint->binding();
+          auto it = tracks.find({false, binding.id});
+          if (it == tracks.end() || it->second.endpoint != endpoint ||
+              endpoint->snapshot().state != TrackState::ready) {
+            pending->fail(detail::error("RTC subscription is not ready", ErrorCode::stale_handle));
+            return;
+          }
+          if (endpoint->descriptor.kind != MediaKind::video) {
+            pending->fail(
+                detail::error("Audio has no keyframe request", ErrorCode::invalid_argument));
+            return;
+          }
+          endpoint->require_keyframe();
+          send_pli(it->second);
+          pending->succeed();
+        },
+        operation);
+    return wait(operation);
   }
 
   void send_pli(Entry& entry) {
@@ -768,7 +864,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       refresh();
       if (joining) {
         joining->succeed();
-        joining.reset();
+        joining = nullptr;
       }
       emit({RoomEventKind::connected, {}, {}, epoch, {}});
       return;
@@ -778,17 +874,17 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       if (it == controls.end() || it->second.epoch != event.binding.epoch)
         return;
       if (it->second.stop.stop_requested() || SteadyClock::now() >= it->second.deadline)
-        it->second.promise->fail(error(
+        it->second.pending->fail(error(
             "RTC control completion arrived after cancellation/deadline; remote outcome is unknown",
             ErrorCode::outcome_unknown));
       else if (event.control_error)
-        it->second.promise->fail(
+        it->second.pending->fail(
             std::make_exception_ptr(SDKError(ErrorDomain::signaling, *event.control_error,
                                              event.error, false, event.control_reason)));
       else {
         if (it->second.applied)
           it->second.applied();
-        it->second.promise->succeed();
+        it->second.pending->succeed();
       }
       erase_control(event.operation_id);
       return;
@@ -998,9 +1094,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
         const auto found = controls.find(id);
         if (found != controls.end() &&
             (found->second.stop.stop_requested() || now >= found->second.deadline)) {
-          auto promise = found->second.promise;
+          auto pending = found->second.pending;
           erase_control(id);
-          promise->fail(
+          pending->fail(
               error("RTC control cancelled or timed out after dispatch; remote outcome is unknown",
                     ErrorCode::outcome_unknown));
         }
@@ -1017,66 +1113,60 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     return next;
   }
 
+  void pump() noexcept {
+    ++controller_wakeups;
+    std::map<std::shared_ptr<Endpoint>, std::exception_ptr> failures, detached;
+    {
+      std::lock_guard lock(mutex);
+      failures.swap(graph_failures);
+      detached.swap(completed_removals);
+    }
+    try {
+      handle_service_failure();
+      for (const auto& [endpoint, failure] : detached) {
+        finish_removal(endpoint, failure);
+      }
+      for (const auto& [endpoint, failure] : failures) {
+        const Key key{endpoint->publication, endpoint->descriptor.id};
+        const auto it = tracks.find(key);
+        if (it != tracks.end() && it->second.endpoint == endpoint) {
+          fail_track(key, failure, describe_failure(failure)->message);
+        }
+      }
+    } catch (...) {
+      stop_all(ConnectionState::failed, "Graph failure cleanup failed", std::current_exception());
+    }
+    try {
+      if (connection == ConnectionState::connecting || connection == ConnectionState::connected ||
+          connection == ConnectionState::reconnecting) {
+        for (auto& event : transport->take_events()) {
+          if (connection == ConnectionState::closed || connection == ConnectionState::failed) {
+            break;
+          }
+          handle(std::move(event));
+        }
+        service_ready();
+      }
+    } catch (const std::exception& e) {
+      stop_all(ConnectionState::failed, e.what(), std::current_exception());
+    } catch (...) {
+      stop_all(ConnectionState::failed, "Unknown RTC transport failure");
+    }
+  }
+
   void run(std::stop_token stop) noexcept {
     while (!stop.stop_requested()) {
       const auto observed = wakeup->revision();
-      ++controller_wakeups;
-      std::deque<Command> pending;
-      std::map<std::shared_ptr<Endpoint>, std::exception_ptr> failures, detached;
+      std::optional<SteadyClock::time_point> deadline;
       {
-        std::lock_guard lock(mutex);
-        pending.swap(commands);
-        failures.swap(graph_failures);
-        detached.swap(completed_removals);
+        std::lock_guard controller_lock(controller_mutex);
+        pump();
+        deadline = next_deadline();
       }
-      try {
-        handle_service_failure();
-        for (const auto& [endpoint, failure] : detached) {
-          finish_removal(endpoint, failure);
-        }
-        for (const auto& [endpoint, failure] : failures) {
-          const Key key{endpoint->publication, endpoint->descriptor.id};
-          const auto it = tracks.find(key);
-          if (it != tracks.end() && it->second.endpoint == endpoint) {
-            fail_track(key, failure, describe_failure(failure)->message);
-          }
-        }
-      } catch (...) {
-        stop_all(ConnectionState::failed, "Graph failure cleanup failed", std::current_exception());
-      }
-      for (auto& command : pending) {
-        try {
-          command.run();
-        } catch (...) {
-          command.cancel(std::current_exception());
-        }
-      }
-      try {
-        if (connection == ConnectionState::connecting || connection == ConnectionState::connected ||
-            connection == ConnectionState::reconnecting) {
-          for (auto& event : transport->take_events()) {
-            if (connection == ConnectionState::closed || connection == ConnectionState::failed) {
-              break;
-            }
-            handle(std::move(event));
-          }
-          service_ready();
-        }
-        wakeup->wait(observed, stop, next_deadline());
-      } catch (const std::exception& e) {
-        stop_all(ConnectionState::failed, e.what(), std::current_exception());
-      } catch (...) {
-        stop_all(ConnectionState::failed, "Unknown RTC transport failure");
-      }
+      wakeup->wait(observed, stop, deadline);
     }
+    std::lock_guard controller_lock(controller_mutex);
     stop_all(ConnectionState::closed, "RTC room destroyed");
-    std::deque<Command> pending;
-    {
-      std::lock_guard lock(mutex);
-      pending.swap(commands);
-    }
-    for (auto& command : pending)
-      command.cancel(error("RTC room destroyed"));
   }
 };
 }  // namespace detail
@@ -1106,13 +1196,13 @@ WriteStatus PublishedTrack::try_write(EncodedFrame frame) {
   return endpoint_->write(std::move(frame));
 }
 
-Result<void> PublishedTrack::set_muted(bool muted, ControlOptions options) {
+ErrorCode PublishedTrack::set_muted(bool muted, ControlOptions options) {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
       detail::OperationGuard guard(*session->control);
       return session->set_muted(endpoint_->descriptor.id, muted, options, endpoint_);
     }
-    return detail::rejected<void>(detail::error("RTC room destroyed"));
+    return ErrorCode::session_closed;
   });
 }
 
@@ -1130,20 +1220,21 @@ std::shared_ptr<detail::SessionControl> PublishedTrack::operation_control() cons
   return session->control;
 }
 
-Result<void> PublishedTrack::close() {
+ErrorCode PublishedTrack::close() {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
       detail::OperationGuard guard(*session->control);
       return close_locked();
     }
-    return detail::rejected<void>(detail::error("RTC room destroyed"));
+    return ErrorCode::session_closed;
   });
 }
 
-Result<void> PublishedTrack::close_locked() {
-  if (auto session = session_.lock())
+ErrorCode PublishedTrack::close_locked() {
+  if (auto session = session_.lock()) {
     return session->close_track(endpoint_);
-  return detail::rejected<void>(detail::error("RTC room destroyed"));
+  }
+  return ErrorCode::session_closed;
 }
 
 SubscribedTrack::SubscribedTrack(std::shared_ptr<detail::Endpoint> endpoint,
@@ -1166,23 +1257,23 @@ ReadResult SubscribedTrack::wait_frame(std::stop_token stop) {
   return endpoint_->wait_frame(stop);
 }
 
-Result<void> SubscribedTrack::request_keyframe() {
+ErrorCode SubscribedTrack::request_keyframe() {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
       detail::OperationGuard guard(*session->control);
       return session->request_keyframe(endpoint_);
     }
-    return detail::rejected<void>(detail::error("RTC room destroyed"));
+    return ErrorCode::session_closed;
   });
 }
 
-Result<void> SubscribedTrack::set_demand(ReceiveDemand demand, ControlOptions options) {
+ErrorCode SubscribedTrack::set_demand(ReceiveDemand demand, ControlOptions options) {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
       detail::OperationGuard guard(*session->control);
       return session->set_receive_demand(endpoint_->descriptor.id, demand, options, endpoint_);
     }
-    return detail::rejected<void>(detail::error("RTC room destroyed"));
+    return ErrorCode::session_closed;
   });
 }
 
@@ -1200,20 +1291,21 @@ std::shared_ptr<detail::SessionControl> SubscribedTrack::operation_control() con
   return session->control;
 }
 
-Result<void> SubscribedTrack::close() {
+ErrorCode SubscribedTrack::close() {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
       detail::OperationGuard guard(*session->control);
       return close_locked();
     }
-    return detail::rejected<void>(detail::error("RTC room destroyed"));
+    return ErrorCode::session_closed;
   });
 }
 
-Result<void> SubscribedTrack::close_locked() {
-  if (auto session = session_.lock())
+ErrorCode SubscribedTrack::close_locked() {
+  if (auto session = session_.lock()) {
     return session->close_track(endpoint_);
-  return detail::rejected<void>(detail::error("RTC room destroyed"));
+  }
+  return ErrorCode::session_closed;
 }
 
 RoomEngine::RoomEngine(TransportFactory factory)
@@ -1227,17 +1319,7 @@ std::shared_ptr<detail::SessionControl> RoomEngine::control() const {
 }
 
 void SubscribedTrack::request_keyframe_async() {
-  if (auto session = session_.lock()) {
-    auto endpoint = endpoint_;
-    session->post({[session, endpoint] {
-                     auto it = session->tracks.find({false, endpoint->descriptor.id});
-                     if (it != session->tracks.end() && it->second.endpoint == endpoint) {
-                       endpoint->require_keyframe();
-                       session->send_pli(it->second);
-                     }
-                   },
-                   [](auto) {}});
-  }
+  endpoint_->require_keyframe();
 }
 
 RoomEngine::~RoomEngine() {
@@ -1245,351 +1327,457 @@ RoomEngine::~RoomEngine() {
   state_->shutdown();
 }
 
-Result<std::shared_ptr<RoomServices>> RoomEngine::services() const {
-  return detail::control_boundary([&] {
-    std::lock_guard lock(state_->mutex);
-    if (!state_->services) {
-      throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
-                     "This transport does not provide room services");
-    }
-    return Result<std::shared_ptr<RoomServices>>::success(state_->services);
-  });
+std::shared_ptr<RoomServices> RoomEngine::services(ErrorCode* error) const {
+  return detail::return_value(
+      detail::control_boundary([&] {
+        std::lock_guard lock(state_->mutex);
+        if (!state_->services) {
+          return detail::failure_result<std::shared_ptr<RoomServices>>(
+              ErrorCode::unsupported, "This transport does not provide room services");
+        }
+        return Result<std::shared_ptr<RoomServices>>::success(state_->services);
+      }),
+      error);
 }
 
-Result<void> RoomEngine::join(RoomOptions options) {
+ErrorCode RoomEngine::join(RoomOptions options) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return join_locked(std::move(options));
   });
 }
 
-Result<void> RoomEngine::join_locked(RoomOptions options) {
-  auto promise = std::make_shared<detail::OperationRecord<void>>();
+ErrorCode RoomEngine::join_locked(RoomOptions options) {
+  std::lock_guard controller_lock(state_->controller_mutex);
+  detail::PendingOperation<void> operation;
+  auto* pending = &operation;
   auto* s = state_.get();
-  s->post({[s, options = std::move(options), promise] {
-             if (s->connection != ConnectionState::disconnected &&
-                 s->connection != ConnectionState::closed &&
-                 s->connection != ConnectionState::failed) {
-               throw std::logic_error("Leave the RTC room before joining again");
-             }
-             if (!options.max_queued_bytes || options.max_queued_bytes > 1024ull * 1024 * 1024 ||
-                 !options.max_tracks || options.max_tracks > 1024 || !options.max_events ||
-                 options.max_events > 65536 ||
-                 options.operation_timeout <= std::chrono::milliseconds::zero() ||
-                 options.operation_timeout > std::chrono::minutes(5) ||
-                 (options.stats_interval.count() != 0 &&
-                  (options.stats_interval < std::chrono::milliseconds(200) ||
-                   options.stats_interval > std::chrono::minutes(1)))) {
-               throw std::invalid_argument("Invalid RTC room options");
-             }
-             if (options.subscription_permissions)
-               detail::validate_subscription_permissions(*options.subscription_permissions);
-             if (s->connection != ConnectionState::disconnected) {
-               auto replacement = s->transport_factory();
-               if (!replacement) {
-                 throw std::invalid_argument("RTC transport factory returned null");
-               }
-               s->attach_service_notifications(*replacement);
-               auto services = replacement->services();
-               s->transport = std::move(replacement);
-               std::lock_guard lock(s->mutex);
-               // Release old service state after unlocking; it may own executors.
-               s->services.swap(services);
-             }
-             {
-               std::lock_guard lock(s->mutex);
-               s->events.clear();
-               s->status = {};
-             }
-             s->options = options;
-             s->budget = std::make_shared<detail::QueueBudget>(options.max_queued_bytes);
-             s->connection = ConnectionState::connecting;
-             ++s->epoch;
-             s->join_deadline = SteadyClock::now() + options.operation_timeout;
-             s->refresh();
-             s->joining = promise;
-             try {
-               s->transport->attach_wakeup(s->wakeup);
-               s->transport->set_queue_budget(s->budget);
-               s->transport->start(options, s->epoch);
-             } catch (...) {
-               s->stop_all(ConnectionState::failed, "RTC transport start failed",
-                           std::current_exception());
-               throw;
-             }
-           },
-           [promise](auto failure) { promise->fail(failure); }});
-  return promise->await_completion();
+  s->run_request(
+      [&] {
+        if (!s->transport) {
+          pending->fail(s->initialization_failure ? s->initialization_failure
+                                                  : detail::error("RTC room requires a transport",
+                                                                  ErrorCode::invalid_argument));
+          return;
+        }
+        if (s->connection != ConnectionState::disconnected &&
+            s->connection != ConnectionState::closed && s->connection != ConnectionState::failed) {
+          {
+            pending->fail(
+                detail::error("Leave the RTC room before joining again", ErrorCode::invalid_state));
+            return;
+          }
+        }
+        if (!options.max_queued_bytes || options.max_queued_bytes > 1024ull * 1024 * 1024 ||
+            !options.max_tracks || options.max_tracks > 1024 || !options.max_events ||
+            options.max_events > 65536 ||
+            options.operation_timeout <= std::chrono::milliseconds::zero() ||
+            options.operation_timeout > std::chrono::minutes(5) ||
+            (options.stats_interval.count() != 0 &&
+             (options.stats_interval < std::chrono::milliseconds(200) ||
+              options.stats_interval > std::chrono::minutes(1)))) {
+          {
+            pending->fail(detail::error("Invalid RTC room options", ErrorCode::invalid_argument));
+            return;
+          }
+        }
+        if (options.subscription_permissions)
+          detail::validate_subscription_permissions(*options.subscription_permissions);
+        if (s->connection != ConnectionState::disconnected) {
+          auto replacement = s->transport_factory();
+          if (!replacement) {
+            {
+              pending->fail(detail::error("RTC transport factory returned null",
+                                          ErrorCode::invalid_argument));
+              return;
+            }
+          }
+          s->attach_service_notifications(*replacement);
+          auto services = replacement->services();
+          s->transport = std::move(replacement);
+          std::lock_guard lock(s->mutex);
+          // Release old service state after unlocking; it may own executors.
+          s->services.swap(services);
+        }
+        {
+          std::lock_guard lock(s->mutex);
+          s->events.clear();
+          s->status = {};
+        }
+        s->options = options;
+        s->budget = std::make_shared<detail::QueueBudget>(options.max_queued_bytes);
+        s->connection = ConnectionState::connecting;
+        ++s->epoch;
+        s->join_deadline = SteadyClock::now() + options.operation_timeout;
+        s->refresh();
+        s->joining = pending;
+        try {
+          s->transport->attach_wakeup(s->wakeup);
+          s->transport->set_queue_budget(s->budget);
+          s->transport->start(options, s->epoch);
+        } catch (...) {
+          s->stop_all(ConnectionState::failed, "RTC transport start failed",
+                      std::current_exception());
+          pending->fail(std::current_exception());
+        }
+      },
+      operation);
+  return state_->wait(operation);
 }
 
-Result<std::shared_ptr<PublishedTrack>> RoomEngine::publish(TrackDescriptor descriptor) {
-  return detail::control_boundary([&] {
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
-    }
-    return publish_locked(std::move(descriptor));
-  });
+std::shared_ptr<PublishedTrack> RoomEngine::publish(TrackDescriptor descriptor, ErrorCode* error) {
+  return detail::return_value(detail::control_boundary([&] {
+                                if (detail::callback_depth || detail::active_session) {
+                                  return detail::failure_result<std::shared_ptr<PublishedTrack>>(
+                                      ErrorCode::invalid_thread, "RTC callback control rejected");
+                                }
+                                detail::OperationGuard guard(*state_->control);
+                                if (state_->control->closed) {
+                                  return detail::failure_result<std::shared_ptr<PublishedTrack>>(
+                                      ErrorCode::session_closed, "RTC engine closed");
+                                }
+                                return publish_locked(std::move(descriptor));
+                              }),
+                              error);
 }
 
 Result<std::shared_ptr<PublishedTrack>> RoomEngine::publish_locked(TrackDescriptor descriptor) {
-  auto promise = std::make_shared<detail::OperationRecord<std::shared_ptr<PublishedTrack>>>();
+  std::lock_guard controller_lock(state_->controller_mutex);
+  detail::PendingOperation<std::shared_ptr<PublishedTrack>> operation;
+  auto* pending = &operation;
   auto* s = state_.get();
-  s->post(
-      {[s, weak = std::weak_ptr(state_), descriptor = std::move(descriptor), promise]() mutable {
-         auto endpoint = s->make_endpoint(std::move(descriptor), true);
-         auto track = std::shared_ptr<PublishedTrack>(new PublishedTrack(endpoint, weak));
-         s->add(endpoint, [s, promise, track](auto failure) {
-           if (failure)
-             promise->fail(failure);
-           else
-             promise->succeed(track);
-         });
-       },
-       [s, promise](auto failure) { promise->fail(failure); }});
-  return promise->await_completion();
+  s->run_request(
+      [&] {
+        auto endpoint = s->make_endpoint(std::move(descriptor), true);
+        if (!endpoint) {
+          pending->fail(
+              detail::error("Join the RTC room before adding tracks", ErrorCode::invalid_state));
+          return;
+        }
+        auto track = std::shared_ptr<PublishedTrack>(new PublishedTrack(endpoint, state_));
+        s->add(endpoint, [s, pending, track](auto failure) {
+          if (failure)
+            pending->fail(failure);
+          else
+            pending->succeed(track);
+        });
+      },
+      operation);
+  return state_->wait(operation);
 }
 
-Result<std::shared_ptr<SubscribedTrack>> RoomEngine::subscribe(TrackDescriptor descriptor) {
-  return detail::control_boundary([&] {
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
-    }
-    return subscribe_locked(std::move(descriptor));
-  });
+std::shared_ptr<SubscribedTrack> RoomEngine::subscribe(TrackDescriptor descriptor,
+                                                       ErrorCode* error) {
+  return detail::return_value(detail::control_boundary([&] {
+                                if (detail::callback_depth || detail::active_session) {
+                                  return detail::failure_result<std::shared_ptr<SubscribedTrack>>(
+                                      ErrorCode::invalid_thread, "RTC callback control rejected");
+                                }
+                                detail::OperationGuard guard(*state_->control);
+                                if (state_->control->closed) {
+                                  return detail::failure_result<std::shared_ptr<SubscribedTrack>>(
+                                      ErrorCode::session_closed, "RTC engine closed");
+                                }
+                                return subscribe_locked(std::move(descriptor));
+                              }),
+                              error);
 }
 
 Result<std::shared_ptr<SubscribedTrack>> RoomEngine::subscribe_locked(TrackDescriptor descriptor) {
-  auto promise = std::make_shared<detail::OperationRecord<std::shared_ptr<SubscribedTrack>>>();
+  std::lock_guard controller_lock(state_->controller_mutex);
+  detail::PendingOperation<std::shared_ptr<SubscribedTrack>> operation;
+  auto* pending = &operation;
   auto* s = state_.get();
-  s->post(
-      {[s, weak = std::weak_ptr(state_), descriptor = std::move(descriptor), promise]() mutable {
-         auto endpoint = s->make_endpoint(std::move(descriptor), false);
-         auto track = std::shared_ptr<SubscribedTrack>(new SubscribedTrack(endpoint, weak));
-         s->add(endpoint, [s, promise, track](auto failure) {
-           if (failure)
-             promise->fail(failure);
-           else
-             promise->succeed(track);
-         });
-       },
-       [s, promise](auto failure) { promise->fail(failure); }});
-  return promise->await_completion();
+  s->run_request(
+      [&] {
+        auto endpoint = s->make_endpoint(std::move(descriptor), false);
+        if (!endpoint) {
+          pending->fail(
+              detail::error("Join the RTC room before adding tracks", ErrorCode::invalid_state));
+          return;
+        }
+        auto track = std::shared_ptr<SubscribedTrack>(new SubscribedTrack(endpoint, state_));
+        s->add(endpoint, [s, pending, track](auto failure) {
+          if (failure)
+            pending->fail(failure);
+          else
+            pending->succeed(track);
+        });
+      },
+      operation);
+  return state_->wait(operation);
 }
 
-Result<void> RoomEngine::leave() {
+ErrorCode RoomEngine::leave() {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return leave_locked();
   });
 }
 
-Result<void> RoomEngine::leave_locked() {
-  auto promise = std::make_shared<detail::OperationRecord<void>>();
+ErrorCode RoomEngine::leave_locked() {
+  std::lock_guard controller_lock(state_->controller_mutex);
+  detail::PendingOperation<void> operation;
+  auto* pending = &operation;
   auto* s = state_.get();
-  s->post({[s, promise] {
-             if (s->connection != ConnectionState::closed)
-               s->stop_all(ConnectionState::closed, "RTC room left");
-             promise->succeed();
-           },
-           [promise](auto failure) { promise->fail(failure); }});
-  auto result = promise->await_completion();
+  s->run_request(
+      [&] {
+        if (s->connection != ConnectionState::closed)
+          s->stop_all(ConnectionState::closed, "RTC room left");
+        pending->succeed();
+      },
+      operation);
+  auto result = state_->wait(operation);
   {
     std::unique_lock lock(state_->mutex);
     state_->changed.wait(
         lock, [&] { return !state_->notification_scheduled && state_->extra_notifications == 0; });
   }
-  state_->notifications->postSyncTask([] {});
   return result;
 }
 
-Result<void> RoomEngine::unpublish(const TrackId& id) {
+ErrorCode RoomEngine::unpublish(const TrackId& id) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return unpublish_locked(id);
   });
 }
 
-Result<void> RoomEngine::unpublish_locked(const TrackId& id) {
+ErrorCode RoomEngine::unpublish_locked(const TrackId& id) {
   return state_->close_id(id, true);
 }
 
-Result<void> RoomEngine::unsubscribe(const TrackId& id) {
+ErrorCode RoomEngine::unsubscribe(const TrackId& id) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return unsubscribe_locked(id);
   });
 }
 
-Result<void> RoomEngine::unsubscribe_locked(const TrackId& id) {
+ErrorCode RoomEngine::unsubscribe_locked(const TrackId& id) {
   return state_->close_id(id, false);
 }
 
-Result<void> RoomEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
+ErrorCode RoomEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return set_muted_locked(id, muted, options);
   });
 }
 
-Result<void> RoomEngine::set_muted_locked(const TrackId& id, bool muted, ControlOptions options) {
+ErrorCode RoomEngine::set_muted_locked(const TrackId& id, bool muted, ControlOptions options) {
   return state_->set_muted(id, muted, options);
 }
 
-Result<void> RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
-                                            ControlOptions options) {
+ErrorCode RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
+                                         ControlOptions options) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return set_receive_demand_locked(id, demand, options);
   });
 }
 
-Result<void> RoomEngine::set_receive_demand_locked(const TrackId& id, ReceiveDemand demand,
-                                                   ControlOptions options) {
+ErrorCode RoomEngine::set_receive_demand_locked(const TrackId& id, ReceiveDemand demand,
+                                                ControlOptions options) {
   return state_->set_receive_demand(id, demand, options);
 }
 
-Result<void> RoomEngine::update_local_participant(ParticipantUpdate update,
-                                                  ControlOptions options) {
+ErrorCode RoomEngine::update_local_participant(ParticipantUpdate update, ControlOptions options) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return update_local_participant_locked(std::move(update), options);
   });
 }
 
-Result<void> RoomEngine::update_local_participant_locked(ParticipantUpdate update,
-                                                         ControlOptions options) {
-  auto promise = std::make_shared<detail::OperationRecord<void>>();
+ErrorCode RoomEngine::update_local_participant_locked(ParticipantUpdate update,
+                                                      ControlOptions options) {
+  std::lock_guard controller_lock(state_->controller_mutex);
+  detail::PendingOperation<void> operation;
+  auto* pending = &operation;
   try {
     size_t bytes = update.name.size() + update.metadata.size();
     if (update.name.size() > 1024 || update.metadata.size() > 65536 ||
         update.attributes.size() > 128 || !livekit::sdk::detail::valid_utf8(update.name) ||
         !livekit::sdk::detail::valid_utf8(update.metadata) || options.timeout.count() < 0 ||
-        options.timeout > std::chrono::minutes(5))
-      throw std::invalid_argument("Invalid participant update");
+        options.timeout > std::chrono::minutes(5)) {
+      return ErrorCode::invalid_argument;
+    }
     for (const auto& [key, value] : update.attributes) {
       if (key.empty() || key.size() > 256 || value.size() > 16384 ||
-          !livekit::sdk::detail::valid_utf8(key) || !livekit::sdk::detail::valid_utf8(value))
-        throw std::invalid_argument("Invalid participant attribute");
+          !livekit::sdk::detail::valid_utf8(key) || !livekit::sdk::detail::valid_utf8(value)) {
+        return ErrorCode::invalid_argument;
+      }
       bytes += key.size() + value.size();
     }
-    if (bytes > 65536)
-      throw std::invalid_argument("Participant update exceeds 64 KiB");
+    if (bytes > 65536) {
+      return ErrorCode::invalid_argument;
+    }
     auto* s = state_.get();
     const auto submitted = SteadyClock::now();
-    s->post(
-        {[s, promise, update = std::move(update), options, submitted]() mutable {
-           if (s->connection != ConnectionState::connected)
-             std::rethrow_exception(detail::error("Room is not connected"));
-           if (!s->transport->capabilities().participant_update_ack) {
-             std::rethrow_exception(
-                 detail::error("Backend does not support acknowledged participant updates",
-                               ErrorCode::unsupported));
-           }
-           if (options.stop.stop_requested())
-             std::rethrow_exception(detail::error("Participant update cancelled before dispatch",
-                                                  ErrorCode::cancelled));
-           const auto deadline =
-               submitted +
-               (options.timeout.count() ? options.timeout : s->options.operation_timeout);
-           if (SteadyClock::now() >= deadline)
-             std::rethrow_exception(
-                 detail::error("Participant update expired before dispatch", ErrorCode::timeout));
-           if (s->controls.size() >= 128 || s->next_control == std::numeric_limits<uint32_t>::max())
-             std::rethrow_exception(detail::error("Participant update capacity exhausted",
-                                                  ErrorCode::resource_exhausted));
-           const auto id = ++s->next_control;
-           s->add_control(id, detail::RoomEngineState::PendingControl{promise, s->epoch, deadline,
-                                                                      options.stop});
-           try {
-             s->transport->update_participant(
-                 {id, s->epoch, std::move(update), deadline, options.stop});
-           } catch (...) {
-             s->erase_control(id);
-             throw;
-           }
-         },
-         [promise](auto failure) { promise->fail(failure); }});
+    s->run_request(
+        [&] {
+          if (s->connection != ConnectionState::connected) {
+            pending->fail(detail::error("Room is not connected"));
+            return;
+          }
+          if (!s->transport->capabilities().participant_update_ack) {
+            {
+              pending->fail(
+                  detail::error("Backend does not support acknowledged participant updates",
+                                ErrorCode::unsupported));
+              return;
+            }
+          }
+          if (options.stop.stop_requested()) {
+            pending->fail(detail::error("Participant update cancelled before dispatch",
+                                        ErrorCode::cancelled));
+            return;
+          }
+          const auto deadline =
+              submitted +
+              (options.timeout.count() ? options.timeout : s->options.operation_timeout);
+          if (SteadyClock::now() >= deadline) {
+            pending->fail(
+                detail::error("Participant update expired before dispatch", ErrorCode::timeout));
+            return;
+          }
+          if (s->controls.size() >= 128 ||
+              s->next_control == std::numeric_limits<uint32_t>::max()) {
+            pending->fail(detail::error("Participant update capacity exhausted",
+                                        ErrorCode::resource_exhausted));
+            return;
+          }
+          const auto id = ++s->next_control;
+          if (!s->add_control(id, detail::RoomEngineState::PendingControl{
+                                      pending, s->epoch, deadline, options.stop})) {
+            return;
+          }
+          try {
+            s->transport->update_participant(
+                {id, s->epoch, std::move(update), deadline, options.stop});
+          } catch (...) {
+            s->erase_control(id);
+            pending->fail(std::current_exception());
+          }
+        },
+        operation);
   } catch (...) {
-    promise->fail(std::current_exception());
+    pending->fail(std::current_exception());
   }
-  return promise->await_completion();
+  return state_->wait(operation);
 }
 
-Result<void> RoomEngine::set_subscription_permissions(SubscriptionPermissions policy,
-                                                      ControlOptions options) {
+ErrorCode RoomEngine::set_subscription_permissions(SubscriptionPermissions policy,
+                                                   ControlOptions options) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     return set_subscription_permissions_locked(std::move(policy), options);
   });
 }
 
-Result<void> RoomEngine::set_subscription_permissions_locked(SubscriptionPermissions policy,
-                                                             ControlOptions options) {
-  auto promise = std::make_shared<detail::OperationRecord<void>>();
+ErrorCode RoomEngine::set_subscription_permissions_locked(SubscriptionPermissions policy,
+                                                          ControlOptions options) {
+  std::lock_guard controller_lock(state_->controller_mutex);
+  detail::PendingOperation<void> operation;
+  auto* pending = &operation;
   try {
     detail::validate_subscription_permissions(policy);
-    if (options.timeout.count() < 0 || options.timeout > std::chrono::minutes(5))
-      throw std::invalid_argument("Invalid subscription permission timeout");
+    if (options.timeout.count() < 0 || options.timeout > std::chrono::minutes(5)) {
+      return ErrorCode::invalid_argument;
+    }
     auto* s = state_.get();
     const auto submitted = SteadyClock::now();
-    s->post(
-        {[s, promise, policy = std::move(policy), options, submitted]() mutable {
-           if (s->connection != ConnectionState::connected)
-             std::rethrow_exception(detail::error("Room is not connected"));
-           if (options.stop.stop_requested())
-             std::rethrow_exception(detail::error("Permission update cancelled before dispatch",
-                                                  ErrorCode::cancelled));
-           const auto deadline =
-               submitted +
-               (options.timeout.count() ? options.timeout : s->options.operation_timeout);
-           if (SteadyClock::now() >= deadline)
-             std::rethrow_exception(
-                 detail::error("Permission update expired before dispatch", ErrorCode::timeout));
-           if (s->controls.size() >= 128 || s->next_control == std::numeric_limits<uint32_t>::max())
-             std::rethrow_exception(
-                 detail::error("RTC control capacity exhausted", ErrorCode::resource_exhausted));
-           const auto id = ++s->next_control;
-           s->add_control(id, detail::RoomEngineState::PendingControl{promise, s->epoch, deadline,
-                                                                      options.stop});
-           try {
-             s->transport->set_subscription_permissions(
-                 {id, s->epoch, std::move(policy), deadline, options.stop});
-           } catch (...) {
-             s->erase_control(id);
-             throw;
-           }
-         },
-         [promise](auto failure) { promise->fail(failure); }});
+    s->run_request(
+        [&] {
+          if (s->connection != ConnectionState::connected) {
+            pending->fail(detail::error("Room is not connected"));
+            return;
+          }
+          if (options.stop.stop_requested()) {
+            pending->fail(
+                detail::error("Permission update cancelled before dispatch", ErrorCode::cancelled));
+            return;
+          }
+          const auto deadline =
+              submitted +
+              (options.timeout.count() ? options.timeout : s->options.operation_timeout);
+          if (SteadyClock::now() >= deadline) {
+            pending->fail(
+                detail::error("Permission update expired before dispatch", ErrorCode::timeout));
+            return;
+          }
+          if (s->controls.size() >= 128 ||
+              s->next_control == std::numeric_limits<uint32_t>::max()) {
+            pending->fail(
+                detail::error("RTC control capacity exhausted", ErrorCode::resource_exhausted));
+            return;
+          }
+          const auto id = ++s->next_control;
+          if (!s->add_control(id, detail::RoomEngineState::PendingControl{
+                                      pending, s->epoch, deadline, options.stop})) {
+            return;
+          }
+          try {
+            s->transport->set_subscription_permissions(
+                {id, s->epoch, std::move(policy), deadline, options.stop});
+          } catch (...) {
+            s->erase_control(id);
+            pending->fail(std::current_exception());
+          }
+        },
+        operation);
   } catch (...) {
-    promise->fail(std::current_exception());
+    pending->fail(std::current_exception());
   }
-  return promise->await_completion();
+  return state_->wait(operation);
 }
 
 RoomSnapshot RoomEngine::snapshot() const {
@@ -1597,18 +1785,26 @@ RoomSnapshot RoomEngine::snapshot() const {
   return state_->status;
 }
 
-Result<void> RoomEngine::set_event_handler(std::function<void(const RoomEvent&)> handler) {
+ErrorCode RoomEngine::set_event_handler(std::function<void(const RoomEvent&)> handler) {
   return detail::control_boundary([&] {
+    if (detail::callback_depth || detail::active_session) {
+      return ErrorCode::invalid_thread;
+    }
     detail::OperationGuard guard(*state_->control);
     if (state_->control->closed && handler) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
+      return ErrorCode::session_closed;
     }
     set_event_handler_locked(std::move(handler));
+    return ErrorCode::ok;
   });
 }
 
 void RoomEngine::set_event_handler_locked(std::function<void(const RoomEvent&)> handler) {
   state_->set_handler(std::move(handler));
+}
+
+void RoomEngine::notification_failed() {
+  state_->notification_failed();
 }
 
 void RoomEngine::post_notification(std::function<void()> callback) {

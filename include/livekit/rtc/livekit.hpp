@@ -30,5 +30,5 @@ struct LiveKitRoomOptions : RoomSettings, SignalingOptions {
 
 // Creates the LiveKit signaling/WebRTC adapter. Links LiveKit::RTCLiveKit;
 // no engine, media graph, device or actual codec factory is required.
-Result<std::unique_ptr<RoomEngine>> create_livekit_room();
+std::unique_ptr<RoomEngine> create_livekit_room(ErrorCode* error = nullptr);
 }  // namespace livekit::sdk::rtc

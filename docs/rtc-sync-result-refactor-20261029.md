@@ -2,14 +2,14 @@
 
 日期：2026-10-29。版本：锁串行化简化方案。
 
-状态：已按本方案实施，2026-10-30 更新验收状态。本文替换此前“专属控制 TaskQueue + postSyncTask + 抢占取消”的方案。Windows 编译、契约测试与隔离 SFU 集成结果见 [实施验证记录](rtc-sync-result-validation-20261029.md)；真实设备与其他平台尚未人工验收。后文“当前实现”描述重构前基线，目标设计现已落地。
+状态：历史方案。2026-10-30 已进一步统一为直接返回错误码/值，当前接口以 [RTC 同步控制接口](rtc-direct-control.md) 为准；下文保留有值结果的早期设计，无数据操作已更新为错误码。本文替换此前“专属控制 TaskQueue + postSyncTask + 抢占取消”的方案。Windows 编译、契约测试与隔离 SFU 集成结果见 [实施验证记录](rtc-sync-result-validation-20261029.md)；真实设备与其他平台尚未人工验收。后文“当前实现”描述重构前基线，目标设计现已落地。
 
 ## 1. 最终设计
 
 采用 **调用线程执行 + 操作锁串行化 + 同步返回 Result**。
 
 1. 删除 RTC 的 `AsyncResult`、`CompletionSource` 和 `.then()` 操作编排，不保留兼容层。
-2. 公共可失败控制接口同步返回 `Result<T>`，成功携带值，失败携带结构化错误；`Result<void>` 成功没有数据，失败仍有错误。
+2. 公共可失败控制接口同步返回 `Result<T>`，成功携带值，失败携带结构化错误；无数据操作返回 `ErrorCode`，成功为 `ErrorCode::ok`，失败为具体错误码。
 3. 不引入控制任务队列，不通过 `postSyncTask()` 转发公共控制调用，也不为控制 API 创建专属线程。移除现有 RtcEngine 控制 TaskQueue 及对应执行器依赖。
 4. 同一引擎会话的控制操作通过一把非递归操作锁串行执行。入会和离会互相等待，不抢占、不要求相互打断。
 5. 保留现有必要的房间事件、网络、媒体和设备工作线程。等待连接结果期间，这些线程继续运行。
@@ -45,14 +45,14 @@
 
 项目保持 C++20，增加小型 `Result<T>`，不为使用 std::expected 升级语言标准。
 
-- `Result<T>::success(value)` / `Result<void>::success()` 表示成功。
+- `Result<T>::success(value)` / `ErrorCode::ok` 表示成功。
 - `Result<T>::failure(record)` 接受非空错误记录。
 - `has_value()`、显式布尔转换判断状态。
 - `operator*` / `operator->` 访问成功值，支持 move-only 值。
 - `error()` 返回 `const FailureInfo&`，在失败分支使用。
 - 可提供 `value_if()` / `error_if()` 以空指针表示当前没有对应状态。
 
-不提供 wait、get、then、as_future 或抛异常的 value。错误状态下解引用属于调用契约错误，用断言或前置条件约束。`Result<void>` 与其他 Result 使用同一套错误模型。
+不提供 wait、get、then、as_future 或抛异常的 value。错误状态下解引用属于调用契约错误，用断言或前置条件约束。无数据操作直接返回 `ErrorCode`，不提供 Result 的成员方法，应显式比较 `ErrorCode::ok`。
 
 错误复用现有 FailureInfo，可共享不可变错误记录，保留 id、domain、code、message、retryable、backend_reason 以及 operation/track_id/epoch 等上下文。同一故障在结果、事件和快照间传播时保留关联 ID。
 
@@ -64,7 +64,7 @@
 
 | 接口性质 | 返回形式 |
 | --- | --- |
-| 生命周期、配置、发布订阅等可失败操作 | Result<T> / Result<void> |
+| 生命周期、配置、发布订阅等可失败操作 | Result<T> / ErrorCode |
 | 普通属性、已有安全快照 | 直接返回值 |
 | 未找到属于正常情况的查询 | std::optional<T> |
 | 高频帧读写、背压与流结束 | 保留 WriteStatus、ReadResult 等专用类型 |
@@ -77,22 +77,22 @@
 
 ```cpp
 // RtcEngine
-Result<void> join(RoomOptions options);
-Result<void> leave();
-Result<void> close();
-Result<void> enable_media(AudioOutputOptions options = {});
+ErrorCode join(RoomOptions options);
+ErrorCode leave();
+ErrorCode close();
+ErrorCode enable_media(AudioOutputOptions options = {});
 Result<TrackId> publish(TrackDescriptor descriptor);
-Result<void> unpublish(const TrackId& id);
-Result<void> unsubscribe(const TrackId& id);
-Result<void> set_muted(const TrackId& id, bool muted, ControlOptions options = {});
-Result<void> set_receive_demand(
+ErrorCode unpublish(const TrackId& id);
+ErrorCode unsubscribe(const TrackId& id);
+ErrorCode set_muted(const TrackId& id, bool muted, ControlOptions options = {});
+ErrorCode set_receive_demand(
     const TrackId& id, ReceiveDemand demand, ControlOptions options = {});
 
 // RoomEngine
-Result<void> join(RoomOptions options);
+ErrorCode join(RoomOptions options);
 Result<std::shared_ptr<PublishedTrack>> publish(TrackDescriptor descriptor);
 Result<std::shared_ptr<SubscribedTrack>> subscribe(TrackDescriptor descriptor);
-Result<void> leave();
+ErrorCode leave();
 
 // 保持普通查询和数据通路。
 bool media_enabled() const;
@@ -102,8 +102,8 @@ WriteStatus write(const TrackId& id, EncodedFrame frame);
 
 ```cpp
 auto joined = engine.join(options);
-if (!joined) {
-  report_error(joined.error());
+if (joined != ErrorCode::ok) {
+  report_error(joined);
   return;
 }
 
@@ -127,12 +127,12 @@ use_track(*publication);
 
 ```cpp
 // 示意，非完整实现。进入加锁前先检查回调/后台线程误用。
-Result<void> RoomEngine::join(RoomOptions options) {
+ErrorCode RoomEngine::join(RoomOptions options) {
   std::lock_guard lock(operation_mutex_);
   return join_locked(std::move(options));
 }
 
-Result<void> RoomEngine::leave() {
+ErrorCode RoomEngine::leave() {
   std::lock_guard lock(operation_mutex_);
   return leave_locked();
 }
@@ -292,7 +292,7 @@ Result<MediaPublication> publish_audio(MediaPublishSpec spec);
 // subscribe_media 使用对应的 MediaSubscription。
 ```
 
-MediaTrack::throw_if_failed 改为返回 Result<void> 的状态检查。运行期故障通过原有后台报告更新快照、停止继续接收/产生无效媒体并发出通知，不从故障线程同步进入加操作锁的图清理流程。
+MediaTrack::throw_if_failed 改为返回 ErrorCode 的状态检查。运行期故障通过原有后台报告更新快照、停止继续接收/产生无效媒体并发出通知，不从故障线程同步进入加操作锁的图清理流程。
 
 删除控制队列后，需要明确故障后的资源回收：后台先设置故障和停止标记、使等待中的操作失败；需要获取操作锁的完整图销毁由后续控制操作或显式 close/leave 执行。本方案不增加专属清理线程。应用可在错误通知后异步安排外部工作线程调用关闭，但通知回调本身不等待它。闲置故障对象保留的资源受原有轨道上限约束，不能继续无限创建；实现和测试须记录这项相对原自动清理的变化。
 
@@ -315,7 +315,7 @@ MediaTrack::throw_if_failed 改为返回 Result<void> 的状态检查。运行�
 
 | 阶段 | 工作 |
 | --- | --- |
-| 1 | 增加 Result<T>/Result<void>、错误转换和目标接口说明 |
+| 1 | 增加 Result<T>/ErrorCode、错误转换和目标接口说明 |
 | 2 | 确立会话操作锁、状态锁、内部 *_locked 调用关系和回调重入检查 |
 | 3 | RoomEngine 复用现有后台循环，将 CompletionSource 改为私有结果记录及唤醒 |
 | 4 | 传输解绑、轨道/RoomView 控制、超时及关闭屏障迁移 |
@@ -354,7 +354,7 @@ MediaTrack::throw_if_failed 改为返回 Result<void> 的状态检查。运行�
 
 | 源码 | 观察到的行为 | 本方案借鉴或区别 |
 | --- | --- | --- |
-| `examples/echo/main.go` | 顺序调用 `JoinWithToken` 和 `PublishTrack`，以 `error` 判断失败 | 对应 C++ 的 `Result<void>` 和 `Result<T>` |
+| `examples/echo/main.go` | 顺序调用 `JoinWithToken` 和 `PublishTrack`，以 `error` 判断失败 | 对应 C++ 的 `ErrorCode` 和 `Result<T>` |
 | `room.go`：`JoinWithContextAndToken` | 支持 context，默认连接超时为 5 秒，可通过选项修改 | 借鉴同步返回及超时；本方案不要求入会/离会支持主动打断 |
 | `localparticipant.go`：`PublishTrack` | 建立缓冲 channel，注册响应监听后发送请求，通过 select 等发布 ACK 或 10 秒超时 | 先登记再发请求；同步等待的完成由后台路径提供 |
 | `engine.go`：`OnLocalTrackPublished` | 查找响应 channel，解锁后发送结果 | 完成信号不能依赖等待者继续执行其队列 |

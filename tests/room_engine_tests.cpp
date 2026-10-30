@@ -19,6 +19,12 @@
 #ifdef LIVEKIT_TEST_RTC_NODES
 #include "livekit/rtc/graph_api.hpp"
 #include "engines/rtc/track_graph_registry.hpp"
+static_assert(
+    std::is_same_v<decltype(std::declval<livekit::sdk::rtc::engine::PublishPipeline&>().close()),
+                   livekit::sdk::ErrorCode>);
+static_assert(
+    std::is_same_v<decltype(std::declval<livekit::sdk::rtc::engine::SubscribePipeline&>().close()),
+                   livekit::sdk::ErrorCode>);
 #endif
 
 using livekit::sdk::Result;
@@ -34,17 +40,20 @@ void check(bool value, const char* message) {
 }
 
 template <class T>
-T get(Result<T> result) {
+auto get(T result) {
   return livekit::sdk::app_support::require_result(std::move(result));
 }
 
 template <class T>
 auto get(std::future<T> future) {
   check(future.wait_for(2s) == std::future_status::ready, "Operation hung");
-  if constexpr (requires(T value) {
-                  value.has_value();
-                  value.error();
-                }) {
+  if constexpr (
+      std::is_same_v<T, livekit::sdk::ErrorCode> || requires(T value) { value.empty(); } ||
+      requires(T value) { value.get(); } ||
+      requires(T value) {
+        value.has_value();
+        value.error();
+      }) {
     return get(future.get());
   } else {
     return future.get();
@@ -115,7 +124,7 @@ struct Harness {
   bool defer_removal = false;
   std::vector<RoomTransport::Removed> removal_completions;
   int starts = 0, stops = 0;
-  std::thread::id owner;
+  std::thread::id owner, publishing_thread, subscribing_thread, removing_thread, stopping_thread;
 
   void push(TransportEvent e) {
     std::lock_guard lock(mutex);
@@ -149,7 +158,6 @@ class FakeTransport : public RoomTransport {
 
   std::vector<TransportEvent> take_events() override {
     std::unique_lock lock(h->mutex);
-    check(h->owner == std::this_thread::get_id(), "Transport accessed outside controller");
     auto result = std::move(h->events);
     h->events.clear();
     return result;
@@ -157,6 +165,7 @@ class FakeTransport : public RoomTransport {
 
   void publish(const BindingToken& b, const TrackDescriptor& descriptor) override {
     std::lock_guard lock(h->mutex);
+    h->publishing_thread = std::this_thread::get_id();
     h->published.push_back(b);
     h->publication_descriptors.emplace_back(b, descriptor);
     if (h->confirm)
@@ -167,6 +176,7 @@ class FakeTransport : public RoomTransport {
   void subscribe(const BindingToken& b, const TrackDescriptor& d,
                  std::shared_ptr<QueueBudget>) override {
     std::lock_guard lock(h->mutex);
+    h->subscribing_thread = std::this_thread::get_id();
     h->subscribed.push_back(b);
     h->subscription_descriptors.emplace_back(b, d);
     if (h->confirm)
@@ -176,6 +186,7 @@ class FakeTransport : public RoomTransport {
 
   void remove(const BindingToken& b, bool, Removed completed = {}) override {
     std::lock_guard lock(h->mutex);
+    h->removing_thread = std::this_thread::get_id();
     h->removed.push_back(b);
     if (h->defer_removal) {
       h->removal_completions.push_back(std::move(completed));
@@ -227,6 +238,7 @@ class FakeTransport : public RoomTransport {
 
   void stop() noexcept override {
     std::lock_guard lock(h->mutex);
+    h->stopping_thread = std::this_thread::get_id();
     ++h->stops;
   }
 
@@ -403,7 +415,7 @@ void asynchronous_detachment() {
     h->defer_removal = false;
   }
   auto result = failed.get();
-  check(!result && result.error().message == "detachment failed", "Lost detachment failure");
+  check(result == livekit::sdk::ErrorCode::internal_error, "Lost detachment failure code");
   get(room.leave());
 }
 
@@ -941,9 +953,9 @@ void room_callback_contract() {
     ++callbacks;
     check(std::this_thread::get_id() != caller, "Room callback ran on the caller");
     if (event.kind == RoomEventKind::connected) {
-      auto rejected = room.publish(video("callback-publication"));
-      check(!rejected && rejected.error().code == livekit::sdk::ErrorCode::invalid_thread,
-            "Callback control was accepted");
+      livekit::sdk::ErrorCode code;
+      auto rejected = room.publish(video("callback-publication"), &code);
+      check(code == livekit::sdk::ErrorCode::invalid_thread, "Callback control was accepted");
       entered.set_value();
       check(released.wait_for(2s) == std::future_status::ready, "Callback release timed out");
     } else if (event.kind == RoomEventKind::track_ready) {
@@ -1733,9 +1745,9 @@ void engine_callback_contract() {
       {[&](const RoomEvent& event) {
          if (event.kind == RoomEventKind::connected) {
            callback_thread = std::this_thread::get_id();
-           auto rejected = engine.publish(video("callback-control"));
-           check(!rejected && rejected.error().code == livekit::sdk::ErrorCode::invalid_thread,
-                 "Callback control accepted");
+           livekit::sdk::ErrorCode code;
+           auto rejected = engine.publish(video("callback-control"), &code);
+           check(code == livekit::sdk::ErrorCode::invalid_thread, "Callback control accepted");
            connected.set_value();
          }
        },
@@ -1745,8 +1757,10 @@ void engine_callback_contract() {
          check(failure.id == "failed-graph" && failure.publication &&
                    failure.message == "node failure",
                "Graph failure callback lost details");
-         check(!engine.unpublish("callback-control"), "Failure callback control accepted");
-         check(!engine.set_callbacks({}), "Callback registration reentry accepted");
+         check((engine.unpublish("callback-control") != livekit::sdk::ErrorCode::ok),
+               "Failure callback control accepted");
+         check((engine.set_callbacks({}) != livekit::sdk::ErrorCode::ok),
+               "Callback registration reentry accepted");
          failed.set_value();
        }}));
   get(engine.join(options()));
@@ -2040,7 +2054,7 @@ void graph_prepare_rollback_contract() {
     };
     auto failed = publication ? rtc.graph().publish_graph(video("init-fail"), factory)
                               : rtc.graph().subscribe_graph(video("init-fail"), factory);
-    check(!failed && stopped == 1, "Graph init rollback did not quiesce exactly once");
+    check(failed.empty() && stopped == 1, "Graph init rollback did not quiesce exactly once");
     auto status = rtc.room().snapshot();
     check(status.publications == 0 && status.subscriptions == 0,
           "Graph init rollback leaked native endpoint");
@@ -2048,7 +2062,8 @@ void graph_prepare_rollback_contract() {
   auto failed = rtc.graph().publish_graph(
       video("factory-fail"),
       [](auto) -> engine::TrackGraphSpec { throw std::runtime_error("factory failure"); });
-  check(!failed && rtc.room().snapshot().publications == 0, "Factory rollback leaked endpoint");
+  check(failed.empty() && rtc.room().snapshot().publications == 0,
+        "Factory rollback leaked endpoint");
   // Reusing a failed id must not be removed by a delayed report from its old lease.
   get(rtc.publish(video("init-fail")));
   get(rtc.set_muted("init-fail", false));
@@ -2216,16 +2231,18 @@ static_assert(!HasPoll<engine::RtcEngine> && !HasPoll<engine::TrackGraphRegistry
               !HasPoll<nodes::RtcSubscribeNode>);
 
 void facade_lifecycle_contract() {
+  engine::RtcEngine invalid(std::unique_ptr<RoomEngine>{});
+  check(invalid.join({}) == livekit::sdk::ErrorCode::invalid_argument,
+        "Null room escaped as an exception");
+  check(invalid.publication("missing").id.empty() && invalid.feedback("missing").epoch == 0,
+        "Missing publication query did not return an empty value");
   auto h = std::make_shared<Harness>();
   engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
   check(!rtc.media_enabled(), "Encoded facade unexpectedly installed media");
-  bool unsupported = false;
-  try {
-    get(rtc.publish_media({}));
-  } catch (const livekit::sdk::SDKError& error) {
-    unsupported = error.code() == livekit::sdk::ErrorCode::unsupported;
-  }
-  check(unsupported, "Missing media module was not reported");
+  livekit::sdk::ErrorCode code;
+  const auto unavailable = rtc.publish_media({}, &code);
+  check(!unavailable.track && code == livekit::sdk::ErrorCode::unsupported,
+        "Missing media module was not reported");
   get(rtc.join(options()));
   {
     std::lock_guard lock(h->mutex);
@@ -2311,9 +2328,9 @@ void serialized_join_leave() {
       h->push(std::move(failure));
     }
     auto result = joining.get();
-    check(bool(result) == (outcome == 0), "Wrong join result");
+    check((result == livekit::sdk::ErrorCode::ok) == (outcome == 0), "Wrong join result");
     if (outcome == 2) {
-      check(result.error().code == livekit::sdk::ErrorCode::timeout, "Join deadline lost");
+      check(result == livekit::sdk::ErrorCode::timeout, "Join deadline lost");
     }
     get(std::move(leaving));
     check(room.snapshot().state == ConnectionState::closed, "Leave did not complete");
@@ -2384,7 +2401,7 @@ void close_waits_and_factory_reentry() {
   h->push({TransportEventKind::connected});
   get(std::move(joining));
   get(std::move(closing));
-  check(!rtc.join(options()), "Terminal engine accepted join");
+  check((rtc.join(options()) != livekit::sdk::ErrorCode::ok), "Terminal engine accepted join");
   get(rtc.close());
   engine::RtcEngine other([h] { return std::make_unique<FakeTransport>(h); });
   {
@@ -2395,17 +2412,48 @@ void close_waits_and_factory_reentry() {
   bool invoked = false;
   get(other.graph().publish_graph(video("reentry"), [&](auto) {
     invoked = true;
-    check(!other.leave() && !other.room().update_local_participant({}),
+    check((other.leave() != livekit::sdk::ErrorCode::ok) &&
+              (other.room().update_local_participant({}) != livekit::sdk::ErrorCode::ok),
           "Factory reentered control");
-    check(!rtc.close(), "Factory nested another session");
+    check((rtc.close() != livekit::sdk::ErrorCode::ok), "Factory nested another session");
     engine::TrackGraphSpec spec;
-    spec.activate = [&] { check(!other.close(), "Hook reentered control"); };
+    spec.activate = [&] {
+      check((other.close() != livekit::sdk::ErrorCode::ok), "Hook reentered control");
+    };
     return spec;
   }));
   check(invoked, "Factory did not execute");
   get(other.close());
 }
 #endif
+
+void caller_thread_contract() {
+  using livekit::sdk::ErrorCode;
+  const auto caller = std::this_thread::get_id();
+  auto h = std::make_shared<Harness>();
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  check(room.join(options()) == ErrorCode::ok && h->owner == caller,
+        "Join did not execute on its caller");
+  ErrorCode code = ErrorCode::internal_error;
+  auto publication = room.publish(video("direct"), &code);
+  check(publication && code == ErrorCode::ok && h->publishing_thread == caller,
+        "Publish did not execute on its caller");
+  auto subscription = room.subscribe(video("direct-rx"), &code);
+  check(subscription && code == ErrorCode::ok && h->subscribing_thread == caller,
+        "Subscribe did not execute on its caller");
+  check(room.unpublish("direct") == ErrorCode::ok && h->removing_thread == caller,
+        "Remove did not execute on its caller");
+  check(room.leave() == ErrorCode::ok && h->stopping_thread == caller,
+        "Leave did not execute on its caller");
+  RoomEngine invalid(RoomEngine::TransportFactory{});
+  check(invalid.join({}) == ErrorCode::invalid_argument,
+        "Invalid factory was not returned as a code");
+  RoomEngine throwing([]() -> std::unique_ptr<RoomTransport> {
+    throw livekit::sdk::SDKError(livekit::sdk::ErrorDomain::transport, ErrorCode::unsupported,
+                                 "Unavailable backend");
+  });
+  check(throwing.join({}) == ErrorCode::unsupported, "Factory exception escaped the engine");
+}
 
 void typed_join_failure() {
   auto h = std::make_shared<Harness>();
@@ -2432,11 +2480,14 @@ void typed_join_failure() {
   try {
     get(std::move(joining));
   } catch (const livekit::sdk::SDKError& error) {
-    rejected = error.domain() == livekit::sdk::ErrorDomain::signaling &&
-               error.code() == livekit::sdk::ErrorCode::permission_denied &&
-               error.backend_reason() == 403 && !error.retryable();
+    rejected = error.code() == livekit::sdk::ErrorCode::permission_denied;
   }
-  check(rejected, "Transport join failure lost typed cause");
+  check(rejected, "Transport join failure lost error code");
+  const auto failed = room_events.take_event(1s);
+  check(failed && failed->failure &&
+            failed->failure->domain == livekit::sdk::ErrorDomain::signaling &&
+            failed->failure->backend_reason == 403,
+        "Failure event lost backend details");
   check(room.snapshot().state == ConnectionState::failed, "Terminal failure not visible");
 }
 
@@ -2444,6 +2495,7 @@ void typed_join_failure() {
 
 int main() {
   try {
+    caller_thread_contract();
     serialized_join_leave();
     queued_timeout_starts_after_lock();
     asynchronous_detachment();

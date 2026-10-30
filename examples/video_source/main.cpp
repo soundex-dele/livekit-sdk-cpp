@@ -15,7 +15,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto engine = require_result(engine::create_livekit_engine({}));
+    auto engine =
+        require_result(engine::create_livekit_engine(livekit::sdk::rtc::AudioOutputOptions{}));
     livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
     LiveKitRoomOptions options;
     options.url = argv[1];

@@ -96,7 +96,8 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
       };
       try {
         std::map<TrackId, std::shared_ptr<Track>> tracks;
-        auto engine = require_result(engine::create_livekit_engine({}));
+        auto engine =
+            require_result(engine::create_livekit_engine(livekit::sdk::rtc::AudioOutputOptions{}));
         livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
         const auto report = [&](const Json& event) {
           {
