@@ -29,8 +29,8 @@ Result<T> rejected(std::exception_ptr failure) {
 }  // namespace
 
 struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
-  explicit RoomEngineState(RoomEngine::TransportFactory factory)
-      : transport_factory(std::move(factory)) {
+  RoomEngineState(RoomEngine::TransportFactory factory, std::shared_ptr<SessionControl> context)
+      : transport_factory(std::move(factory)), control(std::move(context)) {
     if (!transport_factory) {
       throw std::invalid_argument("RTC room requires a transport factory");
     }
@@ -83,7 +83,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   std::shared_ptr<livekit::sdk::detail::ReadySet<WorkKey>> ready_work =
       std::make_shared<livekit::sdk::detail::ReadySet<WorkKey>>(wakeup, 1024 + 128);
   std::jthread worker;
-  SessionControl control;
+  std::shared_ptr<SessionControl> control;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
   std::deque<Command> commands;
@@ -1109,7 +1109,7 @@ WriteStatus PublishedTrack::try_write(EncodedFrame frame) {
 Result<void> PublishedTrack::set_muted(bool muted, ControlOptions options) {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
-      detail::OperationGuard guard(session->control);
+      detail::OperationGuard guard(*session->control);
       return session->set_muted(endpoint_->descriptor.id, muted, options, endpoint_);
     }
     return detail::rejected<void>(detail::error("RTC room destroyed"));
@@ -1127,13 +1127,13 @@ std::shared_ptr<detail::SessionControl> PublishedTrack::operation_control() cons
   if (!session) {
     throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC room destroyed");
   }
-  return std::shared_ptr<detail::SessionControl>(session, &session->control);
+  return session->control;
 }
 
 Result<void> PublishedTrack::close() {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
-      detail::OperationGuard guard(session->control);
+      detail::OperationGuard guard(*session->control);
       return close_locked();
     }
     return detail::rejected<void>(detail::error("RTC room destroyed"));
@@ -1169,7 +1169,7 @@ ReadResult SubscribedTrack::wait_frame(std::stop_token stop) {
 Result<void> SubscribedTrack::request_keyframe() {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
-      detail::OperationGuard guard(session->control);
+      detail::OperationGuard guard(*session->control);
       return session->request_keyframe(endpoint_);
     }
     return detail::rejected<void>(detail::error("RTC room destroyed"));
@@ -1179,7 +1179,7 @@ Result<void> SubscribedTrack::request_keyframe() {
 Result<void> SubscribedTrack::set_demand(ReceiveDemand demand, ControlOptions options) {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
-      detail::OperationGuard guard(session->control);
+      detail::OperationGuard guard(*session->control);
       return session->set_receive_demand(endpoint_->descriptor.id, demand, options, endpoint_);
     }
     return detail::rejected<void>(detail::error("RTC room destroyed"));
@@ -1197,13 +1197,13 @@ std::shared_ptr<detail::SessionControl> SubscribedTrack::operation_control() con
   if (!session) {
     throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC room destroyed");
   }
-  return std::shared_ptr<detail::SessionControl>(session, &session->control);
+  return session->control;
 }
 
 Result<void> SubscribedTrack::close() {
   return detail::control_boundary([&] {
     if (auto session = session_.lock()) {
-      detail::OperationGuard guard(session->control);
+      detail::OperationGuard guard(*session->control);
       return close_locked();
     }
     return detail::rejected<void>(detail::error("RTC room destroyed"));
@@ -1217,9 +1217,12 @@ Result<void> SubscribedTrack::close_locked() {
 }
 
 RoomEngine::RoomEngine(TransportFactory factory)
-    : state_(std::make_shared<detail::RoomEngineState>(std::move(factory))) {}
+    : RoomEngine(std::move(factory), std::make_shared<detail::SessionControl>()) {}
 
-detail::SessionControl& RoomEngine::control() const {
+RoomEngine::RoomEngine(TransportFactory factory, std::shared_ptr<detail::SessionControl> control)
+    : state_(std::make_shared<detail::RoomEngineState>(std::move(factory), std::move(control))) {}
+
+std::shared_ptr<detail::SessionControl> RoomEngine::control() const {
   return state_->control;
 }
 
@@ -1255,8 +1258,8 @@ Result<std::shared_ptr<RoomServices>> RoomEngine::services() const {
 
 Result<void> RoomEngine::join(RoomOptions options) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return join_locked(std::move(options));
@@ -1324,8 +1327,8 @@ Result<void> RoomEngine::join_locked(RoomOptions options) {
 
 Result<std::shared_ptr<PublishedTrack>> RoomEngine::publish(TrackDescriptor descriptor) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return publish_locked(std::move(descriptor));
@@ -1352,8 +1355,8 @@ Result<std::shared_ptr<PublishedTrack>> RoomEngine::publish_locked(TrackDescript
 
 Result<std::shared_ptr<SubscribedTrack>> RoomEngine::subscribe(TrackDescriptor descriptor) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return subscribe_locked(std::move(descriptor));
@@ -1380,8 +1383,8 @@ Result<std::shared_ptr<SubscribedTrack>> RoomEngine::subscribe_locked(TrackDescr
 
 Result<void> RoomEngine::leave() {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return leave_locked();
@@ -1409,8 +1412,8 @@ Result<void> RoomEngine::leave_locked() {
 
 Result<void> RoomEngine::unpublish(const TrackId& id) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return unpublish_locked(id);
@@ -1423,8 +1426,8 @@ Result<void> RoomEngine::unpublish_locked(const TrackId& id) {
 
 Result<void> RoomEngine::unsubscribe(const TrackId& id) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return unsubscribe_locked(id);
@@ -1437,8 +1440,8 @@ Result<void> RoomEngine::unsubscribe_locked(const TrackId& id) {
 
 Result<void> RoomEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return set_muted_locked(id, muted, options);
@@ -1452,8 +1455,8 @@ Result<void> RoomEngine::set_muted_locked(const TrackId& id, bool muted, Control
 Result<void> RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                             ControlOptions options) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return set_receive_demand_locked(id, demand, options);
@@ -1468,8 +1471,8 @@ Result<void> RoomEngine::set_receive_demand_locked(const TrackId& id, ReceiveDem
 Result<void> RoomEngine::update_local_participant(ParticipantUpdate update,
                                                   ControlOptions options) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return update_local_participant_locked(std::move(update), options);
@@ -1538,8 +1541,8 @@ Result<void> RoomEngine::update_local_participant_locked(ParticipantUpdate updat
 Result<void> RoomEngine::set_subscription_permissions(SubscriptionPermissions policy,
                                                       ControlOptions options) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     return set_subscription_permissions_locked(std::move(policy), options);
@@ -1596,8 +1599,8 @@ RoomSnapshot RoomEngine::snapshot() const {
 
 Result<void> RoomEngine::set_event_handler(std::function<void(const RoomEvent&)> handler) {
   return detail::control_boundary([&] {
-    detail::OperationGuard guard(state_->control);
-    if (state_->control.closed && handler) {
+    detail::OperationGuard guard(*state_->control);
+    if (state_->control->closed && handler) {
       throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC engine closed");
     }
     set_event_handler_locked(std::move(handler));

@@ -9,7 +9,7 @@ namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
 
 // Single-room facade. Completed Result values are returned on the calling thread.
-// Controls share the room's non-recursive operation lock, including protocol waits.
+// Controls share a session control context with the room, including protocol waits.
 // Call from application workers, never from notifications/media callbacks or hooks.
 // Stop and join all callers before destruction; close does not preempt an operation.
 class RtcEngine final {

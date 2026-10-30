@@ -75,14 +75,24 @@ def main():
         assert any(node["inputs"] > 0 and node["outputs"] > 0 for node in nodes), f"{label}: inactive {kind}"
         assert all(node["errors"] == 0 for node in nodes), f"{label}: errors in {kind}"
 
-    def require_edge(label, source, target, data_type):
+    def require_edge(label, source, target, data_type, allow_sync=False):
         for event in events(label):
             if event.get("event") != "media-graph-stats":
                 continue
             kinds = {node["name"]: node["kind"] for node in event["nodes"]}
-            if any(kinds.get(edge["from"]) == source and kinds.get(edge["to"]) == target
-                   and edge["dataType"] == data_type for edge in event.get("edges", [])):
-                return
+            edges = [edge for edge in event.get("edges", []) if edge["dataType"] == data_type]
+            for edge in edges:
+                if kinds.get(edge["from"]) != source:
+                    continue
+                if kinds.get(edge["to"]) == target:
+                    return
+                # Synchronized subscriptions route raw frames through the clock.
+                # Require both typed edges in the same track snapshot; accepting
+                # arbitrary reachability would hide an unintended processing path.
+                if allow_sync and edge["to"] == "presentation.clock" and any(
+                        next_edge["from"] == "presentation.clock"
+                        and kinds.get(next_edge["to"]) == target for next_edge in edges):
+                    return
         raise AssertionError(f"{label}: missing GraphEngine edge {source} -> {target} ({data_type})")
 
     try:
@@ -117,9 +127,9 @@ def main():
                        if event.get("event") == "media-graph-stats" for node in event["nodes"])
         require_edge("subscriber", "RtcSubscribeNode", "VideoDecoderNode", "EncodedFrameEvent")
         require_edge("subscriber", "RtcSubscribeNode", "AudioDecoderNode", "EncodedFrameEvent")
-        require_edge("subscriber", "VideoDecoderNode", "ApplicationOutputNode", "VideoFrameEvent")
-        require_edge("subscriber", "VideoDecoderNode", "RecordingNode", "VideoFrameEvent")
-        require_edge("subscriber", "AudioDecoderNode", "RecordingNode", "AudioFrameEvent")
+        require_edge("subscriber", "VideoDecoderNode", "ApplicationOutputNode", "VideoFrameEvent", allow_sync=True)
+        require_edge("subscriber", "VideoDecoderNode", "RecordingNode", "VideoFrameEvent", allow_sync=True)
+        require_edge("subscriber", "AudioDecoderNode", "RecordingNode", "AudioFrameEvent", allow_sync=True)
         for label in ("publisher", "subscriber"):
             reports = [event for event in events(label) if event.get("event") == "rtc-stats"]
             assert {event["target"] for event in reports} == {0, 1}, "Missing native peer statistics"

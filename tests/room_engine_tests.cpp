@@ -18,7 +18,7 @@
 #include <thread>
 #ifdef LIVEKIT_TEST_RTC_NODES
 #include "livekit/rtc/graph_api.hpp"
-#include "engines/rtc/pipeline_engine.hpp"
+#include "engines/rtc/track_graph_registry.hpp"
 #endif
 
 using livekit::sdk::Result;
@@ -1944,6 +1944,122 @@ class GraphRelay : public graphflow::core::GraphNode {
   }
 };
 
+// Registry control is independent from RoomEngine. Only the test's composition
+// root creates/detaches endpoints, just as the production facade does.
+void independent_registry_contract() {
+  static_assert(std::is_default_constructible_v<engine::TrackGraphRegistry>);
+  static_assert(!std::is_constructible_v<engine::TrackGraphRegistry, RoomEngine&>);
+  auto h = std::make_shared<Harness>();
+  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  get(room.join(options()));
+  auto endpoint = get(room.publish(video("registry")));
+  auto receiver = get(room.subscribe(video("registry-receive")));
+  int stopped = 0;
+  {
+    engine::TrackGraphRegistry registry;
+    engine::TrackGraphSpec spec;
+    spec.quiesce = [&] { ++stopped; };
+    auto graph = registry.prepare(std::make_shared<nodes::RtcPublishNode>("sink", endpoint), spec);
+    registry.install(graph);
+    registry.install(
+        registry.prepare(std::make_shared<nodes::RtcSubscribeNode>("source", receiver), {}));
+    auto retired = registry.take("registry", true);
+    check(stopped == 1 && graph->write(frame(1, 2)) == WriteStatus::closed,
+          "Registry did not close graph admission and quiesce");
+    check(endpoint->snapshot().state == TrackState::ready && room.snapshot().publications == 1 &&
+              room.snapshot().subscriptions == 1,
+          "Registry teardown issued a transport command");
+    get(endpoint->close());
+  }
+  check(receiver->snapshot().state == TrackState::ready,
+        "Registry destruction detached its subscription");
+  get(receiver->close());
+  get(room.leave());
+}
+
+void coordinated_detachment_contract() {
+  auto h = std::make_shared<Harness>();
+  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  get(rtc.join(options()));
+  std::atomic<int> stopped{0};
+  std::weak_ptr<GraphRelay> retained;
+  get(rtc.graph().publish_graph(video("retained"), [&](auto) {
+    auto relay = std::make_shared<GraphRelay>();
+    retained = relay;
+    engine::TrackGraphSpec spec;
+    spec.nodes = {relay};
+    spec.quiesce = [&] { ++stopped; };
+    return spec;
+  }));
+  {
+    std::lock_guard lock(h->mutex);
+    h->defer_removal = true;
+  }
+  auto removing = async_control([&] { return rtc.unpublish("retained"); });
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return !h->removal_completions.empty();
+      },
+      "Coordinator did not request native detach");
+  check(stopped == 1 && !retained.expired() && removing.wait_for(0ms) != std::future_status::ready,
+        "Graph released before native detach or detach preceded quiescence");
+  RoomTransport::Removed complete;
+  {
+    std::lock_guard lock(h->mutex);
+    complete = std::move(h->removal_completions.back());
+    h->defer_removal = false;
+  }
+  complete({});
+  get(std::move(removing));
+  check(retained.expired(), "Coordinator retained a detached graph");
+  get(rtc.close());
+}
+
+class RejectGraphInit final : public graphflow::core::GraphNode {
+ public:
+  RejectGraphInit() : GraphNode("reject.init", nullptr) {}
+
+ protected:
+  bool doInit() override {
+    return false;
+  }
+};
+
+void graph_prepare_rollback_contract() {
+  auto h = std::make_shared<Harness>();
+  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  get(rtc.join(options()));
+  for (bool publication : {true, false}) {
+    int stopped = 0;
+    auto factory = [&](auto) {
+      engine::TrackGraphSpec spec;
+      spec.nodes = {std::make_shared<RejectGraphInit>()};
+      spec.quiesce = [&] { ++stopped; };
+      return spec;
+    };
+    auto failed = publication ? rtc.graph().publish_graph(video("init-fail"), factory)
+                              : rtc.graph().subscribe_graph(video("init-fail"), factory);
+    check(!failed && stopped == 1, "Graph init rollback did not quiesce exactly once");
+    auto status = rtc.room().snapshot();
+    check(status.publications == 0 && status.subscriptions == 0,
+          "Graph init rollback leaked native endpoint");
+  }
+  auto failed = rtc.graph().publish_graph(
+      video("factory-fail"),
+      [](auto) -> engine::TrackGraphSpec { throw std::runtime_error("factory failure"); });
+  check(!failed && rtc.room().snapshot().publications == 0, "Factory rollback leaked endpoint");
+  // Reusing a failed id must not be removed by a delayed report from its old lease.
+  get(rtc.publish(video("init-fail")));
+  get(rtc.set_muted("init-fail", false));
+  check(rtc.publication("init-fail").state == TrackState::ready,
+        "Stale startup failure removed the replacement graph");
+  get(rtc.leave());
+  get(rtc.join(options()));
+  get(rtc.publish(video("init-fail")));
+  get(rtc.close());
+}
+
 void composed_graph_contract() {
   auto h = std::make_shared<Harness>();
   engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
@@ -2095,7 +2211,7 @@ static_assert(!CanLeave<RoomView> && !CanPublish<RoomView>);
 template <class T>
 concept HasPoll = requires(T& value) { value.poll(); };
 static_assert(!HasEventPolling<engine::RtcEngine> && !HasFailurePolling<engine::RtcEngine>);
-static_assert(!HasPoll<engine::RtcEngine> && !HasPoll<engine::RtcPipelineEngine> &&
+static_assert(!HasPoll<engine::RtcEngine> && !HasPoll<engine::TrackGraphRegistry> &&
               !HasPoll<engine::SubscribePipeline> && !HasPoll<engine::PublishPipeline> &&
               !HasPoll<nodes::RtcSubscribeNode>);
 
@@ -2347,6 +2463,9 @@ int main() {
     active_failure_correlation_contract();
     std::cout << "composed graphs" << std::endl;
     composed_graph_contract();
+    independent_registry_contract();
+    coordinated_detachment_contract();
+    graph_prepare_rollback_contract();
     std::cout << "RTC graph pipeline contracts passed\n";
 #else
     indexed_work_contract();

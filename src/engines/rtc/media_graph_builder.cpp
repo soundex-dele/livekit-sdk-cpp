@@ -1,8 +1,9 @@
-#include "engines/rtc/media_engine.hpp"
+#include "engines/rtc/media_graph_builder.hpp"
+#include "engine/graph_engine.h"
 #include "engines/rtc/application_output.hpp"
 #include "engines/rtc/sync_node.hpp"
 #include "media_graph/raw_frame_queue.hpp"
-#include "engines/rtc/rtc_engine_impl.hpp"
+#include "backends/rtc/control_context.hpp"
 #include <atomic>
 #include <algorithm>
 #include "livekit/rtc/input_node.hpp"
@@ -368,38 +369,11 @@ Result<void> MediaTrack::check() const {
   return detail::control_boundary([&] { state_->check(); });
 }
 
-RtcMediaEngine::RtcMediaEngine(RtcPipelineEngine& engine, AudioOutputOptions options)
-    : echo_reference_(options.echo_reference ? options.echo_reference
-                                             : std::make_shared<AudioRenderReference>()),
-      output_(std::make_shared<AudioOutputSession>([&] {
-        options.echo_reference = echo_reference_;
-        return options;
-      }())),
-      engine_(&engine) {}
-
-Result<void> RtcEngine::enable_media(AudioOutputOptions options) {
-  return impl_->execute([state = impl_.get(), options = std::move(options)]() mutable {
-    state->require_open();
-    if (state->media || state->room->snapshot().state != ConnectionState::disconnected) {
-      throw std::logic_error("Install media once before joining a room");
-    }
-    state->media = std::make_unique<RtcMediaEngine>(*state->pipelines, std::move(options));
-    state->has_media = true;
-  });
-}
-
-RtcPipelineEngine::FailureCleanup RtcMediaEngine::failure_cleanup(
-    std::shared_ptr<MediaTrack::State> state) {
-  return [state = std::move(state)](std::exception_ptr failure) {
-    state->quiesce();
-    state->failed(failure);
-  };
-}
-
-Result<MediaPublication> RtcMediaEngine::publish_media(MediaPublishSpec spec) {
+PreparedMediaGraph RtcMediaGraphBuilder::build_publish(
+    MediaPublishSpec spec, std::shared_ptr<nodes::RtcPublishNode> sink) {
   validate_output(spec.track.kind, spec.preview);
   if (!spec.input.echo_reference) {
-    spec.input.echo_reference = echo_reference_;
+    spec.input.echo_reference = resources_.echo_reference;
   }
   if (spec.input.encoded_source &&
       (spec.preview.video || spec.preview.audio || spec.preview.frame || spec.preview.playout ||
@@ -444,57 +418,53 @@ Result<MediaPublication> RtcMediaEngine::publish_media(MediaPublishSpec spec) {
   if (shared_target) {
     shared_target->report = state->input->failureReporter();
   }
-  auto ready = engine_->publish_graph(
-      spec.track,
-      [state, spec, device = output_](auto sink) {
-        std::lock_guard lock(state->mutex);
-        state->sink = sink;
-        state->published = sink->track();
-        TrackGraphSpec graph;
-        graph.nodes.push_back(state->input);
-        if (spec.input.encoded_source)
-          state->connect<nodes::EncodedFrameEvent>(graph, state->input, sink);
-        else if (spec.track.kind == MediaKind::video) {
-          auto config = spec.video;
-          config.fps = spec.input.fps;
-          state->video =
-              std::make_shared<nodes::VideoCodecNode>("video.encoder", spec.track, true, config);
-          graph.nodes.push_back(state->video);
-          state->connect<nodes::VideoFrameEvent>(graph, state->input, state->video);
-          state->connect<nodes::EncodedFrameEvent>(graph, state->video, sink);
-          state->connect<nodes::SenderFeedbackEvent>(graph, sink, state->video);
-        } else {
-          state->audio = std::make_shared<nodes::AudioCodecNode>("audio.encoder", spec.track, true,
-                                                                 spec.audio);
-          graph.nodes.push_back(state->audio);
-          state->connect<nodes::AudioFrameEvent>(graph, state->input, state->audio);
-          state->connect<nodes::EncodedFrameEvent>(graph, state->audio, sink);
-          state->connect<nodes::SenderFeedbackEvent>(graph, sink, state->audio);
-        }
-        if (spec.preview.video || spec.preview.audio || spec.preview.frame ||
-            spec.preview.playout || !spec.preview.recording.empty()) {
-          state->outputs(graph, state->input, spec.preview, device);
-        }
-        state->connect<nodes::SenderFeedbackEvent>(graph, sink, state->input);
-        state->topology(graph);
-        graph.activate = [state] {
-          state->input->activate();
-          if (state->start_source)
-            state->start_source();
-        };
-        graph.quiesce = [state] { state->quiesce(); };
-        graph.on_failure = [state](auto error) { state->failed(error); };
-        return graph;
-      },
-      failure_cleanup(state));
-  if (!ready) {
-    return Result<MediaPublication>::failure(ready.failure_record());
+  try {
+    std::lock_guard lock(state->mutex);
+    state->sink = sink;
+    state->published = sink->track();
+    TrackGraphSpec graph;
+    graph.nodes.push_back(state->input);
+    if (spec.input.encoded_source)
+      state->connect<nodes::EncodedFrameEvent>(graph, state->input, sink);
+    else if (spec.track.kind == MediaKind::video) {
+      auto config = spec.video;
+      config.fps = spec.input.fps;
+      state->video =
+          std::make_shared<nodes::VideoCodecNode>("video.encoder", spec.track, true, config);
+      graph.nodes.push_back(state->video);
+      state->connect<nodes::VideoFrameEvent>(graph, state->input, state->video);
+      state->connect<nodes::EncodedFrameEvent>(graph, state->video, sink);
+      state->connect<nodes::SenderFeedbackEvent>(graph, sink, state->video);
+    } else {
+      state->audio =
+          std::make_shared<nodes::AudioCodecNode>("audio.encoder", spec.track, true, spec.audio);
+      graph.nodes.push_back(state->audio);
+      state->connect<nodes::AudioFrameEvent>(graph, state->input, state->audio);
+      state->connect<nodes::EncodedFrameEvent>(graph, state->audio, sink);
+      state->connect<nodes::SenderFeedbackEvent>(graph, sink, state->audio);
+    }
+    if (spec.preview.video || spec.preview.audio || spec.preview.frame || spec.preview.playout ||
+        !spec.preview.recording.empty()) {
+      state->outputs(graph, state->input, spec.preview, resources_.output);
+    }
+    state->connect<nodes::SenderFeedbackEvent>(graph, sink, state->input);
+    state->topology(graph);
+    graph.activate = [state] {
+      state->input->activate();
+      if (state->start_source)
+        state->start_source();
+    };
+    graph.quiesce = [state] { state->quiesce(); };
+    graph.on_failure = [state](auto error) { state->failed(error); };
+    return {std::move(graph), std::shared_ptr<MediaTrack>(new MediaTrack(state))};
+  } catch (...) {
+    state->quiesce();
+    throw;
   }
-  return Result<MediaPublication>::success(
-      {*ready, std::shared_ptr<MediaTrack>(new MediaTrack(std::move(state)))});
 }
 
-Result<MediaSubscription> RtcMediaEngine::subscribe_media(MediaSubscribeSpec spec) {
+PreparedMediaGraph RtcMediaGraphBuilder::build_subscribe(
+    MediaSubscribeSpec spec, std::shared_ptr<nodes::RtcSubscribeNode> source) {
   validate_output(spec.track.kind, spec.output);
   if (spec.presentation_delay.count() < 0 ||
       spec.presentation_delay > std::chrono::milliseconds(500)) {
@@ -502,67 +472,63 @@ Result<MediaSubscription> RtcMediaEngine::subscribe_media(MediaSubscribeSpec spe
   }
   std::shared_ptr<detail::MediaSyncClock> clock;
   if (spec.synchronize && !spec.track.source_id.empty()) {
-    std::erase_if(clocks_, [](const auto& entry) { return entry.second.expired(); });
+    std::erase_if(resources_.clocks, [](const auto& entry) { return entry.second.expired(); });
     const auto key = std::pair{spec.track.source_id, spec.track.stream_group};
-    clock = clocks_[key].lock();
+    clock = resources_.clocks[key].lock();
     if (!clock) {
-      clocks_[key] = clock = std::make_shared<detail::MediaSyncClock>(spec.presentation_delay);
+      resources_.clocks[key] = clock =
+          std::make_shared<detail::MediaSyncClock>(spec.presentation_delay);
     }
   }
   auto state = std::make_shared<MediaTrack::State>();
   state->descriptor = spec.track;
-  auto ready = engine_->subscribe_graph(
-      spec.track,
-      [state, spec, clock, device = output_](auto source) {
-        std::lock_guard lock(state->mutex);
-        state->source = source;
-        state->subscribed = source->track();
-        TrackGraphSpec graph;
-        std::shared_ptr<graphflow::core::GraphNode> decoder;
-        if (spec.track.kind == MediaKind::video) {
-          state->video = std::make_shared<nodes::VideoCodecNode>("video.decoder", spec.track, false,
-                                                                 spec.video);
-          decoder = state->video;
-          state->connect<nodes::KeyframeRequestEvent>(graph, decoder, source);
-        } else {
-          state->audio = std::make_shared<nodes::AudioCodecNode>("audio.decoder", spec.track, false,
-                                                                 spec.audio);
-          decoder = state->audio;
-        }
-        graph.nodes.push_back(decoder);
-        state->connect<nodes::EncodedFrameEvent>(graph, source, decoder);
-        if (clock) {
-          auto sync = std::make_shared<MediaSyncNode>(clock);
-          graph.nodes.push_back(sync);
-          if (spec.track.kind == MediaKind::video) {
-            state->connect<nodes::VideoFrameEvent>(graph, decoder, sync);
-          } else {
-            state->connect<nodes::AudioFrameEvent>(graph, decoder, sync);
-          }
-          state->outputs(graph, sync, spec.output, device);
-        } else {
-          state->outputs(graph, decoder, spec.output, device);
-        }
-        state->topology(graph);
-        graph.quiesce = [state] { state->quiesce(); };
-        graph.on_failure = [state](auto error) { state->failed(error); };
-        return graph;
-      },
-      failure_cleanup(state));
-  if (!ready) {
-    return Result<MediaSubscription>::failure(ready.failure_record());
+  try {
+    std::lock_guard lock(state->mutex);
+    state->source = source;
+    state->subscribed = source->track();
+    TrackGraphSpec graph;
+    std::shared_ptr<graphflow::core::GraphNode> decoder;
+    if (spec.track.kind == MediaKind::video) {
+      state->video =
+          std::make_shared<nodes::VideoCodecNode>("video.decoder", spec.track, false, spec.video);
+      decoder = state->video;
+      state->connect<nodes::KeyframeRequestEvent>(graph, decoder, source);
+    } else {
+      state->audio =
+          std::make_shared<nodes::AudioCodecNode>("audio.decoder", spec.track, false, spec.audio);
+      decoder = state->audio;
+    }
+    graph.nodes.push_back(decoder);
+    state->connect<nodes::EncodedFrameEvent>(graph, source, decoder);
+    if (clock) {
+      auto sync = std::make_shared<MediaSyncNode>(clock);
+      graph.nodes.push_back(sync);
+      if (spec.track.kind == MediaKind::video) {
+        state->connect<nodes::VideoFrameEvent>(graph, decoder, sync);
+      } else {
+        state->connect<nodes::AudioFrameEvent>(graph, decoder, sync);
+      }
+      state->outputs(graph, sync, spec.output, resources_.output);
+    } else {
+      state->outputs(graph, decoder, spec.output, resources_.output);
+    }
+    state->topology(graph);
+    graph.quiesce = [state] { state->quiesce(); };
+    graph.on_failure = [state](auto error) { state->failed(error); };
+    return {std::move(graph), std::shared_ptr<MediaTrack>(new MediaTrack(state))};
+  } catch (...) {
+    state->quiesce();
+    throw;
   }
-  return Result<MediaSubscription>::success(
-      {*ready, std::shared_ptr<MediaTrack>(new MediaTrack(std::move(state)))});
 }
 
-std::shared_ptr<SharedMediaInput> RtcMediaEngine::create_shared_input(TrackDescriptor format,
-                                                                      MediaInput options) {
+std::shared_ptr<SharedMediaInput> RtcMediaGraphBuilder::create_shared_input(TrackDescriptor format,
+                                                                            MediaInput options) {
   if (options.encoded_source || !options.input.empty())
     throw std::invalid_argument("Shared capture requires a live raw source");
   format.follow_subscriber_demand = false;
   if (!options.echo_reference) {
-    options.echo_reference = echo_reference_;
+    options.echo_reference = resources_.echo_reference;
   }
   // Validate before a publication exists; constructing a source opens no device.
   {

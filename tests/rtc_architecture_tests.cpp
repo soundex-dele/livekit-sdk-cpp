@@ -10,6 +10,7 @@ using livekit::sdk::app_support::require_result;
 #include "media_nodes/capture/audio_processor.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include "engines/rtc/application_output.hpp"
+#include "engines/rtc/media_graph_builder.hpp"
 #include "rtc_audio_fixtures.hpp"
 #include <atomic>
 #include <condition_variable>
@@ -90,6 +91,42 @@ void synchronous_engine() {
         "Missing publication timeout");
   require_result(engine.close());
   check(!engine.publish(descriptor), "Closed engine accepted publication");
+}
+
+void independent_builder_contract() {
+  RoomEngine room([] { return std::make_unique<LocalTransport>(); });
+  require_result(room.join({}));
+  auto descriptor = rtc_audio_test::descriptor("builder");
+  auto endpoint = require_result(room.publish(descriptor));
+  auto receiver = require_result(room.subscribe(descriptor));
+  RtcMediaResources resources({});
+  PreparedMediaGraph publication, subscription;
+  {
+    RtcMediaGraphBuilder builder(resources);
+    MediaPublishSpec spec;
+    spec.track = descriptor;
+    spec.input.generated = true;
+    publication = builder.build_publish(
+        spec, std::make_shared<nodes::RtcPublishNode>("builder.sink", endpoint));
+    MediaSubscribeSpec receive;
+    receive.track = descriptor;
+    subscription = builder.build_subscribe(
+        receive, std::make_shared<nodes::RtcSubscribeNode>("builder.source", receiver));
+  }
+  check(publication.track && subscription.track && !publication.graph.nodes.empty() &&
+            !subscription.graph.nodes.empty(),
+        "Builder did not return independent prepared graphs");
+  const auto snapshot = publication.track->snapshot();
+  check(snapshot.input && snapshot.input->emitted == 0,
+        "Builder started media before graph installation");
+  publication.graph.quiesce();
+  subscription.graph.quiesce();
+  check(endpoint->snapshot().state == TrackState::ready &&
+            receiver->snapshot().state == TrackState::ready,
+        "Builder quiescence detached a transport endpoint");
+  require_result(endpoint->close());
+  require_result(receiver->close());
+  require_result(room.leave());
 }
 
 void shared_storage_and_clock() {
@@ -382,6 +419,7 @@ void echo_convergence() {
 int main() {
   try {
     synchronous_engine();
+    independent_builder_contract();
     shared_storage_and_clock();
     callback_isolation();
     active_output_failure();

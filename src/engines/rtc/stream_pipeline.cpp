@@ -143,12 +143,25 @@ PublishPipeline::PublishPipeline(std::shared_ptr<PublishedTrack> track, PublishG
   }
   observation_ = observe(track, std::move(stopped));
   sink_->set_terminal_handler([state = observation_] { state->terminal(); });
+  prepare();
+}
+
+PublishPipeline::PublishPipeline(std::shared_ptr<nodes::RtcPublishNode> node, TrackGraphSpec spec,
+                                 GraphStopped stopped)
+    : sink_(std::move(node)), extension_(std::move(spec)), owns_endpoint_(false) {
+  input_ = std::make_shared<Input>(sink_->track()->descriptor().id);
+  observation_ = observe(sink_->track(), std::move(stopped));
+  sink_->set_terminal_handler([state = observation_] { state->terminal(); });
+}
+
+void PublishPipeline::prepare() {
   auto graph_nodes = extension_.nodes;
   auto connections = extension_.connections;
   graph_nodes.insert(graph_nodes.begin(), sink_);
   graph_nodes.push_back(input_);
   connections.push_back(TrackGraphSpec::connect<nodes::EncodedFrameEvent>(input_, sink_));
   build(graph_, std::move(graph_nodes), std::move(connections), observation_);
+  prepared_ = true;
 }
 
 PublishPipeline::~PublishPipeline() {
@@ -171,6 +184,9 @@ void PublishPipeline::start_locked() {
       return;
   }
   try {
+    if (!prepared_) {
+      prepare();
+    }
     if (!graph_.start())
       throw std::runtime_error("RTC publication graph start failed");
     // Deliver current epoch/bitrate before producers can emit their first frame.
@@ -190,11 +206,13 @@ void PublishPipeline::start_locked() {
       closed_ = true;
     }
     const auto error = startup_failure(observation_, sink_->track());
-    notify_failure(error);
     sink_->quiesce();
     quiesce(extension_);
     graph_.stop();
-    (void)sink_->track()->close_locked();
+    notify_failure(error);
+    if (owns_endpoint_) {
+      (void)sink_->track()->close_locked();
+    }
     std::rethrow_exception(error);
   }
 }
@@ -213,6 +231,10 @@ std::exception_ptr PublishPipeline::failure() const {
 }
 
 void PublishPipeline::notify_failure(std::exception_ptr failure) {
+  if (failure_notified_) {
+    return;
+  }
+  failure_notified_ = true;
   sink_->track()->report_failure(failure);
   if (extension_.on_failure) {
     detail::CallbackScope scope;
@@ -246,7 +268,7 @@ Result<void> PublishPipeline::close_locked() {
     quiesce(extension_);
     graph_.stop();
   }
-  return sink_->track()->close_locked();
+  return owns_endpoint_ ? sink_->track()->close_locked() : Result<void>::success();
 }
 
 SubscribePipeline::SubscribePipeline(std::shared_ptr<SubscribedTrack> track,
@@ -273,9 +295,21 @@ SubscribePipeline::SubscribePipeline(std::shared_ptr<SubscribedTrack> track,
   }
   observation_ = observe(track, std::move(stopped));
   source_->set_terminal_handler([state = observation_] { state->terminal(); });
+  prepare();
+}
+
+SubscribePipeline::SubscribePipeline(std::shared_ptr<nodes::RtcSubscribeNode> node,
+                                     TrackGraphSpec spec, GraphStopped stopped)
+    : source_(std::move(node)), extension_(std::move(spec)), owns_endpoint_(false) {
+  observation_ = observe(source_->track(), std::move(stopped));
+  source_->set_terminal_handler([state = observation_] { state->terminal(); });
+}
+
+void SubscribePipeline::prepare() {
   auto graph_nodes = extension_.nodes;
   graph_nodes.push_back(source_);
   build(graph_, std::move(graph_nodes), extension_.connections, observation_);
+  prepared_ = true;
 }
 
 SubscribePipeline::~SubscribePipeline() {
@@ -300,6 +334,9 @@ void SubscribePipeline::start_locked() {
     }
   }
   try {
+    if (!prepared_) {
+      prepare();
+    }
     if (!graph_.start()) {
       throw std::runtime_error("RTC subscription graph start failed");
     }
@@ -321,11 +358,13 @@ void SubscribePipeline::start_locked() {
       closed_ = true;
     }
     const auto error = startup_failure(observation_, source_->track());
-    notify_failure(error);
     source_->quiesce();
     quiesce(extension_);
     graph_.stop();
-    (void)source_->track()->close_locked();
+    notify_failure(error);
+    if (owns_endpoint_) {
+      (void)source_->track()->close_locked();
+    }
     std::rethrow_exception(error);
   }
 }
@@ -335,6 +374,10 @@ std::exception_ptr SubscribePipeline::failure() const {
 }
 
 void SubscribePipeline::notify_failure(std::exception_ptr failure) {
+  if (failure_notified_) {
+    return;
+  }
+  failure_notified_ = true;
   source_->track()->report_failure(failure);
   if (extension_.on_failure) {
     detail::CallbackScope scope;
@@ -368,6 +411,6 @@ Result<void> SubscribePipeline::close_locked() {
     quiesce(extension_);
     graph_.stop();
   }
-  return source_->track()->close_locked();
+  return owns_endpoint_ ? source_->track()->close_locked() : Result<void>::success();
 }
 }  // namespace livekit::sdk::rtc::engine

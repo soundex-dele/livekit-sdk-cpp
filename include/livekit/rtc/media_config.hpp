@@ -76,7 +76,7 @@ class SharedMediaInput {
   SharedInputSnapshot snapshot() const;
 
  private:
-  friend class RtcMediaEngine;
+  friend class RtcMediaGraphBuilder;
   struct Impl;
 
   explicit SharedMediaInput(std::shared_ptr<Impl> value) : impl_(std::move(value)) {}
@@ -131,7 +131,7 @@ class MediaTrack {
   Result<void> check() const;
 
  private:
-  friend class RtcMediaEngine;
+  friend class RtcMediaGraphBuilder;
   friend class RtcEngine;
   struct State;
 
