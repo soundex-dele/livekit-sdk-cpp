@@ -1548,19 +1548,12 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
 }  // namespace livekit::sdk::rtc::detail
 
 namespace livekit::sdk::rtc {
-std::unique_ptr<RoomEngine> create_livekit_room(ErrorCode* error) {
+Result<std::unique_ptr<RoomEngine>> create_livekit_room() {
   try {
-    auto room =
-        std::make_unique<RoomEngine>([] { return std::make_unique<detail::LiveKitTransport>(); });
-    if (error) {
-      *error = ErrorCode::ok;
-    }
-    return room;
+    return Result<std::unique_ptr<RoomEngine>>::success(
+        std::make_unique<RoomEngine>([] { return std::make_unique<detail::LiveKitTransport>(); }));
   } catch (...) {
-    if (error) {
-      *error = describe_failure(std::current_exception())->code;
-    }
-    return {};
+    return Result<std::unique_ptr<RoomEngine>>::failure(describe_failure(std::current_exception()));
   }
 }
 }  // namespace livekit::sdk::rtc

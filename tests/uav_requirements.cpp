@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/livekit.hpp"
 // Headless C++ clients for the Go SFU requirement assessment. No capture devices.
@@ -415,7 +416,7 @@ static void dynacast_case(const std::string& url, const std::string& codec,
 }
 
 static void transport_reject_case(const std::string& url, Json& report) {
-  auto room = require_result(transport::create_livekit_room());
+  auto room = require_result(livekit::sdk::app_support::create_blocking_room());
   livekit::sdk::app_support::RtcEventMailbox room_events(*room);
   transport::LiveKitRoomOptions options;
   options.url = url;

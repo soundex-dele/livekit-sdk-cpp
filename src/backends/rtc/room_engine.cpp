@@ -1,6 +1,7 @@
 #include "livekit/rtc/room_engine.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/control_context.hpp"
+#include "backends/rtc/async_control.hpp"
 #include "backends/rtc/bounded_events.hpp"
 #include "backends/rtc/subscription_policy.hpp"
 #include "livekit/error.hpp"
@@ -44,7 +45,8 @@ struct PendingOperation {
   void fail(std::exception_ptr failure) {
     if (!result) {
       if constexpr (std::is_void_v<T>) {
-        result.emplace(describe_failure(failure)->code);
+        control_failure = describe_failure(failure);
+        result.emplace(control_failure->code);
       } else {
         result.emplace(Result<T>::failure(describe_failure(failure)));
       }
@@ -157,6 +159,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       stop_all(ConnectionState::failed, describe_failure(error)->message, error);
     }
   }
+
+  ObserverSlot<RoomObserver> room_observer;
+  ObserverSlot<PublicationObserver> publication_observer;
+  ObserverSlot<SubscriptionObserver> subscription_observer;
   std::function<void(const RoomEvent&)> event_handler;
   bool notification_scheduled = false;
   size_t extra_notifications = 0;
@@ -235,10 +241,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     changed.wait(lock, [&] { return !notification_scheduled && extra_notifications == 0; });
   }
 
-  void post_notification(std::function<void()> callback) {
+  void post_notification(std::function<void()> callback, bool completion = false) {
     {
       std::lock_guard lock(mutex);
-      if (extra_notifications >= 256) {
+      if (!completion && extra_notifications >= 256) {
         std::lock_guard failure_lock(service_failure->mutex);
         service_failure->cause =
             error("RTC notification task queue exhausted", ErrorCode::resource_exhausted);
@@ -364,7 +370,12 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   auto wait(PendingOperation<T>& operation) {
     while (!operation.result) {
       const auto observed = wakeup->revision();
-      pump();
+      if (control->interrupted.load()) {
+        stop_all(ConnectionState::closed, "RTC operation cancelled by leave/close",
+                 error("RTC operation cancelled by leave/close", ErrorCode::cancelled));
+      } else {
+        pump();
+      }
       if (!operation.result) {
         wakeup->wait(observed, {}, next_deadline());
       }
@@ -400,6 +411,11 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     if (!message.empty())
       status.error = std::move(message);
     changed.notify_all();
+  }
+
+  bool emit_track(RoomEvent event, bool publication, bool fatal_overflow = true) {
+    event.publication = publication;
+    return emit(std::move(event), fatal_overflow);
   }
 
   bool emit(RoomEvent event, bool fatal_overflow = true) {
@@ -513,7 +529,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     }
     RoomEvent notification{RoomEventKind::track_failed, key.second, {}, epoch, info->message};
     notification.failure = info;
-    emit(std::move(notification));
+    emit_track(std::move(notification), key.first);
     refresh();
   }
 
@@ -603,7 +619,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
           try {
             // Reserve the notification before dispatch. If it cannot be queued,
             // no native operation may survive request rejection.
-            if (!emit({RoomEventKind::track_mute_changed, id, {}, epoch, {}}, false) ||
+            if (!emit_track({RoomEventKind::track_mute_changed, id, {}, epoch, {}}, true, false) ||
                 !add_control(operation, PendingControl{pending, epoch, deadline, opts.stop})) {
               endpoint->set_muted(previous);
               pending->fail(
@@ -957,7 +973,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       case TransportEventKind::mute_changed:
         if (endpoint.publication) {
           endpoint.set_muted(event.muted);
-          emit({RoomEventKind::track_mute_changed, event.binding.id, {}, epoch, {}});
+          emit_track({RoomEventKind::track_mute_changed, event.binding.id, {}, epoch, {}}, true);
         }
         break;
       case TransportEventKind::published:
@@ -969,7 +985,8 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
           entry.completion({});
           entry.completion = {};
         }
-        emit({RoomEventKind::track_ready, event.binding.id, endpoint.descriptor, epoch, {}});
+        emit_track({RoomEventKind::track_ready, event.binding.id, endpoint.descriptor, epoch, {}},
+                   event.binding.publication);
         break;
       case TransportEventKind::operation_failed:
       case TransportEventKind::removed: {
@@ -988,7 +1005,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
         if (failed) {
           notification.failure = info;
         }
-        emit(std::move(notification));
+        emit_track(std::move(notification), event.binding.publication);
         erase_track(it);
         refresh();
         break;
@@ -1312,7 +1329,25 @@ RoomEngine::RoomEngine(TransportFactory factory)
     : RoomEngine(std::move(factory), std::make_shared<detail::SessionControl>()) {}
 
 RoomEngine::RoomEngine(TransportFactory factory, std::shared_ptr<detail::SessionControl> control)
-    : state_(std::make_shared<detail::RoomEngineState>(std::move(factory), std::move(control))) {}
+    : state_(std::make_shared<detail::RoomEngineState>(std::move(factory), std::move(control))) {
+  auto* state = state_.get();
+  state_->control->async = std::make_shared<detail::AsyncControl>(
+      *state_->control, [state](auto task) { state->post_notification(std::move(task), true); },
+      [wakeup = state_->wakeup] { wakeup->signal(); });
+  state_->set_handler([state](const RoomEvent& event) {
+    if (!event.publication) {
+      if (auto observer = state->room_observer.get().lock()) {
+        observer->on_room_event(event);
+      }
+    } else if (*event.publication) {
+      if (auto observer = state->publication_observer.get().lock()) {
+        observer->on_publication_event(event);
+      }
+    } else if (auto observer = state->subscription_observer.get().lock()) {
+      observer->on_subscription_event(event);
+    }
+  });
+}
 
 std::shared_ptr<detail::SessionControl> RoomEngine::control() const {
   return state_->control;
@@ -1323,33 +1358,32 @@ void SubscribedTrack::request_keyframe_async() {
 }
 
 RoomEngine::~RoomEngine() {
+  state_->control->async->shutdown();
   state_->set_handler({});
   state_->shutdown();
 }
 
-std::shared_ptr<RoomServices> RoomEngine::services(ErrorCode* error) const {
-  return detail::return_value(
-      detail::control_boundary([&] {
-        std::lock_guard lock(state_->mutex);
-        if (!state_->services) {
-          return detail::failure_result<std::shared_ptr<RoomServices>>(
-              ErrorCode::unsupported, "This transport does not provide room services");
-        }
-        return Result<std::shared_ptr<RoomServices>>::success(state_->services);
-      }),
-      error);
+Result<std::shared_ptr<RoomServices>> RoomEngine::services() const {
+  return detail::control_boundary([&] {
+    std::lock_guard lock(state_->mutex);
+    if (!state_->services) {
+      return detail::failure_result<std::shared_ptr<RoomServices>>(
+          ErrorCode::unsupported, "This transport does not provide room services");
+    }
+    return Result<std::shared_ptr<RoomServices>>::success(state_->services);
+  });
 }
 
 ErrorCode RoomEngine::join(RoomOptions options) {
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return join_locked(std::move(options));
+    return state_->control->async->submit(
+        "room.join",
+        [this, options = std::move(options)]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return join_locked(std::move(options));
+        },
+        state_->room_observer.get(),
+        [](auto& observer, auto result) { observer.on_join_completed(std::move(result)); });
   });
 }
 
@@ -1431,20 +1465,20 @@ ErrorCode RoomEngine::join_locked(RoomOptions options) {
   return state_->wait(operation);
 }
 
-std::shared_ptr<PublishedTrack> RoomEngine::publish(TrackDescriptor descriptor, ErrorCode* error) {
-  return detail::return_value(detail::control_boundary([&] {
-                                if (detail::callback_depth || detail::active_session) {
-                                  return detail::failure_result<std::shared_ptr<PublishedTrack>>(
-                                      ErrorCode::invalid_thread, "RTC callback control rejected");
-                                }
-                                detail::OperationGuard guard(*state_->control);
-                                if (state_->control->closed) {
-                                  return detail::failure_result<std::shared_ptr<PublishedTrack>>(
-                                      ErrorCode::session_closed, "RTC engine closed");
-                                }
-                                return publish_locked(std::move(descriptor));
-                              }),
-                              error);
+ErrorCode RoomEngine::publish(TrackDescriptor descriptor) {
+  const auto track_id = descriptor.id;
+  return detail::control_boundary([&] {
+    return state_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, descriptor = std::move(descriptor)]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return publish_locked(std::move(descriptor));
+        },
+        state_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_publish_completed(track_id, std::move(result));
+        });
+  });
 }
 
 Result<std::shared_ptr<PublishedTrack>> RoomEngine::publish_locked(TrackDescriptor descriptor) {
@@ -1472,21 +1506,20 @@ Result<std::shared_ptr<PublishedTrack>> RoomEngine::publish_locked(TrackDescript
   return state_->wait(operation);
 }
 
-std::shared_ptr<SubscribedTrack> RoomEngine::subscribe(TrackDescriptor descriptor,
-                                                       ErrorCode* error) {
-  return detail::return_value(detail::control_boundary([&] {
-                                if (detail::callback_depth || detail::active_session) {
-                                  return detail::failure_result<std::shared_ptr<SubscribedTrack>>(
-                                      ErrorCode::invalid_thread, "RTC callback control rejected");
-                                }
-                                detail::OperationGuard guard(*state_->control);
-                                if (state_->control->closed) {
-                                  return detail::failure_result<std::shared_ptr<SubscribedTrack>>(
-                                      ErrorCode::session_closed, "RTC engine closed");
-                                }
-                                return subscribe_locked(std::move(descriptor));
-                              }),
-                              error);
+ErrorCode RoomEngine::subscribe(TrackDescriptor descriptor) {
+  const auto track_id = descriptor.id;
+  return detail::control_boundary([&] {
+    return state_->control->async->submit(
+        "subscription.subscribe" + std::string(":") + track_id,
+        [this, descriptor = std::move(descriptor)]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return subscribe_locked(std::move(descriptor));
+        },
+        state_->subscription_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_subscribe_completed(track_id, std::move(result));
+        });
+  });
 }
 
 Result<std::shared_ptr<SubscribedTrack>> RoomEngine::subscribe_locked(TrackDescriptor descriptor) {
@@ -1516,14 +1549,14 @@ Result<std::shared_ptr<SubscribedTrack>> RoomEngine::subscribe_locked(TrackDescr
 
 ErrorCode RoomEngine::leave() {
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return leave_locked();
+    return state_->control->async->submit(
+        "room.leave",
+        [this]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return leave_locked();
+        },
+        state_->room_observer.get(),
+        [](auto& observer, auto result) { observer.on_leave_completed(std::move(result)); }, true);
   });
 }
 
@@ -1549,15 +1582,18 @@ ErrorCode RoomEngine::leave_locked() {
 }
 
 ErrorCode RoomEngine::unpublish(const TrackId& id) {
+  const auto track_id = id;
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return unpublish_locked(id);
+    return state_->control->async->submit(
+        "publication.remove" + std::string(":") + track_id,
+        [this, id]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return unpublish_locked(id);
+        },
+        state_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_unpublish_completed(track_id, std::move(result));
+        });
   });
 }
 
@@ -1566,15 +1602,18 @@ ErrorCode RoomEngine::unpublish_locked(const TrackId& id) {
 }
 
 ErrorCode RoomEngine::unsubscribe(const TrackId& id) {
+  const auto track_id = id;
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return unsubscribe_locked(id);
+    return state_->control->async->submit(
+        "subscription.remove" + std::string(":") + track_id,
+        [this, id]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return unsubscribe_locked(id);
+        },
+        state_->subscription_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_unsubscribe_completed(track_id, std::move(result));
+        });
   });
 }
 
@@ -1583,15 +1622,18 @@ ErrorCode RoomEngine::unsubscribe_locked(const TrackId& id) {
 }
 
 ErrorCode RoomEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
+  const auto track_id = id;
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return set_muted_locked(id, muted, options);
+    return state_->control->async->submit(
+        "publication.mute" + std::string(":") + track_id,
+        [this, id, muted, options]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return set_muted_locked(id, muted, options);
+        },
+        state_->publication_observer.get(),
+        [track_id, muted](auto& observer, auto result) {
+          observer.on_muted_completed(track_id, muted, std::move(result));
+        });
   });
 }
 
@@ -1601,15 +1643,18 @@ ErrorCode RoomEngine::set_muted_locked(const TrackId& id, bool muted, ControlOpt
 
 ErrorCode RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                          ControlOptions options) {
+  const auto track_id = id;
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return set_receive_demand_locked(id, demand, options);
+    return state_->control->async->submit(
+        "subscription.demand" + std::string(":") + track_id,
+        [this, id, demand, options]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return set_receive_demand_locked(id, demand, options);
+        },
+        state_->subscription_observer.get(),
+        [track_id, demand](auto& observer, auto result) {
+          observer.on_receive_demand_completed(track_id, demand, std::move(result));
+        });
   });
 }
 
@@ -1620,14 +1665,16 @@ ErrorCode RoomEngine::set_receive_demand_locked(const TrackId& id, ReceiveDemand
 
 ErrorCode RoomEngine::update_local_participant(ParticipantUpdate update, ControlOptions options) {
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return update_local_participant_locked(std::move(update), options);
+    return state_->control->async->submit(
+        "room.participant",
+        [this, update = std::move(update), options]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return update_local_participant_locked(std::move(update), options);
+        },
+        state_->room_observer.get(),
+        [](auto& observer, auto result) {
+          observer.on_participant_update_completed(std::move(result));
+        });
   });
 }
 
@@ -1712,14 +1759,16 @@ ErrorCode RoomEngine::update_local_participant_locked(ParticipantUpdate update,
 ErrorCode RoomEngine::set_subscription_permissions(SubscriptionPermissions policy,
                                                    ControlOptions options) {
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed) {
-      return ErrorCode::session_closed;
-    }
-    return set_subscription_permissions_locked(std::move(policy), options);
+    return state_->control->async->submit(
+        "room.permissions",
+        [this, policy = std::move(policy), options]() mutable {
+          detail::OperationGuard guard(*state_->control);
+          return set_subscription_permissions_locked(std::move(policy), options);
+        },
+        state_->room_observer.get(),
+        [](auto& observer, auto result) {
+          observer.on_subscription_permissions_completed(std::move(result));
+        });
   });
 }
 
@@ -1785,17 +1834,30 @@ RoomSnapshot RoomEngine::snapshot() const {
   return state_->status;
 }
 
-ErrorCode RoomEngine::set_event_handler(std::function<void(const RoomEvent&)> handler) {
+void RoomEngine::set_room_observer(std::weak_ptr<RoomObserver> observer) {
+  state_->room_observer.set(std::move(observer));
+}
+
+void RoomEngine::set_publication_observer(std::weak_ptr<PublicationObserver> observer) {
+  state_->publication_observer.set(std::move(observer));
+}
+
+void RoomEngine::set_subscription_observer(std::weak_ptr<SubscriptionObserver> observer) {
+  state_->subscription_observer.set(std::move(observer));
+}
+
+ErrorCode RoomEngine::close() {
   return detail::control_boundary([&] {
-    if (detail::callback_depth || detail::active_session) {
-      return ErrorCode::invalid_thread;
-    }
-    detail::OperationGuard guard(*state_->control);
-    if (state_->control->closed && handler) {
-      return ErrorCode::session_closed;
-    }
-    set_event_handler_locked(std::move(handler));
-    return ErrorCode::ok;
+    return state_->control->async->submit(
+        "room.close",
+        [this] {
+          detail::OperationGuard guard(*state_->control);
+          state_->control->closed = true;
+          return leave_locked();
+        },
+        state_->room_observer.get(),
+        [](auto& observer, auto result) { observer.on_close_completed(std::move(result)); }, true,
+        true);
   });
 }
 

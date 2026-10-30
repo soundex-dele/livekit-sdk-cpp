@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "../../support/rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -13,7 +14,7 @@ using namespace std::chrono_literals;
 
 namespace {
 template <class Future>
-auto complete(rtc::engine::RtcEngine&, Future future) {
+auto complete(livekit::sdk::app_support::BlockingRtc&, Future future) {
   return require_result(std::move(future));
 }
 
@@ -49,7 +50,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
-    auto engine = require_result(rtc::engine::create_livekit_engine());
+    auto engine = require_result(livekit::sdk::app_support::create_blocking_engine());
     livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
     rtc::LiveKitRoomOptions options;
     options.url = argv[1];

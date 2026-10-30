@@ -3,6 +3,7 @@
 #include "engines/rtc/track_graph_registry.hpp"
 #include "engines/rtc/media_graph_contract.hpp"
 #include "backends/rtc/control_context.hpp"
+#include "backends/rtc/async_control.hpp"
 #include <memory>
 #include <thread>
 #include <atomic>
@@ -20,6 +21,7 @@ struct RtcEngine::Impl {
   Result<TrackId> publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> = {});
   Result<TrackId> subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode>);
 
+  // Runs inline and never retains the callable; references to caller arguments are safe.
   template <class Function>
   auto execute(Function function, bool allow_closed = false) const {
     using Value = std::invoke_result_t<Function>;
@@ -54,7 +56,11 @@ struct RtcEngine::Impl {
     });
   }
 
-  std::shared_ptr<std::atomic<bool>> callback_active;
+  detail::ObserverSlot<RoomObserver> room_observer;
+  detail::ObserverSlot<PublicationObserver> publication_observer;
+  detail::ObserverSlot<SubscriptionObserver> subscription_observer;
+  std::shared_ptr<rtc::PublicationObserver> publication_events;
+  std::shared_ptr<rtc::SubscriptionObserver> subscription_events;
   bool closed = false;
   std::atomic<bool> has_media{false};
   std::shared_ptr<detail::SessionControl> control;

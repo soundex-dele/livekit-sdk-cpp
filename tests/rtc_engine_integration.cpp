@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -18,7 +19,7 @@ void check(bool ok, const char* message) {
 }
 
 template <class Future>
-auto await(engine::RtcEngine& engine, Future future) {
+auto await(livekit::sdk::app_support::BlockingRtc& engine, Future future) {
   return require_result(std::move(future));
 }
 
@@ -62,8 +63,8 @@ class Consumer : public graphflow::core::GraphNode {
 
 int main() {
   try {
-    auto tx = require_result(engine::create_livekit_engine()),
-         rx = require_result(engine::create_livekit_engine());
+    auto tx = require_result(livekit::sdk::app_support::create_blocking_engine()),
+         rx = require_result(livekit::sdk::app_support::create_blocking_engine());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
     livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
     LiveKitRoomOptions options;
@@ -75,7 +76,6 @@ int main() {
     await(*rx, rx->join(options));
     std::vector<TrackDescriptor> descriptors;
     std::vector<std::vector<uint8_t>> payloads;
-    std::vector<TrackId> publishing;
     for (int i = 0; i < 4; ++i) {
       TrackDescriptor d;
       d.id = d.name = "graph-" + std::to_string(i);
@@ -88,14 +88,12 @@ int main() {
       descriptors.push_back(d);
       payloads.push_back(i < 2 ? std::vector<uint8_t>{0xf8, 0xff, 0xfe}
                                : fixture_video(Codec::vp8, i == 3));
-      publishing.push_back(tx->publish(d));
+      await(*tx, tx->publish(d));
     }
-    for (auto& future : publishing)
-      await(*tx, std::move(future));
     std::vector<std::shared_ptr<Consumer>> sinks(4);
-    std::vector<TrackId> subscribing;
+    size_t subscribed = 0;
     const auto discovered_by = SteadyClock::now() + 10s;
-    while (subscribing.size() < 4) {
+    while (subscribed < 4) {
       check(SteadyClock::now() < discovered_by, "Engine remote discovery timed out");
       auto event = rx_events.take_event(100ms);
       if (!event || event->kind != RoomEventKind::remote_track_added)
@@ -105,11 +103,10 @@ int main() {
           sinks[i] = std::make_shared<Consumer>(payloads[i]);
           auto d = *event->descriptor;
           d.id = descriptors[i].id;
-          subscribing.push_back(rx->graph().subscribe(d, sinks[i]));
+          await(*rx, rx->graph().subscribe(d, sinks[i]));
+          ++subscribed;
         }
     }
-    for (auto& future : subscribing)
-      await(*rx, std::move(future));
     uint64_t sequence = 0;
     auto run = [&](std::vector<int> active) {
       for (int i : active)

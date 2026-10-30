@@ -99,8 +99,8 @@ struct SubscriptionPermissionsRequest {
 };
 enum class SendResult { sent, would_block, dropped };
 
-// Calls are serialized by RoomEngine. Control requests run on the calling
-// application thread; idle event/media servicing and recovery run on its worker.
+// Calls are serialized by RoomEngine. Control requests run on its control
+// worker; idle event/media servicing and recovery run on its transport worker.
 // Adapters must not depend on a fixed controller thread. Never called concurrently.
 // start/publish/subscribe enqueue work and must not wait for a server response.
 // take_events drains callbacks after a wakeup; it never waits. Native threads never

@@ -5,6 +5,34 @@
 #include "livekit/error.hpp"
 
 namespace livekit::sdk::rtc::engine {
+namespace {
+struct PublicationEvents final : rtc::PublicationObserver {
+  explicit PublicationEvents(detail::ObserverSlot<engine::PublicationObserver>& slot)
+      : slot(slot) {}
+
+  void on_publication_event(const RoomEvent& event) override {
+    if (auto observer = slot.get().lock()) {
+      observer->on_publication_event(event);
+    }
+  }
+
+  detail::ObserverSlot<engine::PublicationObserver>& slot;
+};
+
+struct SubscriptionEvents final : rtc::SubscriptionObserver {
+  explicit SubscriptionEvents(detail::ObserverSlot<engine::SubscriptionObserver>& slot)
+      : slot(slot) {}
+
+  void on_subscription_event(const RoomEvent& event) override {
+    if (auto observer = slot.get().lock()) {
+      observer->on_subscription_event(event);
+    }
+  }
+
+  detail::ObserverSlot<engine::SubscriptionObserver>& slot;
+};
+}  // namespace
+
 RtcEngine::RtcEngine(RoomEngine::TransportFactory factory)
     : RtcEngine(std::unique_ptr<RoomEngine>(
           new RoomEngine(std::move(factory), std::make_shared<detail::SessionControl>()))) {}
@@ -21,16 +49,32 @@ RtcEngine::Impl::Impl(std::unique_ptr<RoomEngine> value)
     room_view = RoomView(room.get());
   }
   control = room->control();
+  publication_events = std::make_shared<PublicationEvents>(publication_observer);
+  subscription_events = std::make_shared<SubscriptionEvents>(subscription_observer);
+  room->set_publication_observer(publication_events);
+  room->set_subscription_observer(subscription_events);
   graphs = std::make_unique<TrackGraphRegistry>();
+  graphs->set_failure_handler([this](auto failure) {
+    GraphFailure value{failure.id, failure.publication, failure.message, failure.failure};
+    auto publisher = publication_observer.get();
+    auto subscriber = subscription_observer.get();
+    room->post_notification([value = std::move(value), publisher, subscriber] {
+      if (value.publication) {
+        if (auto observer = publisher.lock()) {
+          observer->on_graph_failure(value);
+        }
+      } else if (auto observer = subscriber.lock()) {
+        observer->on_graph_failure(value);
+      }
+    });
+  });
 }
 
 RtcEngine::Impl::~Impl() {
+  control->async->shutdown();
   // Applications must join all callers before destroying the facade.
   try {
     detail::OperationGuard guard(*control);
-    if (callback_active) {
-      *callback_active = false;
-    }
     room->set_event_handler_locked({});
     graphs->set_failure_handler({});
     (void)clear_tracks();
@@ -189,43 +233,65 @@ bool RtcEngine::media_enabled() const {
 }
 
 ErrorCode RtcEngine::join(RoomOptions options) {
-  return impl_->execute([state = impl_.get(), options = std::move(options)]() mutable {
-    const auto connection = state->room->snapshot().state;
-    if (connection == ConnectionState::failed || connection == ConnectionState::closed) {
-      auto cleaned = state->clear_tracks();
-      if (cleaned != ErrorCode::ok) {
-        return cleaned;
-      }
-    }
-    return state->room->join_locked(std::move(options));
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "room.join",
+        [this, options = std::move(options)]() mutable {
+          return impl_->execute([state = impl_.get(), options = std::move(options)]() mutable {
+            const auto connection = state->room->snapshot().state;
+            if (connection == ConnectionState::failed || connection == ConnectionState::closed) {
+              auto cleaned = state->clear_tracks();
+              if (cleaned != ErrorCode::ok) {
+                return cleaned;
+              }
+            }
+            return state->room->join_locked(std::move(options));
+          });
+        },
+        impl_->room_observer.get(),
+        [](auto& observer, auto result) { observer.on_join_completed(std::move(result)); });
   });
 }
 
 ErrorCode RtcEngine::leave() {
-  return impl_->execute([state = impl_.get()] {
-    auto graphs = state->clear_tracks();
-    auto left = state->room->leave_locked();
-    return graphs == ErrorCode::ok ? left : graphs;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "room.leave",
+        [this]() mutable {
+          return impl_->execute([state = impl_.get()] {
+            auto graphs = state->clear_tracks();
+            auto left = state->room->leave_locked();
+            return graphs == ErrorCode::ok ? left : graphs;
+          });
+        },
+        impl_->room_observer.get(),
+        [](auto& observer, auto result) { observer.on_leave_completed(std::move(result)); }, true,
+        false);
   });
 }
 
 ErrorCode RtcEngine::close() {
-  return impl_->execute(
-      [state = impl_.get()] {
-        if (state->closed) {
-          return ErrorCode::ok;
-        }
-        state->control->closed = true;
-        if (state->callback_active) {
-          *state->callback_active = false;
-        }
-        state->room->set_event_handler_locked({});
-        auto graphs = state->clear_tracks();
-        auto left = state->room->leave_locked();
-        state->closed = graphs == ErrorCode::ok && left == ErrorCode::ok;
-        return graphs == ErrorCode::ok ? left : graphs;
-      },
-      true);
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "room.close",
+        [this]() mutable {
+          return impl_->execute(
+              [state = impl_.get()] {
+                if (state->closed) {
+                  return ErrorCode::ok;
+                }
+                state->control->closed = true;
+                auto graphs = state->clear_tracks();
+                auto left = state->room->leave_locked();
+                state->closed = graphs == ErrorCode::ok && left == ErrorCode::ok;
+                return graphs == ErrorCode::ok ? left : graphs;
+              },
+              true);
+        },
+        impl_->room_observer.get(),
+        [](auto& observer, auto result) { observer.on_close_completed(std::move(result)); }, true,
+        true);
+  });
 }
 
 Result<MediaPublication> RtcEngine::start_media(MediaPublishSpec spec,
@@ -253,133 +319,268 @@ Result<MediaPublication> RtcEngine::start_media(MediaPublishSpec spec,
   });
 }
 
-MediaPublication RtcEngine::publish_media(MediaPublishSpec spec, ErrorCode* error) {
-  return detail::return_value(start_media(std::move(spec)), error);
+ErrorCode RtcEngine::publish_media(MediaPublishSpec spec) {
+  const auto track_id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, spec = std::move(spec)]() mutable { return start_media(std::move(spec)); },
+        impl_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_media_publish_completed(track_id, std::move(result));
+        });
+  });
 }
 
-MediaPublication RtcEngine::publish_video(MediaPublishSpec spec, ErrorCode* error) {
-  return detail::return_value(start_media(std::move(spec), MediaKind::video), error);
+ErrorCode RtcEngine::publish_video(MediaPublishSpec spec) {
+  const auto track_id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, spec = std::move(spec)]() mutable {
+          return start_media(std::move(spec), MediaKind::video);
+        },
+        impl_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_media_publish_completed(track_id, std::move(result));
+        });
+  });
 }
 
-MediaPublication RtcEngine::publish_audio(MediaPublishSpec spec, ErrorCode* error) {
-  return detail::return_value(start_media(std::move(spec), MediaKind::audio), error);
+ErrorCode RtcEngine::publish_audio(MediaPublishSpec spec) {
+  const auto track_id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, spec = std::move(spec)]() mutable {
+          return start_media(std::move(spec), MediaKind::audio);
+        },
+        impl_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_media_publish_completed(track_id, std::move(result));
+        });
+  });
 }
 
-MediaSubscription RtcEngine::subscribe_media(MediaSubscribeSpec spec, ErrorCode* error) {
-  return detail::return_value(impl_->execute([&]() -> Result<MediaSubscription> {
+ErrorCode RtcEngine::subscribe_media(MediaSubscribeSpec spec) {
+  const auto track_id = spec.track.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "subscription.subscribe" + std::string(":") + track_id,
+        [this, spec = std::move(spec)]() mutable {
+          return impl_->execute([&]() -> Result<MediaSubscription> {
+            if (!impl_->media) {
+              return detail::failure_result<MediaSubscription>(ErrorCode::unsupported,
+                                                               "RTC media module is not enabled");
+            }
+            auto& builder = *impl_->media;
+            std::shared_ptr<MediaTrack> track;
+            auto ready = impl_->subscribe_graph(spec.track, [&](auto node) {
+              auto prepared = builder.build_subscribe(std::move(spec), std::move(node));
+              track = std::move(prepared.track);
+              return std::move(prepared.graph);
+            });
+            if (!ready) {
+              return Result<MediaSubscription>::failure(ready.failure_record());
+            }
+            return Result<MediaSubscription>::success({*ready, std::move(track)});
+          });
+        },
+        impl_->subscription_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_media_subscribe_completed(track_id, std::move(result));
+        });
+  });
+}
+
+ErrorCode RtcEngine::create_shared_input(TrackDescriptor format, MediaInput input) {
+  const auto id = format.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.input:" + id,
+        [this, format = std::move(format), input = std::move(input)]() mutable {
+          return create_shared_input_impl(std::move(format), std::move(input));
+        },
+        impl_->publication_observer.get(),
+        [id](auto& observer, auto result) {
+          observer.on_shared_input_created(id, std::move(result));
+        });
+  });
+}
+
+Result<std::shared_ptr<SharedMediaInput>> RtcEngine::create_shared_input_impl(
+    TrackDescriptor format, MediaInput input) {
+  return impl_->execute([&] {
     if (!impl_->media) {
-      return detail::failure_result<MediaSubscription>(ErrorCode::unsupported,
-                                                       "RTC media module is not enabled");
-    }
-    auto& builder = *impl_->media;
-    std::shared_ptr<MediaTrack> track;
-    auto ready = impl_->subscribe_graph(spec.track, [&](auto node) {
-      auto prepared = builder.build_subscribe(std::move(spec), std::move(node));
-      track = std::move(prepared.track);
-      return std::move(prepared.graph);
-    });
-    if (!ready) {
-      return Result<MediaSubscription>::failure(ready.failure_record());
-    }
-    return Result<MediaSubscription>::success({*ready, std::move(track)});
-  }),
-                              error);
-}
-
-std::shared_ptr<SharedMediaInput> RtcEngine::create_shared_input(TrackDescriptor format,
-                                                                 MediaInput input,
-                                                                 ErrorCode* error) {
-  return detail::return_value(impl_->execute([state = impl_.get(), format = std::move(format),
-                                              input = std::move(input)]() mutable {
-    if (!state->media) {
       return detail::failure_result<std::shared_ptr<SharedMediaInput>>(
           ErrorCode::unsupported, "RTC media module is not enabled");
     }
     return Result<std::shared_ptr<SharedMediaInput>>::success(
-        state->media->create_shared_input(std::move(format), std::move(input)));
-  }),
-                              error);
+        impl_->media->create_shared_input(std::move(format), std::move(input)));
+  });
 }
 
-TrackId RtcEngine::publish(TrackDescriptor descriptor, ErrorCode* error) {
-  return detail::return_value(
-      impl_->execute([state = impl_.get(), descriptor = std::move(descriptor)]() mutable {
-        return state->publish(std::move(descriptor));
-      }),
-      error);
+ErrorCode RtcEngine::publish(TrackDescriptor descriptor) {
+  const auto track_id = descriptor.id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.publish" + std::string(":") + track_id,
+        [this, descriptor = std::move(descriptor)]() mutable {
+          return impl_->execute([&] { return impl_->publish(std::move(descriptor)); });
+        },
+        impl_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_publish_completed(track_id, std::move(result));
+        });
+  });
 }
 
 RtcGraphApi RtcEngine::graph() {
   return RtcGraphApi(*this);
 }
 
-TrackId RtcGraphApi::publish(TrackDescriptor descriptor,
-                             std::shared_ptr<graphflow::core::GraphNode> sink, ErrorCode* error) {
-  return detail::return_value(
-      engine_->impl_->execute([state = engine_->impl_.get(), descriptor = std::move(descriptor),
-                               sink = std::move(sink)]() mutable {
-        return state->publish(std::move(descriptor), std::move(sink));
-      }),
-      error);
+ErrorCode RtcGraphApi::publish(TrackDescriptor descriptor,
+                               std::shared_ptr<graphflow::core::GraphNode> sink) {
+  const auto track_id = descriptor.id;
+  auto* engine = engine_;
+  return detail::control_boundary([&] {
+    return engine->impl_->control->async->submit(
+        "publication.publish:" + track_id,
+        [engine, descriptor = std::move(descriptor), sink = std::move(sink)]() mutable {
+          return engine->impl_->execute(
+              [&] { return engine->impl_->publish(std::move(descriptor), std::move(sink)); });
+        },
+        engine->impl_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_publish_completed(track_id, std::move(result));
+        });
+  });
 }
 
-TrackId RtcGraphApi::subscribe(TrackDescriptor descriptor,
-                               std::shared_ptr<graphflow::core::GraphNode> consumer,
-                               ErrorCode* error) {
-  return detail::return_value(
-      engine_->impl_->execute([state = engine_->impl_.get(), descriptor = std::move(descriptor),
-                               consumer = std::move(consumer)]() mutable {
-        return state->subscribe(std::move(descriptor), std::move(consumer));
-      }),
-      error);
+ErrorCode RtcGraphApi::subscribe(TrackDescriptor descriptor,
+                                 std::shared_ptr<graphflow::core::GraphNode> consumer) {
+  const auto track_id = descriptor.id;
+  auto* engine = engine_;
+  return detail::control_boundary([&] {
+    return engine->impl_->control->async->submit(
+        "subscription.subscribe:" + track_id,
+        [engine, descriptor = std::move(descriptor), consumer = std::move(consumer)]() mutable {
+          return engine->impl_->execute(
+              [&] { return engine->impl_->subscribe(std::move(descriptor), std::move(consumer)); });
+        },
+        engine->impl_->subscription_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_subscribe_completed(track_id, std::move(result));
+        });
+  });
 }
 
-TrackId RtcGraphApi::publish_graph(TrackDescriptor descriptor, PublishGraphFactory factory,
-                                   ErrorCode* error) {
-  return detail::return_value(
-      engine_->impl_->execute([state = engine_->impl_.get(), descriptor = std::move(descriptor),
-                               factory = std::move(factory)]() mutable {
-        return state->publish_graph(std::move(descriptor), std::move(factory));
-      }),
-      error);
+ErrorCode RtcGraphApi::publish_graph(TrackDescriptor descriptor, PublishGraphFactory factory) {
+  const auto track_id = descriptor.id;
+  auto* engine = engine_;
+  return detail::control_boundary([&] {
+    return engine->impl_->control->async->submit(
+        "publication.publish:" + track_id,
+        [engine, descriptor = std::move(descriptor), factory = std::move(factory)]() mutable {
+          return engine->impl_->execute([&] {
+            return engine->impl_->publish_graph(std::move(descriptor), std::move(factory));
+          });
+        },
+        engine->impl_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_publish_completed(track_id, std::move(result));
+        });
+  });
 }
 
-TrackId RtcGraphApi::subscribe_graph(TrackDescriptor descriptor, SubscribeGraphFactory factory,
-                                     ErrorCode* error) {
-  return detail::return_value(
-      engine_->impl_->execute([state = engine_->impl_.get(), descriptor = std::move(descriptor),
-                               factory = std::move(factory)]() mutable {
-        return state->subscribe_graph(std::move(descriptor), std::move(factory));
-      }),
-      error);
+ErrorCode RtcGraphApi::subscribe_graph(TrackDescriptor descriptor, SubscribeGraphFactory factory) {
+  const auto track_id = descriptor.id;
+  auto* engine = engine_;
+  return detail::control_boundary([&] {
+    return engine->impl_->control->async->submit(
+        "subscription.subscribe:" + track_id,
+        [engine, descriptor = std::move(descriptor), factory = std::move(factory)]() mutable {
+          return engine->impl_->execute([&] {
+            return engine->impl_->subscribe_graph(std::move(descriptor), std::move(factory));
+          });
+        },
+        engine->impl_->subscription_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_subscribe_completed(track_id, std::move(result));
+        });
+  });
 }
 
 ErrorCode RtcEngine::unpublish(const TrackId& id) {
-  return impl_->execute([state = impl_.get(), id] {
-    auto retired = state->graphs->take(id, true);
-    // Keep graph leases alive until the native remove operation completes.
-    return state->room->unpublish_locked(id);
+  const auto track_id = id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.remove" + std::string(":") + track_id,
+        [this, id]() mutable {
+          return impl_->execute([state = impl_.get(), id] {
+            auto retired = state->graphs->take(id, true);
+            // Keep graph leases alive until the native remove operation completes.
+            return state->room->unpublish_locked(id);
+          });
+        },
+        impl_->publication_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_unpublish_completed(track_id, std::move(result));
+        });
   });
 }
 
 ErrorCode RtcEngine::unsubscribe(const TrackId& id) {
-  return impl_->execute([state = impl_.get(), id] {
-    auto retired = state->graphs->take(id, false);
-    // Keep graph leases alive until the native remove operation completes.
-    return state->room->unsubscribe_locked(id);
+  const auto track_id = id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "subscription.remove" + std::string(":") + track_id,
+        [this, id]() mutable {
+          return impl_->execute([state = impl_.get(), id] {
+            auto retired = state->graphs->take(id, false);
+            // Keep graph leases alive until the native remove operation completes.
+            return state->room->unsubscribe_locked(id);
+          });
+        },
+        impl_->subscription_observer.get(),
+        [track_id](auto& observer, auto result) {
+          observer.on_unsubscribe_completed(track_id, std::move(result));
+        });
   });
 }
 
 ErrorCode RtcEngine::set_muted(const TrackId& id, bool muted, ControlOptions options) {
-  return impl_->execute([state = impl_.get(), id, muted, options] {
-    return state->room->set_muted_locked(id, muted, options);
+  const auto track_id = id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "publication.mute" + std::string(":") + track_id,
+        [this, id, muted, options]() mutable {
+          return impl_->execute([state = impl_.get(), id, muted, options] {
+            return state->room->set_muted_locked(id, muted, options);
+          });
+        },
+        impl_->publication_observer.get(),
+        [track_id, muted](auto& observer, auto result) {
+          observer.on_muted_completed(track_id, muted, std::move(result));
+        });
   });
 }
 
 ErrorCode RtcEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                         ControlOptions options) {
-  return impl_->execute([state = impl_.get(), id, demand, options] {
-    return state->room->set_receive_demand_locked(id, demand, options);
+  const auto track_id = id;
+  return detail::control_boundary([&] {
+    return impl_->control->async->submit(
+        "subscription.demand" + std::string(":") + track_id,
+        [this, id, demand, options]() mutable {
+          return impl_->execute([state = impl_.get(), id, demand, options] {
+            return state->room->set_receive_demand_locked(id, demand, options);
+          });
+        },
+        impl_->subscription_observer.get(),
+        [track_id, demand](auto& observer, auto result) {
+          observer.on_receive_demand_completed(track_id, demand, std::move(result));
+        });
   });
 }
 
@@ -395,53 +596,17 @@ SenderFeedback RtcEngine::feedback(const TrackId& id) const {
   return impl_->graphs->feedback(id);
 }
 
-ErrorCode RtcEngine::set_callbacks(Callbacks callbacks) {
-  return impl_->execute(
-      [&]() -> ErrorCode {
-        if (impl_->control->closed && (callbacks.on_event || callbacks.on_failure)) {
-          return ErrorCode::session_closed;
-        }
-        auto active = std::make_shared<std::atomic<bool>>(true);
-        if (impl_->callback_active) {
-          *impl_->callback_active = false;
-        }
-        impl_->callback_active = active;
-        impl_->graphs->set_failure_handler([state = impl_.get(), active,
-                                            handler =
-                                                std::move(callbacks.on_failure)](auto failure) {
-          if (handler) {
-            state->room->post_notification([state, active, handler, failure = std::move(failure)] {
-              if (*active) {
-                try {
-                  handler(GraphFailure{failure.id, failure.publication, failure.message,
-                                       failure.failure});
-                } catch (...) {
-                  *active = false;
-                  state->room->notification_failed();
-                }
-              }
-            });
-          }
-        });
-        // Control reentry is rejected before the operation lock.
-        std::function<void(const RoomEvent&)> event;
-        if (callbacks.on_event) {
-          event = [state = impl_.get(), active,
-                   handler = std::move(callbacks.on_event)](const RoomEvent& value) {
-            if (*active) {
-              try {
-                handler(value);
-              } catch (...) {
-                *active = false;
-                state->room->notification_failed();
-              }
-            }
-          };
-        }
-        impl_->room->set_event_handler_locked(std::move(event));
-        return ErrorCode::ok;
-      },
-      true);
+void RtcEngine::set_room_observer(std::weak_ptr<RoomObserver> observer) {
+  impl_->room_observer.set(observer);
+  impl_->room->set_room_observer(std::move(observer));
+}
+
+void RtcEngine::set_publication_observer(std::weak_ptr<PublicationObserver> observer) {
+  impl_->publication_observer.set(std::move(observer));
+}
+
+void RtcEngine::set_subscription_observer(std::weak_ptr<SubscriptionObserver> observer) {
+  impl_->subscription_observer.set(std::move(observer));
 }
 
 const RoomView& RtcEngine::room() const {

@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
@@ -129,7 +130,7 @@ class Transport final : public RoomTransport {
 };
 
 template <class F>
-void until(RtcEngine& engine, F done) {
+void until(livekit::sdk::app_support::BlockingRtc& engine, F done) {
   const auto deadline = SteadyClock::now() + 5s;
   while (!done()) {
     check(SteadyClock::now() < deadline, "Media engine operation timed out");
@@ -139,7 +140,7 @@ void until(RtcEngine& engine, F done) {
 }
 
 template <class T>
-auto await(RtcEngine&, T& operation) {
+auto await(livekit::sdk::app_support::BlockingRtc&, T& operation) {
   return require_result(operation);
 }
 
@@ -153,8 +154,8 @@ MediaPublishSpec video(std::string id) {
   return spec;
 }
 
-std::unique_ptr<RtcEngine> make_engine(std::shared_ptr<Wire> wire) {
-  auto result = std::make_unique<RtcEngine>([wire] { return std::make_unique<Transport>(wire); });
+std::unique_ptr<livekit::sdk::app_support::BlockingRtc> make_engine(std::shared_ptr<Wire> wire) {
+  auto result = std::make_unique<livekit::sdk::app_support::BlockingRtc>([wire] { return std::make_unique<Transport>(wire); });
   require_result(result->enable_media());
   LiveKitRoomOptions options;
   options.url = "ws://test";
@@ -182,15 +183,15 @@ void multi_track() {
   };
   auto rx = engine->subscribe_media(config);
   await(*engine, rx);
-  until(*engine, [&] { return frames >= 3 && second.track->snapshot().frames >= 3; });
-  const auto graph = first.track->snapshot();
+  until(*engine, [&] { return frames >= 3 && second->track->snapshot().frames >= 3; });
+  const auto graph = first->track->snapshot();
   check(graph.video && graph.video->completed > 0 && graph.edges.size() == 4,
         "Engine did not build codec and feedback graph");
   require_result(engine->unpublish("first"));
   require_result(engine->unsubscribe("rx"));
   const auto received = frames.load();
-  const auto before = second.track->snapshot().frames;
-  until(*engine, [&] { return second.track->snapshot().frames >= before + 3; });
+  const auto before = second->track->snapshot().frames;
+  until(*engine, [&] { return second->track->snapshot().frames >= before + 3; });
   check(frames == received && wire->starts == 1 && wire->stops == 0,
         "Closing one graph disturbed room or callback barrier");
   require_result(engine->close());
@@ -209,7 +210,7 @@ void cancelled_and_failed_sources() {
   spec.input.generated = false;
   spec.input.video_source = source;
   auto pending = engine->publish_video(spec);
-  check(!pending.track && !source->stats().attached, "Timed out publication leaked input");
+  check(!pending && !source->stats().attached, "Timed out publication leaked input");
   require_result(engine->unpublish(spec.track.id));
   bool cancelled = false;
   try {
@@ -219,7 +220,7 @@ void cancelled_and_failed_sources() {
   }
   check(cancelled && !source->stats().attached && !source->stats().closed,
         "Cancelled publication leaked or closed application source");
-  check(!pending.track, "Timed out operation succeeded");
+  check(!pending, "Timed out operation succeeded");
   spec.track.id = "backend-rejected";
   auto rejecting = std::async(std::launch::async, [&] { return engine->publish_video(spec); });
   BindingToken rejected_binding;
@@ -242,7 +243,7 @@ void cancelled_and_failed_sources() {
   } catch (...) {
     backend_failed = true;
   }
-  check(backend_failed && !source->stats().attached && !source->stats().closed && !rejected.track,
+  check(backend_failed && !source->stats().attached && !source->stats().closed && !rejected,
         "Backend failure became ready before media cleanup");
   wire->acknowledge = true;
   spec.track.id = "bad-codec";
@@ -297,7 +298,7 @@ void raw_audio_and_encoded() {
   passthrough.input.encoded_source = std::make_shared<livekit::sdk::EncodedMediaSource>(options);
   auto encoded = engine->publish_media(passthrough);
   await(*engine, encoded);
-  const auto graph = encoded.track->snapshot();
+  const auto graph = encoded->track->snapshot();
   check(!graph.video && !graph.audio && graph.edges.size() == 2, "Encoded input created a codec");
   require_result(engine->close());
 }
@@ -317,15 +318,15 @@ void shared_capture() {
   await(*engine, first);
   await(*other, second);
   until(*engine, [&] {
-    return first.track->snapshot().frames >= 3 && second.track->snapshot().frames >= 3;
+    return first->track->snapshot().frames >= 3 && second->track->snapshot().frames >= 3;
   });
   check(shared->snapshot().consumers == 2 && shared->snapshot().running,
         "Shared capture was not activated once for two consumers");
   require_result(engine->leave());
   check(shared->snapshot().consumers == 1 && shared->snapshot().running,
         "One publication stopped shared capture");
-  const auto previous = second.track->snapshot().frames;
-  until(*engine, [&] { return second.track->snapshot().frames >= previous + 3; });
+  const auto previous = second->track->snapshot().frames;
+  until(*engine, [&] { return second->track->snapshot().frames >= previous + 3; });
   require_result(other->unpublish(b.track.id));
   check(!shared->snapshot().running && shared->snapshot().consumers == 0,
         "Last publication leaked capture");
@@ -336,7 +337,7 @@ void shared_capture() {
   await(*engine, joining);
   auto replacement = engine->publish_video(a);
   await(*engine, replacement);
-  until(*engine, [&] { return replacement.track->snapshot().frames >= 2; });
+  until(*engine, [&] { return replacement->track->snapshot().frames >= 2; });
   require_result(engine->close());
   check(!shared->snapshot().running, "Reusable source survived room close as active capture");
   require_result(other->close());
@@ -447,7 +448,7 @@ void media_leave_and_rejoin() {
     cancelled = true;
   }
   check(cancelled, "Leave failed to settle media operation");
-  check(active.track->snapshot().transport.state == TrackState::closed,
+  check(active->track->snapshot().transport.state == TrackState::closed,
         "Leave retained active media endpoint");
   wire->acknowledge = true;
   LiveKitRoomOptions room;
@@ -459,7 +460,7 @@ void media_leave_and_rejoin() {
   auto resumed = rtc->publish_video(spec);
   await(*rtc, resumed);
   until(*rtc, [&] { return callbacks >= stopped + 2; });
-  check(resumed.track->snapshot().transport.epoch > active.track->snapshot().transport.epoch,
+  check(resumed->track->snapshot().transport.epoch > active->track->snapshot().transport.epoch,
         "Rejoined media reused the old epoch");
   require_result(rtc->close());
   require_result(rtc->close());

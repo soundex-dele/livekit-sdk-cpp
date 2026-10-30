@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -20,7 +21,7 @@ void check(bool ok, const char* message) {
 }
 
 template <class Future>
-auto await(engine::RtcEngine& engine, Future future) {
+auto await(livekit::sdk::app_support::BlockingRtc& engine, Future future) {
   return require_result(std::move(future));
 }
 
@@ -56,8 +57,8 @@ int main() {
   try {
     const auto kind = std::getenv("LIVEKIT_MEDIA_ENCRYPTION");
     const bool encrypted = kind && std::string(kind) == "1";
-    auto tx = require_result(engine::create_livekit_engine()),
-         rx = require_result(engine::create_livekit_engine());
+    auto tx = require_result(livekit::sdk::app_support::create_blocking_engine()),
+         rx = require_result(livekit::sdk::app_support::create_blocking_engine());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
     livekit::sdk::app_support::RtcEventMailbox tx_events(*tx);
     LiveKitRoomOptions opts;

@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -38,8 +39,8 @@ int main() {
   try {
     std::mutex mutex;
     std::array<Observation, 2> observed;
-    auto tx = require_result(create_livekit_engine(AudioOutputOptions{}));
-    auto rx = require_result(create_livekit_engine(AudioOutputOptions{}));
+    auto tx = require_result(livekit::sdk::app_support::create_blocking_engine(AudioOutputOptions{}));
+    auto rx = require_result(livekit::sdk::app_support::create_blocking_engine(AudioOutputOptions{}));
     livekit::sdk::app_support::RtcEventMailbox rx_events;
     rx_events.attach(*rx);
     LiveKitRoomOptions options;

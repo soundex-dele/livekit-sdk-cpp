@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_event_mailbox.hpp"
 #include "rtc_result.hpp"
 #ifndef LIVEKIT_TEST_RTC_NODES
@@ -47,13 +48,10 @@ auto get(T result) {
 template <class T>
 auto get(std::future<T> future) {
   check(future.wait_for(2s) == std::future_status::ready, "Operation hung");
-  if constexpr (
-      std::is_same_v<T, livekit::sdk::ErrorCode> || requires(T value) { value.empty(); } ||
-      requires(T value) { value.get(); } ||
-      requires(T value) {
-        value.has_value();
-        value.error();
-      }) {
+  if constexpr (std::is_same_v<T, livekit::sdk::ErrorCode> || requires(T value) {
+                  value.has_value();
+                  value.error();
+                }) {
     return get(future.get());
   } else {
     return future.get();
@@ -304,7 +302,7 @@ void indexed_work_contract() {
 
 void dirty_track_dispatch_contract() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   std::vector<std::shared_ptr<PublishedTrack>> tracks;
@@ -366,7 +364,7 @@ void dirty_track_dispatch_contract() {
 
 void asynchronous_detachment() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   auto original = get(room.publish(video("reused")));
   auto peer = get(room.publish(video("peer")));
@@ -451,7 +449,7 @@ void bounded_event_admission() {
 
 void permission_controls() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   auto opts = options();
   opts.subscription_permissions = SubscriptionPermissions{false, {{"viewer", false, {"camera"}}}};
@@ -544,7 +542,7 @@ void permission_controls() {
 
 void statistics_events() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   auto opts = options();
   opts.max_events = 2;
@@ -593,7 +591,8 @@ void statistics_events() {
   get(room.leave());
   auto bad = options();
   bad.stats_interval = 199ms;
-  RoomEngine invalid([] { return std::make_unique<FakeTransport>(std::make_shared<Harness>()); });
+  livekit::sdk::app_support::BlockingRoom invalid(
+      [] { return std::make_unique<FakeTransport>(std::make_shared<Harness>()); });
   bool rejected = false;
   try {
     get(invalid.join(bad));
@@ -605,7 +604,7 @@ void statistics_events() {
 
 void receive_demand_controls() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   auto descriptor = video("receive");
@@ -745,7 +744,7 @@ void receive_demand_controls() {
 
 void publication_sources() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   for (auto source :
@@ -820,7 +819,7 @@ void mute_contract() {
           "Native rates overrode local mute gate");
   }
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   auto descriptor = video("muted");
@@ -906,7 +905,7 @@ template <class T>
 concept HasEventPolling = requires(T& value) { value.next_event(); };
 template <class T>
 concept HasFailurePolling = requires(T& value) { value.next_failure(); };
-static_assert(!HasEventPolling<RoomEngine>);
+static_assert(!HasEventPolling<livekit::sdk::rtc::RoomEngine>);
 
 #ifndef LIVEKIT_TEST_RTC_NODES
 void task_queue_wakeup_contract() {
@@ -943,7 +942,7 @@ void task_queue_wakeup_contract() {
 
 void room_callback_contract() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   std::promise<void> entered, release;
   auto entered_future = entered.get_future();
   auto released = release.get_future().share();
@@ -953,9 +952,9 @@ void room_callback_contract() {
     ++callbacks;
     check(std::this_thread::get_id() != caller, "Room callback ran on the caller");
     if (event.kind == RoomEventKind::connected) {
-      livekit::sdk::ErrorCode code;
-      auto rejected = room.publish(video("callback-publication"), &code);
-      check(code == livekit::sdk::ErrorCode::invalid_thread, "Callback control was accepted");
+      auto rejected = room.publish(video("callback-publication"));
+      check(!rejected && rejected.error().code == livekit::sdk::ErrorCode::invalid_thread,
+            "Callback control was accepted");
       entered.set_value();
       check(released.wait_for(2s) == std::future_status::ready, "Callback release timed out");
     } else if (event.kind == RoomEventKind::track_ready) {
@@ -963,18 +962,20 @@ void room_callback_contract() {
       check(released.wait_for(2s) == std::future_status::ready, "Callback release timed out");
     }
   }));
-  get(room.join(options()));
+  auto joining = async_control([&] { return room.join(options()); });
   get(std::move(entered_future));
   auto removed = std::async(std::launch::async, [&] { get(room.set_event_handler({})); });
   check(removed.wait_for(30ms) == std::future_status::timeout,
         "Handler removal did not fence an in-flight callback");
   release.set_value();
+  get(std::move(joining));
   get(std::move(removed));
   const auto before = callbacks.load();
   get(room.leave());
   check(callbacks == before, "Callback ran after removal completed");
   get(room.set_event_handler(
       [](const RoomEvent&) { throw std::runtime_error("callback failure"); }));
+  (void)room.join(options());
   eventually([&] { return room.snapshot().state == ConnectionState::failed; },
              "Throwing callback escaped the task queue boundary");
   get(room.set_event_handler({}));
@@ -982,27 +983,46 @@ void room_callback_contract() {
 
 void mute_event_overflow() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   auto opts = options();
   opts.max_events = 1;
   get(room.join(opts));
   check(bool(room_events.take_event(1s)), "Missing connected event");
-  get(room.set_event_handler({}));
   auto track = get(room.publish(video("event-capacity")));
+  std::promise<void> entered, release;
+  auto released = release.get_future().share();
+  get(room.set_event_handler([&](const RoomEvent& event) {
+    if (event.track_id == "block-notifications") {
+      entered.set_value();
+      released.wait();
+    }
+  }));
+  TransportEvent block{TransportEventKind::remote_track_added, {"block-notifications", 1}};
+  block.descriptor = video("block-notifications");
+  h->push(block);
+  get(entered.get_future());
+  const auto wakes = room.snapshot().controller_wakeups;
+  block.binding.id = "queued-notification";
+  block.descriptor = video("queued-notification");
+  h->push(block);
+  eventually([&] { return room.snapshot().controller_wakeups > wakes; },
+             "Queued event not serviced");
   bool rejected = false;
   try {
     get(track->set_muted(true));
   } catch (const livekit::sdk::SDKError& e) {
     rejected = e.code() == livekit::sdk::ErrorCode::resource_exhausted;
   }
+  release.set_value();
   check(rejected && !track->snapshot().muted, "Event overflow left failed mute intent");
   {
     std::lock_guard lock(h->mutex);
     check(h->mutes.empty(), "Event overflow dispatched unobservable native control");
   }
   room_events.attach(room);
-  check(bool(room_events.take_event(1s)), "Missing publication event");
+  while (room_events.take_event(0ms)) {
+  }
   get(track->set_muted(true));
   check(room.snapshot().state == ConnectionState::connected && track->snapshot().muted,
         "Rejected mute retained a double-completing promise");
@@ -1011,7 +1031,7 @@ void mute_event_overflow() {
 void participant_controls() {
   using livekit::sdk::ErrorCode;
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   auto opts = options();
   opts.signal_protocol = 15;
@@ -1097,10 +1117,10 @@ void participant_controls() {
       async_control([&] { return room.update_local_participant({"queued", {}, {}}, {200ms}); });
   auto queued_request = request(6);
   auto leaving = async_control([&] { return room.leave(); });
-  check(leaving.wait_for(20ms) == std::future_status::timeout,
-        "Leave preempted participant update");
+  check(queued.wait_for(2s) == std::future_status::ready,
+        "Leave did not interrupt participant update");
+  rejects(queued.get(), ErrorCode::outcome_unknown);
   respond(queued_request);
-  get(std::move(queued));
   get(std::move(leaving));
   rejects(room.update_local_participant({"closed", {}, {}}), ErrorCode::session_closed);
   bool invalid = false;
@@ -1114,7 +1134,7 @@ void participant_controls() {
 
 void session_lifetime() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   auto opts = options();
   opts.max_events = 4;
@@ -1255,7 +1275,7 @@ void feedback_admission() {
 
 void multi_stream_and_recovery() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   auto a = get(room.publish(video("camera-a")));
@@ -1313,7 +1333,8 @@ void multi_stream_and_recovery() {
 
 void receive_and_lifetime() {
   auto h = std::make_shared<Harness>();
-  auto room = std::make_unique<RoomEngine>([h] { return std::make_unique<FakeTransport>(h); });
+  auto room = std::make_unique<livekit::sdk::app_support::BlockingRoom>(
+      [h] { return std::make_unique<FakeTransport>(h); });
   get(room->join(options()));
   auto a = get(room->subscribe(video("remote-a")));
   auto b = get(room->subscribe(video("remote-b")));
@@ -1356,7 +1377,7 @@ void receive_and_lifetime() {
 
 void timeout_and_reused_identity() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   auto opts = options();
   opts.operation_timeout = 50ms;
@@ -1397,7 +1418,7 @@ void timeout_and_reused_identity() {
 
 void cancel_pending_and_isolate_failure() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   {
@@ -1560,7 +1581,7 @@ class FeedbackConsumer : public graphflow::core::GraphNode {
 
 void pipeline_contract() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   auto a = get(room.publish(video("a")));
@@ -1642,7 +1663,7 @@ class CallbackConsumer final : public graphflow::core::GraphNode {
 
 void source_worker_contract() {
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   get(room.join(options()));
   auto slow_track = get(room.subscribe(video("slow-source", 2)));
@@ -1735,7 +1756,7 @@ void source_worker_contract() {
 
 void engine_callback_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc engine([h] { return std::make_unique<FakeTransport>(h); });
   std::promise<void> connected, failed;
   auto connected_future = connected.get_future();
   auto failed_future = failed.get_future();
@@ -1745,13 +1766,14 @@ void engine_callback_contract() {
       {[&](const RoomEvent& event) {
          if (event.kind == RoomEventKind::connected) {
            callback_thread = std::this_thread::get_id();
-           livekit::sdk::ErrorCode code;
-           auto rejected = engine.publish(video("callback-control"), &code);
-           check(code == livekit::sdk::ErrorCode::invalid_thread, "Callback control accepted");
+
+           auto rejected = engine.publish(video("callback-control"));
+           check(!rejected && rejected.error().code == livekit::sdk::ErrorCode::invalid_thread,
+                 "Callback control accepted");
            connected.set_value();
          }
        },
-       [&](const engine::RtcEngine::GraphFailure& failure) {
+       [&](const livekit::sdk::app_support::BlockingRtc::GraphFailure& failure) {
          check(std::this_thread::get_id() == callback_thread,
                "Engine notifications did not share a serial queue");
          check(failure.id == "failed-graph" && failure.publication &&
@@ -1779,21 +1801,21 @@ void engine_callback_contract() {
 
 void active_failure_correlation_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc engine([h] { return std::make_unique<FakeTransport>(h); });
   std::promise<std::shared_ptr<const livekit::sdk::FailureInfo>> graph_report, room_report;
   auto graph_result = graph_report.get_future(), room_result = room_report.get_future();
   std::atomic<size_t> notifications{0};
-  get(engine.set_callbacks({[&](const RoomEvent& event) {
-                              if (event.kind == RoomEventKind::track_failed &&
-                                  event.track_id == "fault") {
-                                room_report.set_value(event.failure);
-                              }
-                            },
-                            [&](const engine::RtcEngine::GraphFailure& failure) {
-                              if (++notifications == 1) {
-                                graph_report.set_value(failure.failure);
-                              }
-                            }}));
+  get(engine.set_callbacks(
+      {[&](const RoomEvent& event) {
+         if (event.kind == RoomEventKind::track_failed && event.track_id == "fault") {
+           room_report.set_value(event.failure);
+         }
+       },
+       [&](const livekit::sdk::app_support::BlockingRtc::GraphFailure& failure) {
+         if (++notifications == 1) {
+           graph_report.set_value(failure.failure);
+         }
+       }}));
   get(engine.join(options()));
   auto node = std::make_shared<graphflow::core::GraphNode>("codec.failure", nullptr);
   std::shared_ptr<PublishedTrack> endpoint;
@@ -1858,7 +1880,7 @@ void active_failure_correlation_contract() {
 
 void engine_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc engine([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox engine_events(engine);
   get(engine.join(options()));
   auto first = async_control([&] { return engine.publish(video("first")); });
@@ -1958,13 +1980,14 @@ class GraphRelay : public graphflow::core::GraphNode {
   }
 };
 
-// Registry control is independent from RoomEngine. Only the test's composition
+// Registry control is independent from livekit::sdk::app_support::BlockingRoom. Only the test's composition
 // root creates/detaches endpoints, just as the production facade does.
 void independent_registry_contract() {
   static_assert(std::is_default_constructible_v<engine::TrackGraphRegistry>);
-  static_assert(!std::is_constructible_v<engine::TrackGraphRegistry, RoomEngine&>);
+  static_assert(!std::is_constructible_v<engine::TrackGraphRegistry,
+                                         livekit::sdk::rtc::RoomEngine&>);
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
   auto endpoint = get(room.publish(video("registry")));
   auto receiver = get(room.subscribe(video("registry-receive")));
@@ -1993,7 +2016,7 @@ void independent_registry_contract() {
 
 void coordinated_detachment_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc rtc([h] { return std::make_unique<FakeTransport>(h); });
   get(rtc.join(options()));
   std::atomic<int> stopped{0};
   std::weak_ptr<GraphRelay> retained;
@@ -2042,7 +2065,7 @@ class RejectGraphInit final : public graphflow::core::GraphNode {
 
 void graph_prepare_rollback_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc rtc([h] { return std::make_unique<FakeTransport>(h); });
   get(rtc.join(options()));
   for (bool publication : {true, false}) {
     int stopped = 0;
@@ -2054,16 +2077,23 @@ void graph_prepare_rollback_contract() {
     };
     auto failed = publication ? rtc.graph().publish_graph(video("init-fail"), factory)
                               : rtc.graph().subscribe_graph(video("init-fail"), factory);
-    check(failed.empty() && stopped == 1, "Graph init rollback did not quiesce exactly once");
+    check(!failed && stopped == 1, "Graph init rollback did not quiesce exactly once");
     auto status = rtc.room().snapshot();
     check(status.publications == 0 && status.subscriptions == 0,
           "Graph init rollback leaked native endpoint");
   }
+  const auto cause = livekit::sdk::describe_failure(std::make_exception_ptr(livekit::sdk::SDKError(
+      livekit::sdk::ErrorDomain::media, livekit::sdk::ErrorCode::processing_failed,
+      "factory failure", true, 503)));
   auto failed = rtc.graph().publish_graph(
       video("factory-fail"),
-      [](auto) -> engine::TrackGraphSpec { throw std::runtime_error("factory failure"); });
-  check(failed.empty() && rtc.room().snapshot().publications == 0,
-        "Factory rollback leaked endpoint");
+      [cause](auto) -> engine::TrackGraphSpec { throw livekit::sdk::SDKError(cause); });
+  check(!failed && rtc.room().snapshot().publications == 0, "Factory rollback leaked endpoint");
+  check(failed.error().id == cause->id && failed.error().domain == cause->domain &&
+            failed.error().code == cause->code && failed.error().message == cause->message &&
+            failed.error().retryable && failed.error().backend_reason == 503 &&
+            failed.error().context.track_id == "factory-fail",
+        "Public graph result lost structured failure details");
   // Reusing a failed id must not be removed by a delayed report from its old lease.
   get(rtc.publish(video("init-fail")));
   get(rtc.set_muted("init-fail", false));
@@ -2077,7 +2107,7 @@ void graph_prepare_rollback_contract() {
 
 void composed_graph_contract() {
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine engine([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc engine([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox engine_events(engine);
   get(engine.join(options()));
   std::atomic<int> activations{0}, quiescences{0};
@@ -2186,7 +2216,7 @@ void composed_graph_contract() {
 void room_reuse_contract() {
   auto h = std::make_shared<Harness>();
   int adapters = 0;
-  RoomEngine room([&] {
+  livekit::sdk::app_support::BlockingRoom room([&] {
     ++adapters;
     return std::make_unique<FakeTransport>(h);
   });
@@ -2225,23 +2255,25 @@ concept CanPublish = requires(T& value) { value.publish(TrackDescriptor{}); };
 static_assert(!CanLeave<RoomView> && !CanPublish<RoomView>);
 template <class T>
 concept HasPoll = requires(T& value) { value.poll(); };
-static_assert(!HasEventPolling<engine::RtcEngine> && !HasFailurePolling<engine::RtcEngine>);
-static_assert(!HasPoll<engine::RtcEngine> && !HasPoll<engine::TrackGraphRegistry> &&
-              !HasPoll<engine::SubscribePipeline> && !HasPoll<engine::PublishPipeline> &&
-              !HasPoll<nodes::RtcSubscribeNode>);
+static_assert(!HasEventPolling<livekit::sdk::rtc::engine::RtcEngine> &&
+              !HasFailurePolling<livekit::sdk::rtc::engine::RtcEngine>);
+static_assert(!HasPoll<livekit::sdk::rtc::engine::RtcEngine> &&
+              !HasPoll<engine::TrackGraphRegistry> && !HasPoll<engine::SubscribePipeline> &&
+              !HasPoll<engine::PublishPipeline> && !HasPoll<nodes::RtcSubscribeNode>);
 
 void facade_lifecycle_contract() {
-  engine::RtcEngine invalid(std::unique_ptr<RoomEngine>{});
+  livekit::sdk::app_support::BlockingRtc invalid(
+      std::unique_ptr<livekit::sdk::app_support::BlockingRoom>{});
   check(invalid.join({}) == livekit::sdk::ErrorCode::invalid_argument,
         "Null room escaped as an exception");
   check(invalid.publication("missing").id.empty() && invalid.feedback("missing").epoch == 0,
         "Missing publication query did not return an empty value");
   auto h = std::make_shared<Harness>();
-  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc rtc([h] { return std::make_unique<FakeTransport>(h); });
   check(!rtc.media_enabled(), "Encoded facade unexpectedly installed media");
-  livekit::sdk::ErrorCode code;
-  const auto unavailable = rtc.publish_media({}, &code);
-  check(!unavailable.track && code == livekit::sdk::ErrorCode::unsupported,
+
+  const auto unavailable = rtc.publish_media({});
+  check(!unavailable && unavailable.error().code == livekit::sdk::ErrorCode::unsupported,
         "Missing media module was not reported");
   get(rtc.join(options()));
   {
@@ -2298,12 +2330,241 @@ void facade_lifecycle_contract() {
 }
 #endif
 
+// These contracts exercise the public observer APIs directly, without the
+// blocking supervisor bridge used by the older transport/media fixtures.
+struct ObserverLog {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::vector<std::pair<std::string, livekit::sdk::ErrorCode>> values;
+  std::thread::id notification_thread;
+  bool wrong_thread = false;
+
+  void add(std::string kind, livekit::sdk::ErrorCode code) {
+    std::lock_guard lock(mutex);
+    if (notification_thread == std::thread::id{}) {
+      notification_thread = std::this_thread::get_id();
+    }
+    wrong_thread |= notification_thread != std::this_thread::get_id();
+    values.emplace_back(std::move(kind), code);
+    changed.notify_all();
+  }
+
+  livekit::sdk::ErrorCode take(const std::string& kind) {
+    std::unique_lock lock(mutex);
+    auto find = [&] {
+      return std::find_if(values.begin(), values.end(),
+                          [&](const auto& v) { return v.first == kind; });
+    };
+    check(changed.wait_for(lock, 2s, [&] { return find() != values.end(); }),
+          "Observer completion missing");
+    auto it = find();
+    auto code = it->second;
+    values.erase(it);
+    return code;
+  }
+};
+
+struct RoomProbe final : RoomObserver {
+  explicit RoomProbe(std::shared_ptr<ObserverLog> log) : log(std::move(log)) {}
+
+  std::shared_ptr<ObserverLog> log;
+  std::function<void()> after_join;
+  std::shared_ptr<const livekit::sdk::FailureInfo> failure;
+
+  void on_join_completed(const OperationResult& result) override {
+    failure = result.failure;
+    log->add("join", result.code);
+    if (result && after_join) {
+      after_join();
+    }
+  }
+
+  void on_leave_completed(const OperationResult& r) override {
+    log->add("leave", r.code);
+  }
+
+  void on_close_completed(const OperationResult& r) override {
+    log->add("close", r.code);
+  }
+};
+
+struct PublicationProbe final : PublicationObserver {
+  explicit PublicationProbe(std::shared_ptr<ObserverLog> log) : log(std::move(log)) {}
+
+  std::shared_ptr<ObserverLog> log;
+  std::shared_ptr<PublishedTrack> track;
+
+  void on_publish_completed(const TrackId& id, Result<std::shared_ptr<PublishedTrack>> r) override {
+    if (r) {
+      track = *r;
+    }
+    log->add("publish:" + id, r ? livekit::sdk::ErrorCode::ok : r.error().code);
+  }
+
+  void on_unpublish_completed(const TrackId& id, const OperationResult& r) override {
+    log->add("remove:" + id, r.code);
+  }
+};
+#ifdef LIVEKIT_TEST_RTC_NODES
+struct RtcPublicationProbe final : engine::PublicationObserver {
+  explicit RtcPublicationProbe(std::shared_ptr<ObserverLog> log) : log(std::move(log)) {}
+
+  std::shared_ptr<ObserverLog> log;
+
+  void on_publish_completed(const TrackId& id, Result<TrackId> r) override {
+    log->add("publish:" + id, r ? livekit::sdk::ErrorCode::ok : r.error().code);
+  }
+
+  void on_unpublish_completed(const TrackId& id, const OperationResult& r) override {
+    log->add("remove:" + id, r.code);
+  }
+};
+#endif
+
+template <class Engine, class Publication>
+void observer_control_contract() {
+  using livekit::sdk::ErrorCode;
+  auto h = std::make_shared<Harness>();
+  h->connect = false;
+  auto log = std::make_shared<ObserverLog>();
+  auto room = std::make_shared<RoomProbe>(log);
+  auto publication = std::make_shared<Publication>(log);
+  Engine engine([h] { return std::make_unique<FakeTransport>(h); });
+  check(engine.join(options()) == ErrorCode::invalid_state, "Request without observer accepted");
+  engine.set_room_observer(room);
+  engine.set_publication_observer(publication);
+  auto opts = options();
+  opts.operation_timeout = 10s;
+  const auto started = SteadyClock::now();
+  check(engine.join(opts) == ErrorCode::ok, "Join admission failed");
+  check(SteadyClock::now() - started < 250ms, "Join waited for the network");
+  check(engine.join(opts) == ErrorCode::busy, "Duplicate join accepted");
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->starts == 1;
+      },
+      "Join not dispatched");
+  check(engine.publish(video("cancelled")) == ErrorCode::ok, "Queued publication rejected");
+  check(engine.publish(video("cancelled")) == ErrorCode::busy, "Duplicate publication accepted");
+  check(engine.leave() == ErrorCode::ok, "Leave admission failed");
+  check(log->take("join") == ErrorCode::cancelled, "Leave did not interrupt join");
+  check(log->take("publish:cancelled") == ErrorCode::cancelled, "Queued request lost cancellation");
+  check(log->take("leave") == ErrorCode::ok, "Leave did not finish");
+  {
+    std::lock_guard lock(h->mutex);
+    check(h->published.empty(), "Cancelled queued request reached transport");
+    h->connect = true;
+  }
+  std::atomic<ErrorCode> admission{ErrorCode::internal_error};
+  room->after_join = [&] { admission = engine.publish(video("from-observer")); };
+  check(engine.join(opts) == ErrorCode::ok, "Rejoin rejected");
+  check(log->take("join") == ErrorCode::ok, "Rejoin failed");
+  check(log->take("publish:from-observer") == ErrorCode::ok && admission == ErrorCode::ok,
+        "Observer could not submit the next operation");
+  check(engine.unpublish("from-observer") == ErrorCode::ok, "Unpublish rejected");
+  check(log->take("remove:from-observer") == ErrorCode::ok, "Unpublish completion missing");
+  {
+    std::lock_guard lock(h->mutex);
+    h->confirm = false;
+  }
+  check(engine.publish(video("late")) == ErrorCode::ok, "Delayed publish rejected");
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return h->published.size() == 2;
+      },
+      "Delayed publish not dispatched");
+  // Replacement must never receive a result for an operation it did not submit.
+  auto replacement_log = std::make_shared<ObserverLog>();
+  auto replacement = std::make_shared<Publication>(replacement_log);
+  engine.set_publication_observer(replacement);
+  BindingToken binding;
+  {
+    std::lock_guard lock(h->mutex);
+    binding = h->published.back();
+  }
+  h->push({TransportEventKind::published, binding, "late-sid"});
+  check(log->take("publish:late") == ErrorCode::ok, "Pending result changed observer");
+  {
+    std::lock_guard lock(replacement_log->mutex);
+    check(replacement_log->values.empty(), "Replacement received an old result");
+  }
+  check(engine.publish(video("expired")) == ErrorCode::ok, "Expiring observer request rejected");
+  replacement.reset();
+  check(engine.close() == ErrorCode::ok, "Close rejected");
+  check(log->take("close") == ErrorCode::ok, "Close did not complete after observer destruction");
+  check(engine.join(opts) == ErrorCode::session_closed, "Closed engine accepted control");
+  check(engine.close() == ErrorCode::session_closed,
+        "Repeated close accepted without a completion");
+  {
+    std::lock_guard lock(log->mutex);
+    check(!log->wrong_thread && log->notification_thread != std::this_thread::get_id(),
+          "Completion observers did not share a separate serial thread");
+    check(log->values.empty(), "Operation produced duplicate completions");
+  }
+}
+
+void observer_capacity_and_destruction(bool close_first) {
+  using livekit::sdk::ErrorCode;
+  auto h = std::make_shared<Harness>();
+  h->connect = false;
+  auto log = std::make_shared<ObserverLog>();
+  auto observer = std::make_shared<RoomProbe>(log);
+  auto publication = std::make_shared<PublicationProbe>(log);
+  auto room = std::make_unique<RoomEngine>([h] { return std::make_unique<FakeTransport>(h); });
+  room->set_room_observer(observer);
+  room->set_publication_observer(publication);
+  auto opts = options();
+  opts.operation_timeout = 10s;
+  check(room->join(opts) == ErrorCode::ok, "Join rejected");
+  for (int i = 0; i < 127; ++i) {
+    check(room->publish(video("queued-" + std::to_string(i))) == ErrorCode::ok,
+          "Queue filled prematurely");
+  }
+  check(room->publish(video("overflow")) == ErrorCode::resource_exhausted,
+        "Unbounded command queue");
+  if (close_first) {
+    check(room->close() == ErrorCode::ok, "Full queue prevented close admission");
+    check(log->take("close") == ErrorCode::ok, "Reserved close slot did not complete");
+  }
+  // Destruction cancels both active and queued work and drains all completions.
+  const auto started = SteadyClock::now();
+  room.reset();
+  check(SteadyClock::now() - started < 2s, "Destruction waited for join timeout");
+  check(log->take("join") == ErrorCode::cancelled, "Destructor lost active cancellation");
+  for (int i = 0; i < 127; ++i) {
+    check(log->take("publish:queued-" + std::to_string(i)) == ErrorCode::cancelled,
+          "Destructor lost queued cancellation");
+  }
+  std::lock_guard lock(log->mutex);
+  check(log->values.empty(), "Rejected submission produced a completion");
+}
+
+void observer_structured_failure() {
+  using namespace livekit::sdk;
+  auto log = std::make_shared<ObserverLog>();
+  auto observer = std::make_shared<RoomProbe>(log);
+  const auto failure = std::make_shared<FailureInfo>(FailureInfo{
+      next_failure_id(), ErrorDomain::transport, ErrorCode::unsupported,
+      "backend unavailable", false, 503});
+  RoomEngine room([failure]() -> std::unique_ptr<RoomTransport> { throw SDKError(failure); });
+  room.set_room_observer(observer);
+  check(room.join(options()) == ErrorCode::ok, "Backend failure confused admission with completion");
+  check(log->take("join") == ErrorCode::unsupported, "Observer lost backend code");
+  check(observer->failure && observer->failure->id == failure->id &&
+            observer->failure->backend_reason == 503 &&
+            observer->failure->domain == ErrorDomain::transport,
+        "Void completion lost structured failure details");
+}
+
 // Every protocol completion is driven independently of the operation lock.
 void serialized_join_leave() {
   for (int outcome = 0; outcome < 3; ++outcome) {
     auto h = std::make_shared<Harness>();
     h->connect = false;
-    RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+    livekit::sdk::app_support::BlockingRoom room(
+        [h] { return std::make_unique<FakeTransport>(h); });
     auto opts = options();
     opts.operation_timeout = 180ms;
     auto joining = async_control([&] { return room.join(opts); });
@@ -2314,24 +2575,9 @@ void serialized_join_leave() {
         },
         "Join not started");
     auto leaving = async_control([&] { return room.leave(); });
-    check(leaving.wait_for(25ms) == std::future_status::timeout, "Leave preempted join");
-    {
-      std::lock_guard lock(h->mutex);
-      check(h->stops == 0, "Leave stopped an in-flight join");
-    }
-    if (outcome == 0) {
-      h->push({TransportEventKind::connected});
-    }
-    if (outcome == 1) {
-      TransportEvent failure{TransportEventKind::terminal_error};
-      failure.error = "join rejected";
-      h->push(std::move(failure));
-    }
-    auto result = joining.get();
-    check((result == livekit::sdk::ErrorCode::ok) == (outcome == 0), "Wrong join result");
-    if (outcome == 2) {
-      check(result == livekit::sdk::ErrorCode::timeout, "Join deadline lost");
-    }
+    check(joining.wait_for(2s) == std::future_status::ready, "Leave did not interrupt join");
+    check(joining.get() == livekit::sdk::ErrorCode::cancelled,
+          "Interrupted join lost cancellation");
     get(std::move(leaving));
     check(room.snapshot().state == ConnectionState::closed, "Leave did not complete");
     {
@@ -2346,7 +2592,7 @@ void serialized_join_leave() {
 void queued_timeout_starts_after_lock() {
   auto h = std::make_shared<Harness>();
   h->connect = false;
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   auto opts = options();
   opts.operation_timeout = 500ms;
   opts.signal_protocol = 15;
@@ -2388,7 +2634,7 @@ void queued_timeout_starts_after_lock() {
 void close_waits_and_factory_reentry() {
   auto h = std::make_shared<Harness>();
   h->connect = false;
-  engine::RtcEngine rtc([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc rtc([h] { return std::make_unique<FakeTransport>(h); });
   auto joining = async_control([&] { return rtc.join(options()); });
   eventually(
       [&] {
@@ -2397,13 +2643,12 @@ void close_waits_and_factory_reentry() {
       },
       "Join not started");
   auto closing = async_control([&] { return rtc.close(); });
-  check(closing.wait_for(30ms) == std::future_status::timeout, "Close preempted join");
-  h->push({TransportEventKind::connected});
-  get(std::move(joining));
+  check(joining.wait_for(2s) == std::future_status::ready, "Close did not interrupt join");
+  check(joining.get() == livekit::sdk::ErrorCode::cancelled, "Close lost cancellation");
   get(std::move(closing));
   check((rtc.join(options()) != livekit::sdk::ErrorCode::ok), "Terminal engine accepted join");
   get(rtc.close());
-  engine::RtcEngine other([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRtc other([h] { return std::make_unique<FakeTransport>(h); });
   {
     std::lock_guard lock(h->mutex);
     h->connect = true;
@@ -2431,34 +2676,72 @@ void caller_thread_contract() {
   using livekit::sdk::ErrorCode;
   const auto caller = std::this_thread::get_id();
   auto h = std::make_shared<Harness>();
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
-  check(room.join(options()) == ErrorCode::ok && h->owner == caller,
-        "Join did not execute on its caller");
-  ErrorCode code = ErrorCode::internal_error;
-  auto publication = room.publish(video("direct"), &code);
-  check(publication && code == ErrorCode::ok && h->publishing_thread == caller,
-        "Publish did not execute on its caller");
-  auto subscription = room.subscribe(video("direct-rx"), &code);
-  check(subscription && code == ErrorCode::ok && h->subscribing_thread == caller,
-        "Subscribe did not execute on its caller");
-  check(room.unpublish("direct") == ErrorCode::ok && h->removing_thread == caller,
-        "Remove did not execute on its caller");
-  check(room.leave() == ErrorCode::ok && h->stopping_thread == caller,
-        "Leave did not execute on its caller");
-  RoomEngine invalid(RoomEngine::TransportFactory{});
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
+  check(room.join(options()) == ErrorCode::ok && h->owner != caller,
+        "Join did not execute on the control worker");
+  auto publication = room.publish(video("direct"));
+  check(publication && h->publishing_thread == h->owner,
+        "Publish did not execute on the control worker");
+  auto subscription = room.subscribe(video("direct-rx"));
+  check(subscription && h->subscribing_thread == h->owner,
+        "Subscribe did not execute on the control worker");
+  check(room.unpublish("direct") == ErrorCode::ok && h->removing_thread == h->owner,
+        "Remove did not execute on the control worker");
+  check(room.leave() == ErrorCode::ok && h->stopping_thread == h->owner,
+        "Leave did not execute on the control worker");
+  livekit::sdk::app_support::BlockingRoom invalid(
+      livekit::sdk::app_support::BlockingRoom::TransportFactory{});
   check(invalid.join({}) == ErrorCode::invalid_argument,
         "Invalid factory was not returned as a code");
-  RoomEngine throwing([]() -> std::unique_ptr<RoomTransport> {
+  livekit::sdk::app_support::BlockingRoom throwing([]() -> std::unique_ptr<RoomTransport> {
     throw livekit::sdk::SDKError(livekit::sdk::ErrorDomain::transport, ErrorCode::unsupported,
                                  "Unavailable backend");
   });
   check(throwing.join({}) == ErrorCode::unsupported, "Factory exception escaped the engine");
 }
 
+void typed_publication_failure() {
+  using namespace livekit::sdk;
+  auto h = std::make_shared<Harness>();
+  h->confirm = false;
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
+  get(room.join(options()));
+  auto publishing = async_control([&] { return room.publish(video("denied")); });
+  eventually(
+      [&] {
+        std::lock_guard lock(h->mutex);
+        return !h->published.empty();
+      },
+      "Publish did not reach transport");
+  const auto cause = describe_failure(std::make_exception_ptr(
+      SDKError(ErrorDomain::signaling, ErrorCode::permission_denied, "Access denied", false, 403)));
+  TransportEvent event{TransportEventKind::operation_failed};
+  {
+    std::lock_guard lock(h->mutex);
+    event.binding = h->published.back();
+  }
+  event.error = cause->message;
+  event.failure = std::make_exception_ptr(SDKError(cause));
+  h->push(std::move(event));
+  check(publishing.wait_for(2s) == std::future_status::ready, "Publication failure hung");
+  const auto failed = publishing.get();
+  check(!failed && failed.error().id == cause->id &&
+            failed.error().code == ErrorCode::permission_denied &&
+            failed.error().domain == ErrorDomain::signaling &&
+            failed.error().backend_reason == 403 && failed.error().message == "Access denied" &&
+            failed.error().context.track_id == "denied",
+        "Public room result lost structured failure details");
+  const auto services = room.services();
+  check(!services && services.error().code == ErrorCode::unsupported &&
+            !services.error().message.empty(),
+        "Service access lost its failure result");
+  get(room.leave());
+}
+
 void typed_join_failure() {
   auto h = std::make_shared<Harness>();
   h->connect = false;
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   livekit::sdk::app_support::RtcEventMailbox room_events(room);
   LiveKitRoomOptions options;
   options.url = "ws://test";
@@ -2495,6 +2778,13 @@ void typed_join_failure() {
 
 int main() {
   try {
+    observer_control_contract<RoomEngine, PublicationProbe>();
+    observer_capacity_and_destruction(false);
+    observer_capacity_and_destruction(true);
+    observer_structured_failure();
+#ifdef LIVEKIT_TEST_RTC_NODES
+    observer_control_contract<engine::RtcEngine, RtcPublicationProbe>();
+#endif
     caller_thread_contract();
     serialized_join_leave();
     queued_timeout_starts_after_lock();
@@ -2526,6 +2816,7 @@ int main() {
     room_callback_contract();
     endpoint_wait_contract();
     room_reuse_contract();
+    typed_publication_failure();
     typed_join_failure();
     statistics_events();
     permission_controls();

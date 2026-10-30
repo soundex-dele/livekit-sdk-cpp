@@ -1,6 +1,7 @@
 #pragma once
 #include "livekit/rtc/room_engine.hpp"
 #include "livekit/rtc/media_config.hpp"
+#include "livekit/rtc/engine_observer.hpp"
 #include <memory>
 #include <optional>
 #include <string>
@@ -8,13 +9,12 @@
 namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
 
-// Single-room facade. Controls execute synchronously on the calling thread.
-// Operations return ErrorCode::ok on success. Creation returns an empty ID,
-// null pointer or empty media handle on failure; optional error is always set.
-// Backend exceptions are translated to error codes at the control boundary.
-// Controls share a session control context with the room, including protocol waits.
-// Call from application workers, never from notifications/media callbacks or hooks.
-// Stop and join all callers before destruction; close does not preempt an operation.
+// Single-room facade. Network/track controls enqueue work and return admission
+// status, never the operation result. Register observers before submitting.
+// Same-object/same-kind duplicates return busy. Completion is delivered once per
+// accepted request to its original observer (if alive). See observer.hpp for
+// threading/lifetime rules. leave/close interrupt and cancel pending work.
+// Stop application callers before destruction; never destroy from a callback.
 class RtcEngine final {
  public:
   explicit RtcEngine(RoomEngine::TransportFactory);
@@ -27,20 +27,19 @@ class RtcEngine final {
   ErrorCode enable_media(AudioOutputOptions = {});
   bool media_enabled() const;
   ErrorCode join(RoomOptions);
-  // Waits for preceding operations, then quiesces graphs before leaving.
+  // Cancels preceding requests, then quiesces graphs before leaving.
   ErrorCode leave();
-  // Terminal and idempotent. Rejects subsequent control operations.
+  // Terminal. Further submissions return session_closed.
   ErrorCode close();
 
-  MediaPublication publish_media(MediaPublishSpec, ErrorCode* error = nullptr);
-  MediaPublication publish_video(MediaPublishSpec, ErrorCode* error = nullptr);
-  MediaPublication publish_audio(MediaPublishSpec, ErrorCode* error = nullptr);
-  MediaSubscription subscribe_media(MediaSubscribeSpec, ErrorCode* error = nullptr);
-  std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput,
-                                                        ErrorCode* error = nullptr);
+  ErrorCode publish_media(MediaPublishSpec);
+  ErrorCode publish_video(MediaPublishSpec);
+  ErrorCode publish_audio(MediaPublishSpec);
+  ErrorCode subscribe_media(MediaSubscribeSpec);
+  ErrorCode create_shared_input(TrackDescriptor, MediaInput);
 
   // Encoded publication. Advanced graph composition requires graph_api.hpp.
-  TrackId publish(TrackDescriptor, ErrorCode* error = nullptr);
+  ErrorCode publish(TrackDescriptor);
   RtcGraphApi graph();
   ErrorCode unpublish(const TrackId&);
   ErrorCode unsubscribe(const TrackId&);
@@ -51,26 +50,10 @@ class RtcEngine final {
   TrackSnapshot publication(const TrackId&) const;
   SenderFeedback feedback(const TrackId&) const;
 
-  struct GraphFailure {
-    TrackId id;
-    bool publication;
-    std::string message;
-    // The same failure may also arrive as a RoomEvent. Deduplicate by failure->id;
-    // no ordering between the two notification paths is guaranteed.
-    std::shared_ptr<const FailureInfo> failure;
-  };
-
-  struct Callbacks {
-    std::function<void(const RoomEvent&)> on_event;
-    std::function<void(const GraphFailure&)> on_failure;
-  };
-
-  // Serial notification task queue, separate from application callers and media workers.
-  // Register before join. Replacing/clearing callbacks fences old invocations.
-  // Synchronous control and destruction from a callback are forbidden.
-  // Serialize registration calls. Callback arguments are borrowed for the call.
-  // Callbacks must return promptly; throwing disables them and fails the room.
-  ErrorCode set_callbacks(Callbacks);
+  using GraphFailure = engine::GraphFailure;
+  void set_room_observer(std::weak_ptr<RoomObserver>);
+  void set_publication_observer(std::weak_ptr<PublicationObserver>);
+  void set_subscription_observer(std::weak_ptr<SubscriptionObserver>);
 
   // Borrowed view valid until engine destruction. No room/track teardown escape hatch.
   const RoomView& room() const;
@@ -78,12 +61,13 @@ class RtcEngine final {
  private:
   friend class RtcGraphApi;
   Result<MediaPublication> start_media(MediaPublishSpec, std::optional<MediaKind> expected = {});
+  Result<std::shared_ptr<SharedMediaInput>> create_shared_input_impl(TrackDescriptor, MediaInput);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 
 // Encoded-only factory links LiveKit::RTCEngine; overload with audio options
 // installs media support and links LiveKit::RTCMediaEngine.
-std::unique_ptr<RtcEngine> create_livekit_engine(ErrorCode* error = nullptr);
-std::unique_ptr<RtcEngine> create_livekit_engine(AudioOutputOptions, ErrorCode* error = nullptr);
+Result<std::unique_ptr<RtcEngine>> create_livekit_engine();
+Result<std::unique_ptr<RtcEngine>> create_livekit_engine(AudioOutputOptions);
 }  // namespace livekit::sdk::rtc::engine

@@ -19,33 +19,25 @@ GraphFlow engine; applications using the facade link RTCMediaEngine.
 
 ## Execution
 
-RTC control calls execute on the calling application worker, serialized by one
-non-recursive operation mutex owned by RoomEngineState. The lock covers protocol
-waits and teardown. Private `*_locked` paths reuse ownership without relocking.
-There is no engine control TaskQueue, command mailbox or RtcExecutor.
+RtcEngine, RoomEngine and RtcGraphApi submit controls to a shared bounded
+AsyncControl queue and immediately return ErrorCode admission status. Room,
+publication and subscription observers receive completion results separately.
+No public RequestId or per-call completion callable is required. Value completions
+retain Result<T>; other completions carry OperationResult with structured FailureInfo.
+Factories, services and snapshots retain their immediate interfaces. Low-level
+track controls, pipeline close, RoomServices and Player retain their own contracts.
 
-RtcEngine, RoomEngine and RtcGraphApi return ErrorCode or concrete values.
-Creation failure returns an empty ID, null pointer or empty media handle; the
-optional ErrorCode output is always assigned. Backend exceptions are caught at
-the boundary. Detailed runtime failures retain their correlation ID in events
-and snapshots. Track controls, pipeline close and MediaTrack::check() return ErrorCode.
-RoomServices, Player and native SDP/statistics retain their independent APIs.
+The control worker serializes private protocol operations with the session and
+controller mutexes, pumping events/deadlines while waiting. The background worker
+uses the same controller mutex for idle media/event processing and recovery.
+leave/close interrupt protocol waits and cancel queued requests; close is terminal.
+Timeout budgets start when a queued operation begins execution. Destruction drains
+work and notifications; application callers must stop before destroying the engine.
 
-The caller acquires the controller mutex, submits directly to the adapter and
-pumps events/deadlines until its stack-owned operation completes. No promise,
-future, heap-shared completion record or cross-thread result handoff is used.
-The background worker acquires the same mutex for idle media/event processing
-and recovery; adapters therefore require serialization, not thread affinity.
-Native completion callbacks only queue events and signal the wake source.
-Join, leave, close and track controls wait for preceding operations; protocol timeouts
-start after acquiring the lock. Close is terminal and idempotent, not a cancellation
-channel. Destructor callers must first join all outstanding member calls.
-
-Room and graph notifications run on the existing serial notification queue.
-Callbacks, graph factories/hooks and SDK media workers reject control reentry
-before acquiring the operation lock (`invalid_thread`), including nested sessions.
-Applications post requests to their own worker and never wait for that worker from
-a callback. Clearing callbacks fences prior invocations. Callback arguments are borrowed.
+Observers run on the room's serial notification queue and may submit new asynchronous
+controls. They must not block or destroy the engine. Observers are weakly registered;
+replacement does not transfer pending results to the replacement. See
+[observer contracts](rtc-observers.md) for admission, cancellation and lifetime details.
 
 Graphs start nodes, activate initial sender feedback, then start producers.
 Teardown closes admission, quiesces source/codec/output workers, stops GraphEngine,
@@ -75,7 +67,7 @@ unpublish. Frame timing is separate from storage, so reconnect retags a branch's
 new input without modifying a buffer shared by another room. Shared audio keeps
 the source sample clock, including gaps, rather than recomputing RTP time from
 callback arrival. Invalid shared queue limits fail synchronously without attaching
-a consumer; graph startup failures return an empty media handle and an optional error code.
+a consumer; graph startup failures return a failed Result with structured error details.
 
 ## Audio and synchronization
 
@@ -128,10 +120,10 @@ be reported separately; this document is not a device-acceptance claim.
    `engine.graph().subscribe/publish_graph/subscribe_graph`. Plain encoded
    `engine.publish(descriptor)` remains on the ordinary facade.
 3. Remove all RtcEngine/pipeline poll calls and receive-frame poll budgets.
-   Controls now complete synchronously. Use an application worker when the UI
-   must remain responsive. Nodes actively report failures; failed graphs are reclaimed
-   on the next control operation or close. Replace engine event/failure
-   reads with `set_callbacks`, or `RoomEngine::set_event_handler` for backend-only use.
+   Controls return admission status immediately. Implement separate room,
+   publication and subscription observers to receive completion/results/events;
+   register them before submission. No RequestId or per-call completion callable
+   is exposed. leave/close cancel outstanding work. See [observer contracts](rtc-observers.md).
 4. Media callbacks now run on per-output dispatchers. Retaining immutable frames
    is safe; callbacks must not wait for lifecycle completion.
 

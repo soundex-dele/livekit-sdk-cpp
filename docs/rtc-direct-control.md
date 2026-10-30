@@ -1,3 +1,5 @@
+> 历史记录：本文同步控制契约已被 [observer 异步控制](rtc-observers.md) 替代。当前 RtcEngine、RoomEngine 和 RtcGraphApi 的返回码仅表示受理，完成结果通过分职责 observer 通知。以下代码和验证记录描述旧版本。
+
 # RTC 同步控制接口
 
 `RtcEngine`、`RoomEngine` 和高级图接口 `RtcGraphApi` 直接在调用线程执行控制逻辑，不投递控制任务，也不返回或使用 promise/future。媒体节点、网络和通知仍保留各自的后台执行机制。

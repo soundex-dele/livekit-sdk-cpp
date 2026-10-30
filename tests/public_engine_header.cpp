@@ -16,7 +16,17 @@ static_assert(
     std::is_same_v<decltype(std::declval<const engine::MediaTrack&>().check()), ErrorCode>);
 static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().join({})), ErrorCode>);
 static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().publish({})),
-                             std::shared_ptr<PublishedTrack>>);
-static_assert(std::is_same_v<decltype(std::declval<engine::RtcEngine&>().publish({})), TrackId>);
+                             ErrorCode>);
+static_assert(
+    std::is_same_v<decltype(std::declval<engine::RtcEngine&>().publish({})), ErrorCode>);
 static_assert(std::is_same_v<decltype(std::declval<engine::RtcEngine&>().publish_media({})),
-                             engine::MediaPublication>);
+                             ErrorCode>);
+
+static_assert(std::is_same_v<decltype(std::declval<RoomEngine&>().subscribe({})),
+                             ErrorCode>);
+static_assert(std::is_same_v<decltype(std::declval<const RoomView&>().services()),
+                             Result<std::shared_ptr<RoomServices>>>);
+static_assert(std::is_same_v<decltype(engine::create_livekit_engine()),
+                             Result<std::unique_ptr<engine::RtcEngine>>>);
+static_assert(std::is_same_v<decltype(engine::create_livekit_engine(AudioOutputOptions{})),
+                             Result<std::unique_ptr<engine::RtcEngine>>>);

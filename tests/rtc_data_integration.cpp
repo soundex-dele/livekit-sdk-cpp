@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "data_event_mailbox.hpp"
@@ -49,7 +50,7 @@ void eventually(F test) {
 int main() {
   try {
     const bool encrypted = env("LIVEKIT_DATA_ENCRYPTION") == "1";
-    auto tx = require_result(create_livekit_room()), rx = require_result(create_livekit_room());
+    auto tx = require_result(livekit::sdk::app_support::create_blocking_room()), rx = require_result(livekit::sdk::app_support::create_blocking_room());
     auto sending = require_result(tx->services()), receiving = require_result(rx->services());
     app_support::DataEventMailbox data_events(receiving);
     receiving->register_rpc("echo", [](RpcInvocation call, RpcCompletion complete) {

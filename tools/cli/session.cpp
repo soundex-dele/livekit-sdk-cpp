@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "data_event_mailbox.hpp"
@@ -128,7 +129,7 @@ void run_session(const SessionOptions& options, std::function<void(const Json&)>
   std::map<TrackId, std::shared_ptr<Track>> tracks;
   auto display =
       options.video_playout ? std::make_shared<lk::VideoPlayout>(display_events) : nullptr;
-  auto engine = require_result(engine::create_livekit_engine(
+  auto engine = require_result(livekit::sdk::app_support::create_blocking_engine(
       livekit::sdk::rtc::AudioOutputOptions{}));  // Destroy before consumers/display.
   livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
   livekit::sdk::app_support::DataEventMailbox data_events(

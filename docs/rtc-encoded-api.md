@@ -1,4 +1,4 @@
-> `RtcEngine`、`RoomEngine` 和 `RtcGraphApi` 在调用线程同步执行。操作返回 `ErrorCode`（成功为 `ok`），创建接口直接返回对象、ID 或媒体句柄；失败为空值，可通过可选的 `ErrorCode*` 获取原因。引擎边界将后端异常转成错误码，不使用 promise/future 或控制命令队列。`require_result` 仅是仓库旧应用的异常处理适配器，不属于 SDK API。轨道控制、流水线关闭与 `MediaTrack::check()` 同样直接返回 `ErrorCode`。通知/媒体回调与图 hook 禁止重入同步控制。
+> RtcEngine、RoomEngine 和 RtcGraphApi 的控制接口返回异步受理状态，实际结果通过房间、发布、订阅 observer 通知；详见 [observer 异步控制](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
 
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)。自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
@@ -37,24 +37,14 @@ options.token = token;
 // 房间事件由通知任务队列回调；注册后再 join。
 std::promise<TrackDescriptor> discovered;
 bool selected = false;  // 只在串行通知队列访问。
-room->set_event_handler([&](const RoomEvent& event) {
-  if (!selected && event.kind == RoomEventKind::remote_track_added) {
-    selected = true;
-    discovered.set_value(*event.descriptor);
-  }
-});
-require_result(room->join(options));
-auto descriptor = discovered.get_future().get();
-room->set_event_handler({});  // 等待正在执行的回调返回。
-descriptor.id = "camera-input";
-auto track = require_result(room->subscribe(descriptor));
-auto received = track->read(100ms);  // 媒体读取不占用通知队列。
-if (received.status == ReadStatus::frame) {
-  auto frame = std::move(*received.frame);
-  // frame.buffer.bytes() 是完整 Opus/VP8/H26x 编码数据。
-}
-require_result(track->close());
-require_result(room->leave());
+// 上层分别实现 RoomObserver、PublicationObserver 与 SubscriptionObserver。
+room->set_room_observer(room_observer);
+room->set_publication_observer(publication_observer);
+room->set_subscription_observer(subscription_observer);
+require_result(room->join(options));  // 仅受理。
+// on_join_completed 成功后可发布；on_publish_completed 返回 PublishedTrack。
+// 离开完成通过 on_leave_completed 通知。
+
 ```
 
 发现事件里的 `remote_sid` 是订阅选择器，不能省略或当作可重用的本地 ID。相同远端 SID 只创建一个后端订阅；需要多个消费者时，在媒体图内分流。
@@ -104,13 +94,13 @@ require_result(room->join(options));
 
 运行中用 `room->set_subscription_permissions(policy)` 完整替换策略。`all_participants=true` 允许全部成员，不能同时提供成员列表；`all_tracks=true` 允许指定 identity 的全部轨道，不能再指定 track_ids。false 加空成员列表拒绝全部订阅。最多 64 个成员、每个成员 128 个轨道 ID、总文本 32,000 字节，拒绝重复 identity/ID 和非法 UTF-8。
 
-`ErrorCode::ok` 表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
+`on_subscription_permissions_completed` 的成功结果表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
 
-订阅方通过 `subscription_permission_changed` 事件的 `permission` 读取 publisher participant SID、track SID 和 allowed。该通知可以在订阅尚未绑定时到达；阻塞等待中的 subscribe 调用 仍受 operation_timeout 限制，授权及时恢复可继续完成，超时后需要重新 subscribe。运行中撤销与重新授权由服务器驱动转发变化；已绑定句柄不因权限提示自动销毁。权限通知带房间 epoch，旧会话事件不会混入当前会话。
+订阅方通过 `subscription_permission_changed` 事件的 `permission` 读取 publisher participant SID、track SID 和 allowed。该通知可以在订阅尚未绑定时到达；待完成的 subscribe 操作仍受 operation_timeout 限制，授权及时恢复可继续完成，超时后需要重新 subscribe。运行中撤销与重新授权由服务器驱动转发变化；已绑定句柄不因权限提示自动销毁。权限通知带房间 epoch，旧会话事件不会混入当前会话。
 
 ### 修改自己的成员信息
 
-使用 `RoomEngine::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；只在服务端 ACK 后返回 `ErrorCode::ok`，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `ErrorCode::permission_denied`。
+使用 `RoomEngine::update_local_participant(ParticipantUpdate, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；只在服务端 ACK 后通过 `on_participant_update_completed` 通知成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `ErrorCode::permission_denied`。
 
 ```cpp
 livekit::sdk::rtc::ParticipantUpdate update;
@@ -122,7 +112,7 @@ require_result(room->update_local_participant(std::move(update)));
 
 空名称/元数据遵循 LiveKit 线协议语义，表示保持原值；空属性值删除该键，未包含的键保持原值。ACK 和本地/远端成员快照是独立观测，应用通过 `session_changed` 读取随后更新的状态。
 
-默认超时使用房间的 `operation_timeout`；`ControlOptions` 可指定不超过五分钟的超时与停止令牌。请求在派发前取消/过期会明确失败；派发后取消、超时或中断可能已经改变服务器状态，返回 `outcome_unknown`，不会自动重放。重连后的调用使用新 epoch 和未复用的请求 ID，迟到 ACK 不能完成新操作。每次更新最多 64 KiB，内部待确认记录上限为 128 项，公共调用由操作锁串行准入。更新不会自动持久化为下一次入会的身份配置。
+默认超时使用房间的 `operation_timeout`；`ControlOptions` 可指定不超过五分钟的超时与停止令牌。请求在派发前取消/过期会明确失败；派发后取消、超时或中断可能已经改变服务器状态，返回 `outcome_unknown`，不会自动重放。重连后的调用使用新 epoch 和未复用的请求 ID，迟到 ACK 不能完成新操作。每次更新最多 64 KiB，内部待确认记录上限为 128 项，公共调用由异步控制队列串行执行。更新不会自动持久化为下一次入会的身份配置。
 
 ## 发布与多流
 
@@ -166,7 +156,7 @@ require_result(room->update_local_participant(std::move(update)));
 
 `engine::create_livekit_engine()` 创建真实 LiveKit 后端。`publish()` 为轨道创建发布 sink 图，`engine.graph().subscribe(descriptor, consumer)` 创建订阅 source 图（需包含 `rtc/graph_api.hpp`），consumer 接收 `nodes::EncodedFrameEvent`。
 
-Engine 的建图与关闭在调用线程持会话操作锁串行执行；返回非空值时端点和图已经就绪。订阅源节点和发送反馈各自在节点工作线程等待通知并分发图事件；`write()` 可由生产媒体的线程调用。
+Engine 的建图与关闭在调用线程持会话操作锁串行执行；返回成功结果时端点和图已经就绪。订阅源节点和发送反馈各自在节点工作线程等待通知并分发图事件；`write()` 可由生产媒体的线程调用。
 
 各轨道具有独立队列和图生命周期。房间总预算随载荷在端点、原生发送、原生接收队列间转交，不重复扣额度；读出到应用后，应用自行负责后续内存限制。此预算统计 SDK 管理的待处理访问单元，不包含网络协议栈的 RTP 重传缓存、操作系统 socket 缓冲区或应用保留的帧。
 

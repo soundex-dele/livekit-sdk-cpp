@@ -1,14 +1,19 @@
 #include "livekit/rtc/engine.hpp"
+#include "backends/rtc/control_context.hpp"
+
 namespace livekit::sdk::rtc::engine {
-std::unique_ptr<RtcEngine> create_livekit_engine(AudioOutputOptions options, ErrorCode* error) {
-  auto engine = create_livekit_engine(error);
-  if (!engine) {
-    return {};
-  }
-  const auto enabled = engine->enable_media(std::move(options));
-  if (error) {
-    *error = enabled;
-  }
-  return enabled == ErrorCode::ok ? std::move(engine) : nullptr;
+Result<std::unique_ptr<RtcEngine>> create_livekit_engine(AudioOutputOptions options) {
+  return detail::control_boundary([&] {
+    auto engine = create_livekit_engine();
+    if (!engine) {
+      return engine;
+    }
+    const auto enabled = (*engine)->enable_media(std::move(options));
+    if (enabled != ErrorCode::ok) {
+      return detail::failure_result<std::unique_ptr<RtcEngine>>(enabled,
+                                                                "Failed to enable RTC media");
+    }
+    return engine;
+  });
 }
 }  // namespace livekit::sdk::rtc::engine

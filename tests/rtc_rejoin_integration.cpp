@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -38,7 +39,7 @@ int main(int argc, char** argv) {
           "reconnect-test", "reconnect-integration-secret-32-characters", identity,
           {{"roomJoin", true}, {"room", "rejoin"}, {"canPublish", true}, {"canSubscribe", true}});
     };
-    auto tx = require_result(create_livekit_room()), rx = require_result(create_livekit_room());
+    auto tx = require_result(livekit::sdk::app_support::create_blocking_room()), rx = require_result(livekit::sdk::app_support::create_blocking_room());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
     LiveKitRoomOptions options;
     options.url = argv[1];

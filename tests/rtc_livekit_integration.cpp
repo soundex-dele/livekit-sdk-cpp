@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -199,8 +200,8 @@ void verify_receive_pause(const std::vector<std::shared_ptr<PublishedTrack>>& tx
 
 int main() {
   try {
-    auto publisher = require_result(create_livekit_room()),
-         subscriber = require_result(create_livekit_room());
+    auto publisher = require_result(livekit::sdk::app_support::create_blocking_room()),
+         subscriber = require_result(livekit::sdk::app_support::create_blocking_room());
     livekit::sdk::app_support::RtcEventMailbox subscriber_events(*subscriber);
     livekit::sdk::app_support::RtcEventMailbox publisher_events(*publisher);
     LiveKitRoomOptions options;

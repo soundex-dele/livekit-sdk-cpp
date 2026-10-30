@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "livekit/rtc/engine.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
@@ -80,21 +81,21 @@ class LocalTransport final : public detail::RoomTransport {
 };
 
 void synchronous_engine() {
-  RtcEngine engine([] { return std::make_unique<LocalTransport>(); });
+  livekit::sdk::app_support::BlockingRtc engine([] { return std::make_unique<LocalTransport>(); });
   RoomOptions options;
   options.operation_timeout = 100ms;
   require_result(engine.join(options));
   auto descriptor = rtc_audio_test::descriptor("active");
   check(require_result(engine.publish(descriptor)) == descriptor.id, "Graph identity changed");
-  livekit::sdk::ErrorCode code;
-  auto pending = engine.publish(rtc_audio_test::descriptor("pending"), &code);
-  check(pending.empty() && code == livekit::sdk::ErrorCode::timeout, "Missing publication timeout");
+  auto pending = engine.publish(rtc_audio_test::descriptor("pending"));
+  check(!pending && pending.error().code == livekit::sdk::ErrorCode::timeout,
+        "Missing publication timeout");
   require_result(engine.close());
-  check(engine.publish(descriptor).empty(), "Closed engine accepted publication");
+  check(!engine.publish(descriptor), "Closed engine accepted publication");
 }
 
 void independent_builder_contract() {
-  RoomEngine room([] { return std::make_unique<LocalTransport>(); });
+  livekit::sdk::app_support::BlockingRoom room([] { return std::make_unique<LocalTransport>(); });
   require_result(room.join({}));
   auto descriptor = rtc_audio_test::descriptor("builder");
   auto endpoint = require_result(room.publish(descriptor));

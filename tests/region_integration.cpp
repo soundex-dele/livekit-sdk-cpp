@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -30,7 +31,7 @@ int main(int argc, char** argv) {
     options.token = token;
     options.regions.trusted_endpoints = {server};
     options.reconnect.enabled = false;
-    auto join = [&](transport::RoomEngine& room, const std::string& url,
+    auto join = [&](livekit::sdk::app_support::BlockingRoom& room, const std::string& url,
                     transport::LiveKitRoomOptions value) {
       value.url = url;
       return room.join(std::move(value));
@@ -41,7 +42,7 @@ int main(int argc, char** argv) {
     video.format.width = 64;
     video.format.height = 48;
     {
-      auto room = require_result(transport::create_livekit_room());
+      auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       livekit::sdk::app_support::RtcEventMailbox room_events(*room);
       require_result(join(*room, fixture + "/allowed", options));
       const auto session = room->snapshot().session;
@@ -53,7 +54,7 @@ int main(int argc, char** argv) {
       require_result(room->leave());
     }
     for (const auto& path : {"/unavailable", "/silent", "/media-stall"}) {
-      auto room = require_result(transport::create_livekit_room());
+      auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       livekit::sdk::app_support::RtcEventMailbox room_events(*room);
       auto initial = options;
       initial.connect_timeout = 10;
@@ -79,7 +80,7 @@ int main(int argc, char** argv) {
       require_result(room->leave());
     }
     for (const auto& path : {"/denied", "/unauthorized", "/malformed"}) {
-      auto room = require_result(transport::create_livekit_room());
+      auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       auto initial = options;
       initial.regions.fallback_endpoints = {server};
       bool rejected = false;
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
       check(rejected, "Initial failover bypassed a terminal error");
     }
     {
-      auto room = require_result(transport::create_livekit_room());
+      auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       auto initial = options;
       initial.connect_timeout = 1;
       initial.regions.endpoint_timeout = 5s;
@@ -107,7 +108,7 @@ int main(int argc, char** argv) {
       check(timed_out && Clock::now() - start < 2500ms, "Initial failover total deadline exceeded");
     }
     {
-      auto room = require_result(transport::create_livekit_room());
+      auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       auto initial = options;
       initial.regions.fallback_endpoints = {server};
       const auto start = Clock::now();
@@ -117,16 +118,16 @@ int main(int argc, char** argv) {
           std::async(std::launch::async, [&] { return join(*room, fixture + "/silent", initial); });
       std::this_thread::sleep_for(100ms);
       auto leaving = std::async(std::launch::async, [&] { return room->leave(); });
-      check(leaving.wait_for(100ms) == std::future_status::timeout,
-            "Leave preempted initial connection");
+      check(leaving.wait_for(2s) == std::future_status::ready,
+            "Leave did not interrupt initial connection");
       auto result = joining.get();
       require_result(leaving.get());
-      check(!result && Clock::now() - start < 2500ms &&
+      check(result == sdk::ErrorCode::cancelled && Clock::now() - start < 2500ms &&
                 room->snapshot().state == transport::ConnectionState::closed,
-            "Serialized timeout/leave failed");
+            "Asynchronous cancellation/leave failed");
     }
     auto rejected = [&](const std::string& path, sdk::ErrorCode expected, int status = 0) {
-      auto room = require_result(transport::create_livekit_room());
+      auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       auto untrusted = options;
       untrusted.regions.trusted_endpoints.clear();
       try {
@@ -141,7 +142,7 @@ int main(int argc, char** argv) {
     rejected("/untrusted", sdk::ErrorCode::permission_denied);
     rejected("/cycle", sdk::ErrorCode::recovery_failed);
     rejected("/http", sdk::ErrorCode::connection_lost, 302);
-    auto force_relay = require_result(transport::create_livekit_room());
+    auto force_relay = require_result(livekit::sdk::app_support::create_blocking_room());
     auto direct = options;
     direct.media_transport = sdk::MediaTransport::udp_only;
     bool relay_conflict = false;

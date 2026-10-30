@@ -1,5 +1,6 @@
 #pragma once
 #include "livekit/result.hpp"
+#include "livekit/rtc/observer.hpp"
 #include "livekit/rtc/track_endpoint.hpp"
 
 #include "livekit/rtc/types.hpp"
@@ -11,14 +12,12 @@
 #include <utility>
 
 namespace livekit::sdk::rtc {
-// Controls execute on the calling thread, including protocol ACK waits. Backend
-// events and media are serviced in the background when no control is running.
-// Operations return ErrorCode::ok; creation/access returns nullptr on failure
-// and always sets the optional error output. Backend exceptions do not escape.
-// Invalid/null transport factories are reported by join().
-// Transport-only room session. The private adapter is injected so the same state
-// machine can be tested without network, devices or codecs. The native factory
-// provides this adapter; callers do not implement GraphEngine or WebRTC objects.
+// Asynchronous controls return only admission status. Register the relevant
+// observer before submitting. Each accepted operation produces one completion
+// while its observer remains alive; rejected operations produce none. Duplicate
+// operations on the same object return busy until completion delivery starts.
+// leave/close cancel pending work. Destruction drains workers/notifications and
+// must happen outside callbacks, after application callers have stopped.
 class RoomEngine {
  public:
   // Factory must return a fresh adapter. It is retained and called again after leave.
@@ -29,10 +28,9 @@ class RoomEngine {
   RoomEngine& operator=(const RoomEngine&) = delete;
 
   ErrorCode join(RoomOptions options);
-  std::shared_ptr<PublishedTrack> publish(TrackDescriptor descriptor, ErrorCode* error = nullptr);
-  std::shared_ptr<SubscribedTrack> subscribe(TrackDescriptor remote_track,
-                                             ErrorCode* error = nullptr);
-  // Waits for the preceding operation, including publication/subscription ACK.
+  ErrorCode publish(TrackDescriptor descriptor);
+  ErrorCode subscribe(TrackDescriptor remote_track);
+  // Completion follows local transport detachment.
   ErrorCode unpublish(const TrackId& id);
   ErrorCode unsubscribe(const TrackId& id);
   ErrorCode set_muted(const TrackId& id, bool muted, ControlOptions = {});
@@ -46,14 +44,12 @@ class RoomEngine {
   // can have an unknown outcome and is never automatically replayed.
   ErrorCode update_local_participant(ParticipantUpdate, ControlOptions = {});
   ErrorCode leave();
+  ErrorCode close();
+  void set_room_observer(std::weak_ptr<RoomObserver>);
+  void set_publication_observer(std::weak_ptr<PublicationObserver>);
+  void set_subscription_observer(std::weak_ptr<SubscriptionObserver>);
   RoomSnapshot snapshot() const;
-  std::shared_ptr<RoomServices> services(ErrorCode* error = nullptr) const;
-  // Events run serially on the notification task queue, never the transport
-  // worker. Register before join. Replacement/removal fences previous callbacks.
-  // Callbacks must not issue synchronous control requests, destroy the engine or throw.
-  // Serialize registration calls; event references are borrowed for the call.
-  // Return promptly. A thrown exception disables the handler and fails the room.
-  ErrorCode set_event_handler(std::function<void(const RoomEvent&)>);
+  Result<std::shared_ptr<RoomServices>> services() const;
 
  private:
   friend class engine::RtcEngine;
@@ -62,7 +58,7 @@ class RoomEngine {
   ErrorCode join_locked(RoomOptions options);
   Result<std::shared_ptr<PublishedTrack>> publish_locked(TrackDescriptor descriptor);
   Result<std::shared_ptr<SubscribedTrack>> subscribe_locked(TrackDescriptor remote_track);
-  // Waits for the preceding operation, including publication/subscription ACK.
+  // Completion follows local transport detachment.
   ErrorCode unpublish_locked(const TrackId& id);
   ErrorCode unsubscribe_locked(const TrackId& id);
   ErrorCode set_muted_locked(const TrackId& id, bool muted, ControlOptions = {});
@@ -83,16 +79,16 @@ class RoomEngine {
 };
 
 // Restricted borrowed facade. Lifecycle/track mutation goes through RtcEngine.
-// Snapshot/services are safe to read across threads. Controls share the session
-// operation lock; retained service handles from a departed room stay closed.
+// Snapshot/services are safe across threads. Controls submit asynchronously and
+// notify RoomObserver; retained service handles from a departed room stay closed.
 class RoomView {
  public:
   RoomSnapshot snapshot() const {
     return room_->snapshot();
   }
 
-  std::shared_ptr<RoomServices> services(ErrorCode* error = nullptr) const {
-    return room_->services(error);
+  Result<std::shared_ptr<RoomServices>> services() const {
+    return room_->services();
   }
 
   ErrorCode update_local_participant(ParticipantUpdate update, ControlOptions options = {}) const {

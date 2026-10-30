@@ -250,6 +250,8 @@ struct RoomEvent {
   std::optional<SubscriptionPermissionChange> permission;
   std::shared_ptr<const TransportStatistics> statistics;
   std::shared_ptr<const FailureInfo> failure;
+  // Present only for local endpoint events; distinguishes equal publish/subscribe IDs.
+  std::optional<bool> publication;
 };
 
 }  // namespace livekit::sdk::rtc

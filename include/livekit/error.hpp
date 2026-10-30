@@ -28,7 +28,8 @@ enum class ErrorCode {
   callback_failed,
   invalid_thread,
   invalid_state,
-  internal_error
+  internal_error,
+  busy
 };
 
 struct FailureContext {

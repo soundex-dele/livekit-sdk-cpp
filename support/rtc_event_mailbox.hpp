@@ -3,6 +3,7 @@
 // callbacks; these existing applications marshal them to their session loop.
 #include "livekit/rtc/engine.hpp"
 #include "rtc_result.hpp"
+#include "rtc_blocking_bridge.hpp"
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -43,7 +44,7 @@ class RtcEventMailbox {
         state->changed.notify_all();
       }
     };
-    if constexpr (std::is_same_v<Engine, rtc::RoomEngine>) {
+    if constexpr (std::is_same_v<Engine, BlockingRoom>) {
       require_result(engine.set_event_handler(event));
     } else {
       require_result(engine.set_callbacks({event, [weak](const auto& failure) {

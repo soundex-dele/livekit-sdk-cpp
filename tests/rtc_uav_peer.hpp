@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "livekit/rtc/graph_api.hpp"
@@ -37,7 +38,7 @@ struct Peer {
         [this, url, identity, started = std::move(started)](std::stop_token stop) mutable {
           bool announced = false;
           try {
-            engine_ = require_result(transport::engine::create_livekit_engine());
+            engine_ = require_result(livekit::sdk::app_support::create_blocking_engine());
             engine_events_.attach(*engine_);
             transport::LiveKitRoomOptions options;
             options.url = url;
@@ -390,7 +391,7 @@ struct Peer {
   std::map<std::string, transport::TrackDescriptor> known_;
   std::set<std::string> active_;
   std::map<std::string, TestTrack> outgoing_;
-  std::unique_ptr<transport::engine::RtcEngine> engine_;
+  std::unique_ptr<livekit::sdk::app_support::BlockingRtc> engine_;
   livekit::sdk::app_support::RtcEventMailbox engine_events_;
   std::exception_ptr failure_;
   bool finished_ = false;

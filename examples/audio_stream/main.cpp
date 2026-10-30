@@ -1,3 +1,4 @@
+#include "rtc_blocking_bridge.hpp"
 #include "../../support/rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
 #include "rtc_event_mailbox.hpp"
@@ -62,7 +63,7 @@ int main(int argc, char** argv) {
       throw std::runtime_error("Set LIVEKIT_URL and a room-join LIVEKIT_TOKEN");
     ApplicationQueue queue;  // Outlives the engine and its decoder workers.
     auto engine =
-        require_result(engine::create_livekit_engine(livekit::sdk::rtc::AudioOutputOptions{}));
+        require_result(livekit::sdk::app_support::create_blocking_engine(livekit::sdk::rtc::AudioOutputOptions{}));
     livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
     LiveKitRoomOptions options;
     options.url = url;
