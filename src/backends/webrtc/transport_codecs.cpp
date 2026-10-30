@@ -4,6 +4,35 @@
 #include "api/make_ref_counted.h"
 
 namespace livekit::sdk::rtc::detail {
+std::vector<webrtc::RtpCodecCapability> select_transport_codecs(
+    const std::vector<webrtc::RtpCodecCapability>& capabilities, const std::string& name,
+    const std::map<std::string, std::string>& fmtp, bool enable_flexfec) {
+  std::vector<webrtc::RtpCodecCapability> selected;
+  for (const auto& codec : capabilities) {
+    if (codec.name != name) {
+      continue;
+    }
+    bool matches = true;
+    for (const auto& [key, value] : fmtp) {
+      const auto found = codec.parameters.find(key);
+      if (found == codec.parameters.end() || found->second != value) {
+        matches = false;
+      }
+    }
+    if (matches) {
+      selected.push_back(codec);
+    }
+  }
+  if (!selected.empty() && enable_flexfec && selected.front().kind == webrtc::MediaType::VIDEO) {
+    for (const auto& codec : capabilities) {
+      if (codec.name == "flexfec-03") {
+        selected.push_back(codec);
+      }
+    }
+  }
+  return selected;
+}
+
 namespace {
 bool opus(const webrtc::SdpAudioFormat& format) {
   return (format.name == "opus" || format.name == "OPUS") && format.clockrate_hz == 48000 &&

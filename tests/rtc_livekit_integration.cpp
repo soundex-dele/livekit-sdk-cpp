@@ -17,6 +17,7 @@ using namespace std::chrono_literals;
 
 namespace {
 uint64_t sfu_silence_frames = 0;
+uint64_t sfu_video_blank_frames = 0;
 
 void check(bool ok, const char* message) {
   if (!ok)
@@ -56,6 +57,19 @@ bool media_encrypted() {
 }
 
 Codec video_codec() {
+  if (const auto* codec = std::getenv("LIVEKIT_TEST_VIDEO_CODEC")) {
+    const std::string name(codec);
+    if (name == "vp8") {
+      return Codec::vp8;
+    }
+    if (name == "h264") {
+      return Codec::h264;
+    }
+    if (name == "h265") {
+      return Codec::h265;
+    }
+    throw std::runtime_error("LIVEKIT_TEST_VIDEO_CODEC must be vp8, h264 or h265");
+  }
   return media_encrypted() ? Codec::h264 : Codec::vp8;
 }
 
@@ -129,6 +143,19 @@ void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
                                                    0x60, 0x00, 0xfe, 0xff, 0xab, 0x50, 0x80};
         if (resubscribed && i == 2 && std::ranges::equal(read.frame->buffer.bytes(), blank))
           continue;
+        // Go downtrack.go injects this exact H264KeyFrame2x2 on publisher mute.
+        // Accept only this known filler after the transition, never arbitrary
+        // mismatched H.264 or encrypted media, and still require source frames.
+        static const std::vector<uint8_t> h264_blank = {
+            0,    0,    0, 1,    0x67, 0x42, 0xc0, 0x1f, 0x0f, 0xd9, 0x1f, 0x88, 0x88,
+            0x84, 0,    0, 3,    0,    4,    0,    0,    3,    0,    0xc8, 0x3c, 0x60,
+            0xc9, 0x20, 0, 0,    0,    1,    0x68, 0x87, 0xcb, 0x83, 0xcb, 0x20, 0,
+            0,    0,    1, 0x65, 0x88, 0x84, 0x0a, 0xf2, 0x62, 0x80, 0,    0xa7, 0xbe};
+        if (resubscribed && i == 2 && !media_encrypted() && video_codec() == Codec::h264 &&
+            normalized(read.frame->buffer.bytes()) == normalized(h264_blank)) {
+          ++sfu_video_blank_frames;
+          continue;
+        }
         // This supplied SFU injects exactly downtrack.go's 80-byte
         // OpusSilenceFrame on publisher mute (f8 ff fe then 77 zero bytes).
         // Only this known filler, on the muted audio track after transition,
@@ -205,6 +232,9 @@ int main() {
     livekit::sdk::app_support::RtcEventMailbox subscriber_events(*subscriber);
     livekit::sdk::app_support::RtcEventMailbox publisher_events(*publisher);
     LiveKitRoomOptions options;
+    if (const auto* flexfec = std::getenv("LIVEKIT_TEST_FLEXFEC")) {
+      options.enable_flexfec = std::string(flexfec) != "0";
+    }
     options.url = env("LIVEKIT_URL");
     options.reconnect.enabled = false;
     options.signal_protocol = 15;
@@ -462,7 +492,8 @@ int main() {
                  "\"serializedRemoval\":true,\"sessionRoster\":true,\"participantControl\":true,"
                  "\"muteControl\":true,\"publicationSources\":true,\"receiveDemand\":true,"
                  "\"subscriptionPermissions\":true,\"sfuSilenceFrames\":"
-              << sfu_silence_frames << "}\n";
+              << sfu_silence_frames << ",\"sfuVideoBlankFrames\":" << sfu_video_blank_frames
+              << "}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

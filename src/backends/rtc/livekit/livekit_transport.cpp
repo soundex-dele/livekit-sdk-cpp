@@ -203,6 +203,7 @@ class LiveKitTransport final : public RoomTransport {
     static_cast<RoomSettings&>(options) = common;
     static_cast<SignalingOptions&>(options) = connection->signaling;
     options.encryption = connection->encryption;
+    options.enable_flexfec = connection->enable_flexfec;
     if (options.url.empty() || (options.token.empty() && !options.token_provider)) {
       throw std::invalid_argument("LiveKit requires a URL and token or token provider");
     }
@@ -648,7 +649,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
           join.client_configuration()))
     config.type = PC::kRelay;
   livekit::sdk::detail::apply_media_transport(config, options_.media_transport, false);
-  auto runtime = std::make_shared<TransportRuntime>();
+  auto runtime = std::make_shared<TransportRuntime>(options_.enable_flexfec);
   NativePeer publisher(*runtime, config, {}, options_.max_events, budget_, session_wakeup_),
       subscriber(*runtime, config, {}, options_.max_events, budget_, session_wakeup_);
   auto cryptor = std::make_shared<livekit::sdk::detail::MediaCryptorContext>();
@@ -1158,19 +1159,10 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
               const auto kind = command.descriptor.kind == MediaKind::audio
                                     ? webrtc::MediaType::AUDIO
                                     : webrtc::MediaType::VIDEO;
-              std::vector<webrtc::RtpCodecCapability> selected;
-              for (const auto& codec : runtime->factory->GetRtpSenderCapabilities(kind).codecs) {
-                if (codec.name != codec_name(command.descriptor.format.codec))
-                  continue;
-                bool matches = true;
-                for (const auto& [key, value] : command.descriptor.format.fmtp) {
-                  const auto found = codec.parameters.find(key);
-                  if (found == codec.parameters.end() || found->second != value)
-                    matches = false;
-                }
-                if (matches)
-                  selected.push_back(codec);
-              }
+              auto selected =
+                  select_transport_codecs(runtime->factory->GetRtpSenderCapabilities(kind).codecs,
+                                          codec_name(command.descriptor.format.codec),
+                                          command.descriptor.format.fmtp, options_.enable_flexfec);
               if (selected.empty())
                 throw std::invalid_argument("Requested encoded codec/fmtp is unavailable");
               const auto selected_codec = added.value()->SetCodecPreferences(selected);

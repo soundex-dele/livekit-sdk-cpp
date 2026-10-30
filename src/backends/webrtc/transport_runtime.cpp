@@ -1,6 +1,7 @@
 #include "backends/webrtc/transport_runtime.hpp"
 #include "backends/webrtc/encoded_video_sender.hpp"
 #include "api/enable_media.h"
+#include "api/field_trials.h"
 #include "api/audio/audio_device.h"
 #include "api/task_queue/default_task_queue_factory.h"
 #include "media/sctp/dcsctp_transport.h"
@@ -23,7 +24,9 @@ class SctpFactory : public webrtc::SctpTransportFactoryInterface {
 };
 }  // namespace
 
-TransportRuntime::TransportRuntime() {
+TransportRuntime::TransportRuntime(bool enable_flexfec,
+                                   webrtc::PeerConnectionFactoryDependencies dependencies)
+    : flexfec_enabled(enable_flexfec) {
 #ifdef _WIN32
   if (winsock_.error())
     throw std::runtime_error("Winsock initialization failed");
@@ -32,12 +35,16 @@ TransportRuntime::TransportRuntime() {
     throw std::runtime_error("WebRTC SSL initialization failed");
   ssl_ = true;
   try {
+    auto deps = std::move(dependencies);
     network = webrtc::Thread::CreateWithSocketServer();
     worker = webrtc::Thread::Create();
     signaling = webrtc::Thread::Create();
     if (!network->Start() || !worker->Start() || !signaling->Start())
       throw std::runtime_error("Cannot start native transport threads");
-    webrtc::PeerConnectionFactoryDependencies deps;
+    // Per-factory trials avoid changing other SDK sessions or global WebRTC state.
+    deps.trials = webrtc::FieldTrials::CreateNoGlobal(
+        enable_flexfec ? "WebRTC-FlexFEC-03/Enabled/WebRTC-FlexFEC-03-Advertised/Enabled/"
+                       : "WebRTC-FlexFEC-03/Disabled/WebRTC-FlexFEC-03-Advertised/Disabled/");
     deps.network_thread = network.get();
     deps.worker_thread = worker.get();
     deps.signaling_thread = signaling.get();

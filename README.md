@@ -110,6 +110,8 @@ LiveKit 数据消息、RPC、流、加密及重连策略实现在 `rtc/livekit/`
 
 支持多条独立音视频轨、VP8/Opus 编码传输及可选 H264/H265 上层 codec、完整重新入会、逐轨静音/订阅需求/发布权限和会话服务。
 
+原生 RTC 默认开启可协商的 FlexFEC 视频保护，可通过 `LiveKitRoomOptions::enable_flexfec` 关闭；对端需支持该能力。SDK 测试方式和当前 SFU 限制见 [FlexFEC 说明](docs/rtc-flexfec.md)。
+
 单 PC、信令 resume/无缝房间迁移、simulcast/SVC 尚未实现。媒体模块新增 APM、NetEq 抖动缓冲/PLC 和基于发送端采集时间的音画同步；缺少共同发送端时钟的轨道不宣称同步。本轮 Windows 自动化验证与限制见 [重构记录](docs/architecture-refactor-20261029.md)；尚未完成真实设备人工验收。多流不等同于同一轨道多编码层。具体已验证范围与限制以 [实施记录](docs/rtc-backend-refactor.md) 为准。
 
 历史接口文档和旧验收记录中的 Room API 示例不能用于当前版本。

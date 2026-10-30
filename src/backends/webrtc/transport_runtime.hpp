@@ -11,10 +11,13 @@ namespace livekit::sdk::rtc::detail {
 // object. No graph, capture device, renderer or actual codec is constructed.
 class TransportRuntime {
  public:
-  TransportRuntime();
+  // Optional native dependencies support headless network/transport testing.
+  explicit TransportRuntime(bool enable_flexfec = true,
+                            webrtc::PeerConnectionFactoryDependencies dependencies = {});
   ~TransportRuntime();
   TransportRuntime(const TransportRuntime&) = delete;
   TransportRuntime& operator=(const TransportRuntime&) = delete;
+  const bool flexfec_enabled;
   std::unique_ptr<webrtc::Thread> network, worker, signaling;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
   std::shared_ptr<CodecBoundaryCounters> codec_counters = std::make_shared<CodecBoundaryCounters>();

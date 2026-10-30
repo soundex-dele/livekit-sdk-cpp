@@ -39,6 +39,10 @@ def main():
     parser.add_argument('--encrypted', action='store_true')
     parser.add_argument('--media-encrypted', action='store_true')
     parser.add_argument('--publisher-kind', choices=['standard', 'agent'], default='standard')
+    parser.add_argument('--codec', choices=['vp8', 'h264', 'h265'],
+                        help='Video codec override; defaults to VP8 or H.264 with media encryption')
+    parser.add_argument('--server-log-level', choices=['info', 'debug'], default='info',
+                        help='Increase server diagnostics; SDP logging depends on server configuration')
     args = parser.parse_args()
     if args.audio_source and (args.encrypted or args.media_encrypted):
         parser.error('The PCM examples do not configure encryption; use the audio graph integration client')
@@ -63,13 +67,15 @@ rtc:
 keys:
   rtctest: {secret}
 logging:
-  level: info
+  level: {args.server_log_level}
 ''')
     env = dict(os.environ, LIVEKIT_URL=f'http://127.0.0.1:{port}',
                LIVEKIT_PUBLISH_TOKEN=token('publisher', secret, args.publisher_kind),
                LIVEKIT_SUBSCRIBE_TOKEN=token('subscriber', secret),
                LIVEKIT_DATA_ENCRYPTION='1' if args.encrypted else '0',
                LIVEKIT_MEDIA_ENCRYPTION='1' if args.media_encrypted else '0')
+    if args.codec:
+        env['LIVEKIT_TEST_VIDEO_CODEC'] = args.codec
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     print(root, flush=True)
     with open(root / 'server.log', 'w') as log:
@@ -96,6 +102,12 @@ logging:
                 if result.returncode:
                     raise RuntimeError(f'Client failed ({result.returncode}); see {root}')
                 report = json.loads((root / 'client.stdout.log').read_text())
+            report['serverBinary'] = str(Path(args.server).resolve())
+            report['serverSha256'] = hashlib.sha256(Path(args.server).read_bytes()).hexdigest()
+            report['clientSha256'] = hashlib.sha256(Path(args.client).read_bytes()).hexdigest()
+            report['videoCodec'] = None if args.audio_source else env.get(
+                'LIVEKIT_TEST_VIDEO_CODEC', 'h264' if args.media_encrypted else 'vp8')
+            report['flexfecRequested'] = env.get('LIVEKIT_TEST_FLEXFEC', '1') != '0'
             (root / 'result.json').write_text(json.dumps(report, indent=2))
             print(json.dumps(report))
         finally:

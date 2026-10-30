@@ -259,6 +259,21 @@ std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_res
     return future;
   }
   for (const auto& transceiver : pc->GetTransceivers()) {
+    // WebRTC advertises receive-side FlexFEC even with its sending trial off.
+    // Apply the SDK opt-out to answers as well as offers.
+    if (!runtime_.flexfec_enabled && transceiver->media_type() == webrtc::MediaType::VIDEO &&
+        !transceiver->stopped()) {
+      auto codecs = transceiver->codec_preferences();
+      if (codecs.empty()) {
+        codecs = runtime_.factory->GetRtpReceiverCapabilities(webrtc::MediaType::VIDEO).codecs;
+      }
+      std::erase_if(codecs, [](const auto& codec) { return codec.name == "flexfec-03"; });
+      const auto error = transceiver->SetCodecPreferences(codecs);
+      if (!error.ok()) {
+        completion->reject(failure(error));
+        return future;
+      }
+    }
     auto extensions = transceiver->GetHeaderExtensionsToNegotiate();
     for (auto& extension : extensions) {
       if (extension.uri == webrtc::RtpExtension::kAbsoluteCaptureTimeUri) {
