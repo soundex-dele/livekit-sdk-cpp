@@ -1,16 +1,12 @@
 #include "livekit/rtc/engine.hpp"
-#include "livekit/rtc/livekit.hpp"
+#include "backends/rtc/livekit/transport_factory.hpp"
 #include "backends/rtc/control_context.hpp"
 
 namespace livekit::sdk::rtc::engine {
 Result<std::unique_ptr<RtcEngine>> create_livekit_engine() {
   return detail::control_boundary([] {
-    auto room = create_livekit_room();
-    if (!room) {
-      return Result<std::unique_ptr<RtcEngine>>::failure(room.failure_record());
-    }
     return Result<std::unique_ptr<RtcEngine>>::success(
-        std::make_unique<RtcEngine>(*std::move(room)));
+        std::make_unique<RtcEngine>(detail::livekit_transport_factory()));
   });
 }
 }  // namespace livekit::sdk::rtc::engine

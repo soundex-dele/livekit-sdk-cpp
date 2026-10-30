@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/rtc/room_engine.hpp"
+#include "livekit/rtc/types.hpp"
 #include "livekit/rtc/signaling_options.hpp"
 
 namespace livekit::sdk::rtc {
@@ -33,7 +33,5 @@ struct LiveKitRoomOptions : RoomSettings, SignalingOptions {
   }
 };
 
-// Creates the LiveKit signaling/WebRTC adapter. Links LiveKit::RTCLiveKit;
-// no engine, media graph, device or actual codec factory is required.
-Result<std::unique_ptr<RoomEngine>> create_livekit_room();
+// Engine construction is exposed by create_livekit_engine() in engine.hpp.
 }  // namespace livekit::sdk::rtc

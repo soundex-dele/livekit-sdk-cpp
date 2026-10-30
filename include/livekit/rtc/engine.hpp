@@ -1,13 +1,28 @@
 #pragma once
-#include "livekit/rtc/room_engine.hpp"
+#include "livekit/rtc/room_view.hpp"
+#include "livekit/rtc/observer.hpp"
 #include "livekit/rtc/media_config.hpp"
 #include "livekit/rtc/engine_observer.hpp"
+#include "livekit/async_result.hpp"
+#include "livekit/rtc/graph_types.hpp"
+#include <atomic>
+#include <map>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <string>
 
+namespace livekit::sdk::rtc::detail {
+class RtcExecutionContext;
+class LifecycleExecutor;
+}  // namespace livekit::sdk::rtc::detail
+
 namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
+class TrackGraphRegistry;
+class MediaResources;
+class MediaGraphBuilder;
+struct RetiredTrackGraphs;
 
 // Single-room facade. Network/track controls enqueue work and return admission
 // status, never the operation result. Pass a completion for each operation.
@@ -17,8 +32,8 @@ class RtcGraphApi;
 // Stop application callers before destruction; never destroy from a callback.
 class RtcEngine final {
  public:
-  explicit RtcEngine(RoomEngine::TransportFactory);
-  explicit RtcEngine(std::unique_ptr<RoomEngine>);
+  using TransportFactory = std::function<std::unique_ptr<detail::RoomTransport>()>;
+  explicit RtcEngine(TransportFactory);
   ~RtcEngine();
   RtcEngine(const RtcEngine&) = delete;
   RtcEngine& operator=(const RtcEngine&) = delete;
@@ -66,9 +81,73 @@ class RtcEngine final {
 
  private:
   friend class RtcGraphApi;
+  friend class ::livekit::sdk::rtc::RoomView;
   Result<std::shared_ptr<SharedMediaInput>> create_shared_input_impl(TrackDescriptor, MediaInput);
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
+  ErrorCode clear_tracks();
+  ErrorCode detach(RetiredTrackGraphs) const;
+  Result<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
+  Result<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  AsyncResult<Result<TrackId>> publish_graph_async(TrackDescriptor, PublishGraphFactory,
+                                                   bool managed = false);
+  AsyncResult<Result<TrackId>> subscribe_graph_async(TrackDescriptor, SubscribeGraphFactory);
+  Result<TrackId> finish_publish_graph(TrackDescriptor, PublishGraphFactory,
+                                       std::shared_ptr<PublishedTrack>);
+  Result<TrackId> finish_subscribe_graph(TrackDescriptor, SubscribeGraphFactory,
+                                         std::shared_ptr<SubscribedTrack>);
+  Result<TrackId> publish_node(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> = {});
+  Result<TrackId> subscribe_node(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode>);
+  Result<MediaPublication> start_media_locked(MediaPublishSpec);
+  AsyncResult<Result<MediaPublication>> start_media_async(MediaPublishSpec,
+                                                          std::optional<MediaKind> = {});
+  void reconcile_video_codec_policy();
+  void notify_video_codec_policy();
+  void reset_video_codec_policy(std::optional<RoomVideoCodecPolicy> = {});
+  void use_h264(MediaPublishSpec&);
+
+  template <class Function, class Callback>
+  ErrorCode submit(std::string key, Function function, Callback completion, bool barrier = false,
+                   bool terminal = false);
+  template <class Function>
+  auto execute(Function function, bool allow_closed = false) const;
+
+  template <class Observer>
+  class ObserverSlot {
+   public:
+    void set(std::weak_ptr<Observer> observer) {
+      std::lock_guard lock(mutex_);
+      observer_ = std::move(observer);
+    }
+
+    std::weak_ptr<Observer> get() const {
+      std::lock_guard lock(mutex_);
+      return observer_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::weak_ptr<Observer> observer_;
+  };
+
+  ObserverSlot<RoomObserver> room_observer;
+  ObserverSlot<PublicationObserver> publication_observer;
+  ObserverSlot<SubscriptionObserver> subscription_observer;
+  bool closed = false;
+  std::atomic<bool> has_media{false};
+  std::shared_ptr<detail::SessionControl> control;
+  std::unique_ptr<detail::RtcExecutionContext> runtime;
+  detail::LifecycleExecutor& lifecycle;
+  std::unique_ptr<TrackGraphRegistry> graphs;
+  std::unique_ptr<MediaResources> media_resources;
+  std::unique_ptr<MediaGraphBuilder> media;
+  RoomView room_view;
+  // Control sequence owns intent/recipes; snapshot is also read by application threads.
+  std::optional<RoomVideoCodecPolicy> codec_policy;
+  std::map<TrackId, MediaPublishSpec> media_publications;
+  bool building_media = false;
+  Epoch policy_advertised_epoch = 0;
+  bool policy_advertised_latch = false;
+  mutable std::mutex policy_mutex;
+  VideoCodecPolicySnapshot policy_status;
 };
 
 // Encoded-only factory links LiveKit::RTCEngine; overload with audio options

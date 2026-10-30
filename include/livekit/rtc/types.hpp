@@ -87,7 +87,7 @@ struct ReceiveDemand {
 };
 
 struct TrackDescriptor {
-  TrackId id;  // Stable within this RoomEngine, never a server SID.
+  TrackId id;  // Stable within this RtcEngine, never a server SID.
   std::string name;
   std::string source_id;
   std::string stream_group;
@@ -191,7 +191,7 @@ struct RoomSettings {
   size_t max_events = 4096;
   std::chrono::milliseconds operation_timeout{30000};
   std::chrono::milliseconds stats_interval{0};  // Disabled, or 200..60000 ms.
-  // Applied by RtcEngine, which owns encoder graphs. RoomEngine alone rejects it.
+  // Applied by RtcEngine, which owns encoder graphs; not a transport setting.
   std::optional<RoomVideoCodecPolicy> video_codec_policy;
 };
 
@@ -220,7 +220,7 @@ struct RoomSnapshot {
   // Native join observations are released after transport establishment. Retained
   // snapshots remain historical values; compare epoch before using server SIDs.
   std::shared_ptr<const SessionInfo> session;
-  // Controller diagnostics are cumulative for this RoomEngine. Track work
+  // Controller diagnostics are cumulative for this room. Track work
   // counts only notified/expired instances, not registry-wide readiness scans.
   uint64_t controller_wakeups = 0, tracks_serviced = 0;
   size_t scheduled_deadlines = 0, ready_work = 0;

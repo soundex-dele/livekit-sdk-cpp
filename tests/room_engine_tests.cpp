@@ -1,3 +1,4 @@
+#include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_event_mailbox.hpp"
 #include "rtc_result.hpp"
@@ -6,7 +7,7 @@
 #include "utoolkit/task_queue/task_queue.h"
 #endif
 #include "livekit/rtc/livekit.hpp"
-#include "livekit/rtc/room_engine.hpp"
+#include "rtc_room_fixture.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/bounded_events.hpp"
 #include "backends/rtc/async_control.hpp"
@@ -1193,7 +1194,7 @@ template <class T>
 concept HasEventPolling = requires(T& value) { value.next_event(); };
 template <class T>
 concept HasFailurePolling = requires(T& value) { value.next_failure(); };
-static_assert(!HasEventPolling<livekit::sdk::rtc::RoomEngine>);
+static_assert(!HasEventPolling<livekit::sdk::rtc::RoomFixture>);
 
 #ifndef LIVEKIT_TEST_RTC_NODES
 void task_queue_wakeup_contract() {
@@ -2272,8 +2273,8 @@ class GraphRelay : public graphflow::core::GraphNode {
 // root creates/detaches endpoints, just as the production facade does.
 void independent_registry_contract() {
   static_assert(std::is_default_constructible_v<engine::TrackGraphRegistry>);
-  static_assert(!std::is_constructible_v<engine::TrackGraphRegistry,
-                                         livekit::sdk::rtc::RoomEngine&>);
+  static_assert(
+      !std::is_constructible_v<engine::TrackGraphRegistry, livekit::sdk::rtc::RoomFixture&>);
   auto h = std::make_shared<Harness>();
   livekit::sdk::app_support::BlockingRoom room([h] { return std::make_unique<FakeTransport>(h); });
   get(room.join(options()));
@@ -2645,10 +2646,9 @@ static_assert(!HasPoll<livekit::sdk::rtc::engine::RtcEngine> &&
               !HasPoll<engine::PublishPipeline> && !HasPoll<nodes::RtcSubscribeNode>);
 
 void facade_lifecycle_contract() {
-  livekit::sdk::app_support::BlockingRtc invalid(
-      std::unique_ptr<livekit::sdk::app_support::BlockingRoom>{});
+  livekit::sdk::app_support::BlockingRtc invalid(engine::RtcEngine::TransportFactory{});
   check(invalid.join({}) == livekit::sdk::ErrorCode::invalid_argument,
-        "Null room escaped as an exception");
+        "Missing transport factory escaped as an exception");
   check(invalid.publication("missing").id.empty() && invalid.feedback("missing").epoch == 0,
         "Missing publication query did not return an empty value");
   auto h = std::make_shared<Harness>();
@@ -2824,7 +2824,7 @@ auto completed(std::shared_ptr<Probe> probe, const std::string& operation, Track
   };
 }
 
-template <class Engine = RoomEngine, class Publication = PublicationProbe>
+template <class Engine = RoomFixture, class Publication = PublicationProbe>
 void room_independent_protocol_contract() {
   using livekit::sdk::ErrorCode;
   auto h = std::make_shared<Harness>();
@@ -2835,7 +2835,7 @@ void room_independent_protocol_contract() {
   Engine room([h] { return std::make_unique<FakeTransport>(h); });
   room.set_room_observer(room_probe);
   room.set_publication_observer(publication);
-  if constexpr (std::is_same_v<Engine, RoomEngine>) {
+  if constexpr (std::is_same_v<Engine, RoomFixture>) {
     room.set_subscription_observer(subscription);
   }
   auto opts = options();
@@ -2878,7 +2878,7 @@ void room_independent_protocol_contract() {
           "Same-track mute ran before publication settled");
     h->confirm = true;
   }
-  if constexpr (std::is_same_v<Engine, RoomEngine>) {
+  if constexpr (std::is_same_v<Engine, RoomFixture>) {
     check(room.subscribe(video("receive"), completed(subscription, "subscribe", "receive")) ==
                   ErrorCode::ok &&
               log->take("subscribe:receive") == ErrorCode::ok,
@@ -3080,7 +3080,7 @@ void observer_capacity_and_destruction(bool close_first) {
   auto log = std::make_shared<ObserverLog>();
   auto observer = std::make_shared<RoomProbe>(log);
   auto publication = std::make_shared<PublicationProbe>(log);
-  auto room = std::make_unique<RoomEngine>([h] { return std::make_unique<FakeTransport>(h); });
+  auto room = std::make_unique<RoomFixture>([h] { return std::make_unique<FakeTransport>(h); });
   room->set_room_observer(observer);
   room->set_publication_observer(publication);
   auto opts = options();
@@ -3121,7 +3121,7 @@ void observer_structured_failure() {
   const auto failure = std::make_shared<FailureInfo>(FailureInfo{
       next_failure_id(), ErrorDomain::transport, ErrorCode::unsupported,
       "backend unavailable", false, 503});
-  RoomEngine room([failure]() -> std::unique_ptr<RoomTransport> { throw SDKError(failure); });
+  RoomFixture room([failure]() -> std::unique_ptr<RoomTransport> { throw SDKError(failure); });
   room.set_room_observer(observer);
   check(room.join(options(), completed(observer, "join")) == ErrorCode::ok,
         "Backend failure confused admission with completion");
@@ -3170,7 +3170,7 @@ void completion_blocks_only_notifications() {
   std::promise<void> entered, release;
   auto gate = release.get_future().share();
   std::promise<Result<void>> closed;
-  RoomEngine room([h] { return std::make_unique<FakeTransport>(h); });
+  RoomFixture room([h] { return std::make_unique<FakeTransport>(h); });
   check(room.join(options(),
                   [&](Result<void> result) {
                     entered.set_value();
@@ -3438,11 +3438,11 @@ int main() {
     deferred_control_lanes_contract();
     deferred_control_fence_contract();
     deferred_control_failure_contract();
-    observer_control_contract<RoomEngine, PublicationProbe>();
+    observer_control_contract<RoomFixture, PublicationProbe>();
     observer_capacity_and_destruction(false);
     observer_capacity_and_destruction(true);
     observer_structured_failure();
-    completion_thread_contract<RoomEngine>();
+    completion_thread_contract<RoomFixture>();
     completion_blocks_only_notifications();
     blocking_bridge_rejects_completion_waits();
     room_independent_protocol_contract<>();

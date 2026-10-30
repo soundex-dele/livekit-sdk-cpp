@@ -1,4 +1,4 @@
-> RtcEngine、RoomEngine 和 RtcGraphApi 的控制接口返回异步受理状态，单次结果通过调用时传入的 Completion 返回，持续事件由 Observer 通知；详见 [异步控制契约](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
+> RtcEngine 和 RtcGraphApi 的控制接口返回异步受理状态，单次结果通过调用时传入的 Completion 返回，持续事件由 Observer 通知；详见 [异步控制契约](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
 
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)。自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
@@ -11,7 +11,7 @@
 | 场景 | 头文件 | CMake target |
 | --- | --- | --- |
 | 配置采集、编解码、预览与输出，由媒体引擎构图 | `livekit/rtc/engine.hpp` | `LiveKit::RTCMediaEngine` |
-| 已有自己的调度/流水线，仅需房间和收发端点 | `livekit/rtc/livekit.hpp` | `LiveKit::RTCLiveKit` |
+| 已有编码媒体，需要统一房间控制与收发 | `livekit/rtc/engine.hpp` | `LiveKit::RTCEngine` |
 | 由 Engine 创建发布、订阅节点及 GraphEngine 流水线 | `livekit/rtc/engine.hpp` | `LiveKit::RTCEngine` |
 | 在自己的 GraphEngine 中组合 RTC 节点 | `livekit/rtc/publish_node.hpp`、`subscribe_node.hpp` | `LiveKit::RTCNodes` |
 | 在 engine 图中使用实际视频编解码 | `livekit/rtc/video_nodes.hpp` | `LiveKit::RTCMedia` |
@@ -21,29 +21,32 @@
 
 命名空间为 `livekit::sdk::rtc`；Engine 位于其 `engine` 子命名空间。节点位于 `nodes` 子命名空间。
 
+RoomEngine 已收为非线程安全的内部协议状态机，不再提供独立公共入口，详见 [执行边界](rtc-room-state-machine.md)。
+
 每个后端是一段房间会话。先 `join()`，最后 `leave()`；再次入会创建新的后端。发布和订阅分别拥有轨道句柄，多轨共享同一个后端。关闭轨道只解绑该轨道。
 
-## 后端接收
+## 引擎连接
 
 ```cpp
 #include <livekit/rtc/livekit.hpp>
+#include <livekit/rtc/engine.hpp>
 using namespace livekit::sdk::rtc;
 using namespace std::chrono_literals;
 
-auto room = require_result(create_livekit_room());
+auto rtc = require_result(engine::create_livekit_engine());
 LiveKitRoomOptions options;
 options.url = url;
 options.token = token;
 // 房间事件由通知任务队列回调；注册后再 join。
 std::promise<TrackDescriptor> discovered;
 bool selected = false;  // 只在串行通知队列访问。
-// 上层分别实现 RoomObserver、PublicationObserver 与 SubscriptionObserver。
-room->set_room_observer(room_observer);
-room->set_publication_observer(publication_observer);
-room->set_subscription_observer(subscription_observer);
-require_result(room->join(options, on_join));  // 仅受理。
+// 上层分别实现 RoomObserver、engine::PublicationObserver 与 engine::SubscriptionObserver。
+rtc->set_room_observer(room_observer);
+rtc->set_publication_observer(publication_observer);
+rtc->set_subscription_observer(subscription_observer);
+require_result(rtc->join(options, on_join));  // 仅受理。
 // on_join 成功后可发布；publish(descriptor, on_published) 返回受理码。
-// on_published 接收 Result<shared_ptr<PublishedTrack>>；leave(on_left) 通知离开结果。
+// on_published 接收 Result<TrackId>；leave(on_left) 通知离开结果。
 
 ```
 
@@ -53,7 +56,7 @@ require_result(room->join(options, on_join));  // 仅受理。
 
 ### 独立订阅需求
 
-`TrackDescriptor::receive_demand` 是初始需求。订阅成功后，使用 `SubscribedTrack::set_demand`，或通过 backend/engine 的 `set_receive_demand(id, demand, on_updated)` 更新。每次完整替换配置，省略字段恢复默认值。
+`TrackDescriptor::receive_demand` 是初始需求。订阅成功后，使用 `SubscribedTrack::set_demand`，或通过 RtcEngine 的 `set_receive_demand(id, demand, on_updated)` 更新。每次完整替换配置，省略字段恢复默认值。
 
 ```cpp
 ReceiveDemand demand;
@@ -71,7 +74,7 @@ Result 成功表示原生适配器已提交信令，协议没有该操作的服�
 
 ## 房间与成员快照
 
-`room->snapshot().session` 是当前信令会话的 `shared_ptr<const SessionInfo>`。它包含房间 SID、名称、元数据和录制标记，本地成员，以及按成员 SID 索引的远端成员。每个成员包含身份、显示名称、元数据、属性、发布轨道、静音标记、可选权限、发言状态与连接质量。未收到权限字段表示未知，不能直接当作禁止。
+`rtc->room().snapshot().session` 是当前信令会话的 `shared_ptr<const SessionInfo>`。它包含房间 SID、名称、元数据和录制标记，本地成员，以及按成员 SID 索引的远端成员。每个成员包含身份、显示名称、元数据、属性、发布轨道、静音标记、可选权限、发言状态与连接质量。未收到权限字段表示未知，不能直接当作禁止。
 
 快照中的发布轨道是服务端公告，包含尚不支持的 codec；它不表示已创建订阅或解码器。实际可订阅的编码端点仍通过 `remote_track_added` 发现。本地发布公告不会触发远端发现。
 
@@ -88,11 +91,11 @@ SubscriptionPermissions policy;
 policy.all_participants = false;
 policy.participants = {{"viewer", false, {"camera-main", "screen-main"}}};
 options.subscription_permissions = policy;
-require_result(room->join(options, on_join));
+require_result(rtc->join(options, on_join));
 // 随后发布 camera-main / screen-main；无需预先知道服务端 SID。
 ```
 
-运行中用 `room->set_subscription_permissions(policy, on_updated)` 完整替换策略。`all_participants=true` 允许全部成员，不能同时提供成员列表；`all_tracks=true` 允许指定 identity 的全部轨道，不能再指定 track_ids。false 加空成员列表拒绝全部订阅。最多 64 个成员、每个成员 128 个轨道 ID、总文本 32,000 字节，拒绝重复 identity/ID 和非法 UTF-8。
+运行中用 `rtc->room().set_subscription_permissions(policy, on_updated)` 完整替换策略。`all_participants=true` 允许全部成员，不能同时提供成员列表；`all_tracks=true` 允许指定 identity 的全部轨道，不能再指定 track_ids。false 加空成员列表拒绝全部订阅。最多 64 个成员、每个成员 128 个轨道 ID、总文本 32,000 字节，拒绝重复 identity/ID 和非法 UTF-8。
 
 权限设置完成回调 的成功结果表示信令已提交，协议没有此请求的服务器 ACK。原生控制循环保留最新派发的策略并在重入时恢复；派发后取消、超时或发送中断可能返回 `outcome_unknown`，新策略仍可能生效并被恢复。需要改变意图时重新提交完整策略。策略由 SFU 执行，不能撤回接收端已经持有的媒体。
 
@@ -100,14 +103,14 @@ require_result(room->join(options, on_join));
 
 ### 修改自己的成员信息
 
-使用 `RoomEngine::update_local_participant(ParticipantUpdate, Completion<void>, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；只在服务端 ACK 后通过 成员更新完成回调 通知成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `ErrorCode::permission_denied`。
+使用 `RoomView::update_local_participant(ParticipantUpdate, Completion<void>, ControlOptions)` 更新自己的名称、元数据和属性。必须开启 `LiveKitRoomOptions::signal_protocol = 15` 或适配器支持的更高版本；只在服务端 ACK 后通过 成员更新完成回调 通知成功，不以本地写入信令队列代替确认。服务器拒绝权限时返回 `ErrorCode::permission_denied`。
 
 ```cpp
 livekit::sdk::rtc::ParticipantUpdate update;
 update.name = "演示者";
 update.metadata = R"({"role":"presenter"})";
 update.attributes = {{"language", "zh"}, {"obsolete-key", ""}};
-require_result(room->update_local_participant(std::move(update), on_updated));
+require_result(rtc->room().update_local_participant(std::move(update), on_updated));
 ```
 
 空名称/元数据遵循 LiveKit 线协议语义，表示保持原值；空属性值删除该键，未包含的键保持原值。ACK 和本地/远端成员快照是独立观测，应用通过 `session_changed` 读取随后更新的状态。
@@ -142,7 +145,7 @@ require_result(room->update_local_participant(std::move(update), on_updated));
 
 ### 轨道静音和恢复
 
-发布前可设置 `TrackDescriptor::muted`，通过 `AddTrackRequest.muted` 以静音状态发布。发布后使用 `PublishedTrack::set_muted(bool)`、`RoomEngine::set_muted(id, bool)` 或 `RtcEngine::set_muted(id, bool)`；它们支持 `ControlOptions`。静音保留轨道、订阅和其他轨道的发送，不等同于取消发布。当前状态读取 `TrackSnapshot::muted`，描述符保留初始配置。
+发布前可设置 `TrackDescriptor::muted`，通过 `AddTrackRequest.muted` 以静音状态发布。发布后使用 `PublishedTrack::set_muted(bool)` 或 `RtcEngine::set_muted(id, bool)`；它们支持 `ControlOptions`。静音保留轨道、订阅和其他轨道的发送，不等同于取消发布。当前状态读取 `TrackSnapshot::muted`，描述符保留初始配置。
 
 静音立即关闭端点输入准入并清空待发帧，随后在原生发送器中使已排队的旧代次失效。`try_write()` 在静音期间返回 `not_ready`。恢复后，视频必须从关键帧开始；本地静音意图会作为新发布配置随完整重入恢复。已越过原生发送检查或进入网络协议栈的包、重传及 SFU 填充帧无法撤回，不能用“接收端完全没有 RTP”判断静音是否生效。
 

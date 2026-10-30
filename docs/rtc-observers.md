@@ -1,6 +1,6 @@
 # RTC 单次完成回调与持续 Observer
 
-RtcEngine、RoomEngine、RoomView 和 RtcGraphApi 的异步控制立即返回 `ErrorCode` 受理状态。
+RtcEngine、RoomView 和 RtcGraphApi 的异步控制立即返回 `ErrorCode` 受理状态。
 每次调用传入 `Completion<T>`（`std::function<void(Result<T>)>`），普通无值控制使用
 `Completion<void>`。Observer 只接收持续状态变化。不提供 OperationHandle、RequestId 或新增的逐请求取消 API。
 
@@ -48,7 +48,7 @@ Observer 参数引用只在当前调用有效；需要跨线程使用时复制�
 
 1. 调用线程只提交，不等待网络、设备或图停止。不保证硬实时安全；音频实时线程须转发控制意图。
 2. 有界 AsyncControl 管理同轨道顺序与房间屏障。不同轨道可以同时等待 ACK 或原生解绑。
-3. RoomEngine 协议状态机结算内部 AsyncResult，控制 worker 只处理已就绪 continuation。
+3. RoomEngine 同步推进协议状态，通过内部结果回调报告完成；RtcEngine 的执行上下文转换为 AsyncResult，控制 worker 只处理已就绪 continuation。RoomEngine 不拥有线程或状态锁，由上层串行驱动。
 4. RtcEngine 在独立生命周期序列执行建图、媒体启停和回收。正常发布/订阅将端点等待与建图分开，
    静音、需求和解绑使用异步协议结果；图构建、失败回滚和自动 codec 切换仍在生命周期序列中串行。
    原生设备停止及 codec 策略内部同步协议等待可能延迟该生命周期序列，不占用公共控制 worker。

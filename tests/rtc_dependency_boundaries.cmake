@@ -6,7 +6,7 @@ foreach(module track_graph_registry media_graph_builder media_resources media_gr
       continue()
     endif()
     file(READ "${path}" source)
-    if(source MATCHES "#include[^\n]*(room_engine|rtc_engine_impl|livekit/rtc/engine)")
+    if(source MATCHES "#include[^\n]*(room_engine|rtc_engine_(impl|control)|livekit/rtc/engine)")
       message(FATAL_ERROR "${module} depends on a room/coordinator header")
     endif()
     if(module MATCHES "media_" AND source MATCHES "TrackGraphRegistry|track_graph_registry")

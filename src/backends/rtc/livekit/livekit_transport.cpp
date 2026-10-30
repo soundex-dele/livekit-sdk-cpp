@@ -1,3 +1,4 @@
+#include "backends/rtc/livekit/transport_factory.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include "backends/rtc/bounded_events.hpp"
@@ -1539,13 +1540,8 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
 }  // namespace
 }  // namespace livekit::sdk::rtc::detail
 
-namespace livekit::sdk::rtc {
-Result<std::unique_ptr<RoomEngine>> create_livekit_room() {
-  try {
-    return Result<std::unique_ptr<RoomEngine>>::success(
-        std::make_unique<RoomEngine>([] { return std::make_unique<detail::LiveKitTransport>(); }));
-  } catch (...) {
-    return Result<std::unique_ptr<RoomEngine>>::failure(describe_failure(std::current_exception()));
-  }
+namespace livekit::sdk::rtc::detail {
+std::function<std::unique_ptr<RoomTransport>()> livekit_transport_factory() {
+  return [] { return std::make_unique<LiveKitTransport>(); };
 }
-}  // namespace livekit::sdk::rtc
+}  // namespace livekit::sdk::rtc::detail

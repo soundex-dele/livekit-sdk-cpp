@@ -1,35 +1,21 @@
-#include "livekit/rtc/room_engine.hpp"
+#include "backends/rtc/room_engine.hpp"
 #include "backends/rtc/endpoint.hpp"
-#include "backends/rtc/control_context.hpp"
-#include "backends/rtc/async_control.hpp"
-#include "backends/rtc/lifecycle_executor.hpp"
-#include "backends/rtc/bounded_events.hpp"
 #include "backends/rtc/subscription_policy.hpp"
-#include "livekit/error.hpp"
 #include "support/utf8.hpp"
-#include "support/task_dispatcher.hpp"
 #include "support/ready_set.hpp"
 #include "support/deadline_index.hpp"
-#include "utoolkit/task_queue/task_queue.h"
 #include <algorithm>
-#include <functional>
 #include <limits>
-#include <thread>
 
 namespace livekit::sdk::rtc {
-bool is_callback_thread() noexcept {
-  return detail::callback_depth || detail::active_session || detail::worker_depth;
-}
-
 namespace detail {
 namespace {
 std::exception_ptr error(std::string message, ErrorCode code = ErrorCode::session_closed) {
   return std::make_exception_ptr(SDKError(ErrorDomain::lifecycle, code, std::move(message)));
 }
-
 }  // namespace
 
-// Promise settlement is a separate phase from protocol mutation. A transport
+// Result delivery is a separate phase from protocol mutation. A transport
 // batch may contain connected followed by the initial roster; observers and
 // synchronous adapters must see the whole batch before consuming join success.
 struct PendingCompletion : std::enable_shared_from_this<PendingCompletion> {
@@ -68,19 +54,21 @@ struct CompletionBatch {
 // timeout or native detachment. Failures cross threads in the completion itself.
 template <class T>
 struct PendingOperation : PendingCompletion {
-  explicit PendingOperation(CompletionBatch& batch) : batch(batch) {}
-  using Return = std::conditional_t<std::is_void_v<T>, ErrorCode, Result<T>>;
-  CompletionSource<Return> completion;
+  PendingOperation(CompletionBatch& batch, RoomEngine::Completed<T> callback)
+      : completion(std::move(callback)), batch(batch) {}
+
+  using Return = Result<T>;
+  RoomEngine::Completed<T> completion;
   CompletionBatch& batch;
   std::optional<Return> value;
   std::exception_ptr failure;
-  bool settled = false;  // Protected by controller_mutex.
+  bool settled = false;  // Owner serializes protocol access.
 
   template <class... Args>
   void succeed(Args&&... args) {
     if (!settled) {
       if constexpr (std::is_void_v<T>) {
-        value.emplace(ErrorCode::ok);
+        value.emplace(Result<void>::success());
       } else {
         value.emplace(Result<T>::success(std::forward<Args>(args)...));
       }
@@ -102,28 +90,19 @@ struct PendingOperation : PendingCompletion {
   }
 
   void complete() noexcept override {
-    try {
-      if (failure) {
-        completion.set_exception(std::move(failure));
-      } else {
-        completion.set_value(std::move(*value));
-      }
-    } catch (...) {
-      try {
-        completion.set_exception(std::current_exception());
-      } catch (...) {
-        // Source destruction still wakes consumers if promise delivery fails.
-      }
+    auto callback = std::move(completion);
+    if (callback) {
+      callback(failure ? Return::failure(describe_failure(failure)) : std::move(*value));
     }
   }
 };
 
-struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
-  RoomEngineState(RoomEngine::TransportFactory factory, std::shared_ptr<SessionControl> context)
-      : transport_factory(std::move(factory)), control(std::move(context)) {
-    notifications = vi::TaskQueue::create("rtc.room.notifications");
-    notification_dispatch.bind(*notifications);
-    service_failure = std::make_shared<ServiceFailure>();
+struct RoomEngineState {
+  RoomEngineState(RoomEngine::TransportFactory factory, RoomEngine::Hooks hooks)
+      : transport_factory(std::move(factory)),
+        hooks(std::move(hooks)),
+        wakeup(this->hooks.wakeup),
+        ready_work(std::make_shared<livekit::sdk::detail::ReadySet<WorkKey>>(wakeup, 1024 + 128)) {
     try {
       if (transport_factory) {
         transport = transport_factory();
@@ -131,24 +110,18 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       if (transport) {
         transport->attach_wakeup(wakeup);
         services = transport->services();
-        attach_service_notifications(*transport);
+        this->hooks.attach_services(*transport);
       }
     } catch (...) {
       initialization_failure = std::current_exception();
       services.reset();
       transport.reset();
     }
-    worker = std::jthread([this](std::stop_token stop) {
-      CallbackScope worker_scope;
-      run(stop);
-    });
   }
 
   ~RoomEngineState() {
-    set_handler({});
-    shutdown();
-    notification_dispatch.close();
-    notifications.reset();
+    stop_all(ConnectionState::closed, "RTC room destroyed");
+    pending_completions.flush();
   }
 
   struct Entry {
@@ -170,214 +143,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   std::unique_ptr<RoomTransport> transport;
   std::exception_ptr initialization_failure;
   std::shared_ptr<RoomServices> services;
-  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup =
-      std::make_shared<livekit::sdk::detail::WakeEvent>();
-  std::shared_ptr<livekit::sdk::detail::ReadySet<WorkKey>> ready_work =
-      std::make_shared<livekit::sdk::detail::ReadySet<WorkKey>>(wakeup, 1024 + 128);
-  std::jthread worker;
-  LifecycleExecutor lifecycle;
-  std::mutex controller_mutex;
-  CompletionBatch pending_completions;  // Protected by controller_mutex.
-  std::shared_ptr<SessionControl> control;
-  mutable std::mutex mutex;
-  std::condition_variable_any changed;
-  // At most one report per registered graph, independent of room event capacity.
-  std::map<std::shared_ptr<Endpoint>, std::exception_ptr> graph_failures;
-  std::map<std::shared_ptr<Endpoint>, std::exception_ptr> completed_removals;
-  std::deque<RoomEvent> events;
-  std::unique_ptr<vi::TaskQueue> notifications;
-  livekit::sdk::detail::TaskDispatcher notification_dispatch;
-
-  struct ServiceFailure {
-    std::mutex mutex;
-    std::exception_ptr cause;
-  };
-
-  std::shared_ptr<ServiceFailure> service_failure;
-  // Notification/control workers never access the adapter-specific pointer,
-  // which is replaced by the controller on rejoin.
-  ServiceFailure notification_failure;
-
-  void report_notification_failure(std::exception_ptr cause) noexcept {
-    try {
-      std::lock_guard lock(notification_failure.mutex);
-      if (!notification_failure.cause) {
-        notification_failure.cause = cause;
-      }
-      wakeup->signal();
-    } catch (...) {
-    }
-  }
-
-  void attach_service_notifications(RoomTransport& adapter) {
-    service_failure = std::make_shared<ServiceFailure>();
-    adapter.attach_notifications(
-        [dispatch = notification_dispatch](auto task) {
-          dispatch([task = std::move(task)] {
-            CallbackScope scope;
-            task();
-          });
-        },
-        [failure = service_failure, event = wakeup](std::exception_ptr cause) {
-          std::lock_guard lock(failure->mutex);
-          if (!failure->cause) {
-            failure->cause = cause;
-          }
-          event->signal();
-        });
-  }
-
-  void handle_service_failure() {
-    std::exception_ptr error;
-    {
-      std::lock_guard lock(service_failure->mutex);
-      error = std::exchange(service_failure->cause, {});
-    }
-    {
-      std::lock_guard lock(notification_failure.mutex);
-      if (auto failure = std::exchange(notification_failure.cause, {})) {
-        error = failure;
-      }
-    }
-    if (error && connection != ConnectionState::failed &&
-        (connection != ConnectionState::closed ||
-         describe_failure(error)->code == ErrorCode::callback_failed)) {
-      stop_all(ConnectionState::failed, describe_failure(error)->message, error);
-    }
-  }
-
-  ObserverSlot<RoomObserver> room_observer;
-  ObserverSlot<RoomObserver> internal_room_observer;
-  ObserverSlot<PublicationObserver> publication_observer;
-  ObserverSlot<SubscriptionObserver> subscription_observer;
-  std::function<void(const RoomEvent&)> event_handler;
-  bool notification_scheduled = false;
-  size_t extra_notifications = 0;
-
-  void notification_failed() noexcept {
-    try {
-      {
-        std::lock_guard lock(mutex);
-        event_handler = {};
-      }
-      report_notification_failure(
-          error("RTC event callback threw; handler disabled", ErrorCode::callback_failed));
-    } catch (...) {
-      // The queue boundary must not propagate callback/dispatch exceptions.
-    }
-  }
-
-  void schedule_events_locked() {
-    if (notification_scheduled || !event_handler || events.empty()) {
-      return;
-    }
-    notification_scheduled = true;
-    try {
-      notifications->postTask([this] {
-        try {
-          for (size_t count = 0; count < 32; ++count) {
-            std::function<void(const RoomEvent&)> callback;
-            std::optional<RoomEvent> event;
-            {
-              std::lock_guard lock(mutex);
-              if (!event_handler || events.empty()) {
-                break;
-              }
-              callback = event_handler;
-              event = std::move(events.front());
-              events.pop_front();
-            }
-            try {
-              CallbackScope callback_scope;
-              callback(*event);
-            } catch (...) {
-              notification_failed();
-              break;
-            }
-          }
-          std::lock_guard lock(mutex);
-          notification_scheduled = false;
-          schedule_events_locked();
-          changed.notify_all();
-        } catch (...) {
-          {
-            std::lock_guard lock(mutex);
-            notification_scheduled = false;
-            changed.notify_all();
-          }
-          notification_failed();
-        }
-      });
-    } catch (...) {
-      notification_scheduled = false;
-      report_notification_failure(std::current_exception());
-    }
-  }
-
-  void set_handler(std::function<void(const RoomEvent&)> handler) {
-    {
-      std::lock_guard lock(mutex);
-      event_handler = std::move(handler);
-      schedule_events_locked();
-    }
-    std::unique_lock lock(mutex);
-    changed.wait(lock, [&] { return !notification_scheduled && extra_notifications == 0; });
-  }
-
-  void post_notification(std::function<void()> callback, bool completion = false) {
-    {
-      std::lock_guard lock(mutex);
-      if (!completion && extra_notifications >= 256) {
-        report_notification_failure(
-            error("RTC notification task queue exhausted", ErrorCode::resource_exhausted));
-        return;
-      }
-      ++extra_notifications;
-    }
-    try {
-      notifications->postTask([this, callback = std::move(callback), completion] {
-        try {
-          CallbackScope callback_scope;
-          // Events are normally dispatched in batches. Drain their already
-          // queued tail before a completion barrier, without making control or
-          // lifecycle workers wait for application code.
-          if (completion) {
-            for (;;) {
-              std::function<void(const RoomEvent&)> handler;
-              std::optional<RoomEvent> event;
-              {
-                std::lock_guard lock(mutex);
-                if (!event_handler || events.empty()) {
-                  break;
-                }
-                handler = event_handler;
-                event = std::move(events.front());
-                events.pop_front();
-              }
-              try {
-                handler(*event);
-              } catch (...) {
-                notification_failed();
-              }
-            }
-          }
-          callback();
-        } catch (...) {
-          notification_failed();
-        }
-        std::lock_guard lock(mutex);
-        --extra_notifications;
-        changed.notify_all();
-      });
-    } catch (...) {
-      std::lock_guard lock(mutex);
-      --extra_notifications;
-      changed.notify_all();
-      report_notification_failure(std::current_exception());
-    }
-  }
-
-  bool shutting_down = false;
+  RoomEngine::Hooks hooks;
+  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
+  std::shared_ptr<livekit::sdk::detail::ReadySet<WorkKey>> ready_work;
+  CompletionBatch pending_completions;
   RoomSnapshot status;
   // The controller exclusively owns everything below this line.
   RoomOptions options;
@@ -449,17 +218,6 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     controls.clear();
   }
 
-  void shutdown() {
-    {
-      std::lock_guard lock(mutex);
-      shutting_down = true;
-    }
-    worker.request_stop();
-    wakeup->signal();
-    if (worker.joinable())
-      worker.join();
-  }
-
   template <class Function, class T>
   void run_request(Function&& request, const std::shared_ptr<PendingOperation<T>>& operation) {
     try {
@@ -470,30 +228,28 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   }
 
   template <class T>
-  auto deferred(const std::shared_ptr<PendingOperation<T>>& operation) {
-    auto result = operation->completion.get_result();
+  void deferred(const std::shared_ptr<PendingOperation<T>>&) {
     pending_completions.flush();
     wakeup->signal();
-    return result;
   }
 
   void report_failure(std::shared_ptr<Endpoint> endpoint, std::exception_ptr failure) {
-    std::lock_guard lock(mutex);
-    if (shutting_down) {
-      return;
+    const Key key{endpoint->publication, endpoint->descriptor.id};
+    const auto found = tracks.find(key);
+    if (found != tracks.end() && found->second.endpoint == endpoint) {
+      fail_track(key, failure, describe_failure(failure)->message);
     }
-    graph_failures.try_emplace(std::move(endpoint), failure);
-    wakeup->signal();
+    pending_completions.flush();
   }
 
   void refresh(std::string message = {}) {
-    std::lock_guard lock(mutex);
     status.state = connection;
     status.epoch = epoch;
     status.capabilities = transport ? transport->capabilities() : BackendCapabilities{};
     if (connection == ConnectionState::closed || connection == ConnectionState::failed ||
-        (status.session && status.session->epoch != epoch))
+        (status.session && status.session->epoch != epoch)) {
       status.session.reset();
+    }
     status.queued_bytes = budget ? budget->used.load() : 0;
     status.publications = publication_count;
     status.subscriptions = subscription_count;
@@ -501,9 +257,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     status.tracks_serviced = tracks_serviced;
     status.scheduled_deadlines = deadlines.size() + bool(joining);
     status.ready_work = ready_work->pending();
-    if (!message.empty())
+    if (!message.empty()) {
       status.error = std::move(message);
-    changed.notify_all();
+    }
   }
 
   bool emit_track(RoomEvent event, bool publication, bool fatal_overflow = true) {
@@ -512,31 +268,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
   }
 
   bool emit(RoomEvent event, bool fatal_overflow = true) {
-    std::lock_guard lock(mutex);
-    const auto result = enqueue_event(
-        events, std::move(event), options.max_events, RoomEventKind::statistics,
-        [](const auto& queued, const auto& incoming) {
-          // A room state event is a hint to read the latest immutable snapshot.
-          return incoming.kind == RoomEventKind::session_changed &&
-                 std::any_of(queued.begin(), queued.end(), [&](const auto& value) {
-                   return value.kind == incoming.kind && value.epoch == incoming.epoch;
-                 });
-        });
-    if (result == EventAdmission::overflow) {
-      if (fatal_overflow) {
-        std::lock_guard failure_lock(service_failure->mutex);
-        service_failure->cause =
-            error("RTC room event queue exhausted", ErrorCode::resource_exhausted);
-        wakeup->signal();
-      }
-      return false;
-    }
-    if (result != EventAdmission::queued) {
-      return true;
-    }
-    schedule_events_locked();
-    changed.notify_all();
-    return true;
+    return hooks.event(std::move(event), false, fatal_overflow);
   }
 
   void stop_all(ConnectionState state, const std::string& message,
@@ -565,21 +297,16 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       transport->stop();
     }
     refresh(state == ConnectionState::failed ? message : "");
-    // A terminal notification must remain observable even if the event consumer
-    // overflowed. Track/data payloads are never retained in this event queue.
-    std::lock_guard lock(mutex);
-    if (events.size() >= options.max_events)
-      events.pop_front();
-    events.push_back(
-        {state == ConnectionState::failed ? RoomEventKind::failed : RoomEventKind::closed,
-         {},
-         {},
-         epoch,
-         message});
+    RoomEvent terminal{
+        state == ConnectionState::failed ? RoomEventKind::failed : RoomEventKind::closed,
+        {},
+        {},
+        epoch,
+        message};
     if (state == ConnectionState::failed) {
-      events.back().failure = info;
+      terminal.failure = info;
     }
-    schedule_events_locked();
+    hooks.event(std::move(terminal), true, false);
     // Completion observes the terminal snapshot and transport shutdown barrier.
     // stop() also covers native removals already queued before shutdown.
     finish_all_removals();
@@ -595,7 +322,6 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     if (joining_result) {
       joining_result->fail(failure);
     }
-    changed.notify_all();
   }
 
   void dispatch(Entry& entry) {
@@ -613,8 +339,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
 
   void fail_track(const Key& key, std::exception_ptr failure, const std::string& message) {
     auto it = tracks.find(key);
-    if (it == tracks.end())
+    if (it == tracks.end()) {
       return;
+    }
     auto entry = it->second;
     erase_track(it);
     failure = normalized_failure(failure, {"track", key.second, {}, epoch});
@@ -660,8 +387,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       track_keys.emplace(incarnation, key);
       endpoint->attach_wakeup(ready_work->watch({WorkKind::track, incarnation}));
       deadlines.set({WorkKind::track, incarnation}, it->second.deadline);
-      if (connection == ConnectionState::connected)
+      if (connection == ConnectionState::connected) {
         dispatch(it->second);
+      }
       refresh();
     } catch (...) {
       auto failed = std::move(it->second.completion);
@@ -681,16 +409,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     return endpoint;
   }
 
-  ErrorCode set_muted(TrackId id, bool muted, ControlOptions opts,
-                      std::shared_ptr<Endpoint> expected = {}) {
-    return control_boundary(
-        [&] { return set_muted_async(std::move(id), muted, opts, std::move(expected)).get(); });
-  }
-
-  AsyncResult<ErrorCode> set_muted_async(TrackId id, bool muted, ControlOptions opts,
-                                         std::shared_ptr<Endpoint> expected = {}) {
-    std::lock_guard controller_lock(controller_mutex);
-    auto operation = std::make_shared<PendingOperation<void>>(pending_completions);
+  void set_muted(TrackId id, bool muted, ControlOptions opts, RoomEngine::Completed<void> completed,
+                 std::shared_ptr<Endpoint> expected = {}) {
+    auto operation =
+        std::make_shared<PendingOperation<void>>(pending_completions, std::move(completed));
     auto pending = operation;
     const auto submitted = SteadyClock::now();
     run_request(
@@ -746,18 +468,11 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     return deferred(operation);
   }
 
-  ErrorCode set_receive_demand(TrackId id, ReceiveDemand demand, ControlOptions opts,
-                               std::shared_ptr<Endpoint> expected = {}) {
-    return control_boundary([&] {
-      return set_receive_demand_async(std::move(id), demand, opts, std::move(expected)).get();
-    });
-  }
-
-  AsyncResult<ErrorCode> set_receive_demand_async(TrackId id, ReceiveDemand demand,
-                                                  ControlOptions opts,
-                                                  std::shared_ptr<Endpoint> expected = {}) {
-    std::lock_guard controller_lock(controller_mutex);
-    auto operation = std::make_shared<PendingOperation<void>>(pending_completions);
+  void set_receive_demand(TrackId id, ReceiveDemand demand, ControlOptions opts,
+                          RoomEngine::Completed<void> completed,
+                          std::shared_ptr<Endpoint> expected = {}) {
+    auto operation =
+        std::make_shared<PendingOperation<void>>(pending_completions, std::move(completed));
     auto pending = operation;
     const auto submitted = SteadyClock::now();
     run_request(
@@ -795,8 +510,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
           const auto operation = ++next_control;
           if (!add_control(operation, PendingControl{pending, epoch, deadline, opts.stop,
                                                      [endpoint, binding, demand] {
-                                                       if (endpoint->matches(binding))
+                                                       if (endpoint->matches(binding)) {
                                                          endpoint->set_receive_demand(demand);
+                                                       }
                                                      }})) {
             return;
           }
@@ -864,18 +580,8 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     if (pending) {
       removals.back().waiting.push_back(std::move(pending));
     }
-    auto weak = weak_from_this();
     try {
-      transport->remove(endpoint->binding(), endpoint->publication,
-                        [weak, endpoint](std::exception_ptr failure) {
-                          if (auto state = weak.lock()) {
-                            std::lock_guard lock(state->mutex);
-                            if (!state->shutting_down) {
-                              state->completed_removals.emplace(endpoint, failure);
-                              state->wakeup->signal();
-                            }
-                          }
-                        });
+      transport->remove(endpoint->binding(), endpoint->publication, hooks.removal(endpoint));
     } catch (...) {
       finish_removal(endpoint, std::current_exception());
     }
@@ -901,13 +607,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     it->waiting.push_back(std::move(pending));
   }
 
-  ErrorCode close_track(const std::shared_ptr<Endpoint>& endpoint) {
-    return control_boundary([&] { return close_track_async(endpoint).get(); });
-  }
-
-  AsyncResult<ErrorCode> close_track_async(const std::shared_ptr<Endpoint>& endpoint) {
-    std::lock_guard controller_lock(controller_mutex);
-    auto operation = std::make_shared<PendingOperation<void>>(pending_completions);
+  void close_track(const std::shared_ptr<Endpoint>& endpoint,
+                   RoomEngine::Completed<void> completed) {
+    auto operation =
+        std::make_shared<PendingOperation<void>>(pending_completions, std::move(completed));
     auto pending = operation;
     run_request(
         [&] {
@@ -923,13 +626,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     return deferred(operation);
   }
 
-  ErrorCode close_id(const TrackId& id, bool publication) {
-    return control_boundary([&] { return close_id_async(id, publication).get(); });
-  }
-
-  AsyncResult<ErrorCode> close_id_async(const TrackId& id, bool publication) {
-    std::lock_guard controller_lock(controller_mutex);
-    auto operation = std::make_shared<PendingOperation<void>>(pending_completions);
+  void close_id(const TrackId& id, bool publication, RoomEngine::Completed<void> completed) {
+    auto operation =
+        std::make_shared<PendingOperation<void>>(pending_completions, std::move(completed));
     auto pending = operation;
     run_request(
         [&] {
@@ -944,13 +643,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     return deferred(operation);
   }
 
-  ErrorCode request_keyframe(const std::shared_ptr<Endpoint>& endpoint) {
-    return control_boundary([&] { return request_keyframe_async(endpoint).get(); });
-  }
-
-  AsyncResult<ErrorCode> request_keyframe_async(const std::shared_ptr<Endpoint>& endpoint) {
-    std::lock_guard controller_lock(controller_mutex);
-    auto operation = std::make_shared<PendingOperation<void>>(pending_completions);
+  void request_keyframe(const std::shared_ptr<Endpoint>& endpoint,
+                        RoomEngine::Completed<void> completed) {
+    auto operation =
+        std::make_shared<PendingOperation<void>>(pending_completions, std::move(completed));
     auto pending = operation;
     run_request(
         [&] {
@@ -976,8 +672,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
 
   void send_pli(Entry& entry) {
     const auto now = SteadyClock::now();
-    if (now - entry.last_pli < std::chrono::milliseconds(250))
+    if (now - entry.last_pli < std::chrono::milliseconds(250)) {
       return;
+    }
     transport->request_keyframe(entry.endpoint->binding());
     entry.last_pli = now;
   }
@@ -989,20 +686,24 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     }
     if (event.kind == TransportEventKind::interrupted) {
       if (connection == ConnectionState::closed || connection == ConnectionState::failed ||
-          connection == ConnectionState::reconnecting)
+          connection == ConnectionState::reconnecting) {
         return;
+      }
       connection = ConnectionState::reconnecting;
       interrupt_controls();
       ++epoch;
-      for (auto& [key, entry] : tracks)
+      for (auto& [key, entry] : tracks) {
         entry.endpoint->rebind(epoch);
+      }
       refresh();
       emit({RoomEventKind::reconnecting, {}, {}, epoch, event.error});
       return;
     }
     if (event.kind == TransportEventKind::connected) {
-      if (connection != ConnectionState::connecting && connection != ConnectionState::reconnecting)
+      if (connection != ConnectionState::connecting &&
+          connection != ConnectionState::reconnecting) {
         return;
+      }
       connection = ConnectionState::connected;
       for (auto it = tracks.begin(); it != tracks.end();) {
         const auto key = it->first;
@@ -1023,27 +724,30 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     }
     if (event.kind == TransportEventKind::control_completed) {
       auto it = controls.find(event.operation_id);
-      if (it == controls.end() || it->second.epoch != event.binding.epoch)
+      if (it == controls.end() || it->second.epoch != event.binding.epoch) {
         return;
-      if (it->second.stop.stop_requested() || SteadyClock::now() >= it->second.deadline)
+      }
+      if (it->second.stop.stop_requested() || SteadyClock::now() >= it->second.deadline) {
         it->second.pending->fail(error(
             "RTC control completion arrived after cancellation/deadline; remote outcome is unknown",
             ErrorCode::outcome_unknown));
-      else if (event.control_error)
+      } else if (event.control_error) {
         it->second.pending->fail(
             std::make_exception_ptr(SDKError(ErrorDomain::signaling, *event.control_error,
                                              event.error, false, event.control_reason)));
-      else {
-        if (it->second.applied)
+      } else {
+        if (it->second.applied) {
           it->second.applied();
+        }
         it->second.pending->succeed();
       }
       erase_control(event.operation_id);
       return;
     }
     if (event.kind == TransportEventKind::statistics) {
-      if (event.binding.epoch != epoch || !event.statistics)
+      if (event.binding.epoch != epoch || !event.statistics) {
         return;
+      }
       RoomEvent notification{RoomEventKind::statistics, {}, {}, epoch, {}};
       notification.statistics = std::move(event.statistics);
       emit(std::move(notification));
@@ -1051,8 +755,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     }
     if (event.kind == TransportEventKind::subscription_permission_changed) {
       if (event.binding.epoch != epoch || !event.permission ||
-          connection == ConnectionState::closed || connection == ConnectionState::failed)
+          connection == ConnectionState::closed || connection == ConnectionState::failed) {
         return;
+      }
       RoomEvent notification{RoomEventKind::subscription_permission_changed, {}, {}, epoch, {}};
       notification.permission = std::move(event.permission);
       emit(std::move(notification));
@@ -1060,12 +765,13 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     }
     if (event.kind == TransportEventKind::session_changed) {
       if (!event.session || event.binding.epoch != epoch || event.session->epoch != epoch ||
-          connection == ConnectionState::closed || connection == ConnectionState::failed)
+          connection == ConnectionState::closed || connection == ConnectionState::failed) {
         return;
+      }
       {
-        std::lock_guard lock(mutex);
-        if (status.session && status.session->revision >= event.session->revision)
+        if (status.session && status.session->revision >= event.session->revision) {
           return;
+        }
         status.session = std::move(event.session);
       }
       emit({RoomEventKind::session_changed, {}, {}, epoch, {}});
@@ -1074,8 +780,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     if (event.kind == TransportEventKind::remote_track_added ||
         event.kind == TransportEventKind::remote_track_removed) {
       if (event.binding.epoch != epoch || connection == ConnectionState::closed ||
-          connection == ConnectionState::failed)
+          connection == ConnectionState::failed) {
         return;
+      }
       emit({event.kind == TransportEventKind::remote_track_added
                 ? RoomEventKind::remote_track_added
                 : RoomEventKind::remote_track_removed,
@@ -1097,10 +804,11 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     auto it = tracks.find({event.binding.publication, event.binding.id});
     if (it == tracks.end() || !it->second.endpoint->matches(event.binding)) {
       if (event.kind == TransportEventKind::published ||
-          event.kind == TransportEventKind::subscribed)
+          event.kind == TransportEventKind::subscribed) {
         transport->remove(
             event.binding,
             event.binding.publication);  // compensate a cancelled/timed-out publication
+      }
       return;
     }
     auto& entry = it->second;
@@ -1114,8 +822,9 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
         break;
       case TransportEventKind::published:
       case TransportEventKind::subscribed:
-        if (connection != ConnectionState::connected)
+        if (connection != ConnectionState::connected) {
           return;
+        }
         endpoint.ready(std::move(event.server_sid));
         emit_track({RoomEventKind::track_ready, event.binding.id, endpoint.descriptor, epoch, {}},
                    event.binding.publication);
@@ -1147,12 +856,14 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
         break;
       }
       case TransportEventKind::frame:
-        if (!endpoint.publication && event.frame)
+        if (!endpoint.publication && event.frame) {
           endpoint.write(std::move(*event.frame));
+        }
         break;
       case TransportEventKind::feedback:
-        if (endpoint.publication && event.feedback)
+        if (endpoint.publication && event.feedback) {
           endpoint.update_feedback(*event.feedback);
+        }
         break;
       case TransportEventKind::writable:
         ready_work->mark({WorkKind::track, event.binding.incarnation});
@@ -1266,7 +977,7 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
     return next;
   }
 
-  void pump() noexcept {
+  void pump(bool interrupted) noexcept {
     struct FlushCompletions {
       CompletionBatch& batch;
 
@@ -1274,9 +985,10 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
         batch.flush();
       }
     } flush{pending_completions};
+
     ++controller_wakeups;
     const bool pending_protocol =
-        control->interrupted.load() &&
+        interrupted &&
         (joining || !controls.empty() ||
          std::any_of(tracks.begin(), tracks.end(),
                      [](const auto& entry) { return bool(entry.second.completion); }) ||
@@ -1286,27 +998,6 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       stop_all(ConnectionState::closed, "RTC operation cancelled by leave/close",
                error("RTC operation cancelled by leave/close", ErrorCode::cancelled));
       return;
-    }
-    std::map<std::shared_ptr<Endpoint>, std::exception_ptr> failures, detached;
-    {
-      std::lock_guard lock(mutex);
-      failures.swap(graph_failures);
-      detached.swap(completed_removals);
-    }
-    try {
-      handle_service_failure();
-      for (const auto& [endpoint, failure] : detached) {
-        finish_removal(endpoint, failure);
-      }
-      for (const auto& [endpoint, failure] : failures) {
-        const Key key{endpoint->publication, endpoint->descriptor.id};
-        const auto it = tracks.find(key);
-        if (it != tracks.end() && it->second.endpoint == endpoint) {
-          fail_track(key, failure, describe_failure(failure)->message);
-        }
-      }
-    } catch (...) {
-      stop_all(ConnectionState::failed, "Graph failure cleanup failed", std::current_exception());
     }
     try {
       if (connection == ConnectionState::connecting || connection == ConnectionState::connected ||
@@ -1325,251 +1016,17 @@ struct RoomEngineState : std::enable_shared_from_this<RoomEngineState> {
       stop_all(ConnectionState::failed, "Unknown RTC transport failure");
     }
   }
-
-  void run(std::stop_token stop) noexcept {
-    while (!stop.stop_requested()) {
-      const auto observed = wakeup->revision();
-      std::optional<SteadyClock::time_point> deadline;
-      {
-        std::lock_guard controller_lock(controller_mutex);
-        pump();
-        deadline = next_deadline();
-      }
-      wakeup->wait(observed, stop, deadline);
-    }
-    std::lock_guard controller_lock(controller_mutex);
-    stop_all(ConnectionState::closed, "RTC room destroyed");
-    pending_completions.flush();
-  }
 };
 }  // namespace detail
 
-PublishedTrack::PublishedTrack(std::shared_ptr<detail::Endpoint> endpoint,
-                               std::weak_ptr<detail::RoomEngineState> session)
-    : endpoint_(std::move(endpoint)), session_(std::move(session)) {}
+RoomEngine::RoomEngine(TransportFactory factory, Hooks hooks)
+    : state_(std::make_unique<detail::RoomEngineState>(std::move(factory), std::move(hooks))) {}
 
-const TrackDescriptor& PublishedTrack::descriptor() const {
-  return endpoint_->descriptor;
-}
+RoomEngine::~RoomEngine() = default;
 
-TrackSnapshot PublishedTrack::snapshot() const {
-  return endpoint_->snapshot();
-}
-
-SenderFeedback PublishedTrack::feedback() const {
-  return endpoint_->feedback();
-}
-
-std::optional<SenderFeedback> PublishedTrack::wait_feedback(Epoch epoch, uint64_t revision,
-                                                            std::stop_token stop) const {
-  return endpoint_->wait_feedback(epoch, revision, stop);
-}
-
-WriteStatus PublishedTrack::try_write(EncodedFrame frame) {
-  return endpoint_->write(std::move(frame));
-}
-
-ErrorCode PublishedTrack::set_muted(bool muted, ControlOptions options) {
-  return detail::control_boundary([&] {
-    if (auto session = session_.lock()) {
-      auto pending = [&] {
-        detail::OperationGuard guard(*session->control);
-        return session->set_muted_async(endpoint_->descriptor.id, muted, options, endpoint_);
-      }();
-      return pending.get();
-    }
-    return ErrorCode::session_closed;
-  });
-}
-
-void PublishedTrack::report_failure(std::exception_ptr failure) {
-  if (auto session = session_.lock()) {
-    session->report_failure(endpoint_, failure);
-  }
-}
-
-std::shared_ptr<detail::SessionControl> PublishedTrack::operation_control() const {
-  auto session = session_.lock();
-  if (!session) {
-    throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC room destroyed");
-  }
-  return session->control;
-}
-
-ErrorCode PublishedTrack::close() {
-  return detail::control_boundary([&] {
-    if (auto session = session_.lock()) {
-      auto pending = [&] {
-        detail::OperationGuard guard(*session->control);
-        return session->close_track_async(endpoint_);
-      }();
-      return pending.get();
-    }
-    return ErrorCode::session_closed;
-  });
-}
-
-ErrorCode PublishedTrack::close_locked() {
-  if (auto session = session_.lock()) {
-    return session->close_track(endpoint_);
-  }
-  return ErrorCode::session_closed;
-}
-
-SubscribedTrack::SubscribedTrack(std::shared_ptr<detail::Endpoint> endpoint,
-                                 std::weak_ptr<detail::RoomEngineState> session)
-    : endpoint_(std::move(endpoint)), session_(std::move(session)) {}
-
-const TrackDescriptor& SubscribedTrack::descriptor() const {
-  return endpoint_->descriptor;
-}
-
-TrackSnapshot SubscribedTrack::snapshot() const {
-  return endpoint_->snapshot();
-}
-
-ReadResult SubscribedTrack::read(std::chrono::milliseconds timeout, std::stop_token stop) {
-  return endpoint_->read(timeout, stop);
-}
-
-ReadResult SubscribedTrack::wait_frame(std::stop_token stop) {
-  return endpoint_->wait_frame(stop);
-}
-
-ErrorCode SubscribedTrack::request_keyframe() {
-  return detail::control_boundary([&] {
-    if (auto session = session_.lock()) {
-      detail::OperationGuard guard(*session->control);
-      return session->request_keyframe(endpoint_);
-    }
-    return ErrorCode::session_closed;
-  });
-}
-
-ErrorCode SubscribedTrack::set_demand(ReceiveDemand demand, ControlOptions options) {
-  return detail::control_boundary([&] {
-    if (auto session = session_.lock()) {
-      auto pending = [&] {
-        detail::OperationGuard guard(*session->control);
-        return session->set_receive_demand_async(endpoint_->descriptor.id, demand, options,
-                                                 endpoint_);
-      }();
-      return pending.get();
-    }
-    return ErrorCode::session_closed;
-  });
-}
-
-void SubscribedTrack::report_failure(std::exception_ptr failure) {
-  if (auto session = session_.lock()) {
-    session->report_failure(endpoint_, failure);
-  }
-}
-
-std::shared_ptr<detail::SessionControl> SubscribedTrack::operation_control() const {
-  auto session = session_.lock();
-  if (!session) {
-    throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed, "RTC room destroyed");
-  }
-  return session->control;
-}
-
-ErrorCode SubscribedTrack::close() {
-  return detail::control_boundary([&] {
-    if (auto session = session_.lock()) {
-      auto pending = [&] {
-        detail::OperationGuard guard(*session->control);
-        return session->close_track_async(endpoint_);
-      }();
-      return pending.get();
-    }
-    return ErrorCode::session_closed;
-  });
-}
-
-ErrorCode SubscribedTrack::close_locked() {
-  if (auto session = session_.lock()) {
-    return session->close_track(endpoint_);
-  }
-  return ErrorCode::session_closed;
-}
-
-RoomEngine::RoomEngine(TransportFactory factory)
-    : RoomEngine(std::move(factory), std::make_shared<detail::SessionControl>()) {}
-
-RoomEngine::RoomEngine(TransportFactory factory, std::shared_ptr<detail::SessionControl> control)
-    : state_(std::make_shared<detail::RoomEngineState>(std::move(factory), std::move(control))) {
-  auto* state = state_.get();
-  state_->control->async = std::make_shared<detail::AsyncControl>(
-      *state_->control, [state](auto task) { state->post_notification(std::move(task), true); },
-      [wakeup = state_->wakeup] { wakeup->signal(); },
-      [state](auto failure) { state->report_notification_failure(failure); });
-  state_->set_handler([state](const RoomEvent& event) {
-    if (!event.publication) {
-      if (auto observer = state->internal_room_observer.get().lock()) {
-        observer->on_room_event(event);
-      }
-      if (auto observer = state->room_observer.get().lock()) {
-        observer->on_room_event(event);
-      }
-    } else if (*event.publication) {
-      if (auto observer = state->publication_observer.get().lock()) {
-        observer->on_publication_event(event);
-      }
-    } else if (auto observer = state->subscription_observer.get().lock()) {
-      observer->on_subscription_event(event);
-    }
-  });
-}
-
-std::shared_ptr<detail::SessionControl> RoomEngine::control() const {
-  return state_->control;
-}
-
-void SubscribedTrack::request_keyframe_async() {
-  endpoint_->require_keyframe();
-}
-
-RoomEngine::~RoomEngine() {
-  state_->control->async->shutdown();
-  state_->lifecycle.shutdown();
-  state_->set_handler({});
-  state_->shutdown();
-}
-
-Result<std::shared_ptr<RoomServices>> RoomEngine::services() const {
-  return detail::control_boundary([&] {
-    std::lock_guard lock(state_->mutex);
-    if (!state_->services) {
-      return detail::failure_result<std::shared_ptr<RoomServices>>(
-          ErrorCode::unsupported, "This transport does not provide room services");
-    }
-    return Result<std::shared_ptr<RoomServices>>::success(state_->services);
-  });
-}
-
-ErrorCode RoomEngine::join(RoomOptions options, Completion<void> completion) {
-  if (options.video_codec_policy) {
-    return ErrorCode::unsupported;
-  }
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "room.join",
-        [this, options = std::move(options)]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return join_async(std::move(options));
-        },
-        std::move(completion));
-  });
-}
-
-ErrorCode RoomEngine::join_locked(RoomOptions options) {
-  return detail::control_boundary([&] { return join_async(std::move(options)).get(); });
-}
-
-AsyncResult<ErrorCode> RoomEngine::join_async(RoomOptions options) {
-  std::lock_guard controller_lock(state_->controller_mutex);
-  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions);
+void RoomEngine::join(RoomOptions options, Completed<void> completed) {
+  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions,
+                                                                    std::move(completed));
   auto pending = operation;
   auto* s = state_.get();
   s->run_request(
@@ -1601,8 +1058,9 @@ AsyncResult<ErrorCode> RoomEngine::join_async(RoomOptions options) {
             return;
           }
         }
-        if (options.subscription_permissions)
+        if (options.subscription_permissions) {
           detail::validate_subscription_permissions(*options.subscription_permissions);
+        }
         if (s->connection != ConnectionState::disconnected) {
           auto replacement = s->transport_factory();
           if (!replacement) {
@@ -1612,16 +1070,15 @@ AsyncResult<ErrorCode> RoomEngine::join_async(RoomOptions options) {
               return;
             }
           }
-          s->attach_service_notifications(*replacement);
+          s->hooks.attach_services(*replacement);
           auto services = replacement->services();
           s->transport = std::move(replacement);
-          std::lock_guard lock(s->mutex);
+
           // Release old service state after unlocking; it may own executors.
           s->services.swap(services);
         }
         {
-          std::lock_guard lock(s->mutex);
-          s->events.clear();
+          s->hooks.reset_events(options.max_events);
           s->status = {};
         }
         s->options = options;
@@ -1645,29 +1102,10 @@ AsyncResult<ErrorCode> RoomEngine::join_async(RoomOptions options) {
   return state_->deferred(operation);
 }
 
-ErrorCode RoomEngine::publish(TrackDescriptor descriptor,
-                              Completion<std::shared_ptr<PublishedTrack>> completion) {
-  const auto track_id = descriptor.id;
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "publication.publish" + std::string(":") + track_id,
-        [this, descriptor = std::move(descriptor)]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return publish_async(std::move(descriptor));
-        },
-        std::move(completion));
-  });
-}
-
-Result<std::shared_ptr<PublishedTrack>> RoomEngine::publish_locked(TrackDescriptor descriptor) {
-  return detail::control_boundary([&] { return publish_async(std::move(descriptor)).get(); });
-}
-
-AsyncResult<Result<std::shared_ptr<PublishedTrack>>> RoomEngine::publish_async(
-    TrackDescriptor descriptor) {
-  std::lock_guard controller_lock(state_->controller_mutex);
+void RoomEngine::publish(TrackDescriptor descriptor,
+                         Completed<std::shared_ptr<PublishedTrack>> completed) {
   auto operation = std::make_shared<detail::PendingOperation<std::shared_ptr<PublishedTrack>>>(
-      state_->pending_completions);
+      state_->pending_completions, std::move(completed));
   auto pending = operation;
   auto* s = state_.get();
   s->run_request(
@@ -1678,41 +1116,23 @@ AsyncResult<Result<std::shared_ptr<PublishedTrack>>> RoomEngine::publish_async(
               detail::error("Join the RTC room before adding tracks", ErrorCode::invalid_state));
           return;
         }
-        auto track = std::shared_ptr<PublishedTrack>(new PublishedTrack(endpoint, state_));
+        auto track = std::shared_ptr<PublishedTrack>(new PublishedTrack(endpoint, s->hooks.tracks));
         s->add(endpoint, [s, pending, track](auto failure) {
-          if (failure)
+          if (failure) {
             pending->fail(failure);
-          else
+          } else {
             pending->succeed(track);
+          }
         });
       },
       operation);
   return state_->deferred(operation);
 }
 
-ErrorCode RoomEngine::subscribe(TrackDescriptor descriptor,
-                                Completion<std::shared_ptr<SubscribedTrack>> completion) {
-  const auto track_id = descriptor.id;
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "subscription.subscribe" + std::string(":") + track_id,
-        [this, descriptor = std::move(descriptor)]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return subscribe_async(std::move(descriptor));
-        },
-        std::move(completion));
-  });
-}
-
-Result<std::shared_ptr<SubscribedTrack>> RoomEngine::subscribe_locked(TrackDescriptor descriptor) {
-  return detail::control_boundary([&] { return subscribe_async(std::move(descriptor)).get(); });
-}
-
-AsyncResult<Result<std::shared_ptr<SubscribedTrack>>> RoomEngine::subscribe_async(
-    TrackDescriptor descriptor) {
-  std::lock_guard controller_lock(state_->controller_mutex);
+void RoomEngine::subscribe(TrackDescriptor descriptor,
+                           Completed<std::shared_ptr<SubscribedTrack>> completed) {
   auto operation = std::make_shared<detail::PendingOperation<std::shared_ptr<SubscribedTrack>>>(
-      state_->pending_completions);
+      state_->pending_completions, std::move(completed));
   auto pending = operation;
   auto* s = state_.get();
   s->run_request(
@@ -1723,162 +1143,24 @@ AsyncResult<Result<std::shared_ptr<SubscribedTrack>>> RoomEngine::subscribe_asyn
               detail::error("Join the RTC room before adding tracks", ErrorCode::invalid_state));
           return;
         }
-        auto track = std::shared_ptr<SubscribedTrack>(new SubscribedTrack(endpoint, state_));
+        auto track =
+            std::shared_ptr<SubscribedTrack>(new SubscribedTrack(endpoint, s->hooks.tracks));
         s->add(endpoint, [s, pending, track](auto failure) {
-          if (failure)
+          if (failure) {
             pending->fail(failure);
-          else
+          } else {
             pending->succeed(track);
+          }
         });
       },
       operation);
   return state_->deferred(operation);
 }
 
-ErrorCode RoomEngine::leave(Completion<void> completion) {
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "room.leave",
-        [this]() mutable {
-          return state_->lifecycle.submit([this] {
-            detail::OperationGuard guard(*state_->control);
-            return leave_locked();
-          });
-        },
-        std::move(completion), true);
-  });
-}
-
-ErrorCode RoomEngine::leave_locked() {
-  std::lock_guard controller_lock(state_->controller_mutex);
-  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions);
-  auto pending = operation;
-  auto* s = state_.get();
-  s->run_request(
-      [&] {
-        if (s->connection != ConnectionState::closed)
-          s->stop_all(ConnectionState::closed, "RTC room left");
-        pending->succeed();
-      },
-      operation);
-  // run_request has synchronously settled this local stop operation. Notification
-  // draining belongs to the notification queue, never to this controller lock.
-  return state_->deferred(operation).get();
-}
-
-ErrorCode RoomEngine::unpublish(const TrackId& id, Completion<void> completion) {
-  const auto track_id = id;
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "publication.remove" + std::string(":") + track_id,
-        [this, id]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return unpublish_async(id);
-        },
-        std::move(completion));
-  });
-}
-
-AsyncResult<ErrorCode> RoomEngine::unpublish_async(const TrackId& id) {
-  return state_->close_id_async(id, true);
-}
-
-ErrorCode RoomEngine::unpublish_locked(const TrackId& id) {
-  return state_->close_id(id, true);
-}
-
-ErrorCode RoomEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
-  const auto track_id = id;
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "subscription.remove" + std::string(":") + track_id,
-        [this, id]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return unsubscribe_async(id);
-        },
-        std::move(completion));
-  });
-}
-
-AsyncResult<ErrorCode> RoomEngine::unsubscribe_async(const TrackId& id) {
-  return state_->close_id_async(id, false);
-}
-
-ErrorCode RoomEngine::unsubscribe_locked(const TrackId& id) {
-  return state_->close_id(id, false);
-}
-
-ErrorCode RoomEngine::set_muted(const TrackId& id, bool muted, Completion<void> completion,
-                                ControlOptions options) {
-  const auto track_id = id;
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "publication.mute" + std::string(":") + track_id,
-        [this, id, muted, options]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return set_muted_async(id, muted, options);
-        },
-        std::move(completion));
-  });
-}
-
-AsyncResult<ErrorCode> RoomEngine::set_muted_async(const TrackId& id, bool muted,
-                                                   ControlOptions options) {
-  return state_->set_muted_async(id, muted, options);
-}
-
-ErrorCode RoomEngine::set_muted_locked(const TrackId& id, bool muted, ControlOptions options) {
-  return state_->set_muted(id, muted, options);
-}
-
-ErrorCode RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
-                                         Completion<void> completion, ControlOptions options) {
-  const auto track_id = id;
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "subscription.demand" + std::string(":") + track_id,
-        [this, id, demand, options]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return set_receive_demand_async(id, demand, options);
-        },
-        std::move(completion));
-  });
-}
-
-AsyncResult<ErrorCode> RoomEngine::set_receive_demand_async(const TrackId& id, ReceiveDemand demand,
-                                                            ControlOptions options) {
-  return state_->set_receive_demand_async(id, demand, options);
-}
-
-ErrorCode RoomEngine::set_receive_demand_locked(const TrackId& id, ReceiveDemand demand,
-                                                ControlOptions options) {
-  return state_->set_receive_demand(id, demand, options);
-}
-
-ErrorCode RoomEngine::update_local_participant(ParticipantUpdate update,
-                                               Completion<void> completion,
-                                               ControlOptions options) {
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "room.participant",
-        [this, update = std::move(update), options]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return update_local_participant_async(std::move(update), options);
-        },
-        std::move(completion));
-  });
-}
-
-ErrorCode RoomEngine::update_local_participant_locked(ParticipantUpdate update,
-                                                      ControlOptions options) {
-  return detail::control_boundary(
-      [&] { return update_local_participant_async(std::move(update), options).get(); });
-}
-
-AsyncResult<ErrorCode> RoomEngine::update_local_participant_async(ParticipantUpdate update,
-                                                                  ControlOptions options) {
-  std::lock_guard controller_lock(state_->controller_mutex);
-  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions);
+void RoomEngine::update_local_participant(ParticipantUpdate update, ControlOptions options,
+                                          Completed<void> completed) {
+  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions,
+                                                                    std::move(completed));
   auto pending = operation;
   try {
     size_t bytes = update.name.size() + update.metadata.size();
@@ -1956,30 +1238,10 @@ AsyncResult<ErrorCode> RoomEngine::update_local_participant_async(ParticipantUpd
   return state_->deferred(operation);
 }
 
-ErrorCode RoomEngine::set_subscription_permissions(SubscriptionPermissions policy,
-                                                   Completion<void> completion,
-                                                   ControlOptions options) {
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "room.permissions",
-        [this, policy = std::move(policy), options]() mutable {
-          detail::OperationGuard guard(*state_->control);
-          return set_subscription_permissions_async(std::move(policy), options);
-        },
-        std::move(completion));
-  });
-}
-
-ErrorCode RoomEngine::set_subscription_permissions_locked(SubscriptionPermissions policy,
-                                                          ControlOptions options) {
-  return detail::control_boundary(
-      [&] { return set_subscription_permissions_async(std::move(policy), options).get(); });
-}
-
-AsyncResult<ErrorCode> RoomEngine::set_subscription_permissions_async(
-    SubscriptionPermissions policy, ControlOptions options) {
-  std::lock_guard controller_lock(state_->controller_mutex);
-  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions);
+void RoomEngine::set_subscription_permissions(SubscriptionPermissions policy,
+                                              ControlOptions options, Completed<void> completed) {
+  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions,
+                                                                    std::move(completed));
   auto pending = operation;
   try {
     detail::validate_subscription_permissions(policy);
@@ -2034,52 +1296,90 @@ AsyncResult<ErrorCode> RoomEngine::set_subscription_permissions_async(
   return state_->deferred(operation);
 }
 
+void RoomEngine::leave(Completed<void> completed) {
+  auto operation = std::make_shared<detail::PendingOperation<void>>(state_->pending_completions,
+                                                                    std::move(completed));
+  auto pending = operation;
+  auto* s = state_.get();
+  s->run_request(
+      [&] {
+        if (s->connection != ConnectionState::closed) {
+          s->stop_all(ConnectionState::closed, "RTC room left");
+        }
+        pending->succeed();
+      },
+      operation);
+  // run_request has synchronously settled this local stop operation. Notification
+  // draining belongs to the notification queue, never to this controller lock.
+  return state_->deferred(operation);
+}
+
+void RoomEngine::unpublish(const TrackId& id, Completed<void> done) {
+  state_->close_id(id, true, std::move(done));
+}
+
+void RoomEngine::unsubscribe(const TrackId& id, Completed<void> done) {
+  state_->close_id(id, false, std::move(done));
+}
+
+void RoomEngine::set_muted(const TrackId& id, bool muted, ControlOptions options,
+                           Completed<void> done, std::shared_ptr<detail::Endpoint> expected) {
+  state_->set_muted(id, muted, options, std::move(done), std::move(expected));
+}
+
+void RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand, ControlOptions options,
+                                    Completed<void> done,
+                                    std::shared_ptr<detail::Endpoint> expected) {
+  state_->set_receive_demand(id, demand, options, std::move(done), std::move(expected));
+}
+
+void RoomEngine::close_track(std::shared_ptr<detail::Endpoint> endpoint, Completed<void> done) {
+  state_->close_track(endpoint, std::move(done));
+}
+
+void RoomEngine::request_keyframe(std::shared_ptr<detail::Endpoint> endpoint,
+                                  Completed<void> done) {
+  state_->request_keyframe(endpoint, std::move(done));
+}
+
+void RoomEngine::poll(bool interrupted) {
+  state_->pump(interrupted);
+}
+
+std::optional<SteadyClock::time_point> RoomEngine::next_deadline() const {
+  return state_->next_deadline();
+}
+
+void RoomEngine::report_failure(std::shared_ptr<detail::Endpoint> endpoint,
+                                std::exception_ptr error) {
+  state_->report_failure(std::move(endpoint), std::move(error));
+}
+
+void RoomEngine::finish_removal(std::shared_ptr<detail::Endpoint> endpoint,
+                                std::exception_ptr error) {
+  state_->finish_removal(endpoint, std::move(error));
+  state_->pending_completions.flush();
+}
+
+void RoomEngine::notification_failed(std::exception_ptr error) {
+  if (state_->connection != ConnectionState::failed &&
+      (state_->connection != ConnectionState::closed ||
+       describe_failure(error)->code == ErrorCode::callback_failed)) {
+    state_->stop_all(ConnectionState::failed, describe_failure(error)->message, error);
+    state_->pending_completions.flush();
+  }
+}
+
 RoomSnapshot RoomEngine::snapshot() const {
-  std::lock_guard lock(state_->mutex);
   return state_->status;
 }
 
-void RoomEngine::set_room_observer(std::weak_ptr<RoomObserver> observer) {
-  state_->room_observer.set(std::move(observer));
+Result<std::shared_ptr<RoomServices>> RoomEngine::services() const {
+  if (!state_->services) {
+    return Result<std::shared_ptr<RoomServices>>::failure(std::make_shared<FailureInfo>(
+        FailureInfo{next_failure_id(), ErrorDomain::lifecycle, ErrorCode::unsupported,
+                    "This transport does not provide room services"}));
+  }
+  return Result<std::shared_ptr<RoomServices>>::success(state_->services);
 }
-
-void RoomEngine::set_publication_observer(std::weak_ptr<PublicationObserver> observer) {
-  state_->publication_observer.set(std::move(observer));
-}
-
-void RoomEngine::set_subscription_observer(std::weak_ptr<SubscriptionObserver> observer) {
-  state_->subscription_observer.set(std::move(observer));
-}
-
-ErrorCode RoomEngine::close(Completion<void> completion) {
-  return detail::control_boundary([&] {
-    return state_->control->async->submit(
-        "room.close",
-        [this] {
-          return state_->lifecycle.submit([this] {
-            detail::OperationGuard guard(*state_->control);
-            state_->control->closed = true;
-            return leave_locked();
-          });
-        },
-        std::move(completion), true, true);
-  });
-}
-
-void RoomEngine::set_event_handler_locked(std::function<void(const RoomEvent&)> handler) {
-  state_->set_handler(std::move(handler));
-}
-
-void RoomEngine::set_internal_room_observer(std::weak_ptr<RoomObserver> observer) {
-  state_->internal_room_observer.set(std::move(observer));
-}
-
-void RoomEngine::notification_failed() {
-  state_->notification_failed();
-}
-
-void RoomEngine::post_notification(std::function<void()> callback) {
-  state_->post_notification(std::move(callback));
-}
-
 }  // namespace livekit::sdk::rtc

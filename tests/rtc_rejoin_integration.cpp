@@ -1,3 +1,4 @@
+#include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;

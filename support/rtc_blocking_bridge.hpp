@@ -11,6 +11,10 @@
 #include <mutex>
 #include <type_traits>
 
+namespace livekit::sdk::rtc {
+class RoomFixture;
+}
+
 namespace livekit::sdk::app_support {
 inline thread_local bool in_blocking_bridge_callback = false;
 
@@ -162,7 +166,7 @@ struct BlockingObservers : rtc::RoomObserver,
 template <class Engine>
 class BlockingEngine {
  public:
-  using TransportFactory = rtc::RoomEngine::TransportFactory;
+  using TransportFactory = rtc::engine::RtcEngine::TransportFactory;
   using GraphFailure = rtc::engine::GraphFailure;
 
   struct Callbacks {
@@ -175,7 +179,7 @@ class BlockingEngine {
 
   explicit BlockingEngine(std::unique_ptr<Engine> engine) : engine_(std::move(engine)) {
     engine_->set_room_observer(std::static_pointer_cast<rtc::RoomObserver>(observer_));
-    if constexpr (std::is_same_v<Engine, rtc::RoomEngine>) {
+    if constexpr (std::is_same_v<Engine, rtc::RoomFixture>) {
       engine_->set_publication_observer(
           std::static_pointer_cast<rtc::PublicationObserver>(observer_));
       engine_->set_subscription_observer(
@@ -187,10 +191,6 @@ class BlockingEngine {
           std::static_pointer_cast<rtc::engine::SubscriptionObserver>(observer_));
     }
   }
-
-  explicit BlockingEngine(std::unique_ptr<BlockingEngine<rtc::RoomEngine>> room)
-    requires std::is_same_v<Engine, rtc::engine::RtcEngine>
-      : BlockingEngine(std::make_unique<Engine>(room ? room->release() : nullptr)) {}
 
   BlockingEngine(const BlockingEngine&) = delete;
   BlockingEngine& operator=(const BlockingEngine&) = delete;
@@ -238,7 +238,7 @@ class BlockingEngine {
   }
 
   auto publish(rtc::TrackDescriptor descriptor) {
-    using Value = std::conditional_t<std::is_same_v<Engine, rtc::RoomEngine>,
+    using Value = std::conditional_t<std::is_same_v<Engine, rtc::RoomFixture>,
                                      std::shared_ptr<rtc::PublishedTrack>, rtc::TrackId>;
     const auto id = descriptor.id;
     return observer_->template wait<Result<Value>>("publish:" + id, [&](auto completion) {
@@ -492,7 +492,7 @@ class BlockingEngine {
 
  private:
   decltype(auto) room_raw() const {
-    if constexpr (std::is_same_v<Engine, rtc::RoomEngine>) {
+    if constexpr (std::is_same_v<Engine, rtc::RoomFixture>) {
       return *engine_;
     } else {
       return engine_->room();
@@ -504,17 +504,8 @@ class BlockingEngine {
   bool closed_ = false;
 };
 
-using BlockingRoom = BlockingEngine<rtc::RoomEngine>;
+using BlockingRoom = BlockingEngine<rtc::RoomFixture>;
 using BlockingRtc = BlockingEngine<rtc::engine::RtcEngine>;
-
-inline Result<std::unique_ptr<BlockingRoom>> create_blocking_room() {
-  auto result = rtc::create_livekit_room();
-  if (!result) {
-    return Result<std::unique_ptr<BlockingRoom>>::failure(result.failure_record());
-  }
-  return Result<std::unique_ptr<BlockingRoom>>::success(
-      std::make_unique<BlockingRoom>(*std::move(result)));
-}
 
 inline Result<std::unique_ptr<BlockingRtc>> create_blocking_engine() {
   auto result = rtc::engine::create_livekit_engine();

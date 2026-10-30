@@ -20,7 +20,7 @@ class SubscribePipeline;
 namespace detail {
 class RoomTransport;
 struct Endpoint;
-struct RoomEngineState;
+struct TrackControl;
 struct SessionControl;
 }  // namespace detail
 
@@ -54,9 +54,9 @@ class PublishedTrack {
   std::shared_ptr<detail::SessionControl> operation_control() const;
   [[nodiscard]] ErrorCode close_locked();
   void report_failure(std::exception_ptr);
-  PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
+  PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::TrackControl>);
   std::shared_ptr<detail::Endpoint> endpoint_;
-  std::weak_ptr<detail::RoomEngineState> session_;
+  std::weak_ptr<detail::TrackControl> session_;
 };
 
 // Synchronous controls return ErrorCode::ok on success; failures return a nonzero code.
@@ -85,9 +85,9 @@ class SubscribedTrack {
   std::shared_ptr<detail::SessionControl> operation_control() const;
   [[nodiscard]] ErrorCode close_locked();
   void report_failure(std::exception_ptr);
-  SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::RoomEngineState>);
+  SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::TrackControl>);
   std::shared_ptr<detail::Endpoint> endpoint_;
-  std::weak_ptr<detail::RoomEngineState> session_;
+  std::weak_ptr<detail::TrackControl> session_;
 };
 
 }  // namespace livekit::sdk::rtc

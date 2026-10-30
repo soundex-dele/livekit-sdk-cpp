@@ -32,7 +32,8 @@ if(NOT TARGET utoolkit_task_queue)
 endif()
 add_library(livekit_rtc_backend STATIC
   src/backends/rtc/endpoint.cpp
-  src/backends/rtc/room_engine.cpp)
+  src/backends/rtc/room_engine.cpp
+  src/engines/rtc/rtc_execution_context.cpp)
 add_library(LiveKit::RTCBackend ALIAS livekit_rtc_backend)
 find_package(Threads REQUIRED)
 target_compile_features(livekit_rtc_backend PUBLIC cxx_std_20)
@@ -51,6 +52,11 @@ if(LIVEKIT_BUILD_TESTS)
   target_link_libraries(livekit_async_result_tests PRIVATE LiveKit::RTCBackend)
   add_test(NAME async_result COMMAND livekit_async_result_tests)
   set_tests_properties(async_result PROPERTIES TIMEOUT 20)
+  add_executable(livekit_room_state_tests tests/room_state_tests.cpp)
+  target_include_directories(livekit_room_state_tests PRIVATE src)
+  target_link_libraries(livekit_room_state_tests PRIVATE LiveKit::RTCBackend)
+  add_test(NAME room_state COMMAND livekit_room_state_tests)
+  set_tests_properties(room_state PROPERTIES TIMEOUT 20)
   add_executable(livekit_rtc_backend_tests tests/room_engine_tests.cpp)
   target_include_directories(livekit_rtc_backend_tests PRIVATE src)
   target_link_libraries(livekit_rtc_backend_tests PRIVATE LiveKit::RTCBackend utoolkit_task_queue)
@@ -494,3 +500,14 @@ if(LIVEKIT_BUILD_RTC_MEDIA AND LIVEKIT_RTC_FFMPEG_CODECS)
     set_tests_properties(ffmpeg_rtc_codecs PROPERTIES TIMEOUT 45)
   endif()
 endif()
+
+# Only protocol test supervisors may use the non-installed state-machine host.
+foreach(_rtc_host_target
+    livekit_rtc_backend_tests livekit_rtc_pipeline_tests livekit_rtc_architecture_tests
+    livekit_rtc_livekit_integration livekit_rtc_data_integration livekit_rtc_rejoin_integration
+    livekit_region_integration livekit_client_extensions_integration livekit_uav_requirements)
+  if(TARGET ${_rtc_host_target})
+    target_include_directories(${_rtc_host_target} PRIVATE src)
+    target_link_libraries(${_rtc_host_target} PRIVATE utoolkit_task_queue)
+  endif()
+endforeach()

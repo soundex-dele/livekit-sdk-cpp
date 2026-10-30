@@ -1,10 +1,10 @@
-#include "engines/rtc/rtc_engine_impl.hpp"
+#include "engines/rtc/rtc_engine_control.hpp"
 #include "engines/rtc/media_graph_builder.hpp"
 
 namespace livekit::sdk::rtc::engine {
 ErrorCode RtcEngine::enable_media(AudioOutputOptions options) {
-  return impl_->execute([state = impl_.get(), options = std::move(options)]() mutable {
-    if (state->media || state->room->snapshot().state != ConnectionState::disconnected) {
+  return this->execute([state = this, options = std::move(options)]() mutable {
+    if (state->media || state->runtime->snapshot().state != ConnectionState::disconnected) {
       return ErrorCode::invalid_state;
     }
     auto resources = std::make_unique<RtcMediaResources>(std::move(options));

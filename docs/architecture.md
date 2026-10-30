@@ -7,7 +7,8 @@ same registry and lifecycle as ordinary media operations.
 
 ## Ownership and dependencies
 
-`RtcEngine` owns RoomEngine, a per-track pipeline coordinator and an optional
+`RtcEngine` directly owns its state and methods (no PImpl), execution resources,
+an internal RoomEngine, a per-track pipeline coordinator and an optional
 media module. RoomEngine owns transport state and encoded endpoints, never media
 graphs or devices. Each track graph owns its nodes; source/codec/output workers
 quiesce before graph teardown. Removing a track does not close the room.
@@ -19,7 +20,14 @@ GraphFlow engine; applications using the facade link RTCMediaEngine.
 
 ## Execution
 
-RtcEngine, RoomEngine, RoomView and RtcGraphApi return ErrorCode admission status.
+Internal RoomEngine is a non-thread-safe protocol state machine with no owned
+thread, executor, state lock or thread-affinity check. Its owner serializes all
+access, including polling and reads. It initiates requests synchronously and
+reports operation results separately from ongoing state events. RtcEngine's
+execution context adapts those callbacks to its deferred control completions.
+See [room state machine boundaries](rtc-room-state-machine.md).
+
+RtcEngine, RoomView and RtcGraphApi return ErrorCode admission status.
 Each control takes Completion<T> carrying Result<T>, or Result<void> for valueless
 operations. Observers receive ongoing events only; registration is optional. There
 is no public operation handle or request ID. Factories, services, snapshots and

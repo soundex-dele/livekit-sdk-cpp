@@ -39,18 +39,19 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 轨道以稳定本地 TrackId 路由，服务端 SID 是当前会话绑定。每轨拥有独立队列、预算、反馈和关闭屏障。停止一条轨道不退出房间。已有编码帧可直接写入 PublishedTrack；SubscribedTrack::read() 返回拥有数据的完整编码帧。
 
-RtcEngine 与 RoomEngine 共用控制 worker，独立生命周期序列执行媒体启停，串行通知队列派发 Completion 和 Observer。单次结果统一为 `Result<T>` / `Result<void>`。媒体源、编解码和设备输出保留各自有界线程；RoomServices 的数据/RPC/流接口保持独立。UI 使用不可变快照，并将 observer 通知转发到自身线程。
+RtcEngine 直接拥有控制调度与执行资源，独立生命周期序列执行媒体启停，串行通知队列派发 Completion 和 Observer。内部 RoomEngine 是无自有线程、无状态锁、无固定线程要求的协议状态机，由上层保证串行访问。单次结果统一为 `Result<T>` / `Result<void>`。媒体源、编解码和设备输出保留各自有界线程；RoomServices 的数据/RPC/流接口保持独立。UI 使用不可变快照，并将 observer 通知转发到自身线程。
 
 ## RTC 后端目录
 
-公共房间控制器为 `rtc::RoomEngine`，头文件为 `livekit/rtc/room_engine.hpp`。
-`RtcEngine` 持有会话，`RoomEngine` 通过内部 `RoomTransport` 接口使用具体适配器。
-`create_livekit_room()` 返回 `Result<std::unique_ptr<RoomEngine>>`，失败保留结构化错误。
+公共入口为 `rtc::engine::RtcEngine`，头文件为 `livekit/rtc/engine.hpp`，状态和逻辑直接定义在该类中。
+RoomEngine 已收为内部组件，不再提供公共头文件或独立工厂；应用使用 `create_livekit_engine()`。
+业务调度由 RtcEngine 负责，内部 RoomEngine 通过 RoomTransport 发起协议请求，分别回调操作结果和状态事件。
+详细边界见 [房间状态机设计](docs/rtc-room-state-machine.md)。
 
 ```text
 src/backends/
 ├── rtc/
-│   ├── room_engine.cpp       # 房间生命周期、轨道、observer 和协议状态机
+│   ├── room_engine.cpp       # 无线程的房间协议状态机
 │   ├── room_transport.hpp     # 内部适配接口
 │   ├── endpoint.cpp
 │   ├── queue_budget.hpp

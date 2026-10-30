@@ -1,4 +1,4 @@
-> RtcEngine、RoomEngine 和 RtcGraphApi 的控制接口返回异步受理状态，单次结果通过调用时传入的 Completion 返回，持续事件由 Observer 通知；详见 [异步控制契约](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
+> RtcEngine 和 RtcGraphApi 的控制接口返回异步受理状态，单次结果通过调用时传入的 Completion 返回，持续事件由 Observer 通知；详见 [异步控制契约](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
 
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)，自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
@@ -6,11 +6,11 @@
 
 普通媒体会话使用 `livekit/rtc/engine.hpp`，链接 `LiveKit::RTCMediaEngine`。`RtcEngine` 是统一公开入口，拥有一个 `RoomEngine`、内部 `RtcPipelineEngine` 和可选的内部 `RtcMediaEngine`。应用 Session 负责业务状态、配置和 UI 数据交接；媒体模块创建采集、编解码、输出节点，流水线模块管理每轨 GraphEngine，房间模块管理成员、信令、发布订阅端点及数据服务。内部模块借用顶层拥有的对象，不反向持有 RtcEngine。
 
-RtcEngine 使用 PImpl：公开类仅持有 `std::unique_ptr<Impl>`，会话操作锁、关闭状态、房间、流水线、可选媒体模块和 RoomView 均封装在私有实现中。析构在实现文件定义，继续保证先停止图与回调，再释放媒体和房间；媒体模块保持可选链接。
+RtcEngine 直接持有状态并实现业务逻辑，不再使用 Impl。公开头文件通过前置声明隔离 GraphFlow、WebRTC 和设备实现依赖；析构在实现文件定义，先停止图与回调，再释放媒体和房间，媒体模块保持可选链接。
 
 `RoomSession` 和公开的 `RtcMediaEngine` 已移除，无兼容接口。配置和媒体句柄位于 `media_config.hpp`，由 `engine.hpp` 包含。高级图接口需包含 `rtc/graph_api.hpp`，通过 `engine.graph().publish_graph` / `subscribe_graph` 使用。
 
-仅收发已有编码帧时，继续使用 [编码媒体 API](rtc-encoded-api.md) 的 RoomEngine 或 RtcEngine，无须链接媒体引擎。`LIVEKIT_BUILD_RTC_MEDIA=ON` 启用可选媒体引擎和媒体节点库，不改变纯传输层依赖。
+仅收发已有编码帧时，继续使用 [编码媒体 API](rtc-encoded-api.md) 的 RtcEngine，无须链接媒体引擎。`LIVEKIT_BUILD_RTC_MEDIA=ON` 启用可选媒体引擎和媒体节点库，不改变纯传输层依赖。
 
 ## 发布与订阅
 
@@ -107,7 +107,7 @@ require_result(engine->room().update_local_participant(participant_update, on_up
 
 ```
 
-`room()` 返回借用的 `const RoomView&`，有效期到引擎销毁；只开放快照、成员更新、订阅权限和房间服务，不开放 join、leave、端点发布和销毁。轨道生命周期操作统一通过 RtcEngine。RoomEngine 仍可单独用于不需要图的纯编码传输。
+`room()` 返回借用的 `const RoomView&`，有效期到引擎销毁；只开放快照、成员更新、订阅权限和房间服务，不开放 join、leave、端点发布和销毁。轨道生命周期操作统一通过 RtcEngine。RoomEngine 是内部协议状态机；编码媒体也统一通过 RtcEngine。
 
 RoomEngine 保留连接状态机、成员快照、期望轨道注册表和实际端点绑定。底层 RoomTransport 恢复网络连接，RoomEngine 恢复期望发布订阅；不得在两个层级重复重放。重入房间创建全新适配器与房间服务，旧服务句柄保持关闭，旧端点不能影响新绑定。用户需要重新取得 `services()` 并注册新会话的 RPC/流处理器。
 

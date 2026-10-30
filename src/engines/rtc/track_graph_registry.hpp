@@ -6,6 +6,11 @@
 #include <vector>
 
 namespace livekit::sdk::rtc::engine {
+struct RetiredTrackGraphs {
+  std::vector<std::shared_ptr<PublishPipeline>> publications;
+  std::vector<std::shared_ptr<SubscribePipeline>> subscriptions;
+};
+
 // Runs per-track graphs. No room, transport commands or device ownership.
 // Lifecycle calls require the owner's control sequence. Reads/writes use only
 // short registry locks; workers never stop or join a graph.
@@ -24,10 +29,7 @@ class TrackGraphRegistry {
 
   // Returned graphs are stopped but retained until the coordinator has awaited
   // native endpoint detachment. Dropping these leases releases graph resources.
-  struct RetiredGraphs {
-    std::vector<std::shared_ptr<PublishPipeline>> publications;
-    std::vector<std::shared_ptr<SubscribePipeline>> subscriptions;
-  };
+  using RetiredGraphs = RetiredTrackGraphs;
 
   RetiredGraphs take(const TrackId&, bool publication);
   RetiredGraphs take_all();

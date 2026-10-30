@@ -48,7 +48,7 @@ inline Result<void> operation_result(ErrorCode code, const std::string& operatio
   return Result<void>::failure(std::move(failure));
 }
 
-// One bounded command queue per room, shared by RoomEngine and RtcEngine.
+// One bounded command queue owned by each RtcEngine execution context.
 // The notification dispatcher must retain every accepted completion. Capacity
 // remains reserved until delivery, so a slow observer cannot grow the queue.
 class AsyncControl {

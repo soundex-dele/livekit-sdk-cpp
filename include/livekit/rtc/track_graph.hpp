@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/rtc/graph_types.hpp"
 #include "livekit/rtc/publish_node.hpp"
 #include "livekit/rtc/subscribe_node.hpp"
 #include "engine/graph_builder.h"
@@ -27,9 +28,5 @@ struct TrackGraphSpec {
     return {from->getName(), to->getName(), graphflow::core::detail::prettyName<Event>(), {}};
   }
 };
-
-using PublishGraphFactory = std::function<TrackGraphSpec(std::shared_ptr<nodes::RtcPublishNode>)>;
-using SubscribeGraphFactory =
-    std::function<TrackGraphSpec(std::shared_ptr<nodes::RtcSubscribeNode>)>;
 
 }  // namespace livekit::sdk::rtc::engine

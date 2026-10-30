@@ -1,4 +1,4 @@
-#include "engines/rtc/rtc_engine_impl.hpp"
+#include "engines/rtc/rtc_engine_control.hpp"
 #include <utility>
 
 namespace livekit::sdk::rtc::engine {
@@ -15,7 +15,7 @@ bool requires_h264(const ParticipantSnapshot& participant) {
 }
 }  // namespace
 
-void RtcEngine::Impl::reset_video_codec_policy(std::optional<RoomVideoCodecPolicy> options) {
+void RtcEngine::reset_video_codec_policy(std::optional<RoomVideoCodecPolicy> options) {
   codec_policy = options;
   policy_advertised_epoch = 0;
   policy_advertised_latch = false;
@@ -25,20 +25,20 @@ void RtcEngine::Impl::reset_video_codec_policy(std::optional<RoomVideoCodecPolic
   policy_status.h264_latched = options && !options->can_decode_h265;
 }
 
-void RtcEngine::Impl::notify_video_codec_policy() {
+void RtcEngine::notify_video_codec_policy() {
   VideoCodecPolicySnapshot status;
   {
     std::lock_guard lock(policy_mutex);
     status = policy_status;
   }
-  room->post_notification([observer = room_observer.get(), status] {
+  runtime->post_notification([observer = room_observer.get(), status] {
     if (auto target = observer.lock()) {
       target->on_video_codec_policy_changed(status);
     }
   });
 }
 
-void RtcEngine::Impl::use_h264(MediaPublishSpec& spec) {
+void RtcEngine::use_h264(MediaPublishSpec& spec) {
   if (spec.track.kind != MediaKind::video || spec.track.format.codec == Codec::h264) {
     return;
   }
@@ -61,10 +61,10 @@ void RtcEngine::Impl::use_h264(MediaPublishSpec& spec) {
   spec.track.format.fmtp.clear();
 }
 
-Result<MediaPublication> RtcEngine::Impl::start_media_locked(MediaPublishSpec spec) {
+Result<MediaPublication> RtcEngine::start_media_locked(MediaPublishSpec spec) {
   return detail::control_boundary([&]() -> Result<MediaPublication> {
     if (codec_policy) {
-      const auto snapshot = room->snapshot();
+      const auto snapshot = runtime->snapshot();
       if (snapshot.state != ConnectionState::connected || !snapshot.session) {
         return detail::failure_result<MediaPublication>(ErrorCode::invalid_state,
                                                         "Codec policy requires a current roster");
@@ -104,11 +104,11 @@ Result<MediaPublication> RtcEngine::Impl::start_media_locked(MediaPublishSpec sp
   });
 }
 
-void RtcEngine::Impl::reconcile_video_codec_policy() {
+void RtcEngine::reconcile_video_codec_policy() {
   if (!codec_policy || closed || control->interrupted) {
     return;
   }
-  const auto snapshot = room->snapshot();
+  const auto snapshot = runtime->snapshot();
   if (snapshot.state != ConnectionState::connected) {
     return;
   }
@@ -163,12 +163,16 @@ void RtcEngine::Impl::reconcile_video_codec_policy() {
       }
       spec.track.muted = current.muted;
       const auto retired = graphs->take(spec.track.id, true);
-      const auto removed = room->unpublish_locked(spec.track.id);
+      const auto removed = runtime
+                               ->invoke<void>([&](RoomEngine& protocol, auto done) {
+                                 protocol.unpublish(spec.track.id, std::move(done));
+                               })
+                               .get();
       if (removed != ErrorCode::ok) {
         auto result = detail::operation_result(removed, "codec_policy.unpublish");
         fail(result.failure_record());
-        room->post_notification([observer = publication_observer.get(), id = spec.track.id,
-                                 failure = result.failure_record()] {
+        runtime->post_notification([observer = publication_observer.get(), id = spec.track.id,
+                                    failure = result.failure_record()] {
           if (auto target = observer.lock()) {
             target->on_video_codec_republished(id, Result<MediaPublication>::failure(failure));
           }
@@ -186,7 +190,12 @@ void RtcEngine::Impl::reconcile_video_codec_policy() {
     update.attributes[kVideoDecodeCodecsAttribute] =
         codec_policy->can_decode_h265 ? "h264,h265" : "h264";
     update.attributes[kVideoH264LatchAttribute] = h264 ? "1" : "0";
-    const auto result = room->update_local_participant_locked(std::move(update));
+    const auto result =
+        runtime
+            ->invoke<void>([&](RoomEngine& protocol, auto done) {
+              protocol.update_local_participant(std::move(update), {}, std::move(done));
+            })
+            .get();
     if (result != ErrorCode::ok) {
       fail(detail::operation_result(result, "codec_policy.advertise").failure_record());
     }
@@ -198,7 +207,7 @@ void RtcEngine::Impl::reconcile_video_codec_policy() {
     if (!result) {
       fail(result.failure_record());
     }
-    room->post_notification(
+    runtime->post_notification(
         [observer = publication_observer.get(), id, result = std::move(result)]() mutable {
           if (auto target = observer.lock()) {
             target->on_video_codec_republished(id, std::move(result));
