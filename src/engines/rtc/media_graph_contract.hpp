@@ -15,7 +15,7 @@ struct PreparedMediaGraph {
 };
 
 // Builds fresh nodes against a single endpoint port. Never starts a graph,
-// registers a track or issues room commands. Called on the control sequence.
+// registers a track or issues room commands. Called on the lifecycle sequence.
 class MediaGraphBuilder {
  public:
   virtual ~MediaGraphBuilder() = default;

@@ -273,7 +273,7 @@ struct Peer {
   }
 
   template <class Future>
-  auto await(Future future) {
+  auto await(Future future) -> decltype(require_result(std::move(future))) {
     return require_result(std::move(future));
   }
 
@@ -372,8 +372,11 @@ struct Peer {
     }
     for (const auto& [id, track] : outgoing_) {
       auto feedback = engine_->feedback(id);
+      if (!feedback) {
+        continue;
+      }
       bool enabled = false;
-      for (const auto& [layer, status] : feedback.encodings)
+      for (const auto& [layer, status] : feedback->encodings)
         enabled |= status.active;
       std::lock_guard lock(mutex_);
       demand_[track.sid] = enabled;

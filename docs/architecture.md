@@ -20,44 +20,34 @@ GraphFlow engine; applications using the facade link RTCMediaEngine.
 
 ## Execution
 
-Internal RoomEngine is a non-thread-safe protocol state machine with no owned
-thread, executor, state lock or thread-affinity check. Its owner serializes all
-access, including polling and reads. It initiates requests synchronously and
-reports operation results separately from ongoing state events. RtcEngine's
-execution context adapts those callbacks to its deferred control completions.
-See [room state machine boundaries](rtc-room-state-machine.md).
+RtcEngine and its internal RoomEngine share exactly three TaskQueue workers:
 
-RtcEngine, RoomView and RtcGraphApi return ErrorCode admission status.
-Each control takes Completion<T> carrying Result<T>, or Result<void> for valueless
-operations. Observers receive ongoing events only; registration is optional. There
-is no public operation handle or request ID. Factories, services, snapshots and
-low-level track/pipeline methods retain their own immediate contracts.
+| Worker | Responsibility |
+| --- | --- |
+| control | Room state, transport requests/events, encoded endpoint send/receive |
+| lifecycle | Graph construction, startup, shutdown and media resource ownership |
+| notification | Public operation completions and continuous Observer notifications |
 
-AsyncControl preserves same-track order and room lifecycle fences while unrelated
-tracks await protocol completion independently. RtcEngine uses a serial lifecycle
-executor for graph/device work and deferred endpoint continuations. Codec policy
-transitions and rollback still serialize that lifecycle executor. leave/close
-interrupt waits and cancel queued requests; close is terminal. Existing protocol
-timeouts begin when execution starts. Control workers never wait for user callbacks.
+Local request setup runs synchronously on its owning worker. Native success
+arrives asynchronously, and publication/subscription callbacks follow graph
+startup. Public controls remain void and accept per-call Completion<T> callbacks.
+Continuous state events use RoomObserver / RtcObserver. Data writes use the existing pipeline and bounded endpoint queues.
 
-Completion and Observer calls share a serial notification thread, outside internal
-locks. They may submit controls or async close, but must not wait or destroy the
-engine. A completion may run before submission returns, never inline on its stack.
-Observers are weakly registered; completions retain their own captures independently.
-Stop application callers and destroy on an owner thread outside SDK callbacks.
-See [completion and observer contracts](rtc-observers.md).
+The execution adapter only provides FIFO post, synchronous invoke and drain.
+Only pending callbacks and existing binding/control IDs are retained; there is no
+RTC deadline scheduler, reserved terminal slot,
+extra media sender worker or graph recovery state machine. Existing backend and
+media-library workers and their own error/queue handling remain unchanged.
 
-Graphs start nodes, activate initial sender feedback, then start producers.
-Teardown closes admission, quiesces source/codec/output workers, stops GraphEngine,
-and waits for native detachment. It never holds a registry/state lock while joining.
-Failures immediately report to the endpoint and notification path; failed graphs
-are reclaimed on the next serialized control or close. Reporting retains at most
-one entry per graph and closed graphs disable retained failure reporters.
+Control never waits for lifecycle or application callbacks. Application callbacks
+may submit requests but must not wait for other callbacks or synchronously leave.
+Graph factories and lifecycle hooks must not wait for notification callbacks.
+The external owner stops application callers before leave/destruction. leave
+stops graphs, stops transport, then drains lifecycle and notification work; close
+is an alias for leave and permits an explicit subsequent join.
 
-Application media callbacks retain their separate bounded output dispatchers.
-Slow callbacks discard only their own backlog. They must eventually return:
-shutdown joins in-flight delivery. Advanced synchronous graph consumers execute
-on the publishing source/codec worker and must not reenter lifecycle operations.
+See [three-thread contract](rtc-hardening-20261031.md) and
+[public callback usage](rtc-simple-observer.md).
 
 ## Frame ownership and timing
 
@@ -75,7 +65,7 @@ unpublish. Frame timing is separate from storage, so reconnect retags a branch's
 new input without modifying a buffer shared by another room. Shared audio keeps
 the source sample clock, including gaps, rather than recomputing RTP time from
 callback arrival. Invalid shared queue limits fail synchronously without attaching
-a consumer; graph startup failures return a failed Result with structured error details.
+a consumer; graph startup errors are logged at the lifecycle task boundary.
 
 ## Audio and synchronization
 
@@ -128,9 +118,10 @@ be reported separately; this document is not a device-acceptance claim.
    `engine.graph().subscribe/publish_graph/subscribe_graph`. Plain encoded
    `engine.publish(descriptor)` remains on the ordinary facade.
 3. Remove all RtcEngine/pipeline poll calls and receive-frame poll budgets.
-   Controls return admission status immediately. Pass Completion<T> per operation;
-   register observers only for ongoing room/publication/subscription events.
-   leave/close cancel outstanding work. See [control contracts](rtc-observers.md).
+   Controls return void; pass Completion<T> for operation results and register an
+   Observer for continuous room/track events.
+   Call leave/close from an external owner thread. See
+   [control contracts](rtc-simple-observer.md).
 4. Media callbacks now run on per-output dispatchers. Retaining immutable frames
    is safe; callbacks must not wait for lifecycle completion.
 

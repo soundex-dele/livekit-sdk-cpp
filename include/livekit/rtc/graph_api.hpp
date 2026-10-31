@@ -3,13 +3,15 @@
 #include "livekit/rtc/stream_pipeline.hpp"
 
 namespace livekit::sdk::rtc::engine {
-// Optional custom topology. Completion uses RtcCallbacks, like media controls.
+// Optional custom topology. Results use per-call completions, like media controls.
 class RtcGraphApi final {
  public:
-  void publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> feedback_sink);
-  void subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> consumer);
-  void publish_graph(TrackDescriptor, PublishGraphFactory);
-  void subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  void publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> feedback_sink,
+               Completion<MediaPublication> = {});
+  void subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> consumer,
+                 Completion<MediaSubscription> = {});
+  void publish_graph(TrackDescriptor, PublishGraphFactory, Completion<MediaPublication> = {});
+  void subscribe_graph(TrackDescriptor, SubscribeGraphFactory, Completion<MediaSubscription> = {});
 
  private:
   friend class RtcEngine;

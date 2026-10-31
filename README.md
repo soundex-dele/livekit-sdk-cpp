@@ -1,6 +1,6 @@
 # livekit-sdk-cpp
 
-当前 RTC 接口见 [最简 Observer / 回调方案](docs/rtc-simple-observer.md)。RtcEngine 的控制接口返回 `void`，RoomEngine 通过单个 Observer 通知入会、发布和订阅结果，RtcEngine 启动对应 GraphEngine 后调用上层 `RtcCallbacks`。底层主动推送结果，应用无需调用 `poll()`；RoomEngine 直接持有成员，不使用 PImpl。控制层没有线程、锁、异常捕获或逐次 completion。
+当前 RTC 接口见 [完成回调与持续 Observer](docs/rtc-simple-observer.md)。RtcEngine 和 RoomEngine 的控制接口返回 `void`，每次调用通过 `Completion<T>` 接收 `Result<T>`；持续状态交给 Observer。RtcEngine 在对应 GraphEngine 启动后交付发布/订阅结果。两层共用 control、lifecycle、notification 三线程，应用无需调用 `poll()`；leave/close 保持同步。
 
 C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 

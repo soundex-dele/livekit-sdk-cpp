@@ -8,6 +8,7 @@ using livekit::sdk::app_support::require_result;
 #include <mutex>
 #include <condition_variable>
 
+using namespace livekit::sdk;
 using namespace livekit::sdk::rtc;
 using namespace livekit::sdk::rtc::engine;
 using namespace std::chrono_literals;
@@ -33,13 +34,32 @@ int main() {
     std::mutex mutex;
     std::condition_variable changed;
     std::array<Observation, 2> observed;
-    auto tx = create_livekit_engine(AudioOutputOptions{});
-    auto rx = create_livekit_engine(AudioOutputOptions{});
+    auto tx = require_result(create_livekit_engine(AudioOutputOptions{}));
+    auto rx = require_result(create_livekit_engine(AudioOutputOptions{}));
     std::array<std::shared_ptr<MediaTrack>, 2> publications, subscriptions;
     const bool require_sender_clock = std::getenv("LIVEKIT_TEST_OBSERVER_ONLY") == nullptr;
     int joined = 0, left = 0, published = 0, subscribed = 0;
-    RtcCallbacks sending;
-    sending.on_joined = [&](const RoomSnapshot& room) {
+    auto on_published = [&](Result<MediaPublication> result) {
+      auto publication = require_result(std::move(result));
+      std::lock_guard lock(mutex);
+      ++published;
+      changed.notify_all();
+      publications[publication.id == "ordinary-video" ? 1 : 0] = publication.track;
+    };
+    auto on_subscribed = [&](Result<MediaSubscription> result) {
+      auto subscription = require_result(std::move(result));
+      std::lock_guard lock(mutex);
+      ++subscribed;
+      changed.notify_all();
+      subscriptions[subscription.id == "receive-video" ? 1 : 0] = subscription.track;
+    };
+    auto on_left = [&](Result<void> result) {
+      require_result(std::move(result));
+      std::lock_guard lock(mutex);
+      ++left;
+    };
+    auto tx_joined = [&](Result<RoomSnapshot> result) {
+      const auto room = require_result(std::move(result));
       check(room.session != nullptr, "Join callback missing roster");
       {
         std::lock_guard lock(mutex);
@@ -57,27 +77,27 @@ int main() {
         spec.track.format.width = 64;
         spec.track.format.height = 48;
         spec.input.generated = true;
-        tx->publish_media(std::move(spec));
+        tx->publish_media(std::move(spec), on_published);
       }
     };
-    sending.on_published = [&](const MediaPublication& publication) {
-      std::lock_guard lock(mutex);
-      ++published;
-      changed.notify_all();
-      publications[publication.id == "ordinary-video" ? 1 : 0] = publication.track;
-    };
-    sending.on_left = [&] {
-      std::lock_guard lock(mutex);
-      ++left;
-    };
-    tx->set_callbacks(std::move(sending));
-    RtcCallbacks receiving;
-    receiving.on_joined = [&](const RoomSnapshot&) {
+    auto rx_joined = [&](Result<RoomSnapshot> result) {
+      require_result(std::move(result));
       std::lock_guard lock(mutex);
       ++joined;
       changed.notify_all();
     };
-    receiving.on_track_published = [&](const TrackDescriptor& track) {
+
+    struct Observer : RtcObserver {
+      std::function<void(const TrackDescriptor&)> discovered;
+
+      void on_room_event(const RoomEvent& event) override {
+        if (event.kind == RoomEventKind::remote_track_added && event.descriptor) {
+          discovered(*event.descriptor);
+        }
+      }
+    } receiving;
+
+    receiving.discovered = [&](const TrackDescriptor& track) {
       const size_t i = track.kind == MediaKind::video ? 1 : 0;
       MediaSubscribeSpec spec;
       spec.track = track;
@@ -105,25 +125,15 @@ int main() {
         observation.retained = frame;
         changed.notify_all();
       };
-      rx->subscribe_media(std::move(spec));
+      rx->subscribe_media(std::move(spec), on_subscribed);
     };
-    receiving.on_subscribed = [&](const MediaSubscription& subscription) {
-      std::lock_guard lock(mutex);
-      ++subscribed;
-      changed.notify_all();
-      subscriptions[subscription.id == "receive-video" ? 1 : 0] = subscription.track;
-    };
-    receiving.on_left = [&] {
-      std::lock_guard lock(mutex);
-      ++left;
-    };
-    rx->set_callbacks(std::move(receiving));
+    require_result(rx->set_observer(&receiving));
     LiveKitRoomOptions options;
     options.url = std::getenv("LIVEKIT_URL");
     options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
-    tx->join(options);
+    tx->join(options, tx_joined);
     options.token = std::getenv("LIVEKIT_SUBSCRIBE_TOKEN");
-    rx->join(options);
+    rx->join(options, rx_joined);
     {
       std::unique_lock lock(mutex);
       const bool received = changed.wait_for(lock, 20s, [&] {
@@ -156,8 +166,9 @@ int main() {
           "Room not connected");
     check(joined == 2 && published == 2 && subscribed == 2 && subscriptions[0] && subscriptions[1],
           "Missing observer callbacks");
-    tx->leave();
-    rx->leave();
+    tx->leave(on_left);
+    rx->leave(on_left);
+    require_result(rx->set_observer(nullptr));
     check(left == 2, "Missing leave callbacks");
     for (const auto& observation : observed) {
       check(observation.retained->owner && !observation.retained->planes[0].empty(),

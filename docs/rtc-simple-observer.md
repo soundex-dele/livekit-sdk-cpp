@@ -1,71 +1,81 @@
-# 最简 RTC 控制接口
+# RTC 完成回调与持续 Observer
 
-本版只实现正常入会、轨道发现、显式发布/订阅、媒体收发、取消发布/订阅和退会。`RoomEngine → RoomObserver → RtcEngine → RtcCallbacks` 是唯一控制结果通知链路。
+当前契约（2026-10-31）：控制方法保持 `void`，每次调用可传入 `Completion<T>`
+（`std::function<void(Result<T>)>`）；持续状态通过 `RoomObserver` / `RtcObserver` 接收。
+空 completion 表示调用方主动忽略本次结果，不再通过全局成功事件找回结果。
 
-## 接口与时序
+## 完成与事件
 
-- `join/publish/subscribe/unpublish/unsubscribe/leave` 返回 `void`。返回不代表网络操作完成。
-- `RoomObserver::on_joined` 在后端连接完成后触发，参数包含该批次的初始 roster。
-- 后端提供接收端点后触发 `RoomObserver::on_subscribed`。RtcEngine 创建并启动对应 GraphEngine，然后触发 `RtcCallbacks::on_subscribed`。不等待首帧。
-- `on_track_published` 表示发现远端轨道，上层明确调用 `subscribe(id)`、`subscribe(descriptor)` 或 `subscribe_media(spec)`。
-- `on_published/on_subscribed` 携带 `MediaPublication/MediaSubscription`。纯编码图的 `track` 为空，媒体图的 `track` 可用于快照查询。
-- `on_event` 传递轨道发现/移除、roster 和统计等持续事件。
-- 取消单轨时先停媒体图，再解除后端端点。只有原生 detach 完成后才发取消成功回调；其它轨道和房间连接继续运行。
-- `leave()` 先停全部媒体图，再停止后端、关闭端点，最后调用 `on_left`。之后可以显式重新 join。`close()` 是 leave 的便捷别名，不再引入永久终止状态。
+- join 的结果为 RoomSnapshot；connected 到达后取出并清空本次回调。后续 connected
+  只产生持续事件，不重复交付 join 结果。初始会话信息在 join 成功时可读。
+- RoomEngine 的 publish/subscribe 返回对应端点；RtcEngine 返回 MediaPublication /
+  MediaSubscription，表示端点 ready 且图已启动，不表示远端首帧已显示。
+- unpublish/unsubscribe 在原生端点解绑完成时结算；RtcEngine 还先停止并释放对应图。
+- set_muted、接收需求和权限成功表示后端本地应用/信令提交；参与者更新等待协议响应。
+- 本地校验、后端失败及媒体构图失败都通过 Result 交付；不以异常向控制调用者报错。
+  重复结果不再次调用 completion；退会会以 cancelled 结算仍在等待的操作。
+- 连接变化、远端轨道增删、会话/权限/统计及后端轨道故障使用持续 Observer。
+  操作结果与状态事件可能由同一故障引起，它们用途不同。
+- Observer 是借用对象，须存活到 set_observer(nullptr) 返回。替换 Observer 不取消
+  已提交 completion。set_observer 返回 ErrorCode，不允许在 SDK 回调中替换。
 
-## 驱动与生命周期
+## 线程与关闭
 
-底层通过 Transport 事件回调主动通知 RoomEngine，RoomEngine 直接调用借用的 Observer，RtcEngine 启动媒体图后调用上层回调。RoomEngine 直接持有 Transport、Observer、房间状态和轨道表，不使用 PImpl。
+继续复用 control、lifecycle、notification 三个 TaskQueue：
 
-不提供 `poll()` 或事件提取接口，也没有 RTC 控制线程或轮询定时器。LiveKit 适配器复用原有网络会话线程，在收到信令、媒体就绪、命令完成等通知后推送结果；空闲时等待通知，仅协议心跳、统计和业务超时保留各自的截止时间。
+- control：RoomEngine 状态、Transport 请求/事件、端点收发、操作结果匹配。
+- lifecycle：RtcEngine 轨道目录、GraphEngine 构图、启停和媒体资源释放。
+- notification：所有公开 completion 与持续 Observer。内部 RoomEngine 的结果续接直接
+  转发到所属工作线程，不经过用户通知队列，慢用户回调不阻塞内部媒体编排。
 
-发布帧写入后立即发起发送，遇到背压后由底层 writable 通知触发重试；订阅帧到达后直接写入接收端点。订阅就绪时请求首个关键帧，后续显式请求直接转发。取消发布/订阅的完成通知由底层解除绑定回调触发。
+本地发起仍在所属线程同步执行，因此方法可能等待队列中的先前工作；不会等待网络 ACK。
+completion 不在提交调用栈内联执行，但另一线程可能在提交方法返回前执行它。
+回调可以提交下一次请求，不得等待其它回调、同步退会、替换 Observer 或销毁引擎。
+媒体输出回调仍使用原有输出线程。
 
-控制层不处理线程安全。成功通知沿底层通知线程执行；`on_left` 在 `leave()` 调用线程执行。允许在入会或发现回调中发起发布、订阅；不要在底层回调中等待另一个结果、退会、替换回调或销毁引擎。Observer、回调捕获对象须存活到后端停止。UI 等上层代码按自己的线程要求转发通知。媒体帧回调继续按媒体节点原有模型执行。
+leave/close 保持同步；只能由外部拥有者线程调用，close 仍是 leave 的别名。
+先停止应用并发请求及写入，再停止图和后端、结算取消结果并清空通知队列。
+leave 的可选 completion 在 notification 执行，正常返回前已交付；之后可重新 join。
+回调内调用 leave 会通过 completion 返回 invalid_thread，不执行退会。
+
+## 非控制接口与异常迁移
+
+enable_media 和 set_observer 返回 ErrorCode；create_shared_input 与 feedback 返回 Result。
+write 对未知轨道返回 not_ready，publication 的未知轨道快照包含 failed 状态及 FailureInfo。
+带音频配置的 create_livekit_engine 返回 Result<unique_ptr<RtcEngine>>；也可以
+先使用无参数工厂，再检查 enable_media 返回的错误码。
+
+本轮不改 GraphEngine、编解码和原生传输的实现，不增加任务调度器、超时线程或恢复机制。
+旧后端、校验器和构图器仍有异常实现；现有 control_boundary 仅作为迁移适配边界，将其
+转换为显式错误。当前 SDK 尚未通过全目标 -fno-exceptions 编译，不能将 API 错误通道迁移
+等同于全仓异常清理。超时和重连支持范围仍以现有后端为准。
+
+## 调用示例
 
 ```cpp
-auto rtc = create_livekit_engine(AudioOutputOptions{});
-RtcCallbacks callbacks;
-callbacks.on_joined = [](const RoomSnapshot&) {
-  std::cout << "joined\n";
-};
-callbacks.on_track_published = [&](const TrackDescriptor& track) {
-  MediaSubscribeSpec spec;
-  spec.track = track;
-  spec.output.playout = true;
-  rtc->subscribe_media(std::move(spec));
-};
-callbacks.on_subscribed = [](const MediaSubscription& track) {
-  std::cout << "subscribed: " << track.id << '\n';
-};
-rtc->set_callbacks(std::move(callbacks));
-rtc->join(options);
-// 入会和订阅成功会由底层主动回调；保持 rtc 存活。
-// 应用结束会话时（不在底层回调内）：
-rtc->leave();
+engine.join(options, [&engine, spec](Result<RoomSnapshot> joined) {
+  if (!joined) {
+    report_error(joined.error());
+    return;
+  }
+  engine.publish_media(spec, [](Result<MediaPublication> published) {
+    if (!published) {
+      report_error(published.error());
+      return;
+    }
+    use_media_track(published->track);
+  });
+});
 ```
 
-完整示例见 `examples/automatic_session/main.cpp`。编码自定义图继续通过 `graph_api.hpp` 提供，并共用 RtcCallbacks。
+将原 on_joined/on_published/on_subscribed/on_unpublished/on_unsubscribed/on_left
+移到对应调用的 completion。远端轨道发现改用 Observer 的 remote_track_added 事件。
+RtcGraphApi 同样接收逐次 completion；非安装的 BlockingEngine 直接等待该回调，
+不再用 Observer/TrackId 建立成功结果映射。
 
-## 简化边界与迁移
+本次验证见 [回调重构记录](rtc-callback-observer-20261031.md)。以下为旧版历史记录。
 
-移除 RtcExecutionContext、AsyncControl、LifecycleExecutor、OperationGuard、TrackGraphRegistry，以及逐次 Completion / Future 等待桥接、控制锁和异常转换。媒体构图复用已有的 RtcMediaGraphBuilder 和 GraphEngine；不增加新的 Builder 接口。
-
-不提供重复请求校验、并发取消、超时结果、失败回调、异常捕获、失败图回收和自动重连恢复。调用者按正常顺序传入有效配置，回调和底层操作的异常不在控制层捕获。LiveKit 默认关闭自动重连；需要重连时由应用显式 leave/join。本版也移除自动 codec 回退重发布，按媒体配置选定 codec。
-
-RoomView 的只读入口合并到 `snapshot()/services()`；修改参与者和订阅权限等命令直接从 RtcEngine 转发到 RoomEngine。服务本身的数据/RPC/流接口保持原有契约。底层 WebRTC、设备、端点帧队列和媒体节点的并发/错误机制不是本次控制层简化范围。
-
-`support/rtc_blocking_bridge.hpp` 是未安装的应用/历史测试适配器，仅用条件变量等待底层主动通知，不驱动引擎；SDK 公共接口不依赖它。`RtcEventMailbox` 将通知转发给旧 supervisor。新应用应直接采用上面的回调写法。
-
-## 自动化验证
-
-`room_engine_tests.cpp` 分别以纯后端和 GraphEngine 模式编译，覆盖延迟 ACK、通知线程、roster 可见性、同名收发轨道、编码帧收发、图启动早于订阅回调、原生 detach 完成通知、单轨关闭、退会及显式重入。
-
-公共头文件测试检查 void 控制接口且不引入 GraphFlow 头文件依赖。架构检查防止核心控制层重新引入锁、线程、Future、Completion 和 catch。媒体测试保留多轨、原始音频/编码输入、共享采集和显式重入的正常流程；旧的并发取消、异常恢复和永久 close 测试按已移除的契约撤销。
-
-验证使用编译及无窗口测试，不操作桌面。自动化通过不代表真实摄像头、麦克风、扬声器或显示设备已人工验收。
-
-## 2026-10-31 主动回调与直接成员版本验证
+## 历史验证：三线程拆分前的主动回调版本
 
 - RoomEngine 的状态、Transport、Observer、端点表直接声明在类中；架构检查禁止重新引入 `Impl/impl_`。
 - 公共头文件检查确认 RoomEngine 和 RtcEngine 均没有 `poll()`。模拟后端在通知线程主动回调，业务线程只等待通知线程结束，验证成功通知无需外部驱动。

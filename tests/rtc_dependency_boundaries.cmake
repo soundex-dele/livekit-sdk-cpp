@@ -21,12 +21,12 @@ foreach(port publish_node subscribe_node track_endpoint)
   endif()
 endforeach()
 
-# The simplified control path must stay free of the retired scheduling machinery.
+# Per-call Completion is allowed; the three FIFO workers remain the execution model.
 foreach(path include/livekit/rtc/engine.hpp include/livekit/rtc/room_engine.hpp
              src/engines/rtc/rtc_engine.cpp src/backends/rtc/room_engine.cpp)
   file(READ "${SDK_SOURCE_DIR}/${path}" source)
-  if(source MATCHES "std::(mutex|atomic|jthread|thread|future)|AsyncResult|Completion<|OperationGuard|catch[ ]*\\(")
-    message(FATAL_ERROR "${path} reintroduces complex control scheduling or exception handling")
+  if(source MATCHES "AsyncResult|OperationGuard|deadline_key|TrackEntry")
+    message(FATAL_ERROR "${path} reintroduces operation scheduling machinery")
   endif()
 endforeach()
 

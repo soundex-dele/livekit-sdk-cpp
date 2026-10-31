@@ -3,13 +3,14 @@
 #include <functional>
 
 namespace livekit::sdk::rtc {
-// Control calls return admission status: rejection never invokes completion.
-// Accepted callbacks are retained until delivery on the room's serial notification
-// thread, outside internal locks. They may run before the submitting call returns,
-// but never inline on its stack. Callbacks may submit controls, but must not wait
-// for SDK work or destroy the engine. Results own their data and may be retained.
-// Stop concurrent callers before destruction and destroy outside SDK callbacks.
-// For blocking adapters: waiting on SDK work from these threads would deadlock.
+// Controls keep synchronous local setup. Validation and backend failures are
+// delivered as Result<T>, without throwing to the caller. The optional completion
+// receives the final result on notification, never inline on the submitting stack.
+// It may run before the call returns. Replacing an Observer does not affect
+// pending completions.
+// Callbacks may submit requests, but must not wait for SDK work, leave, replace
+// observers or destroy the engine. leave/close remain synchronous owner calls.
+// Results own their data. Empty completions explicitly discard operation results.
 bool is_callback_thread() noexcept;
 
 template <class T>

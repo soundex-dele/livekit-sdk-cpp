@@ -1,6 +1,7 @@
 #include "backends/rtc/room_engine.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/track_control.hpp"
+#include "backends/rtc/execution.hpp"
 #include <utility>
 #include <algorithm>
 
@@ -11,9 +12,7 @@ using detail::TransportEventKind;
 
 void RoomEngine::event(RoomEvent value) {
   value.epoch = status_.epoch;
-  if (observer_) {
-    observer_->on_room_event(value);
-  }
+  notify([value = std::move(value)](auto& observer) { observer.on_room_event(value); });
 }
 
 std::shared_ptr<Endpoint> RoomEngine::make_endpoint(TrackDescriptor descriptor, bool publication) {
@@ -36,7 +35,11 @@ void RoomEngine::request_keyframe(const std::shared_ptr<Endpoint>& endpoint) {
   if (endpoint->snapshot().state != TrackState::ready) {
     return;
   }
-  auto& entry = tracks_.at({endpoint->descriptor.id, false});
+  auto it = tracks_.find({endpoint->descriptor.id, false});
+  if (it == tracks_.end() || it->second.endpoint != endpoint) {
+    return;
+  }
+  auto& entry = it->second;
   for (const auto& [id, encoding] : endpoint->feedback().encodings) {
     if (encoding.keyframe_required &&
         (!entry.keyframe_requests || encoding.keyframe_requests > *entry.keyframe_requests)) {
@@ -52,139 +55,454 @@ void RoomEngine::removed(const BindingToken& binding) {
   if (it == tracks_.end() || !it->second.endpoint->matches(binding)) {
     return;
   }
-  it->second.endpoint->finish(TrackState::closed);
+  auto entry = std::move(it->second);
   tracks_.erase(it);
-  if (observer_) {
-    if (binding.publication) {
-      observer_->on_unpublished(binding.id);
+  entry.endpoint->finish(TrackState::closed);
+  auto cancelled = detail::failure_result<void>(ErrorCode::cancelled, "Track removed before ready");
+  complete(entry.publish_done,
+           Result<std::shared_ptr<PublishedTrack>>::failure(cancelled.failure_record()));
+  complete(entry.subscribe_done,
+           Result<std::shared_ptr<SubscribedTrack>>::failure(cancelled.failure_record()));
+  for (auto it = control_completions_.begin(); it != control_completions_.end();) {
+    auto& operation = it->second;
+    if (operation.epoch == binding.epoch && operation.track == binding.id &&
+        operation.publication == binding.publication) {
+      auto done = std::move(operation.callback);
+      it = control_completions_.erase(it);
+      complete(done,
+               detail::failure_result<void>(ErrorCode::cancelled, "Track removed during control"));
     } else {
-      observer_->on_unsubscribed(binding.id);
+      ++it;
     }
   }
+  for (auto& done : entry.remove_done) {
+    complete(done, Result<void>::success());
+  }
+  RoomEvent value{RoomEventKind::track_removed, binding.id};
+  value.publication = binding.publication;
+  event(std::move(value));
 }
 
-void RoomEngine::remove(const TrackId& id, bool publication) {
-  auto& entry = tracks_.at({id, publication});
+void RoomEngine::remove(const TrackId& id, bool publication, Completion<void> completion) {
+  auto it = tracks_.find({id, publication});
+  if (it == tracks_.end()) {
+    complete(completion,
+             detail::failure_result<void>(ErrorCode::invalid_argument, "Unknown track"));
+    return;
+  }
+  auto& entry = it->second;
   if (entry.removing) {
+    if (completion) {
+      entry.remove_done.push_back(std::move(completion));
+    }
     return;
   }
   entry.removing = true;
   auto endpoint = entry.endpoint;
-  transport_->remove(endpoint->binding(), publication,
-                     [this, endpoint](std::exception_ptr failure) {
-                       if (!failure) {
-                         removed(endpoint->binding());
-                       }
-                     });
+  auto submitted = detail::control_boundary([&] {
+    transport_->remove(endpoint->binding(), publication,
+                       [this, endpoint](std::exception_ptr failure) {
+                         execution_->control.post([this, endpoint, failure] {
+                           if (!transport_) {
+                             return;
+                           }
+                           if (!failure) {
+                             removed(endpoint->binding());
+                             return;
+                           }
+                           auto it = tracks_.find({endpoint->descriptor.id, endpoint->publication});
+                           if (it == tracks_.end() || it->second.endpoint != endpoint) {
+                             return;
+                           }
+                           auto callbacks = std::move(it->second.remove_done);
+                           it->second.removing = false;
+                           for (auto& done : callbacks) {
+                             complete(done, Result<void>::failure(describe_failure(failure)));
+                           }
+                         });
+                       });
+    return Result<void>::success();
+  });
+  if (!submitted) {
+    entry.removing = false;
+    complete(completion, std::move(submitted));
+    return;
+  }
+  if (completion) {
+    entry.remove_done.push_back(std::move(completion));
+  }
+}
+
+void RoomEngine::deliver(std::function<void()> callback) {
+  // Only the private RtcEngine-owned room uses internal continuations on control.
+  if (internal_observer_) {
+    callback();
+  } else {
+    execution_->notification.post([callback = std::move(callback)] {
+      detail::CallbackScope scope;
+      callback();
+    });
+  }
+}
+
+void RoomEngine::fail_pending(std::shared_ptr<const FailureInfo> failure) {
+  complete(join_completion_, Result<RoomSnapshot>::failure(failure));
+  for (auto& [key, entry] : tracks_) {
+    complete(entry.publish_done, Result<std::shared_ptr<PublishedTrack>>::failure(failure));
+    complete(entry.subscribe_done, Result<std::shared_ptr<SubscribedTrack>>::failure(failure));
+    auto callbacks = std::move(entry.remove_done);
+    for (auto& done : callbacks) {
+      complete(done, Result<void>::failure(failure));
+    }
+  }
+  auto controls = std::move(control_completions_);
+  control_completions_.clear();
+  for (auto& [id, operation] : controls) {
+    complete(operation.callback, Result<void>::failure(failure));
+  }
 }
 
 RoomEngine::RoomEngine(TransportFactory factory)
-    : factory_(std::move(factory)), commands_(std::make_shared<detail::TrackControl>()) {
-  commands_->send = [this](auto endpoint) { send(endpoint); };
-  commands_->request_keyframe = [this](auto endpoint) { request_keyframe(endpoint); };
+    : RoomEngine(std::move(factory), std::make_shared<detail::RtcExecution>()) {
+  internal_observer_ = false;
+}
+
+RoomEngine::RoomEngine(TransportFactory factory, std::shared_ptr<detail::RtcExecution> execution)
+    : execution_(std::move(execution)),
+      internal_observer_(true),
+      factory_(std::move(factory)),
+      commands_(std::make_shared<detail::TrackControl>()) {
+  commands_->send = [this](auto endpoint) {
+    execution_->control.post([this, endpoint] {
+      if (transport_) {
+        send(endpoint);
+      }
+    });
+  };
+  commands_->request_keyframe = [this](auto endpoint) {
+    execution_->control.post([this, endpoint] {
+      if (transport_) {
+        request_keyframe(endpoint);
+      }
+    });
+  };
   commands_->set_muted = [this](const auto& id, bool muted) { set_muted(id, muted); };
   commands_->set_receive_demand = [this](const auto& id, auto demand) {
     set_receive_demand(id, demand);
   };
   commands_->close_track = [this](auto endpoint) {
-    if (endpoint->snapshot().state == TrackState::closed) {
-      return;
-    }
-    remove(endpoint->descriptor.id, endpoint->publication);
+    execution_->control.post([this, endpoint] {
+      if (transport_ && endpoint->snapshot().state != TrackState::closed) {
+        remove(endpoint->descriptor.id, endpoint->publication);
+      }
+    });
   };
 }
 
 RoomEngine::~RoomEngine() {
-  set_observer(nullptr);
+  (void)set_observer(nullptr);
   leave();
+  commands_.reset();
+  execution_->control.fence();
 }
 
-void RoomEngine::set_observer(RoomObserver* observer) {
-  observer_ = observer;
-}
-
-void RoomEngine::join(RoomOptions options) {
-  transport_ = factory_();
-  transport_->set_event_handler([this](auto events) { on_events(std::move(events)); });
-  transport_->attach_notifications([](auto task) { task(); }, {});
-  budget_ = std::make_shared<detail::QueueBudget>(options.max_queued_bytes);
-  transport_->set_queue_budget(budget_);
-  ++status_.epoch;
-  status_.state = ConnectionState::connecting;
-  status_.capabilities = transport_->capabilities();
-  transport_->start(options, status_.epoch);
-}
-
-void RoomEngine::leave() {
-  if (!transport_) {
+void RoomEngine::notify(std::function<void(RoomObserver&)> fn) {
+  if (!observer_) {
     return;
   }
-  transport_->stop();
-  for (auto& [key, entry] : tracks_) {
-    entry.endpoint->finish(TrackState::closed);
-  }
-  tracks_.clear();
-  remote_tracks_.clear();
-  transport_.reset();
-  status_.state = ConnectionState::disconnected;
-  status_.session.reset();
-  if (observer_) {
-    observer_->on_left();
+  if (internal_observer_) {
+    fn(*observer_);
+  } else {
+    execution_->notification.post([observer = observer_, fn = std::move(fn)] {
+      detail::CallbackScope scope;
+      fn(*observer);
+    });
   }
 }
 
-void RoomEngine::publish(TrackDescriptor descriptor) {
-  auto endpoint = make_endpoint(std::move(descriptor), true);
-  auto track = std::shared_ptr<PublishedTrack>(new PublishedTrack(endpoint, commands_));
-  tracks_.emplace(std::make_pair(endpoint->descriptor.id, true), Entry{endpoint, track, {}});
-  transport_->publish(endpoint->binding(), endpoint->descriptor);
+ErrorCode RoomEngine::set_observer(RoomObserver* observer) {
+  if (!execution_->external()) {
+    return ErrorCode::invalid_thread;
+  }
+  execution_->control.invoke([this, observer] { observer_ = observer; });
+  execution_->notification.fence();
+  return ErrorCode::ok;
 }
 
-void RoomEngine::subscribe(TrackDescriptor descriptor) {
-  auto endpoint = make_endpoint(std::move(descriptor), false);
-  auto track = std::shared_ptr<SubscribedTrack>(new SubscribedTrack(endpoint, commands_));
-  tracks_.emplace(std::make_pair(endpoint->descriptor.id, false), Entry{endpoint, {}, track});
-  transport_->subscribe(endpoint->binding(), endpoint->descriptor, endpoint->queue_budget());
+void RoomEngine::join(RoomOptions options, Completion<RoomSnapshot> completion) {
+  execution_->control.invoke(
+      [this, options = std::move(options), completion = std::move(completion)]() mutable {
+        if (status_.state != ConnectionState::disconnected) {
+          complete(completion, detail::failure_result<RoomSnapshot>(ErrorCode::invalid_state,
+                                                                    "Leave before joining again"));
+          return;
+        }
+        // Compatibility boundary for the existing exception-based backend.
+        auto started = detail::control_boundary([&]() -> Result<void> {
+          transport_ = factory_();
+          if (!transport_) {
+            return detail::failure_result<void>(ErrorCode::internal_error,
+                                                "Transport factory returned null");
+          }
+          transport_->set_event_handler([this](auto events) {
+            execution_->control.post([this, events = std::move(events)]() mutable {
+              if (transport_) {
+                on_events(std::move(events));
+              }
+            });
+          });
+          transport_->attach_notifications([](auto task) { task(); }, {});
+          budget_ = std::make_shared<detail::QueueBudget>(options.max_queued_bytes);
+          transport_->set_queue_budget(budget_);
+          ++status_.epoch;
+          status_.state = ConnectionState::connecting;
+          status_.capabilities = transport_->capabilities();
+          transport_->start(options, status_.epoch);
+          return Result<void>::success();
+        });
+        if (!started) {
+          status_.state = ConnectionState::failed;
+          complete(completion, Result<RoomSnapshot>::failure(started.failure_record()));
+          return;
+        }
+        join_completion_ = std::move(completion);
+      });
 }
 
-void RoomEngine::subscribe(const TrackId& id) {
-  subscribe(remote_tracks_.at(id));
+void RoomEngine::leave(Completion<void> completion) {
+  if (!execution_->external()) {
+    complete(completion, detail::failure_result<void>(ErrorCode::invalid_thread,
+                                                      "Leave requires an external owner thread"));
+    return;
+  }
+  std::lock_guard lock(leave_mutex_);
+  auto transport = execution_->control.invoke([this] {
+    fail_pending(
+        detail::failure_result<void>(ErrorCode::cancelled, "Room is leaving").failure_record());
+    for (auto& [key, entry] : tracks_) {
+      entry.endpoint->finish(TrackState::closed);
+    }
+    tracks_.clear();
+    remote_tracks_.clear();
+    return std::move(transport_);
+  });
+  if (transport) {
+    transport->stop();
+  }
+  execution_->control.invoke(
+      [this, had_transport = bool(transport), completion = std::move(completion)]() mutable {
+        status_.state = ConnectionState::disconnected;
+        status_.session.reset();
+        complete(completion, Result<void>::success());
+        if (had_transport) {
+          event({RoomEventKind::closed});
+        }
+      });
+  execution_->notification.fence();
 }
 
-void RoomEngine::unpublish(const TrackId& id) {
-  remove(id, true);
+void RoomEngine::publish(TrackDescriptor descriptor,
+                         Completion<std::shared_ptr<PublishedTrack>> completion) {
+  execution_->control.invoke([this, descriptor = std::move(descriptor),
+                              completion = std::move(completion)]() mutable {
+    using Value = std::shared_ptr<PublishedTrack>;
+    if (!transport_ || status_.state != ConnectionState::connected) {
+      complete(completion,
+               detail::failure_result<Value>(ErrorCode::invalid_state, "Room is not connected"));
+      return;
+    }
+    const auto key = std::make_pair(descriptor.id, true);
+    if (tracks_.contains(key)) {
+      complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
+      return;
+    }
+    auto started = detail::control_boundary([&]() -> Result<void> {
+      detail::validate_descriptor(descriptor, budget_->limit, true);
+      auto endpoint = make_endpoint(std::move(descriptor), true);
+      auto track = Value(new PublishedTrack(endpoint, commands_));
+      tracks_.emplace(key, Entry{endpoint, track, {}});
+      transport_->publish(endpoint->binding(), endpoint->descriptor);
+      return Result<void>::success();
+    });
+    if (!started) {
+      tracks_.erase(key);
+      complete(completion, Result<Value>::failure(started.failure_record()));
+      return;
+    }
+    tracks_.find(key)->second.publish_done = std::move(completion);
+  });
 }
 
-void RoomEngine::unsubscribe(const TrackId& id) {
-  remove(id, false);
+void RoomEngine::subscribe(TrackDescriptor descriptor,
+                           Completion<std::shared_ptr<SubscribedTrack>> completion) {
+  execution_->control.invoke([this, descriptor = std::move(descriptor),
+                              completion = std::move(completion)]() mutable {
+    using Value = std::shared_ptr<SubscribedTrack>;
+    if (!transport_ || status_.state != ConnectionState::connected) {
+      complete(completion,
+               detail::failure_result<Value>(ErrorCode::invalid_state, "Room is not connected"));
+      return;
+    }
+    const auto key = std::make_pair(descriptor.id, false);
+    if (tracks_.contains(key)) {
+      complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
+      return;
+    }
+    auto started = detail::control_boundary([&]() -> Result<void> {
+      detail::validate_descriptor(descriptor, budget_->limit, false);
+      auto endpoint = make_endpoint(std::move(descriptor), false);
+      auto track = Value(new SubscribedTrack(endpoint, commands_));
+      tracks_.emplace(key, Entry{endpoint, {}, track});
+      transport_->subscribe(endpoint->binding(), endpoint->descriptor, endpoint->queue_budget());
+      return Result<void>::success();
+    });
+    if (!started) {
+      tracks_.erase(key);
+      complete(completion, Result<Value>::failure(started.failure_record()));
+      return;
+    }
+    tracks_.find(key)->second.subscribe_done = std::move(completion);
+  });
 }
 
-void RoomEngine::set_muted(const TrackId& id, bool muted) {
-  auto endpoint = tracks_.at({id, true}).endpoint;
-  endpoint->set_muted(muted);
-  transport_->set_muted(
-      {++next_control_, endpoint->binding(), muted, SteadyClock::time_point::max(), {}});
+void RoomEngine::subscribe(const TrackId& id,
+                           Completion<std::shared_ptr<SubscribedTrack>> completion) {
+  execution_->control.invoke([this, id, completion = std::move(completion)]() mutable {
+    auto it = remote_tracks_.find(id);
+    if (it == remote_tracks_.end()) {
+      complete(completion, detail::failure_result<std::shared_ptr<SubscribedTrack>>(
+                               ErrorCode::invalid_argument, "Unknown remote track"));
+      return;
+    }
+    subscribe(it->second, std::move(completion));
+  });
 }
 
-void RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand) {
-  auto endpoint = tracks_.at({id, false}).endpoint;
-  endpoint->set_receive_demand(demand);
-  transport_->set_receive_demand(
-      {++next_control_, endpoint->binding(), demand, SteadyClock::time_point::max(), {}});
+void RoomEngine::unpublish(const TrackId& id, Completion<void> completion) {
+  execution_->control.invoke([this, id, completion = std::move(completion)]() mutable {
+    remove(id, true, std::move(completion));
+  });
 }
 
-void RoomEngine::update_local_participant(ParticipantUpdate update) {
-  transport_->update_participant(
-      {++next_control_, status_.epoch, std::move(update), SteadyClock::time_point::max(), {}});
+void RoomEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
+  execution_->control.invoke([this, id, completion = std::move(completion)]() mutable {
+    remove(id, false, std::move(completion));
+  });
 }
 
-void RoomEngine::set_subscription_permissions(SubscriptionPermissions permissions) {
-  transport_->set_subscription_permissions(
-      {++next_control_, status_.epoch, std::move(permissions), SteadyClock::time_point::max(), {}});
+void RoomEngine::set_muted(const TrackId& id, bool muted, Completion<void> completion) {
+  execution_->control.invoke([this, id, muted, completion = std::move(completion)]() mutable {
+    if (!transport_ || status_.state != ConnectionState::connected) {
+      complete(completion,
+               detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));
+      return;
+    }
+    auto it = tracks_.find({id, true});
+    if (it == tracks_.end()) {
+      complete(completion,
+               detail::failure_result<void>(ErrorCode::invalid_argument, "Unknown track"));
+      return;
+    }
+    const auto serial = ++next_control_;
+    auto submitted = detail::control_boundary([&]() -> Result<void> {
+      auto endpoint = it->second.endpoint;
+      endpoint->set_muted(muted);
+      transport_->set_muted(
+          {serial, endpoint->binding(), muted, SteadyClock::time_point::max(), {}});
+      return Result<void>::success();
+    });
+    if (!submitted) {
+      complete(completion, std::move(submitted));
+    } else if (completion) {
+      control_completions_.emplace(
+          serial, ControlCompletion{status_.epoch, id, true, std::move(completion)});
+    }
+  });
+}
+
+void RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
+                                    Completion<void> completion) {
+  execution_->control.invoke([this, id, demand, completion = std::move(completion)]() mutable {
+    if (!transport_ || status_.state != ConnectionState::connected) {
+      complete(completion,
+               detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));
+      return;
+    }
+    auto it = tracks_.find({id, false});
+    if (it == tracks_.end()) {
+      complete(completion,
+               detail::failure_result<void>(ErrorCode::invalid_argument, "Unknown track"));
+      return;
+    }
+    const auto serial = ++next_control_;
+    auto submitted = detail::control_boundary([&]() -> Result<void> {
+      auto endpoint = it->second.endpoint;
+      detail::validate_receive_demand(demand, endpoint->descriptor.kind);
+      endpoint->set_receive_demand(demand);
+      transport_->set_receive_demand(
+          {serial, endpoint->binding(), demand, SteadyClock::time_point::max(), {}});
+      return Result<void>::success();
+    });
+    if (!submitted) {
+      complete(completion, std::move(submitted));
+    } else if (completion) {
+      control_completions_.emplace(
+          serial, ControlCompletion{status_.epoch, id, false, std::move(completion)});
+    }
+  });
+}
+
+void RoomEngine::update_local_participant(ParticipantUpdate update, Completion<void> completion) {
+  execution_->control.invoke(
+      [this, update = std::move(update), completion = std::move(completion)]() mutable {
+        if (!transport_ || status_.state != ConnectionState::connected) {
+          complete(completion,
+                   detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));
+          return;
+        }
+
+        const auto serial = ++next_control_;
+        auto submitted = detail::control_boundary([&]() -> Result<void> {
+          transport_->update_participant(
+              {serial, status_.epoch, std::move(update), SteadyClock::time_point::max(), {}});
+          return Result<void>::success();
+        });
+        if (!submitted) {
+          complete(completion, std::move(submitted));
+        } else if (completion) {
+          control_completions_.emplace(
+              serial, ControlCompletion{status_.epoch, {}, true, std::move(completion)});
+        }
+      });
+}
+
+void RoomEngine::set_subscription_permissions(SubscriptionPermissions permissions,
+                                              Completion<void> completion) {
+  execution_->control.invoke(
+      [this, permissions = std::move(permissions), completion = std::move(completion)]() mutable {
+        if (!transport_ || status_.state != ConnectionState::connected) {
+          complete(completion,
+                   detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));
+          return;
+        }
+
+        const auto serial = ++next_control_;
+        auto submitted = detail::control_boundary([&]() -> Result<void> {
+          transport_->set_subscription_permissions(
+              {serial, status_.epoch, std::move(permissions), SteadyClock::time_point::max(), {}});
+          return Result<void>::success();
+        });
+        if (!submitted) {
+          complete(completion, std::move(submitted));
+        } else if (completion) {
+          control_completions_.emplace(
+              serial, ControlCompletion{status_.epoch, {}, true, std::move(completion)});
+        }
+      });
 }
 
 void RoomEngine::on_events(std::vector<detail::TransportEvent> events) {
-  // A join batch includes the initial roster. Make it visible to on_joined.
+  // A join batch includes the initial roster. Make it visible to the join completion.
   for (const auto& event : events) {
     if (event.session) {
       status_.session = event.session;
@@ -202,10 +520,44 @@ void RoomEngine::on_events(std::vector<detail::TransportEvent> events) {
     switch (event.kind) {
       case TransportEventKind::connected:
         status_.state = ConnectionState::connected;
-        if (observer_) {
-          observer_->on_joined(snapshot());
+        complete(join_completion_, Result<RoomSnapshot>::success(snapshot()));
+        this->event({RoomEventKind::connected});
+        break;
+      case TransportEventKind::control_completed: {
+        auto it = control_completions_.find(event.operation_id);
+        if (it == control_completions_.end() ||
+            (event.binding.epoch && event.binding.epoch != it->second.epoch)) {
+          break;
+        }
+        auto done = std::move(it->second.callback);
+        control_completions_.erase(it);
+        if (event.control_error && *event.control_error != ErrorCode::ok) {
+          auto failure = std::make_shared<FailureInfo>(
+              FailureInfo{next_failure_id(), ErrorDomain::protocol, *event.control_error,
+                          event.error, false, event.control_reason});
+          complete(done, Result<void>::failure(std::move(failure)));
+        } else {
+          complete(done, Result<void>::success());
         }
         break;
+      }
+      case TransportEventKind::interrupted:
+      case TransportEventKind::terminal_error: {
+        const bool terminal = event.kind == TransportEventKind::terminal_error;
+        auto failure = event.failure
+                           ? describe_failure(event.failure)
+                           : detail::failure_result<void>(ErrorCode::connection_lost, event.error)
+                                 .failure_record();
+        fail_pending(failure);
+        status_.state = terminal ? ConnectionState::failed : ConnectionState::reconnecting;
+        status_.error = failure->message;
+        status_.session.reset();
+        RoomEvent value{terminal ? RoomEventKind::failed : RoomEventKind::reconnecting};
+        value.failure = failure;
+        value.message = failure->message;
+        this->event(std::move(value));
+        break;
+      }
       case TransportEventKind::remote_track_added:
         remote_tracks_[event.descriptor->id] = *event.descriptor;
         this->event({RoomEventKind::remote_track_added, event.descriptor->id, event.descriptor});
@@ -254,17 +606,35 @@ void RoomEngine::on_events(std::vector<detail::TransportEvent> events) {
         switch (event.kind) {
           case TransportEventKind::published:
             endpoint->ready(event.server_sid);
-            if (observer_) {
-              observer_->on_published(entry.published);
-            }
+            complete(entry.publish_done,
+                     Result<std::shared_ptr<PublishedTrack>>::success(entry.published));
             break;
           case TransportEventKind::subscribed:
             endpoint->ready(event.server_sid);
             request_keyframe(endpoint);
-            if (observer_) {
-              observer_->on_subscribed(entry.subscribed);
-            }
+            complete(entry.subscribe_done,
+                     Result<std::shared_ptr<SubscribedTrack>>::success(entry.subscribed));
             break;
+          case TransportEventKind::operation_failed: {
+            auto failure =
+                event.failure ? describe_failure(event.failure)
+                              : detail::failure_result<void>(ErrorCode::request_failed, event.error)
+                                    .failure_record();
+            complete(entry.publish_done, Result<std::shared_ptr<PublishedTrack>>::failure(failure));
+            complete(entry.subscribe_done,
+                     Result<std::shared_ptr<SubscribedTrack>>::failure(failure));
+            auto callbacks = std::move(entry.remove_done);
+            entry.removing = false;
+            for (auto& done : callbacks) {
+              complete(done, Result<void>::failure(failure));
+            }
+            RoomEvent value{RoomEventKind::track_failed, event.binding.id};
+            value.publication = event.binding.publication;
+            value.failure = failure;
+            value.message = failure->message;
+            this->event(std::move(value));
+            break;
+          }
           case TransportEventKind::frame:
             endpoint->write(std::move(*event.frame));
             request_keyframe(endpoint);
@@ -290,16 +660,19 @@ void RoomEngine::on_events(std::vector<detail::TransportEvent> events) {
 }
 
 RoomSnapshot RoomEngine::snapshot() const {
-  auto result = status_;
-  result.publications = result.subscriptions = 0;
-  for (const auto& [key, entry] : tracks_) {
-    key.second ? ++result.publications : ++result.subscriptions;
-  }
-  result.queued_bytes = budget_ ? budget_->used.load() : 0;
-  return result;
+  return execution_->control.invoke([this] {
+    auto result = status_;
+    result.publications = result.subscriptions = 0;
+    for (const auto& [key, entry] : tracks_) {
+      key.second ? ++result.publications : ++result.subscriptions;
+    }
+    result.queued_bytes = budget_ ? budget_->used.load() : 0;
+    return result;
+  });
 }
 
 std::shared_ptr<RoomServices> RoomEngine::services() const {
-  return transport_ ? transport_->services() : nullptr;
+  return execution_->control.invoke(
+      [this] { return transport_ ? transport_->services() : nullptr; });
 }
 }  // namespace livekit::sdk::rtc

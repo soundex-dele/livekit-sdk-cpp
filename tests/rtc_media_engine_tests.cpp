@@ -307,14 +307,11 @@ void shared_audio() {
   auto invalid = a;
   invalid.track.id = "bad-shared";
   invalid.audio.max_frames = 0;
-  bool failed = false;
-  try {
-    auto bad = engine->publish_audio(invalid);
-    await(*engine, bad);
-  } catch (...) {
-    failed = true;
-  }
-  check(failed && shared->snapshot().consumers == 2, "Failed graph disturbed active shared input");
+  const auto failed = engine->publish_audio(invalid);
+  check(!failed, "Invalid graph must return a failed completion");
+  const bool unavailable = engine->raw().publication(invalid.track.id).state == TrackState::failed;
+  check(unavailable && shared->snapshot().consumers == 2,
+        "Invalid graph became writable or disturbed active shared input");
   require_result(engine->unpublish(a.track.id));
   const auto before = first_blocks.load(), remaining = second_blocks.load();
   until(*engine, [&] {

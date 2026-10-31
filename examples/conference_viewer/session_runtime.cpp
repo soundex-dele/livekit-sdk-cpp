@@ -313,8 +313,11 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
                 track->metrics(graph, metric_number);
                 if (track->publication && track->descriptor.kind == MediaKind::video) {
                   const auto feedback = engine->feedback(id);
+                  if (!feedback) {
+                    continue;
+                  }
                   const bool enabled =
-                      std::any_of(feedback.encodings.begin(), feedback.encodings.end(),
+                      std::any_of(feedback->encodings.begin(), feedback->encodings.end(),
                                   [](const auto& entry) { return entry.second.active; });
                   bool changed;
                   {
