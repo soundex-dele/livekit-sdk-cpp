@@ -16,7 +16,7 @@ class RtcEventMailbox {
     std::mutex mutex;
     std::condition_variable changed;
     std::deque<rtc::RoomEvent> events;
-    std::deque<rtc::engine::RtcEngine::GraphFailure> failures;
+    std::deque<rtc::engine::GraphFailure> failures;
     bool overflow = false;
   };
 
@@ -76,7 +76,7 @@ class RtcEventMailbox {
     return event;
   }
 
-  std::optional<rtc::engine::RtcEngine::GraphFailure> take_failure() {
+  std::optional<rtc::engine::GraphFailure> take_failure() {
     std::lock_guard lock(state_->mutex);
     if (state_->overflow) {
       throw std::runtime_error("Application RTC event mailbox exhausted");

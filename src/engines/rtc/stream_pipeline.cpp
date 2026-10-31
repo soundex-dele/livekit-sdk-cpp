@@ -170,8 +170,6 @@ PublishPipeline::~PublishPipeline() {
 }
 
 void PublishPipeline::start() {
-  auto control = sink_->track()->operation_control();
-  detail::OperationGuard guard(*control);
   start_locked();
 }
 
@@ -235,7 +233,6 @@ void PublishPipeline::notify_failure(std::exception_ptr failure) {
     return;
   }
   failure_notified_ = true;
-  sink_->track()->report_failure(failure);
   if (extension_.on_failure) {
     detail::CallbackScope scope;
     extension_.on_failure(failure);
@@ -243,11 +240,7 @@ void PublishPipeline::notify_failure(std::exception_ptr failure) {
 }
 
 ErrorCode PublishPipeline::close() {
-  return detail::control_boundary([&] {
-    auto control = sink_->track()->operation_control();
-    detail::OperationGuard guard(*control);
-    return close_locked();
-  });
+  return close_locked();
 }
 
 ErrorCode PublishPipeline::close_locked() {
@@ -268,7 +261,7 @@ ErrorCode PublishPipeline::close_locked() {
     quiesce(extension_);
     graph_.stop();
   }
-  return owns_endpoint_ ? sink_->track()->close_locked() : ErrorCode::ok;
+  return stop && owns_endpoint_ ? sink_->track()->close_locked() : ErrorCode::ok;
 }
 
 SubscribePipeline::SubscribePipeline(std::shared_ptr<SubscribedTrack> track,
@@ -318,8 +311,6 @@ SubscribePipeline::~SubscribePipeline() {
 }
 
 void SubscribePipeline::start() {
-  auto control = source_->track()->operation_control();
-  detail::OperationGuard guard(*control);
   start_locked();
 }
 
@@ -378,7 +369,6 @@ void SubscribePipeline::notify_failure(std::exception_ptr failure) {
     return;
   }
   failure_notified_ = true;
-  source_->track()->report_failure(failure);
   if (extension_.on_failure) {
     detail::CallbackScope scope;
     extension_.on_failure(failure);
@@ -386,11 +376,7 @@ void SubscribePipeline::notify_failure(std::exception_ptr failure) {
 }
 
 ErrorCode SubscribePipeline::close() {
-  return detail::control_boundary([&] {
-    auto control = source_->track()->operation_control();
-    detail::OperationGuard guard(*control);
-    return close_locked();
-  });
+  return close_locked();
 }
 
 ErrorCode SubscribePipeline::close_locked() {
@@ -411,6 +397,6 @@ ErrorCode SubscribePipeline::close_locked() {
     quiesce(extension_);
     graph_.stop();
   }
-  return owns_endpoint_ ? source_->track()->close_locked() : ErrorCode::ok;
+  return stop && owns_endpoint_ ? source_->track()->close_locked() : ErrorCode::ok;
 }
 }  // namespace livekit::sdk::rtc::engine

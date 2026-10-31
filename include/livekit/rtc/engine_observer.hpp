@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/rtc/observer.hpp"
 #include "livekit/rtc/media_config.hpp"
 

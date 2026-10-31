@@ -35,6 +35,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--client', required=True)
     parser.add_argument('--server', required=True)
+    parser.add_argument('--observer-only', action='store_true',
+                        help='Media observer contract without requiring sender capture timestamps')
+    parser.add_argument('--server-kind', choices=['official', 'cpp'], default='official')
     parser.add_argument('--audio-source', help='Run audio_stream as --client with this audio_source example')
     parser.add_argument('--encrypted', action='store_true')
     parser.add_argument('--media-encrypted', action='store_true')
@@ -69,11 +72,17 @@ keys:
 logging:
   level: {args.server_log_level}
 ''')
+    if args.server_kind == 'cpp':
+        config.write_text(f"port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n"
+                          f"  port_range_start: {udp}\n  port_range_end: {min(udp + 100, 65535)}\n"
+                          f"keys:\n  rtctest: {secret}\n")
     env = dict(os.environ, LIVEKIT_URL=f'http://127.0.0.1:{port}',
                LIVEKIT_PUBLISH_TOKEN=token('publisher', secret, args.publisher_kind),
                LIVEKIT_SUBSCRIBE_TOKEN=token('subscriber', secret),
                LIVEKIT_DATA_ENCRYPTION='1' if args.encrypted else '0',
                LIVEKIT_MEDIA_ENCRYPTION='1' if args.media_encrypted else '0')
+    if args.observer_only:
+        env['LIVEKIT_TEST_OBSERVER_ONLY'] = '1'
     if args.codec:
         env['LIVEKIT_TEST_VIDEO_CODEC'] = args.codec
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -102,6 +111,7 @@ logging:
                 if result.returncode:
                     raise RuntimeError(f'Client failed ({result.returncode}); see {root}')
                 report = json.loads((root / 'client.stdout.log').read_text())
+            report['serverKind'] = args.server_kind
             report['serverBinary'] = str(Path(args.server).resolve())
             report['serverSha256'] = hashlib.sha256(Path(args.server).read_bytes()).hexdigest()
             report['clientSha256'] = hashlib.sha256(Path(args.client).read_bytes()).hexdigest()

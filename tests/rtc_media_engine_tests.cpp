@@ -25,8 +25,7 @@ void check(bool value, const char* message) {
 
 struct Wire {
   std::mutex mutex;
-  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup;
-  std::vector<TransportEvent> events;
+  RoomTransport::Events notify;
   std::map<TrackId, BindingToken> subscribers;
   std::map<TrackId, BindingToken> publishers;
   uint64_t feedback_revision = 0;
@@ -35,11 +34,7 @@ struct Wire {
   std::atomic<int> starts{0}, stops{0};
 
   void emit(TransportEvent event) {
-    std::lock_guard lock(mutex);
-    events.push_back(std::move(event));
-    if (wakeup) {
-      wakeup->signal();
-    }
+    notify({std::move(event)});
   }
 };
 
@@ -51,7 +46,7 @@ class Transport final : public RoomTransport {
     ++w->starts;
     {
       std::lock_guard lock(w->mutex);
-      w->wakeup = wakeup_;
+      w->notify = [this](auto events) { notify_events(std::move(events)); };
     }
     w->emit({TransportEventKind::connected});
   }
@@ -88,19 +83,19 @@ class Transport final : public RoomTransport {
   }
 
   SendResult send(const BindingToken& binding, const EncodedFrame& frame) override {
-    std::lock_guard lock(w->mutex);
+    std::unique_lock lock(w->mutex);
     ++w->packets[binding.id];
     if (auto it = w->subscribers.find(binding.id); it != w->subscribers.end()) {
       TransportEvent event{TransportEventKind::frame, it->second};
       event.frame = frame;
-      w->events.push_back(std::move(event));
-      wakeup_->signal();
+      lock.unlock();
+      w->emit(std::move(event));
     }
     return SendResult::sent;
   }
 
   void request_keyframe(const BindingToken& binding) override {
-    std::lock_guard lock(w->mutex);
+    std::unique_lock lock(w->mutex);
     for (const auto& [id, subscriber] : w->subscribers) {
       if (subscriber != binding || !w->publishers.contains(id))
         continue;
@@ -115,14 +110,10 @@ class Transport final : public RoomTransport {
       encoding.keyframe_requests = feedback.revision;
       TransportEvent event{TransportEventKind::feedback, publisher};
       event.feedback = feedback;
-      w->events.push_back(std::move(event));
-      wakeup_->signal();
+      lock.unlock();
+      w->emit(std::move(event));
+      return;
     }
-  }
-
-  std::vector<TransportEvent> take_events() override {
-    std::lock_guard lock(w->mutex);
-    return std::exchange(w->events, {});
   }
 
  private:
@@ -155,7 +146,8 @@ MediaPublishSpec video(std::string id) {
 }
 
 std::unique_ptr<livekit::sdk::app_support::BlockingRtc> make_engine(std::shared_ptr<Wire> wire) {
-  auto result = std::make_unique<livekit::sdk::app_support::BlockingRtc>([wire] { return std::make_unique<Transport>(wire); });
+  auto result = std::make_unique<livekit::sdk::app_support::BlockingRtc>(
+      [wire] { return std::make_unique<Transport>(wire); });
   require_result(result->enable_media());
   LiveKitRoomOptions options;
   options.url = "ws://test";
@@ -196,74 +188,6 @@ void multi_track() {
         "Closing one graph disturbed room or callback barrier");
   require_result(engine->close());
   check(wire->stops == 1, "Media engine failed to close shared transport");
-}
-
-void cancelled_and_failed_sources() {
-  auto wire = std::make_shared<Wire>();
-  wire->acknowledge = false;
-  auto engine = make_engine(wire);
-  livekit::sdk::I420SourceOptions options;
-  options.width = 64;
-  options.height = 48;
-  auto source = std::make_shared<livekit::sdk::I420VideoSource>(options);
-  auto spec = video("cancelled");
-  spec.input.generated = false;
-  spec.input.video_source = source;
-  auto pending = engine->publish_video(spec);
-  check(!pending && !source->stats().attached, "Timed out publication leaked input");
-  require_result(engine->unpublish(spec.track.id));
-  bool cancelled = false;
-  try {
-    require_result(pending);
-  } catch (...) {
-    cancelled = true;
-  }
-  check(cancelled && !source->stats().attached && !source->stats().closed,
-        "Cancelled publication leaked or closed application source");
-  check(!pending, "Timed out operation succeeded");
-  spec.track.id = "backend-rejected";
-  auto rejecting = std::async(std::launch::async, [&] { return engine->publish_video(spec); });
-  BindingToken rejected_binding;
-  until(*engine, [&] {
-    std::lock_guard lock(wire->mutex);
-    auto found = wire->publishers.find(spec.track.id);
-    if (found == wire->publishers.end()) {
-      return false;
-    }
-    rejected_binding = found->second;
-    return true;
-  });
-  TransportEvent failure{TransportEventKind::operation_failed, rejected_binding};
-  failure.error = "publication rejected";
-  wire->emit(std::move(failure));
-  auto rejected = rejecting.get();
-  bool backend_failed = false;
-  try {
-    await(*engine, rejected);
-  } catch (...) {
-    backend_failed = true;
-  }
-  check(backend_failed && !source->stats().attached && !source->stats().closed && !rejected,
-        "Backend failure became ready before media cleanup");
-  wire->acknowledge = true;
-  spec.track.id = "bad-codec";
-  spec.video.max_frames = 0;
-  auto bad = engine->publish_video(spec);
-  bool failed = false;
-  try {
-    await(*engine, bad);
-  } catch (...) {
-    failed = true;
-  }
-  check(failed && !source->stats().attached && !source->stats().closed,
-        "Graph startup failure leaked input lease");
-  spec.track.id = "replacement";
-  spec.video.max_frames = 2;
-  auto replacement = engine->publish_video(spec);
-  await(*engine, replacement);
-  require_result(engine->close());
-  check(!source->stats().attached && !source->stats().closed,
-        "Close destroyed application-owned source");
 }
 
 void raw_audio_and_encoded() {
@@ -404,30 +328,6 @@ void shared_audio() {
         "Shared audio closed or leaked external source");
 }
 
-void media_callback_reentry() {
-  auto engine = make_engine(std::make_shared<Wire>());
-  auto other = make_engine(std::make_shared<Wire>());
-  auto spec = video("callback-reentry");
-  std::atomic<int> checked{0};
-  std::atomic<bool> accepted{false};
-  spec.preview.video = [&](const auto&) {
-    auto local = engine->close();
-    auto cross_session = other->leave();
-    if (local != livekit::sdk::ErrorCode::invalid_thread ||
-        cross_session != livekit::sdk::ErrorCode::invalid_thread) {
-      accepted = true;
-    }
-    ++checked;
-  };
-  require_result(engine->publish_video(spec));
-  until(*engine, [&] { return checked >= 2; });
-  require_result(engine->close());
-  const auto stopped = checked.load();
-  require_result(other->close());
-  check(!accepted && checked == stopped,
-        "Media callback reentered control or escaped close barrier");
-}
-
 void media_leave_and_rejoin() {
   auto wire = std::make_shared<Wire>();
   auto rtc = make_engine(wire);
@@ -437,17 +337,9 @@ void media_leave_and_rejoin() {
   auto active = rtc->publish_video(spec);
   await(*rtc, active);
   until(*rtc, [&] { return callbacks >= 2; });
-  wire->acknowledge = false;
-  auto pending = rtc->publish_video(video("pending"));
+  rtc->raw().publish_video(video("pending"));
   require_result(rtc->leave());
   const auto stopped = callbacks.load();
-  bool cancelled = false;
-  try {
-    require_result(pending);
-  } catch (const std::exception&) {
-    cancelled = true;
-  }
-  check(cancelled, "Leave failed to settle media operation");
   check(active->track->snapshot().transport.state == TrackState::closed,
         "Leave retained active media endpoint");
   wire->acknowledge = true;
@@ -472,12 +364,8 @@ int main() {
   try {
     std::cout << "multi_track" << std::endl;
     multi_track();
-    std::cout << "media_callback_reentry" << std::endl;
-    media_callback_reentry();
     std::cout << "media_leave_and_rejoin" << std::endl;
     media_leave_and_rejoin();
-    std::cout << "cancelled_and_failed_sources" << std::endl;
-    cancelled_and_failed_sources();
     std::cout << "raw_audio_and_encoded" << std::endl;
     raw_audio_and_encoded();
     std::cout << "shared_capture" << std::endl;

@@ -3,20 +3,13 @@
 #include "livekit/rtc/stream_pipeline.hpp"
 
 namespace livekit::sdk::rtc::engine {
-// Explicit opt-in to GraphFlow types. Borrowed access shares the engine's track
-// registry and asynchronous completion contract; it must not outlive the engine.
+// Optional custom topology. Completion uses RtcCallbacks, like media controls.
 class RtcGraphApi final {
  public:
-  [[nodiscard]] ErrorCode publish(TrackDescriptor,
-                                  std::shared_ptr<graphflow::core::GraphNode> feedback_sink,
-                                  Completion<TrackId> completion);
-  [[nodiscard]] ErrorCode subscribe(TrackDescriptor,
-                                    std::shared_ptr<graphflow::core::GraphNode> consumer,
-                                    Completion<TrackId> completion);
-  [[nodiscard]] ErrorCode publish_graph(TrackDescriptor, PublishGraphFactory,
-                                        Completion<TrackId> completion);
-  [[nodiscard]] ErrorCode subscribe_graph(TrackDescriptor, SubscribeGraphFactory,
-                                          Completion<TrackId> completion);
+  void publish(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> feedback_sink);
+  void subscribe(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> consumer);
+  void publish_graph(TrackDescriptor, PublishGraphFactory);
+  void subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
 
  private:
   friend class RtcEngine;

@@ -1,5 +1,7 @@
 # RTC 单次完成回调与持续 Observer
 
+> 历史设计记录。当前控制 API 和支持范围见 [最简 Observer / 回调方案](rtc-simple-observer.md)。
+
 RtcEngine、RoomView 和 RtcGraphApi 的异步控制立即返回 `ErrorCode` 受理状态。
 每次调用传入 `Completion<T>`（`std::function<void(Result<T>)>`），普通无值控制使用
 `Completion<void>`。Observer 只接收持续状态变化。不提供 OperationHandle、RequestId 或新增的逐请求取消 API。

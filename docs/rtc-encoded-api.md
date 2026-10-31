@@ -1,5 +1,7 @@
 > RtcEngine 和 RtcGraphApi 的控制接口返回异步受理状态，单次结果通过调用时传入的 Completion 返回，持续事件由 Observer 通知；详见 [异步控制契约](rtc-observers.md)。低层轨道/流水线的同步接口仍保留各自契约。
 
+> 历史设计记录。当前控制 API 和支持范围见 [最简 Observer / 回调方案](rtc-simple-observer.md)。
+
 > 本轮 API 迁移与线程/媒体质量契约见 [当前架构](architecture.md)。自动化验证与未验收项见 [重构记录](architecture-refactor-20261029.md)。
 
 # 编码媒体 RTC API

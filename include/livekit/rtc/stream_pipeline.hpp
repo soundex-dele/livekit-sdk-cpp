@@ -31,7 +31,6 @@ class PublishPipeline {
   }
 
  private:
-  friend class TrackGraphRegistry;
   friend class RtcEngine;
   void start_locked();
   [[nodiscard]] ErrorCode close_locked();
@@ -67,7 +66,6 @@ class SubscribePipeline {
   }
 
  private:
-  friend class TrackGraphRegistry;
   friend class RtcEngine;
   void start_locked();
   [[nodiscard]] ErrorCode close_locked();

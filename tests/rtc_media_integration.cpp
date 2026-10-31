@@ -1,14 +1,12 @@
-#include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
-#include "rtc_event_mailbox.hpp"
 #include "livekit/rtc/engine.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include <array>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
-#include <thread>
+#include <condition_variable>
 
 using namespace livekit::sdk::rtc;
 using namespace livekit::sdk::rtc::engine;
@@ -21,13 +19,8 @@ void check(bool condition, const char* message) {
   }
 }
 
-template <class Future>
-auto await(Future future) {
-  return require_result(std::move(future));
-}
-
 struct Observation {
-  uint64_t frames = 0;
+  uint64_t frames = 0, decoded = 0;
   bool ten_ms_audio = false;
   std::optional<livekit::sdk::media::FrameView> retained;
 };
@@ -38,56 +31,69 @@ struct Observation {
 int main() {
   try {
     std::mutex mutex;
+    std::condition_variable changed;
     std::array<Observation, 2> observed;
-    auto tx = require_result(livekit::sdk::app_support::create_blocking_engine(AudioOutputOptions{}));
-    auto rx = require_result(livekit::sdk::app_support::create_blocking_engine(AudioOutputOptions{}));
-    livekit::sdk::app_support::RtcEventMailbox rx_events;
-    rx_events.attach(*rx);
-    LiveKitRoomOptions options;
-    options.url = std::getenv("LIVEKIT_URL");
-    options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
-    options.reconnect.enabled = false;
-    await(tx->join(options));
-    options.token = std::getenv("LIVEKIT_SUBSCRIBE_TOKEN");
-    await(rx->join(options));
+    auto tx = create_livekit_engine(AudioOutputOptions{});
+    auto rx = create_livekit_engine(AudioOutputOptions{});
     std::array<std::shared_ptr<MediaTrack>, 2> publications, subscriptions;
-    for (size_t i = 0; i < 2; ++i) {
-      MediaPublishSpec spec;
-      spec.track.id = spec.track.name = i ? "ordinary-video" : "ordinary-audio";
-      spec.track.stream_group = "av-sync";
-      spec.track.kind = i ? MediaKind::video : MediaKind::audio;
-      spec.track.format.codec = i ? Codec::vp8 : Codec::opus;
-      spec.track.format.clock_rate = i ? 90000 : 48000;
-      spec.track.format.channels = 2;
-      spec.track.format.width = 64;
-      spec.track.format.height = 48;
-      spec.input.generated = true;
-      auto operation = await(tx->publish_media(spec));
-      publications[i] = operation.track;
-    }
-    const auto deadline = SteadyClock::now() + 20s;
-    while (!subscriptions[0] || !subscriptions[1]) {
-      check(SteadyClock::now() < deadline, "Ordinary media discovery timed out");
-      auto event = rx_events.take_event(20ms);
-      if (!event || event->kind != RoomEventKind::remote_track_added) {
-        std::this_thread::sleep_for(5ms);
-        continue;
+    const bool require_sender_clock = std::getenv("LIVEKIT_TEST_OBSERVER_ONLY") == nullptr;
+    int joined = 0, left = 0, published = 0, subscribed = 0;
+    RtcCallbacks sending;
+    sending.on_joined = [&](const RoomSnapshot& room) {
+      check(room.session != nullptr, "Join callback missing roster");
+      {
+        std::lock_guard lock(mutex);
+        ++joined;
+        changed.notify_all();
       }
-      const size_t i = event->descriptor->kind == MediaKind::video ? 1 : 0;
-      if (subscriptions[i]) {
-        continue;
+      for (size_t i = 0; i < 2; ++i) {
+        MediaPublishSpec spec;
+        spec.track.id = spec.track.name = i ? "ordinary-video" : "ordinary-audio";
+        spec.track.stream_group = "av-sync";
+        spec.track.kind = i ? MediaKind::video : MediaKind::audio;
+        spec.track.format.codec = i ? Codec::vp8 : Codec::opus;
+        spec.track.format.clock_rate = i ? 90000 : 48000;
+        spec.track.format.channels = 2;
+        spec.track.format.width = 64;
+        spec.track.format.height = 48;
+        spec.input.generated = true;
+        tx->publish_media(std::move(spec));
       }
+    };
+    sending.on_published = [&](const MediaPublication& publication) {
+      std::lock_guard lock(mutex);
+      ++published;
+      changed.notify_all();
+      publications[publication.id == "ordinary-video" ? 1 : 0] = publication.track;
+    };
+    sending.on_left = [&] {
+      std::lock_guard lock(mutex);
+      ++left;
+    };
+    tx->set_callbacks(std::move(sending));
+    RtcCallbacks receiving;
+    receiving.on_joined = [&](const RoomSnapshot&) {
+      std::lock_guard lock(mutex);
+      ++joined;
+      changed.notify_all();
+    };
+    receiving.on_track_published = [&](const TrackDescriptor& track) {
+      const size_t i = track.kind == MediaKind::video ? 1 : 0;
       MediaSubscribeSpec spec;
-      spec.track = *event->descriptor;
+      spec.track = track;
       spec.track.id = i ? "receive-video" : "receive-audio";
       spec.output.frame = [&, i](const livekit::sdk::media::FrameView& frame) {
+        std::lock_guard lock(mutex);
+        ++observed[i].decoded;
         check(frame.owner && frame.timing.epoch && !frame.planes.empty(),
               "Received frame lacks owning storage or epoch");
-        if (!frame.timing.sender_capture_time_us || !frame.timing.presentation_time) {
-          return;  // Startup frames can precede the first clock extension.
+        if (require_sender_clock &&
+            (!frame.timing.sender_capture_time_us || !frame.timing.presentation_time)) {
+          return;
         }
-        check(frame.timing.presentation_clock != nullptr, "Missing shared presentation clock");
-        std::lock_guard lock(mutex);
+        if (require_sender_clock) {
+          check(frame.timing.presentation_clock != nullptr, "Missing shared presentation clock");
+        }
         auto& observation = observed[i];
         ++observation.frames;
         if (!i) {
@@ -97,53 +103,78 @@ int main() {
           check(frame.width == 64 && frame.height == 48, "Ordinary video dimensions changed");
         }
         observation.retained = frame;
+        changed.notify_all();
       };
-      auto operation = await(rx->subscribe_media(spec));
-      subscriptions[i] = operation.track;
-    }
-    while (true) {
+      rx->subscribe_media(std::move(spec));
+    };
+    receiving.on_subscribed = [&](const MediaSubscription& subscription) {
+      std::lock_guard lock(mutex);
+      ++subscribed;
+      changed.notify_all();
+      subscriptions[subscription.id == "receive-video" ? 1 : 0] = subscription.track;
+    };
+    receiving.on_left = [&] {
+      std::lock_guard lock(mutex);
+      ++left;
+    };
+    rx->set_callbacks(std::move(receiving));
+    LiveKitRoomOptions options;
+    options.url = std::getenv("LIVEKIT_URL");
+    options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
+    tx->join(options);
+    options.token = std::getenv("LIVEKIT_SUBSCRIBE_TOKEN");
+    rx->join(options);
+    {
+      std::unique_lock lock(mutex);
+      const bool received = changed.wait_for(lock, 20s, [&] {
+        return joined == 2 && published == 2 && subscribed == 2 && observed[0].frames >= 30 &&
+               observed[1].frames >= 10;
+      });
+      check(received, "Missing pushed callbacks or decoded audio/video through SFU");
+      if (require_sender_clock) {
+        const auto& audio = observed[0].retained->timing;
+        const auto& video = observed[1].retained->timing;
+        check(audio.presentation_clock == video.presentation_clock,
+              "Participant A/V tracks do not share a presentation clock");
+        const auto local_delta = std::chrono::duration_cast<std::chrono::microseconds>(
+                                     *audio.presentation_time - *video.presentation_time)
+                                     .count();
+        const auto sender_delta = *audio.sender_capture_time_us - *video.sender_capture_time_us;
+        check(std::abs(local_delta - sender_delta) <= 1,
+              "A/V presentation does not preserve sender capture offset");
+      }
+      check(observed[0].ten_ms_audio, "Ordinary audio bypassed NetEq 10 ms pacing");
       for (const auto& track : publications) {
         require_result(track->check());
       }
       for (const auto& track : subscriptions) {
         require_result(track->check());
       }
-      {
-        std::lock_guard lock(mutex);
-        if (observed[0].frames >= 30 && observed[1].frames >= 10) {
-          const auto& audio = observed[0].retained->timing;
-          const auto& video = observed[1].retained->timing;
-          check(audio.presentation_clock == video.presentation_clock,
-                "Participant A/V tracks do not share a presentation clock");
-          const auto local_delta = std::chrono::duration_cast<std::chrono::microseconds>(
-                                       *audio.presentation_time - *video.presentation_time)
-                                       .count();
-          const auto sender_delta = *audio.sender_capture_time_us - *video.sender_capture_time_us;
-          check(std::abs(local_delta - sender_delta) <= 1,
-                "A/V presentation does not preserve sender capture offset");
-          check(observed[0].ten_ms_audio, "Ordinary audio bypassed NetEq 10 ms pacing");
-          break;
-        }
-      }
-      check(SteadyClock::now() < deadline, "Missing timed audio/video through SFU");
-      std::this_thread::sleep_for(10ms);
     }
-    check(tx->room().snapshot().state == ConnectionState::connected &&
-              rx->room().snapshot().state == ConnectionState::connected,
+    check(tx->snapshot().state == ConnectionState::connected &&
+              rx->snapshot().state == ConnectionState::connected,
           "Room not connected");
-    await(tx->leave());
-    await(rx->leave());
-    require_result(tx->close());
-    require_result(rx->close());
+    check(joined == 2 && published == 2 && subscribed == 2 && subscriptions[0] && subscriptions[1],
+          "Missing observer callbacks");
+    tx->leave();
+    rx->leave();
+    check(left == 2, "Missing leave callbacks");
     for (const auto& observation : observed) {
       check(observation.retained->owner && !observation.retained->planes[0].empty(),
             "Frame storage did not survive shutdown");
       const auto first = observation.retained->planes[0][0];
       (void)first;
     }
-    std::cout << "{\"ordinaryMedia\":true,\"synchronousControl\":true,\"netEq10ms\":true,"
-                 "\"senderClock\":true,\"avPresentation\":true,\"retainedFrames\":true}\n";
-    return 0;
+    std::cout << "{\"ordinaryMedia\":true,\"observerCallbacks\":true,\"netEq10ms\":true,"
+                 "\"joinCallbacks\":"
+              << joined << ",\"publicationCallbacks\":" << published
+              << ",\"subscriptionCallbacks\":" << subscribed << ",\"leaveCallbacks\":" << left
+              << ",\"audioFrames\":" << observed[0].frames
+              << ",\"videoFrames\":" << observed[1].frames
+              << ",\"senderClock\":" << (require_sender_clock ? "true" : "false")
+              << ",\"avPresentation\":" << (require_sender_clock ? "true" : "false")
+              << ",\"retainedFrames\":true}\n";
+
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

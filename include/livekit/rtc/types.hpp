@@ -191,8 +191,6 @@ struct RoomSettings {
   size_t max_events = 4096;
   std::chrono::milliseconds operation_timeout{30000};
   std::chrono::milliseconds stats_interval{0};  // Disabled, or 200..60000 ms.
-  // Applied by RtcEngine, which owns encoder graphs; not a transport setting.
-  std::optional<RoomVideoCodecPolicy> video_codec_policy;
 };
 
 struct RoomOptions : RoomSettings {

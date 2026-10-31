@@ -1,8 +1,6 @@
 # livekit-sdk-cpp
 
-当前分层、帧契约与迁移说明见 [架构说明](docs/architecture.md)。最新的 [源节点分发与任务队列设计](docs/source-driven-runtime.md) 已移除 RtcEngine/pipeline 的 poll 接口。
-
-RTC 控制采用有界异步队列。RtcEngine、RoomEngine 和 RtcGraphApi 立即返回 `ErrorCode` 受理状态，单次结果由每次调用传入的 Completion 接收，房间、发布、订阅 Observer 仅接收持续事件；无 OperationHandle 或 RequestId。leave/close 可中断协议等待。接口与迁移说明见 [observer 异步控制](docs/rtc-observers.md)。
+当前 RTC 接口见 [最简 Observer / 回调方案](docs/rtc-simple-observer.md)。RtcEngine 的控制接口返回 `void`，RoomEngine 通过单个 Observer 通知入会、发布和订阅结果，RtcEngine 启动对应 GraphEngine 后调用上层 `RtcCallbacks`。底层主动推送结果，应用无需调用 `poll()`；RoomEngine 直接持有成员，不使用 PImpl。控制层没有线程、锁、异常捕获或逐次 completion。
 
 C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 
@@ -10,7 +8,7 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 旧 Room、Participant、TrackPublication、VideoFrameStream、AudioFrameStream API 和 LiveKit::SDK 目标已移除，没有兼容层。调用方与测试入口已迁移，支持边界与验证记录见 [实施清单](docs/rtc-backend-refactor.md)。
 
-旧公开 RtcMediaEngine / RoomSession 已移除，统一入口与退房重入契约见 [RTC 引擎 API](docs/rtc-media-engine.md)。
+旧公开 RtcMediaEngine / RoomSession 已移除。旧的异步调度和同步 Result 文档保留为历史记录，当前契约以上述最简方案为准。
 
 ## 入口
 
@@ -30,7 +28,7 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 普通 Session 的入口、共享源示例及所有权规则见 [媒体引擎 API](docs/rtc-media-engine.md)。
 
-房间内出现 H264-only 成员时，可启用 [房间视频统一回退](docs/room-video-codec-policy.md)，由各发布端自动将 H265 切换为 H264，并为后续发布保留回退决定。
+本版按配置选择视频 codec；自动 H265 → H264 重发布策略随复杂控制调度一起移除。H264/H265 codec 节点本身继续保留。
 
     输入 → 编码节点 → 发布节点 ─┐
     输入 → 编码节点 → 发布节点 ─┼─ 共享 RoomEngine / LiveKit 连接
@@ -39,13 +37,13 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 轨道以稳定本地 TrackId 路由，服务端 SID 是当前会话绑定。每轨拥有独立队列、预算、反馈和关闭屏障。停止一条轨道不退出房间。已有编码帧可直接写入 PublishedTrack；SubscribedTrack::read() 返回拥有数据的完整编码帧。
 
-RtcEngine 直接拥有控制调度与执行资源，独立生命周期序列执行媒体启停，串行通知队列派发 Completion 和 Observer。内部 RoomEngine 是无自有线程、无状态锁、无固定线程要求的协议状态机，由上层保证串行访问。单次结果统一为 `Result<T>` / `Result<void>`。媒体源、编解码和设备输出保留各自有界线程；RoomServices 的数据/RPC/流接口保持独立。UI 使用不可变快照，并将 observer 通知转发到自身线程。
+RtcEngine 独占 RoomEngine，以两个 map 保存发布和订阅媒体图。上层回调沿底层通知调用栈执行，`on_left` 在 `leave()` 调用栈执行。底层 WebRTC、媒体节点和设备的线程仍由对应模块管理。不在底层回调中阻塞等待结果、退会或销毁引擎。
 
 ## RTC 后端目录
 
 公共入口为 `rtc::engine::RtcEngine`，头文件为 `livekit/rtc/engine.hpp`，状态和逻辑直接定义在该类中。
-RoomEngine 已收为内部组件，不再提供公共头文件或独立工厂；应用使用 `create_livekit_engine()`。
-业务调度由 RtcEngine 负责，内部 RoomEngine 通过 RoomTransport 发起协议请求，分别回调操作结果和状态事件。
+RoomEngine 的公共头文件为 `livekit/rtc/room_engine.hpp`，可注入 RoomTransport 工厂做无窗口测试；普通应用使用 `create_livekit_engine()`。
+RoomEngine 通过 RoomTransport 发起协议请求，所有成功结果和持续事件统一经 Observer 传给 RtcEngine。
 详细边界见 [房间状态机设计](docs/rtc-room-state-machine.md)。
 
 ```text

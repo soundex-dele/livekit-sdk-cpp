@@ -99,13 +99,9 @@ struct SubscriptionPermissionsRequest {
 };
 enum class SendResult { sent, would_block, dropped };
 
-// Calls are serialized by the owner of the internal RoomEngine state machine.
-// The owner chooses where requests and event/media servicing execute.
-// Adapters must not depend on a fixed controller thread. Never called concurrently.
-// start/publish/subscribe enqueue work and must not wait for a server response.
-// take_events drains callbacks after a wakeup; it never waits. Native threads never
-// enter application code. Connection recovery is adapter-owned; restoring the
-// desired publication/subscription registry is exclusively RoomEngineState-owned.
+// Requests initiate backend work. The backend pushes completed events on its
+// notification thread, outside its internal locks. stop() fences notifications;
+// the owner must outlive stop() and must not stop/destroy itself inside a callback.
 class RoomTransport {
  public:
   virtual ~RoomTransport() = default;
@@ -128,11 +124,12 @@ class RoomTransport {
 
   virtual void start(const RoomOptions&, Epoch initial_epoch) = 0;
 
-  void attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup) {
-    wakeup_ = std::move(wakeup);
+  using Events = std::function<void(std::vector<TransportEvent>)>;
+
+  void set_event_handler(Events handler) {
+    events_handler_ = std::move(handler);
   }
 
-  virtual std::vector<TransportEvent> take_events() = 0;
   virtual void publish(const BindingToken&, const TrackDescriptor&) = 0;
   virtual void subscribe(const BindingToken&, const TrackDescriptor&,
                          std::shared_ptr<QueueBudget>) = 0;
@@ -168,7 +165,14 @@ class RoomTransport {
   virtual void stop() noexcept = 0;
 
  protected:
-  std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup_;
+  void notify_events(std::vector<TransportEvent> events) {
+    if (events_handler_ && !events.empty()) {
+      events_handler_(std::move(events));
+    }
+  }
+
+ private:
+  Events events_handler_;
 };
 
 }  // namespace livekit::sdk::rtc::detail

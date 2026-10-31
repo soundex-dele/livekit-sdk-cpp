@@ -1,157 +1,104 @@
 #pragma once
-#include "livekit/rtc/room_view.hpp"
-#include "livekit/rtc/observer.hpp"
+#include "livekit/rtc/room_engine.hpp"
 #include "livekit/rtc/media_config.hpp"
-#include "livekit/rtc/engine_observer.hpp"
-#include "livekit/async_result.hpp"
 #include "livekit/rtc/graph_types.hpp"
-#include <atomic>
 #include <map>
-#include <mutex>
-#include <memory>
-#include <optional>
-#include <string>
-
-namespace livekit::sdk::rtc::detail {
-class RtcExecutionContext;
-class LifecycleExecutor;
-}  // namespace livekit::sdk::rtc::detail
 
 namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
-class TrackGraphRegistry;
 class MediaResources;
 class MediaGraphBuilder;
-struct RetiredTrackGraphs;
+class PublishPipeline;
+class SubscribePipeline;
 
-// Single-room facade. Network/track controls enqueue work and return admission
-// status, never the operation result. Pass a completion for each operation.
-// Same-object/same-kind duplicates return busy. Completion is delivered once per
-// accepted request to its completion. See completion.hpp for
-// threading/lifetime rules. leave/close interrupt and cancel pending work.
-// Stop application callers before destruction; never destroy from a callback.
-class RtcEngine final {
+struct RtcCallbacks {
+  std::function<void(const RoomSnapshot&)> on_joined;
+  std::function<void()> on_left;
+  std::function<void(const TrackDescriptor&)> on_track_published;
+  std::function<void(const MediaPublication&)> on_published;
+  std::function<void(const MediaSubscription&)> on_subscribed;
+  std::function<void(const TrackId&)> on_unpublished;
+  std::function<void(const TrackId&)> on_unsubscribed;
+  std::function<void(const RoomEvent&)> on_event;
+};
+
+// Single-room facade. The backend pushes success callbacks after media graph
+// startup; the application does not drive an event pump.
+// No control executors, locks, per-call completions or exception handling.
+// Callbacks run on the notifying backend thread (leave on its caller). Do not
+// wait for another result, leave or destroy the engine from a backend callback.
+class RtcEngine final : private RoomObserver {
  public:
-  using TransportFactory = std::function<std::unique_ptr<detail::RoomTransport>()>;
+  using TransportFactory = RoomEngine::TransportFactory;
   explicit RtcEngine(TransportFactory);
   ~RtcEngine();
   RtcEngine(const RtcEngine&) = delete;
   RtcEngine& operator=(const RtcEngine&) = delete;
 
-  // Links LiveKit::RTCMediaEngine. Call before join; repeated installation is rejected.
-  ErrorCode enable_media(AudioOutputOptions = {});
+  void set_callbacks(RtcCallbacks);
+  void join(RoomOptions);
+  void leave();
+  void close();
+  RoomSnapshot snapshot() const;
+  std::shared_ptr<RoomServices> services() const;
+
+  void enable_media(AudioOutputOptions = {});
   bool media_enabled() const;
-  // Thread-safe local policy observation; not a room-wide transition ACK.
-  VideoCodecPolicySnapshot video_codec_policy() const;
-  [[nodiscard]] ErrorCode join(RoomOptions, Completion<void> completion);
-  // Cancels preceding requests, then quiesces graphs before leaving.
-  [[nodiscard]] ErrorCode leave(Completion<void> completion = {});
-  // Terminal. Further submissions return session_closed.
-  [[nodiscard]] ErrorCode close(Completion<void> completion = {});
-
-  [[nodiscard]] ErrorCode publish_media(MediaPublishSpec, Completion<MediaPublication> completion);
-  [[nodiscard]] ErrorCode publish_video(MediaPublishSpec, Completion<MediaPublication> completion);
-  [[nodiscard]] ErrorCode publish_audio(MediaPublishSpec, Completion<MediaPublication> completion);
-  [[nodiscard]] ErrorCode subscribe_media(MediaSubscribeSpec,
-                                          Completion<MediaSubscription> completion);
-  [[nodiscard]] ErrorCode create_shared_input(
-      TrackDescriptor, MediaInput, Completion<std::shared_ptr<SharedMediaInput>> completion);
-
-  // Encoded publication. Advanced graph composition requires graph_api.hpp.
-  [[nodiscard]] ErrorCode publish(TrackDescriptor, Completion<TrackId> completion);
+  void publish(TrackDescriptor);
+  void subscribe(TrackDescriptor);
+  void subscribe(const TrackId&);
+  void publish_media(MediaPublishSpec);
+  void publish_video(MediaPublishSpec);
+  void publish_audio(MediaPublishSpec);
+  void subscribe_media(MediaSubscribeSpec);
+  void unpublish(const TrackId&);
+  void unsubscribe(const TrackId&);
+  void set_muted(const TrackId&, bool);
+  void set_receive_demand(const TrackId&, ReceiveDemand);
+  void update_local_participant(ParticipantUpdate);
+  void set_subscription_permissions(SubscriptionPermissions);
+  std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput);
   RtcGraphApi graph();
-  [[nodiscard]] ErrorCode unpublish(const TrackId&, Completion<void> completion);
-  [[nodiscard]] ErrorCode unsubscribe(const TrackId&, Completion<void> completion);
-  [[nodiscard]] ErrorCode set_muted(const TrackId&, bool, Completion<void> completion,
-                                    ControlOptions = {});
-  [[nodiscard]] ErrorCode set_receive_demand(const TrackId&, ReceiveDemand,
-                                             Completion<void> completion, ControlOptions = {});
-  // Producer threads may write; closed/absent publications return WriteStatus::closed.
   WriteStatus write(const TrackId&, EncodedFrame);
   TrackSnapshot publication(const TrackId&) const;
   SenderFeedback feedback(const TrackId&) const;
 
-  using GraphFailure = engine::GraphFailure;
-  void set_room_observer(std::weak_ptr<RoomObserver>);
-  void set_publication_observer(std::weak_ptr<PublicationObserver>);
-  void set_subscription_observer(std::weak_ptr<SubscriptionObserver>);
-
-  // Borrowed view valid until engine destruction. No room/track teardown escape hatch.
-  const RoomView& room() const;
-
  private:
   friend class RtcGraphApi;
-  friend class ::livekit::sdk::rtc::RoomView;
-  Result<std::shared_ptr<SharedMediaInput>> create_shared_input_impl(TrackDescriptor, MediaInput);
-  ErrorCode clear_tracks();
-  ErrorCode detach(RetiredTrackGraphs) const;
-  Result<TrackId> publish_graph(TrackDescriptor, PublishGraphFactory);
-  Result<TrackId> subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
-  AsyncResult<Result<TrackId>> publish_graph_async(TrackDescriptor, PublishGraphFactory,
-                                                   bool managed = false);
-  AsyncResult<Result<TrackId>> subscribe_graph_async(TrackDescriptor, SubscribeGraphFactory);
-  Result<TrackId> finish_publish_graph(TrackDescriptor, PublishGraphFactory,
-                                       std::shared_ptr<PublishedTrack>);
-  Result<TrackId> finish_subscribe_graph(TrackDescriptor, SubscribeGraphFactory,
-                                         std::shared_ptr<SubscribedTrack>);
-  Result<TrackId> publish_node(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode> = {});
-  Result<TrackId> subscribe_node(TrackDescriptor, std::shared_ptr<graphflow::core::GraphNode>);
-  Result<MediaPublication> start_media_locked(MediaPublishSpec);
-  AsyncResult<Result<MediaPublication>> start_media_async(MediaPublishSpec,
-                                                          std::optional<MediaKind> = {});
-  void reconcile_video_codec_policy();
-  void notify_video_codec_policy();
-  void reset_video_codec_policy(std::optional<RoomVideoCodecPolicy> = {});
-  void use_h264(MediaPublishSpec&);
+  void publish_graph(TrackDescriptor, PublishGraphFactory);
+  void subscribe_graph(TrackDescriptor, SubscribeGraphFactory);
+  void clear_tracks();
+  void on_joined(const RoomSnapshot&) override;
+  void on_left() override;
+  void on_published(std::shared_ptr<PublishedTrack>) override;
+  void on_subscribed(std::shared_ptr<SubscribedTrack>) override;
+  void on_unpublished(const TrackId&) override;
+  void on_unsubscribed(const TrackId&) override;
+  void on_room_event(const RoomEvent&) override;
 
-  template <class Function, class Callback>
-  ErrorCode submit(std::string key, Function function, Callback completion, bool barrier = false,
-                   bool terminal = false);
-  template <class Function>
-  auto execute(Function function, bool allow_closed = false) const;
+  RtcCallbacks callbacks_;
+  std::unique_ptr<RoomEngine> room_;
+  std::unique_ptr<MediaResources> media_resources_;
+  std::unique_ptr<MediaGraphBuilder> media_;
 
-  template <class Observer>
-  class ObserverSlot {
-   public:
-    void set(std::weak_ptr<Observer> observer) {
-      std::lock_guard lock(mutex_);
-      observer_ = std::move(observer);
-    }
-
-    std::weak_ptr<Observer> get() const {
-      std::lock_guard lock(mutex_);
-      return observer_;
-    }
-
-   private:
-    mutable std::mutex mutex_;
-    std::weak_ptr<Observer> observer_;
+  struct Publication {
+    PublishGraphFactory factory;
+    std::optional<MediaPublishSpec> media;
+    std::shared_ptr<PublishPipeline> pipeline;
+    std::shared_ptr<MediaTrack> track;
   };
 
-  ObserverSlot<RoomObserver> room_observer;
-  ObserverSlot<PublicationObserver> publication_observer;
-  ObserverSlot<SubscriptionObserver> subscription_observer;
-  bool closed = false;
-  std::atomic<bool> has_media{false};
-  std::shared_ptr<detail::SessionControl> control;
-  std::unique_ptr<detail::RtcExecutionContext> runtime;
-  detail::LifecycleExecutor& lifecycle;
-  std::unique_ptr<TrackGraphRegistry> graphs;
-  std::unique_ptr<MediaResources> media_resources;
-  std::unique_ptr<MediaGraphBuilder> media;
-  RoomView room_view;
-  // Control sequence owns intent/recipes; snapshot is also read by application threads.
-  std::optional<RoomVideoCodecPolicy> codec_policy;
-  std::map<TrackId, MediaPublishSpec> media_publications;
-  bool building_media = false;
-  Epoch policy_advertised_epoch = 0;
-  bool policy_advertised_latch = false;
-  mutable std::mutex policy_mutex;
-  VideoCodecPolicySnapshot policy_status;
+  struct Subscription {
+    SubscribeGraphFactory factory;
+    std::optional<MediaSubscribeSpec> media;
+    std::shared_ptr<SubscribePipeline> pipeline;
+    std::shared_ptr<MediaTrack> track;
+  };
+
+  std::map<TrackId, Publication> publications_;
+  std::map<TrackId, Subscription> subscriptions_;
 };
 
-// Encoded-only factory links LiveKit::RTCEngine; overload with audio options
-// installs media support and links LiveKit::RTCMediaEngine.
-Result<std::unique_ptr<RtcEngine>> create_livekit_engine();
-Result<std::unique_ptr<RtcEngine>> create_livekit_engine(AudioOutputOptions);
+std::unique_ptr<RtcEngine> create_livekit_engine();
+std::unique_ptr<RtcEngine> create_livekit_engine(AudioOutputOptions);
 }  // namespace livekit::sdk::rtc::engine

@@ -17,7 +17,12 @@ struct SignalingOptions {
   int signal_protocol = 12;
   bool single_peer_connection = false;
   MediaTransport media_transport = MediaTransport::automatic;
-  ReconnectOptions reconnect;
+  // The minimal RoomEngine does not restore tracks after a reconnect.
+  ReconnectOptions reconnect = [] {
+    ReconnectOptions options;
+    options.enabled = false;
+    return options;
+  }();
   TokenProvider token_provider;
   std::chrono::milliseconds token_timeout{10000};
   RegionOptions regions;

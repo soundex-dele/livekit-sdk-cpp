@@ -1,5 +1,7 @@
 # Source-driven RTC runtime
 
+> 历史设计记录。当前控制 API 和支持范围见 [最简 Observer / 回调方案](rtc-simple-observer.md)。
+
 This supersedes the manual-poll execution contract in the earlier architecture
 refactor record. RtcEngine, RtcPipelineEngine and per-track pipeline poll APIs
 are removed, without compatibility wrappers.

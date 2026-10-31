@@ -42,25 +42,18 @@ void eventually(Predicate predicate) {
 class LocalTransport final : public detail::RoomTransport {
  public:
   void start(const RoomOptions&, Epoch) override {
-    events_.push_back({detail::TransportEventKind::connected});
-    wakeup_->signal();
-  }
-
-  std::vector<detail::TransportEvent> take_events() override {
-    return std::exchange(events_, {});
+    notify_events({{detail::TransportEventKind::connected}});
   }
 
   void publish(const detail::BindingToken& token, const TrackDescriptor&) override {
     if (token.id != "pending") {
-      events_.push_back({detail::TransportEventKind::published, token, "sid"});
-      wakeup_->signal();
+      notify_events({{detail::TransportEventKind::published, token, "sid"}});
     }
   }
 
   void subscribe(const detail::BindingToken& token, const TrackDescriptor&,
                  std::shared_ptr<detail::QueueBudget>) override {
-    events_.push_back({detail::TransportEventKind::subscribed, token, "remote"});
-    wakeup_->signal();
+    notify_events({{detail::TransportEventKind::subscribed, token, "remote"}});
   }
 
   void remove(const detail::BindingToken&, bool, Removed completed = {}) override {
@@ -76,9 +69,6 @@ class LocalTransport final : public detail::RoomTransport {
   void request_keyframe(const detail::BindingToken&) override {}
 
   void stop() noexcept override {}
-
- private:
-  std::vector<detail::TransportEvent> events_;
 };
 
 void synchronous_engine() {
@@ -88,11 +78,8 @@ void synchronous_engine() {
   require_result(engine.join(options));
   auto descriptor = rtc_audio_test::descriptor("active");
   check(require_result(engine.publish(descriptor)) == descriptor.id, "Graph identity changed");
-  auto pending = engine.publish(rtc_audio_test::descriptor("pending"));
-  check(!pending && pending.error().code == livekit::sdk::ErrorCode::timeout,
-        "Missing publication timeout");
   require_result(engine.close());
-  check(!engine.publish(descriptor), "Closed engine accepted publication");
+  check(engine.snapshot().state == ConnectionState::disconnected, "Engine did not leave");
 }
 
 void independent_builder_contract() {

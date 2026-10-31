@@ -121,7 +121,7 @@ struct Publication {
   webrtc::scoped_refptr<EncodedAudioSender> audio;
   webrtc::scoped_refptr<EncodedVideoSender> video;
   std::atomic<bool> ready{false}, closed{false};
-  uint64_t feedback_revision = 0;  // controller only
+  uint64_t feedback_revision = 0;  // session worker only
 
   void close() {
     closed = true;
@@ -139,7 +139,7 @@ struct Subscription {
   webrtc::scoped_refptr<EncodedReceiver> receiver;
   std::shared_ptr<QueueBudget> budget;
   std::shared_ptr<livekit::sdk::detail::WakeEvent> media_wakeup;
-  // Timestamp and dependency state belongs exclusively to take_events().
+  // Timestamp and dependency state belongs exclusively to the session worker.
   std::optional<uint32_t> last_timestamp;
   uint64_t timestamp = 0;
   std::optional<std::pair<uint64_t, int64_t>> sender_clock;
@@ -221,8 +221,8 @@ class LiveKitTransport final : public RoomTransport {
     services_->attach_wakeup(session_wakeup_);
     services_->configure(options.encryption, options.operation_timeout);
     options_ = options;
-    media_ready_ =
-        std::make_shared<livekit::sdk::detail::ReadySet<BindingToken>>(wakeup_, options.max_tracks);
+    media_ready_ = std::make_shared<livekit::sdk::detail::ReadySet<BindingToken>>(
+        session_wakeup_, options.max_tracks);
     if (options.subscription_permissions)
       validate_subscription_permissions(*options.subscription_permissions);
     permissions_ = options.subscription_permissions;
@@ -330,7 +330,8 @@ class LiveKitTransport final : public RoomTransport {
     services_->set_dispatcher(std::move(dispatch), std::move(failure));
   }
 
-  std::vector<TransportEvent> take_events() override {
+ private:
+  void deliver_events() {
     std::vector<TransportEvent> result;
     std::vector<std::shared_ptr<Publication>> publications;
     std::vector<std::shared_ptr<Subscription>> subscriptions;
@@ -430,9 +431,10 @@ class LiveKitTransport final : public RoomTransport {
         result.push_back(std::move(value));
       }
     }
-    return result;
+    notify_events(std::move(result));
   }
 
+ public:
   void stop() noexcept override {
     worker_.request_stop();
     changed_.notify_all();
@@ -519,9 +521,7 @@ class LiveKitTransport final : public RoomTransport {
       worker_.request_stop();
     }
     changed_.notify_all();
-    if (wakeup_) {
-      wakeup_->signal();
-    }
+    session_wakeup_->signal();
   }
 
   void run(std::stop_token stop) noexcept {
@@ -945,6 +945,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
     auto last_ping = SteadyClock::now(), last_pong = last_ping;
     const auto deadline = std::min(signal.operation_deadline(), signal.connect_deadline());
     while (!stop.stop_requested()) {
+      const auto observed = session_wakeup_->revision();
       recovery.budget.check();
       completions->run();
       std::deque<Command> commands;
@@ -1307,7 +1308,7 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
         const auto found = receivers.find(subscription->descriptor.remote_sid);
         if (found == receivers.end() || subscription->receiver == found->second.output)
           continue;
-        // Publish a new immutable routing snapshot; the controller owns timestamp state.
+        // Publish a new routing snapshot; the session worker owns timestamp state.
         auto bound = std::make_shared<Subscription>();
         bound->binding = subscription->binding;
         bound->descriptor = subscription->descriptor;
@@ -1360,9 +1361,24 @@ void LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recove
       if (join.ping_timeout() > 0 && now - last_pong > std::chrono::seconds(join.ping_timeout()))
         throw SDKError(ErrorDomain::signaling, ErrorCode::connection_lost,
                        "LiveKit heartbeat timed out", true);
-      auto bytes = signal.receive(5);
-      if (!bytes)
+      deliver_events();
+      auto bytes = signal.take_message();
+      if (!bytes) {
+        auto next = last_ping + std::chrono::seconds(std::max(1, join.ping_interval()));
+        if (join.ping_timeout() > 0) {
+          next = std::min(next, last_pong + std::chrono::seconds(join.ping_timeout()));
+        }
+        if (!connected) {
+          next = std::min(next, deadline);
+        } else if (options_.stats_interval.count()) {
+          next = std::min(next, next_stats);
+        }
+        if (const auto data_deadline = services_->next_data_deadline()) {
+          next = std::min(next, *data_deadline);
+        }
+        session_wakeup_->wait(observed, stop, next);
         continue;
+      }
       livekit::SignalResponse response;
       if (!response.ParseFromString(*bytes))
         throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message,

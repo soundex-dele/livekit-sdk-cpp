@@ -1,5 +1,5 @@
 # Guard architectural dependency direction without loading devices or a server.
-foreach(module track_graph_registry media_graph_builder media_resources media_graph_contract)
+foreach(module media_graph_builder media_resources media_graph_contract)
   foreach(extension hpp cpp)
     set(path "${SDK_SOURCE_DIR}/src/engines/rtc/${module}.${extension}")
     if(NOT EXISTS "${path}")
@@ -20,3 +20,17 @@ foreach(port publish_node subscribe_node track_endpoint)
     message(FATAL_ERROR "${port} pulls in the room facade")
   endif()
 endforeach()
+
+# The simplified control path must stay free of the retired scheduling machinery.
+foreach(path include/livekit/rtc/engine.hpp include/livekit/rtc/room_engine.hpp
+             src/engines/rtc/rtc_engine.cpp src/backends/rtc/room_engine.cpp)
+  file(READ "${SDK_SOURCE_DIR}/${path}" source)
+  if(source MATCHES "std::(mutex|atomic|jthread|thread|future)|AsyncResult|Completion<|OperationGuard|catch[ ]*\\(")
+    message(FATAL_ERROR "${path} reintroduces complex control scheduling or exception handling")
+  endif()
+endforeach()
+
+file(READ "${SDK_SOURCE_DIR}/include/livekit/rtc/room_engine.hpp" room_header)
+if(room_header MATCHES "struct Impl|class Impl|impl_")
+  message(FATAL_ERROR "RoomEngine must own its members directly, without PImpl")
+endif()

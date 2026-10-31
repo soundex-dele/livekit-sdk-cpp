@@ -12,7 +12,6 @@ class RtcSubscribeNode;
 
 namespace engine {
 class RtcEngine;
-class TrackGraphRegistry;
 class PublishPipeline;
 class SubscribePipeline;
 }  // namespace engine
@@ -21,7 +20,6 @@ namespace detail {
 class RoomTransport;
 struct Endpoint;
 struct TrackControl;
-struct SessionControl;
 }  // namespace detail
 
 struct ControlOptions {
@@ -29,7 +27,7 @@ struct ControlOptions {
   std::stop_token stop;
 };
 
-// Synchronous controls return ErrorCode::ok on success; failures return a nonzero code.
+// Controls submit directly to the room; ErrorCode::ok denotes local submission.
 class PublishedTrack {
  public:
   const TrackDescriptor& descriptor() const;
@@ -49,17 +47,14 @@ class PublishedTrack {
  private:
   friend class RoomEngine;
   friend class engine::RtcEngine;
-  friend class engine::TrackGraphRegistry;
   friend class engine::PublishPipeline;
-  std::shared_ptr<detail::SessionControl> operation_control() const;
   [[nodiscard]] ErrorCode close_locked();
-  void report_failure(std::exception_ptr);
   PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::TrackControl>);
   std::shared_ptr<detail::Endpoint> endpoint_;
   std::weak_ptr<detail::TrackControl> session_;
 };
 
-// Synchronous controls return ErrorCode::ok on success; failures return a nonzero code.
+// Controls submit directly to the room; ErrorCode::ok denotes local submission.
 class SubscribedTrack {
  public:
   const TrackDescriptor& descriptor() const;
@@ -78,13 +73,10 @@ class SubscribedTrack {
  private:
   friend class RoomEngine;
   friend class engine::RtcEngine;
-  friend class engine::TrackGraphRegistry;
   friend class engine::SubscribePipeline;
   friend class nodes::RtcSubscribeNode;
   void request_keyframe_async();
-  std::shared_ptr<detail::SessionControl> operation_control() const;
   [[nodiscard]] ErrorCode close_locked();
-  void report_failure(std::exception_ptr);
   SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::TrackControl>);
   std::shared_ptr<detail::Endpoint> endpoint_;
   std::weak_ptr<detail::TrackControl> session_;
