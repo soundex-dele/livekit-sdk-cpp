@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
@@ -155,37 +156,27 @@ int main(int argc, char** argv) {
     check(relay_conflict, "Server relay policy was bypassed by strict direct transport");
     const auto regions =
         lk::fetch_regions(discovery + "/settings-ok", token, {}, Clock::now() + 2s);
-    check(regions == std::vector<std::string>{server}, "Region discovery parse failed");
+    check(regions && *regions == std::vector<std::string>{server}, "Region discovery parse failed");
     for (const auto& path : {"/settings-bad", "/settings-large", "/settings-redirect"}) {
-      bool failed = false;
-      try {
-        lk::fetch_regions(discovery + path, token, {}, Clock::now() + 2s);
-      } catch (const sdk::SDKError&) {
-        failed = true;
-      }
-      check(failed, "Invalid region response accepted");
+      const auto result = lk::fetch_regions(discovery + path, token, {}, Clock::now() + 2s);
+      check(!result, "Invalid region response accepted");
     }
     const auto start = Clock::now();
-    bool timed_out = false;
-    try {
-      lk::fetch_regions(discovery + "/settings-slow", token, {}, start + 100ms);
-    } catch (const sdk::SDKError& e) {
-      timed_out = e.code() == sdk::ErrorCode::timeout;
-    }
-    check(timed_out && Clock::now() - start < 1500ms, "Region discovery deadline not bounded");
+    const auto timeout_result =
+        lk::fetch_regions(discovery + "/settings-slow", token, {}, start + 100ms);
+    check(!timeout_result && timeout_result.error().code == sdk::ErrorCode::timeout &&
+              Clock::now() - start < 1500ms,
+          "Region discovery deadline not bounded");
     std::stop_source stop;
     std::jthread cancel([&] {
       std::this_thread::sleep_for(100ms);
       stop.request_stop();
     });
-    bool cancelled = false;
     const auto cancel_start = Clock::now();
-    try {
-      lk::fetch_regions(discovery + "/settings-slow", token, stop.get_token(), cancel_start + 5s);
-    } catch (const sdk::SDKError& e) {
-      cancelled = e.code() == sdk::ErrorCode::cancelled;
-    }
-    check(cancelled && Clock::now() - cancel_start < 1500ms,
+    const auto cancelled_result =
+        lk::fetch_regions(discovery + "/settings-slow", token, stop.get_token(), cancel_start + 5s);
+    check(!cancelled_result && cancelled_result.error().code == sdk::ErrorCode::cancelled &&
+              Clock::now() - cancel_start < 1500ms,
           "Region discovery cancellation not bounded");
     std::cout << sdk::Json{{"ok", true},
                            {"trustedRedirect", true},

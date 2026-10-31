@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include "backends/rtc/livekit/token_request.hpp"
 #include <future>
 #include <thread>
@@ -9,49 +10,48 @@ inline void token_provider_contract() {
   using Clock = std::chrono::steady_clock;
   auto require = [](bool ok) {
     if (!ok)
-      throw std::runtime_error("Token provider contract failed");
+      std::abort();
   };
   auto expect = [&](auto action, ErrorCode code, bool retryable) {
-    try {
-      action();
-    } catch (const SDKError& e) {
-      require(e.code() == code && e.retryable() == retryable);
-      require(std::string(e.what()).find("secret-credential") == std::string::npos);
-      return;
-    }
-    throw std::runtime_error("Token provider must fail");
+    auto result = action();
+    require(!result && result.error().code == code && result.error().retryable == retryable);
+    require(result.error().message.find("secret-credential") == std::string::npos);
+  };
+  auto accepted = [&](Result<std::string> result, const std::string& expected) {
+    require(result && *result == expected);
   };
   const auto fetch = [&](const TokenProvider& provider, std::stop_token stop = {}) {
     return detail::request_token(provider, "https://rtc.example", TokenRequestReason::initial,
                                  Clock::now() + 1s, stop);
   };
-  require(fetch([&](TokenRequest request, TokenCompletion complete) {
-            require(request.url == "https://rtc.example" &&
-                    request.reason == TokenRequestReason::initial);
-            require(!request.stop.stop_requested() && request.deadline > Clock::now());
-            complete({"first"});
-            complete({"second"});
-          }) == "first");
+  accepted(fetch([&](TokenRequest request, TokenCompletion complete) {
+             require(request.url == "https://rtc.example" &&
+                     request.reason == TokenRequestReason::initial);
+             require(!request.stop.stop_requested() && request.deadline > Clock::now());
+             complete({"first"});
+             complete({"second"});
+           }),
+           "first");
   std::jthread worker;
-  require(fetch([&](TokenRequest, TokenCompletion complete) {
-            worker = std::jthread([complete] { complete({"async"}); });
-          }) == "async");
+  accepted(fetch([&](TokenRequest, TokenCompletion complete) {
+             worker = std::jthread([complete] { complete({"async"}); });
+           }),
+           "async");
   worker.join();
-  expect([&] { fetch([](auto, auto done) { done({{}, TokenFailure::unavailable}); }); },
+  expect([&] { return fetch([](auto, auto done) { done({{}, TokenFailure::unavailable}); }); },
          ErrorCode::connection_lost, true);
-  expect([&] { fetch([](auto, auto done) { done({{}, TokenFailure::denied}); }); },
+  expect([&] { return fetch([](auto, auto done) { done({{}, TokenFailure::denied}); }); },
          ErrorCode::permission_denied, false);
-  expect([&] { fetch([](auto, auto done) { done({}); }); }, ErrorCode::permission_denied, false);
-  expect([&] { fetch([](auto, auto done) { done({std::string(65537, 'x')}); }); },
-         ErrorCode::permission_denied, false);
-  expect([&] { fetch([](auto, auto) { throw std::runtime_error("secret-credential"); }); },
+  expect([&] { return fetch([](auto, auto done) { done({}); }); }, ErrorCode::permission_denied,
+         false);
+  expect([&] { return fetch([](auto, auto done) { done({std::string(65537, 'x')}); }); },
          ErrorCode::permission_denied, false);
   TokenCompletion late;
   std::stop_token provider_stop;
   const auto started = Clock::now();
   expect(
       [&] {
-        detail::request_token(
+        return detail::request_token(
             [&](TokenRequest request, TokenCompletion done) {
               provider_stop = request.stop;
               late = std::move(done);
@@ -66,7 +66,7 @@ inline void token_provider_contract() {
   auto pending = std::async(std::launch::async, [&] {
     expect(
         [&] {
-          fetch(
+          return fetch(
               [&](TokenRequest request, TokenCompletion done) {
                 provider_stop = request.stop;
                 late = std::move(done);
@@ -82,16 +82,12 @@ inline void token_provider_contract() {
   pending.get();
   require(provider_stop.stop_requested());
   late({"late-cancel"});
+  expect([&] { return fetch([](auto, auto) { std::abort(); }, cancel.get_token()); },
+         ErrorCode::cancelled, false);
   expect(
       [&] {
-        fetch([](auto, auto) { throw std::runtime_error("must not start"); }, cancel.get_token());
-      },
-      ErrorCode::cancelled, false);
-  expect(
-      [&] {
-        detail::request_token([](auto, auto) { throw std::runtime_error("must not start"); },
-                              "https://rtc.example", TokenRequestReason::initial,
-                              Clock::now() - 1ms, {});
+        return detail::request_token([](auto, auto) { std::abort(); }, "https://rtc.example",
+                                     TokenRequestReason::initial, Clock::now() - 1ms, {});
       },
       ErrorCode::timeout, true);
 }

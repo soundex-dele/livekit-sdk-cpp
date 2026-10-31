@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/failure.hpp"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -8,54 +9,6 @@
 #include <memory>
 
 namespace livekit::sdk {
-enum class ErrorDomain { signaling, transport, protocol, lifecycle, media, data };
-enum class ErrorCode {
-  ok = 0,
-  connection_lost,
-  timeout,
-  cancelled,
-  permission_denied,
-  malformed_message,
-  resource_exhausted,
-  stale_handle,
-  session_closed,
-  recovery_failed,
-  unsupported,
-  outcome_unknown,
-  request_failed,
-  invalid_argument,
-  processing_failed,
-  callback_failed,
-  invalid_thread,
-  invalid_state,
-  internal_error,
-  busy
-};
-
-struct FailureContext {
-  std::string operation;
-  std::string track_id;
-  std::string node;
-  uint64_t epoch = 0;
-};
-
-// Correlation survives propagation through results, callbacks and snapshots.
-// Consumers deduplicate by id; context may be enriched without changing it.
-struct FailureInfo {
-  uint64_t id = 0;
-  ErrorDomain domain = ErrorDomain::lifecycle;
-  ErrorCode code = ErrorCode::internal_error;
-  std::string message;
-  bool retryable = false;
-  int backend_reason = 0;
-  FailureContext context;
-};
-
-inline uint64_t next_failure_id() {
-  static std::atomic<uint64_t> next{0};
-  return ++next;
-}
-
 // Backend codes (HTTP status, LiveKit reason, etc.) retain their original value.
 class SDKError : public std::runtime_error {
  public:

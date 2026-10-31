@@ -1,5 +1,4 @@
 #include "backends/webrtc/encoded_receiver.hpp"
-#include <stdexcept>
 #include "backends/rtc/queue_budget.hpp"
 #include <utility>
 
@@ -12,8 +11,11 @@ EncodedReceiver::EncodedReceiver(MediaKind kind, QueueLimits limits,
       budget_(std::move(budget)),
       needs_keyframe_(kind == MediaKind::video),
       request_keyframe_(kind == MediaKind::video) {
-  if (!limits.max_frames || !limits.max_bytes || limits.max_age.count() <= 0)
-    throw std::invalid_argument("Encoded receiver needs bounded nonempty queues");
+  if (!limits.max_frames || !limits.max_bytes || limits.max_age.count() <= 0) {
+    failure_ = make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                            "Encoded receiver needs bounded nonempty queues");
+    closed_ = true;
+  }
 }
 
 void EncodedReceiver::discard_chain() {
@@ -24,13 +26,16 @@ void EncodedReceiver::discard_chain() {
     needs_keyframe_ = request_keyframe_ = true;
 }
 
-void EncodedReceiver::configure_queue(QueueLimits limits, std::shared_ptr<QueueBudget> budget) {
+Result<void> EncodedReceiver::configure_queue(QueueLimits limits,
+                                              std::shared_ptr<QueueBudget> budget) {
   if (!budget || !limits.max_frames || !limits.max_bytes || limits.max_age.count() <= 0)
-    throw std::invalid_argument("Invalid subscribed receive queue");
+    return Result<void>::failure(make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                                              "Invalid subscribed receive queue"));
   std::lock_guard lock(mutex_);
   discard_chain();
   limits_ = limits;
   budget_ = std::move(budget);
+  return Result<void>::success();
 }
 
 void EncodedReceiver::attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup) {
@@ -42,14 +47,7 @@ void EncodedReceiver::attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEv
 }
 
 void EncodedReceiver::Transform(std::unique_ptr<webrtc::TransformableFrameInterface> frame) {
-  try {
-    receive(std::move(frame));
-  } catch (...) {
-    // Allocation/metadata failures must not unwind through a native callback.
-    std::lock_guard lock(mutex_);
-    discard_chain();
-    ++dropped_;
-  }
+  receive(std::move(frame));
   std::lock_guard lock(mutex_);
   if (wakeup_) {
     wakeup_->signal();

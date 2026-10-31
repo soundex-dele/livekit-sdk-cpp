@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "livekit/rtc/stream_pipeline.hpp"
 #include "backends/rtc/control_context.hpp"
 #include <atomic>

@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/error.hpp"
+#include "livekit/failure.hpp"
 #include "livekit/rtc/backend_options.hpp"
 #include "livekit/rtc/session_info.hpp"
 #include "livekit/rtc/video_codec_policy.hpp"
@@ -137,6 +137,7 @@ enum class ReadStatus { frame, timeout, cancelled, suspended, closed, failed };
 struct ReadResult {
   ReadStatus status = ReadStatus::timeout;
   std::optional<EncodedFrame> frame;
+  Failure failure;
 };
 
 struct EncodingFeedback {

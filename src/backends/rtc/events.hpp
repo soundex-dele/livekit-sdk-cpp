@@ -2,9 +2,8 @@
 #include "livekit/json.hpp"
 #include <functional>
 #include <deque>
-#include <exception>
+#include "livekit/result.hpp"
 #include <mutex>
-#include <stdexcept>
 
 namespace lk {
 // Producers never execute application code on WebRTC threads or under peer locks.
@@ -15,7 +14,7 @@ class EventEmitter {
     std::mutex mutex;
     std::deque<livekit::sdk::Json> pending;
     Handler handler;
-    std::exception_ptr failure;
+    livekit::sdk::Failure failure;
   };
 
   std::shared_ptr<State> state_;
@@ -33,13 +32,15 @@ class EventEmitter {
     std::lock_guard lock(state_->mutex);
     if (state_->pending.size() >= 4096) {
       if (!state_->failure)
-        state_->failure = std::make_exception_ptr(std::runtime_error("Room event queue overflow"));
+        state_->failure = livekit::sdk::make_failure(livekit::sdk::ErrorDomain::lifecycle,
+                                                     livekit::sdk::ErrorCode::resource_exhausted,
+                                                     "Room event queue overflow");
       return;
     }
     state_->pending.push_back(std::move(fields));
   }
 
-  // Only the session thread drains; callback failures never escape a destructor.
+  // Only the session thread drains. Handlers must not throw.
   void dispatch() const noexcept {
     std::deque<livekit::sdk::Json> events;
     {
@@ -47,20 +48,14 @@ class EventEmitter {
       events.swap(state_->pending);
     }
     for (const auto& value : events) {
-      try {
-        state_->handler(value);
-      } catch (...) {
-        std::lock_guard lock(state_->mutex);
-        if (!state_->failure)
-          state_->failure = std::current_exception();
-      }
+      state_->handler(value);
     }
   }
 
-  void rethrow() const {
+  livekit::sdk::Result<void> status() const {
     std::lock_guard lock(state_->mutex);
-    if (state_->failure)
-      std::rethrow_exception(state_->failure);
+    return state_->failure ? livekit::sdk::Result<void>::failure(state_->failure)
+                           : livekit::sdk::Result<void>::success();
   }
 };
 }  // namespace lk

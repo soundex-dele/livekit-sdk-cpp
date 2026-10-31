@@ -3,7 +3,7 @@
 #include "engines/rtc/application_output.hpp"
 #include "engines/rtc/sync_node.hpp"
 #include "media_graph/raw_frame_queue.hpp"
-#include "backends/rtc/control_context.hpp"
+#include "backends/rtc/legacy_control_boundary.hpp"
 #include <atomic>
 #include <algorithm>
 #include "livekit/rtc/input_node.hpp"

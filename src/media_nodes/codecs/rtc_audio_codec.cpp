@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
 #include "backends/webrtc/pcm_resampler.hpp"

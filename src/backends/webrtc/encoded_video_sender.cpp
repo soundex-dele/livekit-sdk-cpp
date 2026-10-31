@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
-#include <stdexcept>
 
 namespace livekit::sdk::rtc::detail {
 namespace {
@@ -356,8 +355,11 @@ EncodedVideoSender::EncodedVideoSender(BindingToken binding, TrackDescriptor des
       descriptor.format.height > 16384 || descriptor.format.clock_rate != 90000 ||
       !descriptor.queue.max_frames || !descriptor.queue.max_bytes ||
       descriptor.queue.max_age.count() <= 0) {
-    throw std::invalid_argument(
-        "Encoded video transport requires one encoding and a valid video descriptor");
+    failure_ =
+        make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                     "Encoded video transport requires one encoding and a valid video descriptor");
+    state_->closed = true;
+    return;
   }
   state_->wakeup = wakeup;
   broadcaster_.wakeup = std::move(wakeup);

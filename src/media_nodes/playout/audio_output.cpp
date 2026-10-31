@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include "livekit/rtc/audio_processing.hpp"
 #include <algorithm>

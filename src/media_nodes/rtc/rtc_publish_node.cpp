@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "livekit/rtc/publish_node.hpp"
 #include <stdexcept>
 #include "backends/rtc/control_context.hpp"

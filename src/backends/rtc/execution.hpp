@@ -1,9 +1,10 @@
 #pragma once
 #include "backends/rtc/control_context.hpp"
 #include <utoolkit/task_queue/task_queue.h>
-#include <cstdio>
-#include <future>
+#include <optional>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <utility>
 
@@ -19,15 +20,7 @@ class SerialQueue {
 
   template <class F>
   void post(F&& fn) {
-    queue_->postTask([fn = std::forward<F>(fn)]() mutable {
-      try {
-        fn();
-      } catch (const std::exception& error) {
-        std::fprintf(stderr, "RTC worker task failed: %s\n", error.what());
-      } catch (...) {
-        std::fprintf(stderr, "RTC worker task failed\n");
-      }
-    });
+    queue_->postTask(std::forward<F>(fn));
   }
 
   template <class F>
@@ -35,11 +28,37 @@ class SerialQueue {
     if (current()) {
       return fn();
     }
-    auto task =
-        std::make_shared<std::packaged_task<std::invoke_result_t<F>()>>(std::forward<F>(fn));
-    auto result = task->get_future();
-    queue_->postTask([task] { (*task)(); });
-    return result.get();
+    using Value = std::invoke_result_t<F>;
+    using Stored = std::conditional_t<std::is_void_v<Value>, bool, Value>;
+
+    struct CompletionState {
+      std::mutex mutex;
+      std::condition_variable changed;
+      bool done = false;
+      std::optional<Stored> result;
+    };
+
+    // Both sides retain the wait state through notification. TaskQueue's legacy
+    // synchronous helper borrows stack synchronization objects and can notify
+    // after its waiting caller has already returned and destroyed them.
+    auto state = std::make_shared<CompletionState>();
+    queue_->postTask([state, fn = std::forward<F>(fn)]() mutable {
+      if constexpr (std::is_void_v<Value>) {
+        fn();
+      } else {
+        state->result.emplace(fn());
+      }
+      {
+        std::lock_guard lock(state->mutex);
+        state->done = true;
+      }
+      state->changed.notify_one();
+    });
+    std::unique_lock lock(state->mutex);
+    state->changed.wait(lock, [&] { return state->done; });
+    if constexpr (!std::is_void_v<Value>) {
+      return std::move(*state->result);
+    }
   }
 
   void fence() {

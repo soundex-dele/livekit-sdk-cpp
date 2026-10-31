@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "api/environment/environment_factory.h"

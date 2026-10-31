@@ -4,30 +4,39 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include <chrono>
 #include <algorithm>
-#include <stdexcept>
+#include "backends/rtc/livekit/region_policy.hpp"
 #include <thread>
 
 namespace lk {
 using livekit::sdk::ErrorCode;
 using livekit::sdk::ErrorDomain;
-using livekit::sdk::SDKError;
+using livekit::sdk::make_failure;
 
-static void initialize_network() {
+static bool initialize_network() {
   static const bool ready = ix::initNetSystem();
-  if (!ready)
-    throw std::runtime_error("Network initialization failed");
+  return ready;
 }
 
-std::vector<std::string> fetch_regions(const std::string& url, const std::string& token,
-                                       std::stop_token stop,
-                                       std::chrono::steady_clock::time_point deadline) {
+Result<std::vector<std::string>> fetch_regions(const std::string& url, const std::string& token,
+                                               std::stop_token stop,
+                                               std::chrono::steady_clock::time_point deadline) {
   using Clock = std::chrono::steady_clock;
-  initialize_network();
+  if (!initialize_network()) {
+    return Result<std::vector<std::string>>::failure(make_failure(
+        ErrorDomain::transport, ErrorCode::processing_failed, "Network initialization failed"));
+  }
+  auto parsed = livekit::sdk::detail::signal_endpoint(url);
+  if (!parsed) {
+    return Result<std::vector<std::string>>::failure(parsed.failure_record());
+  }
+  const auto address =
+      std::string(parsed->secure ? "https" : "http") + parsed->url.substr(parsed->url.find("://"));
   if (stop.stop_requested())
-    throw SDKError(ErrorDomain::lifecycle, ErrorCode::cancelled, "Region discovery cancelled");
+    return Result<std::vector<std::string>>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::cancelled, "Region discovery cancelled"));
   if (Clock::now() >= deadline)
-    throw SDKError(ErrorDomain::signaling, ErrorCode::timeout, "Region discovery deadline exceeded",
-                   true);
+    return Result<std::vector<std::string>>::failure(make_failure(
+        ErrorDomain::signaling, ErrorCode::timeout, "Region discovery deadline exceeded", true));
   ix::HttpClient client;
   auto args = client.createRequest();
   args->connectTimeout = 30;
@@ -53,37 +62,40 @@ std::vector<std::string> fetch_regions(const std::string& url, const std::string
     if (!timer_stop.stop_requested())
       args->cancel = true;
   });
-  auto response = client.get(endpoint(url, false) + "/settings/regions", args);
+  auto response = client.get(address + "/settings/regions", args);
   timer.request_stop();
   if (stop.stop_requested())
-    throw SDKError(ErrorDomain::lifecycle, ErrorCode::cancelled, "Region discovery cancelled");
+    return Result<std::vector<std::string>>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::cancelled, "Region discovery cancelled"));
   if (Clock::now() >= deadline)
-    throw SDKError(ErrorDomain::signaling, ErrorCode::timeout, "Region discovery deadline exceeded",
-                   true);
+    return Result<std::vector<std::string>>::failure(make_failure(
+        ErrorDomain::signaling, ErrorCode::timeout, "Region discovery deadline exceeded", true));
   if (overflow)
-    throw SDKError(ErrorDomain::protocol, ErrorCode::resource_exhausted,
-                   "Region response exceeds limit");
+    return Result<std::vector<std::string>>::failure(make_failure(
+        ErrorDomain::protocol, ErrorCode::resource_exhausted, "Region response exceeds limit"));
   if (response->errorCode != ix::HttpErrorCode::Ok || response->statusCode != 200)
-    throw SDKError(ErrorDomain::signaling, ErrorCode::connection_lost,
-                   "Region discovery request failed", true, response->statusCode);
-  try {
-    const auto settings = Json::parse(body);
-    const auto& regions = settings.at("regions");
-    if (!regions.is_array() || regions.size() > 32)
-      throw std::runtime_error("region count");
-    std::vector<std::string> result;
-    for (const auto& region : regions)
-      result.push_back(region.at("url").get<std::string>());
-    return result;
-  } catch (...) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::malformed_message,
-                   "Malformed region settings");
+    return Result<std::vector<std::string>>::failure(
+        make_failure(ErrorDomain::signaling, ErrorCode::connection_lost,
+                     "Region discovery request failed", true, response->statusCode));
+  const auto settings = Json::parse(body, nullptr, false);
+  if (!settings.is_object() || !settings.contains("regions") || !settings["regions"].is_array() ||
+      settings["regions"].size() > 32) {
+    return Result<std::vector<std::string>>::failure(make_failure(
+        ErrorDomain::protocol, ErrorCode::malformed_message, "Malformed region settings"));
   }
+  std::vector<std::string> result;
+  for (const auto& region : settings["regions"]) {
+    if (!region.is_object() || !region.contains("url") || !region["url"].is_string()) {
+      return Result<std::vector<std::string>>::failure(make_failure(
+          ErrorDomain::protocol, ErrorCode::malformed_message, "Malformed region endpoint"));
+    }
+    result.push_back(region["url"].get<std::string>());
+  }
+  return Result<std::vector<std::string>>::success(std::move(result));
 }
 
 SignalSocket::SignalSocket(std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup)
     : wakeup_(std::move(wakeup)) {
-  initialize_network();
   socket_.disableAutomaticReconnection();
   socket_.disablePerMessageDeflate();
   socket_.setOnMessageCallback([this](const ix::WebSocketMessagePtr& message) {
@@ -124,10 +136,19 @@ SignalSocket::~SignalSocket() {
   close();
 }
 
-void SignalSocket::connect(const std::string& url, const std::string& token, bool subscribe,
-                           std::stop_token stop, int timeout_seconds, const std::string& resume_sid,
-                           std::chrono::steady_clock::time_point deadline_limit, int protocol,
-                           const std::string& join_request) {
+Result<void> SignalSocket::connect(const std::string& url, const std::string& token, bool subscribe,
+                                   std::stop_token stop, int timeout_seconds,
+                                   const std::string& resume_sid,
+                                   std::chrono::steady_clock::time_point deadline_limit,
+                                   int protocol, const std::string& join_request) {
+  if (!initialize_network()) {
+    return Result<void>::failure(make_failure(ErrorDomain::transport, ErrorCode::processing_failed,
+                                              "Network initialization failed"));
+  }
+  auto parsed = livekit::sdk::detail::signal_endpoint(url);
+  if (!parsed) {
+    return Result<void>::failure(parsed.failure_record());
+  }
   close();  // joins the old reader before resetting its state
   {
     std::lock_guard lock(mutex_);
@@ -139,18 +160,19 @@ void SignalSocket::connect(const std::string& url, const std::string& token, boo
     overflow_ = false;
   }
   if (stop.stop_requested())
-    return;
+    return Result<void>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::cancelled, "Signal connection cancelled"));
   if (std::chrono::steady_clock::now() >= deadline_limit)
-    throw SDKError(ErrorDomain::signaling, ErrorCode::timeout, "Connection deadline exceeded",
-                   true);
+    return Result<void>::failure(make_failure(ErrorDomain::signaling, ErrorCode::timeout,
+                                              "Connection deadline exceeded", true));
   // Bearer header avoids leaking tokens through URLs and access logs.
-  auto address = endpoint(url, true) + "/rtc?protocol=" + std::to_string(protocol) +
+  auto address = parsed->url + "/rtc?protocol=" + std::to_string(protocol) +
                  "&sdk=cpp&version=" + std::string(livekit::sdk::version) +
                  "&auto_subscribe=" + (subscribe ? "1" : "0");
   if (!resume_sid.empty())
     address += "&reconnect=1&sid=" + percent_encode(resume_sid);
   if (!join_request.empty())
-    address = endpoint(url, true) + "/rtc/v1?join_request=" + percent_encode(join_request);
+    address = parsed->url + "/rtc/v1?join_request=" + percent_encode(join_request);
   socket_.setUrl(address);
   socket_.setExtraHeaders({{"Authorization", "Bearer " + token}});
   socket_.setHandshakeTimeout(timeout_seconds);
@@ -161,51 +183,58 @@ void SignalSocket::connect(const std::string& url, const std::string& token, boo
   const bool completed =
       cv_.wait_until(lock, stop, deadline, [&] { return opened_ || !error_.empty() || closing_; });
   if (stop.stop_requested())
-    return;
+    return Result<void>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::cancelled, "Signal connection cancelled"));
   if (!completed) {
-    throw SDKError(ErrorDomain::signaling, ErrorCode::timeout, "WebSocket connect timeout", true);
+    return Result<void>::failure(make_failure(ErrorDomain::signaling, ErrorCode::timeout,
+                                              "WebSocket connect timeout", true));
   }
   if (!error_.empty())
-    throw SDKError(
+    return Result<void>::failure(make_failure(
         ErrorDomain::signaling,
         http_status_ == 401 || http_status_ == 403 ? ErrorCode::permission_denied
                                                    : ErrorCode::connection_lost,
         error_,
         http_status_ == 0 || http_status_ == 408 || http_status_ == 429 || http_status_ >= 500,
-        http_status_);
+        http_status_));
+  return Result<void>::success();
 }
 
-void SignalSocket::send(const std::string& bytes) {
+Result<void> SignalSocket::send(const std::string& bytes) {
   if (!socket_.sendBinary(bytes).success)
-    throw SDKError(ErrorDomain::signaling, ErrorCode::connection_lost, "Signal send failed", true);
+    return Result<void>::failure(make_failure(ErrorDomain::signaling, ErrorCode::connection_lost,
+                                              "Signal send failed", true));
+  return Result<void>::success();
 }
 
-std::optional<std::string> SignalSocket::receive(int timeout_ms) {
+Result<std::optional<std::string>> SignalSocket::receive(int timeout_ms) {
   return receive_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
 }
 
-std::optional<std::string> SignalSocket::take_message() {
+Result<std::optional<std::string>> SignalSocket::take_message() {
   return receive_until(std::chrono::steady_clock::now());
 }
 
-std::optional<std::string> SignalSocket::receive_until(
+Result<std::optional<std::string>> SignalSocket::receive_until(
     std::chrono::steady_clock::time_point deadline, std::stop_token stop) {
   std::unique_lock lock(mutex_);
   cv_.wait_until(lock, stop, deadline,
                  [&] { return !messages_.empty() || !error_.empty() || closing_; });
   if (stop.stop_requested()) {
-    return {};
+    return Result<std::optional<std::string>>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::cancelled, "Signal receive cancelled"));
   }
   if (!messages_.empty()) {
     auto message = std::move(messages_.front());
     messages_.pop_front();
-    return message;
+    return Result<std::optional<std::string>>::success(std::move(message));
   }
   if (!error_.empty())
-    throw SDKError(ErrorDomain::signaling,
-                   overflow_ ? ErrorCode::resource_exhausted : ErrorCode::connection_lost, error_,
-                   !overflow_, http_status_);
-  return std::nullopt;
+    return Result<std::optional<std::string>>::failure(
+        make_failure(ErrorDomain::signaling,
+                     overflow_ ? ErrorCode::resource_exhausted : ErrorCode::connection_lost, error_,
+                     !overflow_, http_status_));
+  return Result<std::optional<std::string>>::success(std::nullopt);
 }
 
 void SignalSocket::close() {

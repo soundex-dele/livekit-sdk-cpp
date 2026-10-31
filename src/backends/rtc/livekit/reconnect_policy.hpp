@@ -2,19 +2,21 @@
 #include "livekit/reconnect.hpp"
 #include <algorithm>
 #include <cmath>
-#include <stdexcept>
 #include <condition_variable>
 #include <mutex>
 #include <stop_token>
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 
 namespace livekit::sdk::detail {
-inline void validate_reconnect(const ReconnectOptions& options) {
+inline Result<void> validate_reconnect(const ReconnectOptions& options) {
   if (options.max_attempts == 0 || options.max_attempts > 1000 ||
       options.resume_attempts > options.max_attempts || options.initial_delay.count() < 0 ||
       options.max_delay < options.initial_delay || options.max_delay > std::chrono::minutes(5) ||
       options.timeout.count() <= 0 || options.timeout > std::chrono::hours(1))
-    throw std::invalid_argument("Invalid reconnect attempt, delay or timeout budget");
+    return Result<void>::failure(
+        make_failure(ErrorDomain::signaling, ErrorCode::invalid_argument,
+                     "Invalid reconnect attempt, delay or timeout budget"));
+  return Result<void>::success();
 }
 
 // Equal jitter: [50%, 100%] of capped exponential delay. The caller supplies
@@ -50,18 +52,20 @@ class RecoveryBudget {
     }
   }
 
-  size_t next_attempt() {
+  Result<size_t> next_attempt() {
     begin();
     if (attempts_ >= options_.max_attempts || Clock::now() >= deadline_)
-      throw SDKError(ErrorDomain::signaling, ErrorCode::recovery_failed,
-                     "Connection recovery budget exhausted");
-    return ++attempts_;
+      return Result<size_t>::failure(make_failure(ErrorDomain::signaling,
+                                                  ErrorCode::recovery_failed,
+                                                  "Connection recovery budget exhausted"));
+    return Result<size_t>::success(++attempts_);
   }
 
-  void check() const {
+  Result<void> check() const {
     if (started_ && Clock::now() >= deadline_)
-      throw SDKError(ErrorDomain::signaling, ErrorCode::recovery_failed,
-                     "Connection recovery deadline exceeded");
+      return Result<void>::failure(make_failure(ErrorDomain::signaling, ErrorCode::recovery_failed,
+                                                "Connection recovery deadline exceeded"));
+    return Result<void>::success();
   }
 
   Clock::time_point deadline() const {
@@ -97,10 +101,8 @@ inline bool terminal_leave(int reason) {
          reason == 12 || reason == 13 || reason == 16;
 }
 
-class RejoinRequired : public SDKError {
- public:
-  explicit RejoinRequired(std::string message, int reason = 0)
-      : SDKError(ErrorDomain::signaling, ErrorCode::connection_lost, std::move(message), true,
-                 reason) {}
-};
+inline Failure rejoin_required(std::string message, int reason = 0) {
+  return make_failure(ErrorDomain::signaling, ErrorCode::connection_lost, std::move(message), true,
+                      reason);
+}
 }  // namespace livekit::sdk::detail

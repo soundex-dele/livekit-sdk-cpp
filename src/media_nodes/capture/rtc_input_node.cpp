@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "media_graph/raw_frame_queue.hpp"

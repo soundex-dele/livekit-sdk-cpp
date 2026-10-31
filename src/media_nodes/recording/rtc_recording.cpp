@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "livekit/rtc/recording_node.hpp"
 #include <condition_variable>
 #include <cstdio>

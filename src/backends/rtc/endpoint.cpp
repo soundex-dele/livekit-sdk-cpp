@@ -1,7 +1,6 @@
 #include "backends/rtc/endpoint.hpp"
 #include <algorithm>
 #include <set>
-#include <stdexcept>
 
 namespace livekit::sdk::rtc::detail {
 
@@ -26,26 +25,37 @@ void Endpoint::notify_locked() {
   }
 }
 
-void validate_receive_demand(const ReceiveDemand& d, MediaKind kind) {
+Result<void> validate_receive_demand(const ReceiveDemand& d, MediaKind kind) {
   if (d.quality != ReceiveQuality::low && d.quality != ReceiveQuality::medium &&
       d.quality != ReceiveQuality::high)
-    throw std::invalid_argument("Invalid receive quality");
+    return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                              "Invalid receive quality"));
   if (d.width > 16384 || d.height > 16384 || (d.width == 0) != (d.height == 0) || d.fps > 240)
-    throw std::invalid_argument("Invalid receive dimensions or frame rate");
+    return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                              "Invalid receive dimensions or frame rate"));
   if (kind == MediaKind::audio &&
       (d.width || d.height || d.fps || d.quality != ReceiveQuality::high))
-    throw std::invalid_argument("Audio receive demand cannot select video dimensions or quality");
+    return Result<void>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                     "Audio receive demand cannot select video dimensions or quality"));
+  return Result<void>::success();
 }
 
-void validate_descriptor(const TrackDescriptor& d, size_t room_budget, bool publication) {
+Result<void> validate_descriptor(const TrackDescriptor& d, size_t room_budget, bool publication) {
   if (d.kind != MediaKind::audio && d.kind != MediaKind::video)
-    throw std::invalid_argument("Invalid RTC media kind");
-  if (!publication)
-    validate_receive_demand(d.receive_demand, d.kind);
+    return Result<void>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument, "Invalid RTC media kind"));
+  if (!publication) {
+    auto valid = validate_receive_demand(d.receive_demand, d.kind);
+    if (!valid) {
+      return valid;
+    }
+  }
   if (d.follow_subscriber_demand &&
       (!publication || d.kind != MediaKind::video || d.encodings.size() != 1))
-    throw std::invalid_argument(
-        "Aggregate subscriber demand requires a single-layer video publication");
+    return Result<void>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                     "Aggregate subscriber demand requires a single-layer video publication"));
   if (publication)
     switch (d.source) {
       case PublicationSource::unknown:
@@ -53,15 +63,20 @@ void validate_descriptor(const TrackDescriptor& d, size_t room_budget, bool publ
       case PublicationSource::camera:
       case PublicationSource::screen:
         if (d.kind != MediaKind::video)
-          throw std::invalid_argument("Video source requires a video track");
+          return Result<void>::failure(make_failure(ErrorDomain::protocol,
+                                                    ErrorCode::invalid_argument,
+                                                    "Video source requires a video track"));
         break;
       case PublicationSource::microphone:
       case PublicationSource::screen_audio:
         if (d.kind != MediaKind::audio)
-          throw std::invalid_argument("Audio source requires an audio track");
+          return Result<void>::failure(make_failure(ErrorDomain::protocol,
+                                                    ErrorCode::invalid_argument,
+                                                    "Audio source requires an audio track"));
         break;
       default:
-        throw std::invalid_argument("Invalid RTC publication source");
+        return Result<void>::failure(make_failure(
+            ErrorDomain::protocol, ErrorCode::invalid_argument, "Invalid RTC publication source"));
     }
   switch (d.format.codec) {
     case Codec::opus:
@@ -70,33 +85,42 @@ void validate_descriptor(const TrackDescriptor& d, size_t room_budget, bool publ
     case Codec::h265:
       break;
     default:
-      throw std::invalid_argument("Invalid RTC codec");
+      return Result<void>::failure(
+          make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument, "Invalid RTC codec"));
   }
   if (d.id.empty() || d.id.size() > 256 || !d.priority || d.priority > 16)
-    throw std::invalid_argument("Invalid RTC track identity or priority");
+    return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                              "Invalid RTC track identity or priority"));
   if (!d.queue.max_frames || d.queue.max_frames > 4096 || !d.queue.max_bytes ||
       d.queue.max_bytes > room_budget || d.queue.max_age <= std::chrono::milliseconds::zero() ||
       d.queue.max_age > std::chrono::seconds(5))
-    throw std::invalid_argument("Invalid RTC track queue limits");
+    return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                              "Invalid RTC track queue limits"));
   if (d.kind == MediaKind::audio) {
     if (d.format.codec != Codec::opus || d.format.clock_rate != 48000 ||
         (d.format.channels != 1 && d.format.channels != 2) || d.encodings.size() != 1)
-      throw std::invalid_argument(
-          "Encoded audio requires mono/stereo Opus with a 48 kHz RTP clock");
+      return Result<void>::failure(
+          make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                       "Encoded audio requires mono/stereo Opus with a 48 kHz RTP clock"));
   } else {
     if (d.format.codec == Codec::opus || d.format.clock_rate != 90000 ||
         (publication && (!d.format.width || !d.format.height)) || d.format.width > 16384 ||
         d.format.height > 16384)
-      throw std::invalid_argument("Invalid encoded video format");
+      return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                                "Invalid encoded video format"));
   }
   if (d.encodings.empty() || d.encodings.size() > 3)
-    throw std::invalid_argument("RTC tracks require one to three declared encodings");
+    return Result<void>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                     "RTC tracks require one to three declared encodings"));
   std::set<std::string> ids;
   for (const auto& encoding : d.encodings) {
     if (!ids.insert(encoding.id).second || (d.encodings.size() > 1 && encoding.id.empty()) ||
         encoding.id.size() > 16 || !encoding.max_bitrate_bps)
-      throw std::invalid_argument("Invalid RTC encoding descriptor");
+      return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                                "Invalid RTC encoding descriptor"));
   }
+  return Result<void>::success();
 }
 
 Endpoint::Endpoint(TrackDescriptor desc, BindingToken binding, std::shared_ptr<QueueBudget> budget)
@@ -295,8 +319,12 @@ WriteStatus Endpoint::write(EncodedFrame frame) {
 }
 
 ReadResult Endpoint::read(std::chrono::milliseconds timeout, std::stop_token stop) {
-  if (timeout < std::chrono::milliseconds::zero())
-    throw std::invalid_argument("Negative RTC read timeout");
+  if (timeout < std::chrono::milliseconds::zero()) {
+    return {ReadStatus::failed,
+            {},
+            make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_argument,
+                         "Negative RTC read timeout")};
+  }
   std::unique_lock lock(mutex_);
   changed_.wait_for(lock, stop, timeout,
                     [&] { return stats_.state != TrackState::ready || !queue_.empty(); });
@@ -325,7 +353,7 @@ ReadResult Endpoint::read_locked(std::stop_token stop) {
   if (stats_.state == TrackState::closed)
     return {ReadStatus::closed, {}};
   if (stats_.state == TrackState::failed)
-    return {ReadStatus::failed, {}};
+    return {ReadStatus::failed, {}, stats_.failure};
   if (stats_.state != TrackState::ready)
     return {ReadStatus::suspended, {}};
   expire_locked();

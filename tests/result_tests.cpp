@@ -1,3 +1,4 @@
+#include "backends/rtc/legacy_control_boundary.hpp"
 #include "livekit/result.hpp"
 #include "backends/rtc/control_context.hpp"
 #include <memory>

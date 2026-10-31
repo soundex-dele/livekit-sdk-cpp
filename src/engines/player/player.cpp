@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "livekit/player.hpp"
 #include "livekit/media_core/clock.hpp"
 #include "engines/player/playback_graph.hpp"

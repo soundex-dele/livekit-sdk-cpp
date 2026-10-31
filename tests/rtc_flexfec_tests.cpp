@@ -1,3 +1,4 @@
+#include "native_completion_wait.hpp"
 #include "backends/webrtc/encoded_video_sender.hpp"
 #include "backends/webrtc/native_peer.hpp"
 #include "backends/webrtc/transport_runtime.hpp"
@@ -21,18 +22,12 @@
 using namespace livekit::sdk::rtc;
 namespace native = livekit::sdk::rtc::detail;
 
+using namespace livekit::sdk::test;
 namespace {
 void check(bool value, const char* message) {
   if (!value) {
     throw std::runtime_error(message);
   }
-}
-
-template <class T>
-T complete(std::future<T> pending) {
-  check(pending.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
-        "Native negotiation timed out");
-  return pending.get();
 }
 
 // Observe SRTP headers and drop ciphertext before WebRTC authentication. Never
@@ -267,7 +262,8 @@ class FixedProtectionFactory final : public webrtc::FecControllerFactoryInterfac
 };
 
 std::string local(native::NativePeer& peer, native::TransportRuntime& runtime, bool offer) {
-  complete(peer.create_local(offer));
+  complete_native<native::NativeDescription>(
+      [&](auto done) { peer.create_local(offer, false, std::move(done)); });
   const auto deadline = SteadyClock::now() + std::chrono::seconds(5);
   while (!peer.gathered && SteadyClock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -334,11 +330,15 @@ void video_case(Codec codec, bool receiver_enabled, bool discard_fec) {
     std::lock_guard lock(state->mutex);
     state->fec_pt = std::stoi(offer.substr(fec_line + 9));
   }
-  complete(subscriber.set_remote({webrtc::SdpType::kOffer, offer}));
+  complete_native<void>([&](auto done) {
+    subscriber.set_remote({webrtc::SdpType::kOffer, offer}, {}, std::move(done));
+  });
   const auto answer = local(subscriber, receiving, false);
   check((answer.find("flexfec-03/90000") != std::string::npos) == receiver_enabled,
         "Answer did not respect remote FlexFEC support");
-  complete(publisher.set_remote({webrtc::SdpType::kAnswer, answer}));
+  complete_native<void>([&](auto done) {
+    publisher.set_remote({webrtc::SdpType::kAnswer, answer}, {}, std::move(done));
+  });
   subscriber.refresh_receivers();
   const auto deadline = SteadyClock::now() + std::chrono::seconds(5);
   while ((!publisher.connected || !subscriber.connected) && SteadyClock::now() < deadline) {
@@ -482,8 +482,11 @@ void sfu_case(Codec codec, bool discard_fec, bool downstream, bool receiver_fec)
       if (id == 0) {
         check(sdp.find("flexfec-03/90000") != std::string::npos, "Missing upstream FlexFEC");
       }
-      complete(peers[id]->set_remote(
-          {type == "offer" ? webrtc::SdpType::kOffer : webrtc::SdpType::kAnswer, sdp}));
+      complete_native<void>([&](auto done) {
+        peers[id]->set_remote(
+            {type == "offer" ? webrtc::SdpType::kOffer : webrtc::SdpType::kAnswer, sdp}, {},
+            std::move(done));
+      });
       if (type == "offer") {
         if (id == 2) {
           const auto receive_caps =
@@ -551,7 +554,7 @@ void sfu_case(Codec codec, bool discard_fec, bool downstream, bool receiver_fec)
       std::string mid, hex;
       command >> id >> index >> mid >> hex;
       check(id >= 0 && id < 3, "Invalid ICE test peer id");
-      peers[id]->add_ice({mid, index, unhex_text(hex)});
+      require_native(peers[id]->add_ice({mid, index, unhex_text(hex)}));
     } else if (op == "tick") {
       int i;
       command >> i;
@@ -631,7 +634,9 @@ void options_and_selection() {
         "Disabled selection retained FlexFEC");
   native::NativePeer peer(disabled, webrtc::PeerConnectionInterface::RTCConfiguration{});
   check(peer.pc->AddTransceiver(webrtc::MediaType::VIDEO).ok(), "Cannot add disabled video track");
-  check(complete(peer.create_local(true)).sdp.find("flexfec-03") == std::string::npos,
+  check(complete_native<native::NativeDescription>([&](auto done) {
+          peer.create_local(true, false, std::move(done));
+        }).sdp.find("flexfec-03") == std::string::npos,
         "Disabled offer still advertised FlexFEC");
 }
 }  // namespace

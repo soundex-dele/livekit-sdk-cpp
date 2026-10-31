@@ -50,7 +50,7 @@ struct QueueBudget : std::enable_shared_from_this<QueueBudget> {
     auto owner = shared_from_this();
     if (!reserve(bytes))
       return {};
-    try {
+    {
       if (parent && !existing_parent) {
         existing_parent = parent->claim(bytes);
         if (!existing_parent) {
@@ -59,9 +59,6 @@ struct QueueBudget : std::enable_shared_from_this<QueueBudget> {
         }
       }
       return std::make_shared<Reservation>(std::move(owner), bytes, std::move(existing_parent));
-    } catch (...) {
-      release(bytes);
-      throw;
     }
   }
 

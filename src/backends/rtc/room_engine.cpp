@@ -99,30 +99,28 @@ void RoomEngine::remove(const TrackId& id, bool publication, Completion<void> co
   }
   entry.removing = true;
   auto endpoint = entry.endpoint;
-  auto submitted = detail::control_boundary([&] {
-    transport_->remove(endpoint->binding(), publication,
-                       [this, endpoint](std::exception_ptr failure) {
-                         execution_->control.post([this, endpoint, failure] {
-                           if (!transport_) {
-                             return;
-                           }
-                           if (!failure) {
-                             removed(endpoint->binding());
-                             return;
-                           }
-                           auto it = tracks_.find({endpoint->descriptor.id, endpoint->publication});
-                           if (it == tracks_.end() || it->second.endpoint != endpoint) {
-                             return;
-                           }
-                           auto callbacks = std::move(it->second.remove_done);
-                           it->second.removing = false;
-                           for (auto& done : callbacks) {
-                             complete(done, Result<void>::failure(describe_failure(failure)));
-                           }
-                         });
-                       });
-    return Result<void>::success();
-  });
+  auto submitted = [&] {
+    return transport_->remove(endpoint->binding(), publication, [this, endpoint](Failure failure) {
+      execution_->control.post([this, endpoint, failure] {
+        if (!transport_) {
+          return;
+        }
+        if (!failure) {
+          removed(endpoint->binding());
+          return;
+        }
+        auto it = tracks_.find({endpoint->descriptor.id, endpoint->publication});
+        if (it == tracks_.end() || it->second.endpoint != endpoint) {
+          return;
+        }
+        auto callbacks = std::move(it->second.remove_done);
+        it->second.removing = false;
+        for (auto& done : callbacks) {
+          complete(done, Result<void>::failure(failure));
+        }
+      });
+    });
+  }();
   if (!submitted) {
     entry.removing = false;
     complete(completion, std::move(submitted));
@@ -237,8 +235,7 @@ void RoomEngine::join(RoomOptions options, Completion<RoomSnapshot> completion) 
                                                                     "Leave before joining again"));
           return;
         }
-        // Compatibility boundary for the existing exception-based backend.
-        auto started = detail::control_boundary([&]() -> Result<void> {
+        auto started = [&]() -> Result<void> {
           transport_ = factory_();
           if (!transport_) {
             return detail::failure_result<void>(ErrorCode::internal_error,
@@ -251,15 +248,17 @@ void RoomEngine::join(RoomOptions options, Completion<RoomSnapshot> completion) 
               }
             });
           });
-          transport_->attach_notifications([](auto task) { task(); }, {});
+          if (auto attached = transport_->attach_notifications([](auto task) { task(); }, {});
+              !attached) {
+            return attached;
+          }
           budget_ = std::make_shared<detail::QueueBudget>(options.max_queued_bytes);
           transport_->set_queue_budget(budget_);
           ++status_.epoch;
           status_.state = ConnectionState::connecting;
           status_.capabilities = transport_->capabilities();
-          transport_->start(options, status_.epoch);
-          return Result<void>::success();
-        });
+          return transport_->start(options, status_.epoch);
+        }();
         if (!started) {
           status_.state = ConnectionState::failed;
           complete(completion, Result<RoomSnapshot>::failure(started.failure_record()));
@@ -316,14 +315,15 @@ void RoomEngine::publish(TrackDescriptor descriptor,
       complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
       return;
     }
-    auto started = detail::control_boundary([&]() -> Result<void> {
-      detail::validate_descriptor(descriptor, budget_->limit, true);
+    auto started = [&]() -> Result<void> {
+      if (auto valid = detail::validate_descriptor(descriptor, budget_->limit, true); !valid) {
+        return valid;
+      }
       auto endpoint = make_endpoint(std::move(descriptor), true);
       auto track = Value(new PublishedTrack(endpoint, commands_));
       tracks_.emplace(key, Entry{endpoint, track, {}});
-      transport_->publish(endpoint->binding(), endpoint->descriptor);
-      return Result<void>::success();
-    });
+      return transport_->publish(endpoint->binding(), endpoint->descriptor);
+    }();
     if (!started) {
       tracks_.erase(key);
       complete(completion, Result<Value>::failure(started.failure_record()));
@@ -348,14 +348,16 @@ void RoomEngine::subscribe(TrackDescriptor descriptor,
       complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
       return;
     }
-    auto started = detail::control_boundary([&]() -> Result<void> {
-      detail::validate_descriptor(descriptor, budget_->limit, false);
+    auto started = [&]() -> Result<void> {
+      if (auto valid = detail::validate_descriptor(descriptor, budget_->limit, false); !valid) {
+        return valid;
+      }
       auto endpoint = make_endpoint(std::move(descriptor), false);
       auto track = Value(new SubscribedTrack(endpoint, commands_));
       tracks_.emplace(key, Entry{endpoint, {}, track});
-      transport_->subscribe(endpoint->binding(), endpoint->descriptor, endpoint->queue_budget());
-      return Result<void>::success();
-    });
+      return transport_->subscribe(endpoint->binding(), endpoint->descriptor,
+                                   endpoint->queue_budget());
+    }();
     if (!started) {
       tracks_.erase(key);
       complete(completion, Result<Value>::failure(started.failure_record()));
@@ -404,13 +406,12 @@ void RoomEngine::set_muted(const TrackId& id, bool muted, Completion<void> compl
       return;
     }
     const auto serial = ++next_control_;
-    auto submitted = detail::control_boundary([&]() -> Result<void> {
+    auto submitted = [&]() -> Result<void> {
       auto endpoint = it->second.endpoint;
       endpoint->set_muted(muted);
-      transport_->set_muted(
+      return transport_->set_muted(
           {serial, endpoint->binding(), muted, SteadyClock::time_point::max(), {}});
-      return Result<void>::success();
-    });
+    }();
     if (!submitted) {
       complete(completion, std::move(submitted));
     } else if (completion) {
@@ -435,14 +436,15 @@ void RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
       return;
     }
     const auto serial = ++next_control_;
-    auto submitted = detail::control_boundary([&]() -> Result<void> {
+    auto submitted = [&]() -> Result<void> {
       auto endpoint = it->second.endpoint;
-      detail::validate_receive_demand(demand, endpoint->descriptor.kind);
+      if (auto valid = detail::validate_receive_demand(demand, endpoint->descriptor.kind); !valid) {
+        return valid;
+      }
       endpoint->set_receive_demand(demand);
-      transport_->set_receive_demand(
+      return transport_->set_receive_demand(
           {serial, endpoint->binding(), demand, SteadyClock::time_point::max(), {}});
-      return Result<void>::success();
-    });
+    }();
     if (!submitted) {
       complete(completion, std::move(submitted));
     } else if (completion) {
@@ -462,11 +464,10 @@ void RoomEngine::update_local_participant(ParticipantUpdate update, Completion<v
         }
 
         const auto serial = ++next_control_;
-        auto submitted = detail::control_boundary([&]() -> Result<void> {
-          transport_->update_participant(
+        auto submitted = [&]() -> Result<void> {
+          return transport_->update_participant(
               {serial, status_.epoch, std::move(update), SteadyClock::time_point::max(), {}});
-          return Result<void>::success();
-        });
+        }();
         if (!submitted) {
           complete(completion, std::move(submitted));
         } else if (completion) {
@@ -487,11 +488,10 @@ void RoomEngine::set_subscription_permissions(SubscriptionPermissions permission
         }
 
         const auto serial = ++next_control_;
-        auto submitted = detail::control_boundary([&]() -> Result<void> {
-          transport_->set_subscription_permissions(
+        auto submitted = [&]() -> Result<void> {
+          return transport_->set_subscription_permissions(
               {serial, status_.epoch, std::move(permissions), SteadyClock::time_point::max(), {}});
-          return Result<void>::success();
-        });
+        }();
         if (!submitted) {
           complete(completion, std::move(submitted));
         } else if (completion) {
@@ -545,7 +545,7 @@ void RoomEngine::on_events(std::vector<detail::TransportEvent> events) {
       case TransportEventKind::terminal_error: {
         const bool terminal = event.kind == TransportEventKind::terminal_error;
         auto failure = event.failure
-                           ? describe_failure(event.failure)
+                           ? event.failure
                            : detail::failure_result<void>(ErrorCode::connection_lost, event.error)
                                  .failure_record();
         fail_pending(failure);
@@ -617,7 +617,7 @@ void RoomEngine::on_events(std::vector<detail::TransportEvent> events) {
             break;
           case TransportEventKind::operation_failed: {
             auto failure =
-                event.failure ? describe_failure(event.failure)
+                event.failure ? event.failure
                               : detail::failure_result<void>(ErrorCode::request_failed, event.error)
                                     .failure_record();
             complete(entry.publish_done, Result<std::shared_ptr<PublishedTrack>>::failure(failure));

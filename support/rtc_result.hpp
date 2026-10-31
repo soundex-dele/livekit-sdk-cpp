@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/error.hpp"
 #include "livekit/result.hpp"
 
 namespace livekit::sdk::app_support {

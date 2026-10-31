@@ -6,7 +6,6 @@
 #include "api/task_queue/default_task_queue_factory.h"
 #include "media/sctp/dcsctp_transport.h"
 #include "rtc_base/ssl_adapter.h"
-#include <stdexcept>
 
 namespace livekit::sdk::rtc::detail {
 namespace {
@@ -28,19 +27,32 @@ TransportRuntime::TransportRuntime(bool enable_flexfec,
                                    webrtc::PeerConnectionFactoryDependencies dependencies)
     : flexfec_enabled(enable_flexfec) {
 #ifdef _WIN32
-  if (winsock_.error())
-    throw std::runtime_error("Winsock initialization failed");
+  if (winsock_.error()) {
+    failure_ = make_failure(ErrorDomain::transport, ErrorCode::processing_failed,
+                            "Winsock initialization failed");
+    cleanup();
+    return;
+  }
 #endif
-  if (!webrtc::InitializeSSL())
-    throw std::runtime_error("WebRTC SSL initialization failed");
+  if (!webrtc::InitializeSSL()) {
+    failure_ = make_failure(ErrorDomain::transport, ErrorCode::processing_failed,
+                            "WebRTC SSL initialization failed");
+    cleanup();
+    return;
+  }
   ssl_ = true;
-  try {
+  {
     auto deps = std::move(dependencies);
     network = webrtc::Thread::CreateWithSocketServer();
     worker = webrtc::Thread::Create();
     signaling = webrtc::Thread::Create();
-    if (!network->Start() || !worker->Start() || !signaling->Start())
-      throw std::runtime_error("Cannot start native transport threads");
+    if (!network || !worker || !signaling || !network->Start() || !worker->Start() ||
+        !signaling->Start()) {
+      failure_ = make_failure(ErrorDomain::transport, ErrorCode::processing_failed,
+                              "Cannot start native transport threads");
+      cleanup();
+      return;
+    }
     // Per-factory trials avoid changing other SDK sessions or global WebRTC state.
     deps.trials = webrtc::FieldTrials::CreateNoGlobal(
         enable_flexfec ? "WebRTC-FlexFEC-03/Enabled/WebRTC-FlexFEC-03-Advertised/Enabled/"
@@ -54,8 +66,12 @@ TransportRuntime::TransportRuntime(bool enable_flexfec,
       return webrtc::AudioDeviceModule::Create(webrtc::AudioDeviceModule::kDummyAudio,
                                                deps.task_queue_factory.get());
     });
-    if (!deps.adm)
-      throw std::runtime_error("Cannot create transport audio module");
+    if (!deps.adm) {
+      failure_ = make_failure(ErrorDomain::transport, ErrorCode::processing_failed,
+                              "Cannot create transport audio module");
+      cleanup();
+      return;
+    }
     install_transport_audio_codecs(deps, codec_counters);
     deps.video_encoder_factory = create_transport_video_encoder_factory();
     deps.video_decoder_factory = create_transport_video_decoder_factory(codec_counters);
@@ -63,14 +79,15 @@ TransportRuntime::TransportRuntime(bool enable_flexfec,
     // built-in audio processing or codec factories.
     webrtc::EnableMedia(deps);
     factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
-    if (!factory)
-      throw std::runtime_error("Cannot create native transport factory");
+    if (!factory) {
+      failure_ = make_failure(ErrorDomain::transport, ErrorCode::processing_failed,
+                              "Cannot create native transport factory");
+      cleanup();
+      return;
+    }
     webrtc::PeerConnectionFactoryInterface::Options options;
     options.network_ignore_mask = 0;
     factory->SetOptions(options);
-  } catch (...) {
-    cleanup();
-    throw;
   }
 }
 

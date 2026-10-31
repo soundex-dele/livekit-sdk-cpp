@@ -1,3 +1,4 @@
+#include "native_completion_wait.hpp"
 #include "backends/webrtc/encoded_audio_sender.hpp"
 #include "backends/webrtc/encoded_receiver.hpp"
 #include "backends/webrtc/encoded_video_sender.hpp"
@@ -21,6 +22,8 @@
 using namespace livekit::sdk::rtc;
 namespace native = livekit::sdk::rtc::detail;
 
+using namespace livekit::sdk::test;
+using livekit::sdk::ErrorCode;
 namespace {
 void check(bool value, const char* message) {
   if (!value)
@@ -81,7 +84,7 @@ void external_audio() {
       native::BindingToken{"audio", 7, 1, true}, limits);
   auto frame = sample();
   check(sender->send(frame) == native::SendResult::would_block, "Unnegotiated sender must wait");
-  sender->configure(1234, 111);
+  require_native(sender->configure(1234, 111));
   std::atomic<int> sent{0};
   std::atomic<bool> valid{true};
   auto delegate = webrtc::make_ref_counted<webrtc::ChannelSendFrameTransformerDelegate>(
@@ -228,7 +231,7 @@ void shared_audio_budget() {
   auto budget = std::make_shared<native::QueueBudget>(3, 1, room_budget);
   auto sender = webrtc::make_ref_counted<native::EncodedAudioSender>(
       native::BindingToken{"audio", 7, 1, true}, QueueLimits{});
-  sender->configure(1234, 111);
+  require_native(sender->configure(1234, 111));
   auto delegate = webrtc::make_ref_counted<webrtc::ChannelSendFrameTransformerDelegate>(
       [](webrtc::AudioFrameType, uint8_t, uint32_t, webrtc::ArrayView<const uint8_t>, int64_t,
          webrtc::ArrayView<const uint32_t>, std::optional<uint8_t>) { return 0; },
@@ -284,9 +287,8 @@ class LoopbackPeer : public native::NativePeer {
       : NativePeer(runtime, PC::RTCConfiguration{}, receive_limits()), runtime_(runtime) {}
 
   std::string local(bool offer) {
-    auto created = create_local(offer);
-    ready(created);
-    created.get();
+    complete_native<native::NativeDescription>(
+        [&](auto done) { create_local(offer, false, std::move(done)); });
     refresh_receivers();
     const auto deadline = SteadyClock::now() + std::chrono::seconds(5);
     while (!gathered && SteadyClock::now() < deadline)
@@ -300,9 +302,7 @@ class LoopbackPeer : public native::NativePeer {
   }
 
   void remote(webrtc::SdpType type, const std::string& sdp) {
-    auto completion = set_remote({type, sdp});
-    ready(completion);
-    completion.get();
+    complete_native<void>([&](auto done) { set_remote({type, sdp}, {}, std::move(done)); });
     refresh_receivers();
   }
 
@@ -314,7 +314,7 @@ class LoopbackPeer : public native::NativePeer {
   }
 
   void keyframe(const std::string& sid) {
-    request_keyframe(sid);
+    require_native(request_keyframe(sid));
   }
 
  private:
@@ -356,7 +356,8 @@ void audio_loopback() {
     auto codec = std::find_if(parameters.codecs.begin(), parameters.codecs.end(),
                               [](const auto& codec) { return codec.name == "opus"; });
     check(codec != parameters.codecs.end(), "Missing negotiated Opus payload type");
-    inputs[i]->configure(*parameters.encodings[0].ssrc, uint8_t(codec->payload_type));
+    require_native(
+        inputs[i]->configure(*parameters.encodings[0].ssrc, uint8_t(codec->payload_type)));
   }
   auto outputs = subscriber.outputs();
   check(outputs.size() == 2 && outputs.contains("microphone") && outputs.contains("music"),
@@ -406,10 +407,10 @@ void audio_loopback() {
       music_mid = transceiver->mid().value_or("");
   check(!music_mid.empty(), "Missing music MID");
   subscriber.take_track_events();
-  auto remapped = subscriber.set_remote({webrtc::SdpType::kOffer, publisher.local(true)},
-                                        {{music_mid, "TR_music"}});
-  ready(remapped);
-  remapped.get();
+  complete_native<void>([&](auto done) {
+    subscriber.set_remote({webrtc::SdpType::kOffer, publisher.local(true)},
+                          {{music_mid, "TR_music"}}, std::move(done));
+  });
   publisher.remote(webrtc::SdpType::kAnswer, subscriber.local(false));
   auto remapped_outputs = subscriber.outputs();
   check(remapped_outputs.size() == 1 && remapped_outputs.contains("TR_music"),
@@ -439,46 +440,49 @@ void audio_loopback() {
 
 void pending_native_close() {
   native::TransportRuntime runtime;
+  require_native(runtime.status());
   native::NativePeer peer(runtime, PC::RTCConfiguration{});
-  std::promise<void> statistics_notified;
-  auto notification = statistics_notified.get_future();
-  auto statistics = peer.statistics([&] { statistics_notified.set_value(); });
-  check(notification.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
-        "Native statistics completion did not notify its event loop");
-  ready(statistics);
-  const auto report = statistics.get();
+  require_native(peer.status());
+  const auto report =
+      complete_native<TransportStatistics>([&](auto done) { peer.statistics(std::move(done)); });
   check(report.timestamp_us > 0 && report.json.starts_with('[') && report.json.ends_with(']') &&
             report.json.find("local-candidate") == std::string::npos &&
             report.json.find("remote-candidate") == std::string::npos &&
             report.json.find("certificate") == std::string::npos,
         "Native diagnostics exposed non-media records");
+
+  PendingCompletion<void> malformed;
+  peer.set_remote({webrtc::SdpType::kOffer, "invalid SDP"}, {}, malformed.callback());
+  auto invalid = malformed.wait();
+  check(!invalid && invalid.error().code == ErrorCode::malformed_message,
+        "Malformed SDP did not report an explicit failure");
+  check(malformed.calls() == 1, "Malformed SDP callback count changed");
+
   auto channel = peer.pc->CreateDataChannelOrError("_test", nullptr);
   check(channel.ok(), "Cannot create negotiation fixture channel");
-  auto pending = peer.create_local(true);
+  PendingCompletion<native::NativeDescription> pending;
+  peer.create_local(true, false, pending.callback());
   peer.close();
-  ready(pending);
-  try {
-    pending.get();
-  } catch (const std::runtime_error&) {
-  }
-  auto after_close = peer.create_local(true);
-  ready(after_close);
-  bool rejected = false;
-  try {
-    after_close.get();
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
-  check(rejected, "Closed native peer accepted negotiation");
-  auto stopped_stats = peer.statistics();
-  ready(stopped_stats);
-  rejected = false;
-  try {
-    stopped_stats.get();
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
-  check(rejected, "Closed native peer accepted statistics request");
+  auto closed = pending.wait();
+  check(closed || closed.error().code != ErrorCode::timeout,
+        "Closing a peer left negotiation pending");
+  check(pending.calls() == 1, "Close delivered multiple negotiation results");
+
+  PendingCompletion<native::NativeDescription> after_close;
+  peer.create_local(true, false, after_close.callback());
+  auto rejected = after_close.wait();
+  check(!rejected && rejected.error().code == ErrorCode::session_closed,
+        "Closed native peer accepted negotiation");
+  PendingCompletion<TransportStatistics> stopped_stats;
+  peer.statistics(stopped_stats.callback());
+  auto stopped = stopped_stats.wait();
+  check(!stopped && stopped.error().code == ErrorCode::session_closed,
+        "Closed native peer accepted statistics request");
+  PendingCompletion<void> stopped_remote;
+  peer.set_remote({webrtc::SdpType::kOffer, ""}, {}, stopped_remote.callback());
+  auto remote = stopped_remote.wait();
+  check(!remote && remote.error().code == ErrorCode::session_closed,
+        "Closed native peer accepted remote description");
 }
 
 std::vector<uint8_t> canonical_annex_b(std::span<const uint8_t> input) {

@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "media_nodes/capture/microphone_driver.hpp"
 #include "media_nodes/capture/audio_source.hpp"
 #include "backends/webrtc/pcm_resampler.hpp"

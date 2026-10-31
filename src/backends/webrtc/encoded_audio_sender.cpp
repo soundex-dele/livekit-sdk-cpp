@@ -1,6 +1,5 @@
 #include "backends/webrtc/encoded_audio_sender.hpp"
 #include "audio/channel_send_frame_transformer_delegate.h"
-#include <stdexcept>
 #include "backends/rtc/queue_budget.hpp"
 #include <atomic>
 #include "system_wrappers/include/clock.h"
@@ -43,22 +42,28 @@ EncodedAudioSender::EncodedAudioSender(BindingToken binding, QueueLimits limits,
       encoding_id_(std::move(encoding_id)),
       budget_(std::make_shared<Budget>(limits)) {
   budget_->wakeup = std::move(wakeup);
-  if (!limits.max_frames || !limits.max_bytes || limits.max_age.count() <= 0)
-    throw std::invalid_argument("Encoded audio sender needs bounded nonempty queues");
+  if (!limits.max_frames || !limits.max_bytes || limits.max_age.count() <= 0) {
+    failure_ = make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                            "Encoded audio sender needs bounded nonempty queues");
+    closed_ = true;
+  }
 }
 
-void EncodedAudioSender::configure(uint32_t ssrc, uint8_t payload_type) {
+Result<void> EncodedAudioSender::configure(uint32_t ssrc, uint8_t payload_type) {
   if (!ssrc || payload_type > 127)
-    throw std::invalid_argument("Invalid negotiated audio sender parameters");
+    return Result<void>::failure(make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                                              "Invalid negotiated audio sender parameters"));
   std::lock_guard lock(mutex_);
   if (closed_)
-    return;
+    return Result<void>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::session_closed, "Audio sender is closed"));
   ssrc_ = ssrc;
   payload_type_ = payload_type;
   configured_ = true;
   if (budget_->wakeup) {
     budget_->wakeup->signal();
   }
+  return Result<void>::success();
 }
 
 SendResult EncodedAudioSender::send(const EncodedFrame& frame) {

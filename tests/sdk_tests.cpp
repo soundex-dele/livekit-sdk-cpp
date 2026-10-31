@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include <livekit/livekit.hpp>
 #include "api_contract.hpp"
 #include "backends/rtc/events.hpp"
@@ -66,16 +67,18 @@ int main(int argc, char** argv) {
     producer.join();
     check(first == 0 && second == 0, "Producer must not call application code");
     a.dispatch();
-    a.rethrow();
+    check(bool(a.status()), "First event sink status");
     check(first == 1 && second == 0, "Session isolation");
     b.dispatch();
-    b.rethrow();
+    check(bool(b.status()), "Second event sink status");
     check(second == 1, "Second event sink");
-    lk::EventEmitter throwing(
-        [](const sdk::Json&) { throw std::runtime_error("callback failure"); });
-    throwing("test");
-    throwing.dispatch();
-    rejects([&] { throwing.rethrow(); });
+    lk::EventEmitter bounded([](const sdk::Json&) {});
+    for (size_t i = 0; i != 4097; ++i) {
+      bounded("test");
+    }
+    const auto overflow = bounded.status();
+    check(!overflow && overflow.error().code == sdk::ErrorCode::resource_exhausted,
+          "Event queue overflow must be explicit");
 
     check(sdk::version == "0.3.0" && sdk::protocol_version == 12, "Version/protocol baseline");
     sdk::ReconnectOptions reconnect;
@@ -85,7 +88,7 @@ int main(int argc, char** argv) {
           "Reconnect exponential backoff");
     check(sdk::detail::reconnect_delay(reconnect, 1000, 1).count() == 5000, "Reconnect delay cap");
     reconnect.max_attempts = 0;
-    rejects([&] { sdk::detail::validate_reconnect(reconnect); });
+    check(!sdk::detail::validate_reconnect(reconnect), "Invalid reconnect budget accepted");
     sdk::SDKError typed(sdk::ErrorDomain::signaling, sdk::ErrorCode::permission_denied, "denied",
                         false, 403);
     check(!typed.retryable() && typed.backend_reason() == 403, "Typed failure semantics");
@@ -94,12 +97,14 @@ int main(int argc, char** argv) {
     sdk::detail::RecoveryBudget budget(budget_options);
     const auto first_attempt = budget.next_attempt();
     const auto original_deadline = budget.deadline();
-    check(
-        first_attempt == 1 && budget.next_attempt() == 2 && budget.deadline() == original_deadline,
-        "Resume/rejoin must share attempt and time budget");
-    rejects([&] { budget.next_attempt(); });
+    const auto second_attempt = budget.next_attempt();
+    check(first_attempt && *first_attempt == 1 && second_attempt && *second_attempt == 2 &&
+              budget.deadline() == original_deadline,
+          "Resume/rejoin must share attempt and time budget");
+    check(!budget.next_attempt(), "Exhausted budget accepted another attempt");
     budget.reset();
-    check(budget.next_attempt() == 1, "Successful recovery resets attempt budget");
+    const auto reset_attempt = budget.next_attempt();
+    check(reset_attempt && *reset_attempt == 1, "Successful recovery resets attempt budget");
     check(sdk::detail::terminal_leave(2) && sdk::detail::terminal_leave(4) &&
               sdk::detail::terminal_leave(5) && !sdk::detail::terminal_leave(6),
           "Lifecycle removal must override reconnect requests");

@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/rtc/types.hpp"
 #include "support/wake_event.hpp"
 #include "api/frame_transformer_interface.h"
@@ -31,13 +32,18 @@ class EncodedReceiver : public webrtc::FrameTransformerInterface {
   std::vector<ReceivedAccessUnit> take_frames();
   void attach_wakeup(std::shared_ptr<livekit::sdk::detail::WakeEvent>);
   // Installed before exposing a new native receiver as a subscribed endpoint.
-  void configure_queue(QueueLimits, std::shared_ptr<QueueBudget>);
+  Result<void> configure_queue(QueueLimits, std::shared_ptr<QueueBudget>);
   bool take_keyframe_request();
   void close();
   uint64_t dropped() const;
 
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
+
  private:
   std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup_;
+  Failure failure_;
   PayloadTransform transform_;
   MediaKind kind_;
   QueueLimits limits_;

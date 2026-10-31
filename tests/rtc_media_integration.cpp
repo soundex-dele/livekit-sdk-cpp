@@ -38,7 +38,7 @@ int main() {
     auto rx = require_result(create_livekit_engine(AudioOutputOptions{}));
     std::array<std::shared_ptr<MediaTrack>, 2> publications, subscriptions;
     const bool require_sender_clock = std::getenv("LIVEKIT_TEST_OBSERVER_ONLY") == nullptr;
-    int joined = 0, left = 0, published = 0, subscribed = 0;
+    int joined = 0, left = 0, published = 0, subscribed = 0, statistics = 0;
     auto on_published = [&](Result<MediaPublication> result) {
       auto publication = require_result(std::move(result));
       std::lock_guard lock(mutex);
@@ -89,14 +89,23 @@ int main() {
 
     struct Observer : RtcObserver {
       std::function<void(const TrackDescriptor&)> discovered;
+      std::function<void()> statistics_received;
 
       void on_room_event(const RoomEvent& event) override {
         if (event.kind == RoomEventKind::remote_track_added && event.descriptor) {
           discovered(*event.descriptor);
         }
+        if (event.kind == RoomEventKind::statistics && event.statistics) {
+          statistics_received();
+        }
       }
     } receiving;
 
+    receiving.statistics_received = [&] {
+      std::lock_guard lock(mutex);
+      ++statistics;
+      changed.notify_all();
+    };
     receiving.discovered = [&](const TrackDescriptor& track) {
       const size_t i = track.kind == MediaKind::video ? 1 : 0;
       MediaSubscribeSpec spec;
@@ -131,6 +140,7 @@ int main() {
     LiveKitRoomOptions options;
     options.url = std::getenv("LIVEKIT_URL");
     options.token = std::getenv("LIVEKIT_PUBLISH_TOKEN");
+    options.stats_interval = 200ms;
     tx->join(options, tx_joined);
     options.token = std::getenv("LIVEKIT_SUBSCRIBE_TOKEN");
     rx->join(options, rx_joined);
@@ -138,7 +148,7 @@ int main() {
       std::unique_lock lock(mutex);
       const bool received = changed.wait_for(lock, 20s, [&] {
         return joined == 2 && published == 2 && subscribed == 2 && observed[0].frames >= 30 &&
-               observed[1].frames >= 10;
+               observed[1].frames >= 10 && statistics >= 2;
       });
       check(received, "Missing pushed callbacks or decoded audio/video through SFU");
       if (require_sender_clock) {
@@ -180,6 +190,7 @@ int main() {
                  "\"joinCallbacks\":"
               << joined << ",\"publicationCallbacks\":" << published
               << ",\"subscriptionCallbacks\":" << subscribed << ",\"leaveCallbacks\":" << left
+              << ",\"statisticsCallbacks\":" << statistics
               << ",\"audioFrames\":" << observed[0].frames
               << ",\"videoFrames\":" << observed[1].frames
               << ",\"senderClock\":" << (require_sender_clock ? "true" : "false")

@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "backends/webrtc/transport_codecs.hpp"
 #include "rtc_base/thread.h"
 #ifdef _WIN32
@@ -17,6 +18,10 @@ class TransportRuntime {
   ~TransportRuntime();
   TransportRuntime(const TransportRuntime&) = delete;
   TransportRuntime& operator=(const TransportRuntime&) = delete;
+
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
   const bool flexfec_enabled;
   std::unique_ptr<webrtc::Thread> network, worker, signaling;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
@@ -26,6 +31,7 @@ class TransportRuntime {
 #ifdef _WIN32
   webrtc::WinsockInitializer winsock_;
 #endif
+  Failure failure_;
   bool ssl_ = false;
   void cleanup();
 };

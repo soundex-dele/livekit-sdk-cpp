@@ -19,7 +19,7 @@ class SignalSession {
   SignalSession(const SignalingOptions& options, std::stop_token stop, EventEmitter events,
                 livekit::sdk::detail::SignalRecoveryState* recovery = nullptr,
                 std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup = {});
-  void connect();
+  Result<void> connect();
 
   void initial_offer(const livekit::SessionDescription& offer,
                      const std::vector<livekit::AddTrackRequest>& tracks = {}) {
@@ -29,9 +29,9 @@ class SignalSession {
 
   // Only before accepting JoinResponse. Closes the previous socket first and
   // never retries permission/protocol errors or revisits an attempted endpoint.
-  bool failover(const livekit::sdk::SDKError& error);
-  void redirect(const std::string& url);
-  void update_regions(const livekit::RegionSettings& regions);
+  Result<bool> failover(const livekit::sdk::FailureInfo& error);
+  Result<void> redirect(const std::string& url);
+  Result<void> update_regions(const livekit::RegionSettings& regions);
 
   void configure_client(const livekit::ClientConfiguration& config) {
     resume_allowed_ = config.resume_connection() != livekit::DISABLED;
@@ -55,20 +55,21 @@ class SignalSession {
 
   void bind_participant(std::string sid);
   void update_token(std::string token);
-  void send(const livekit::SignalRequest& request);
+  Result<void> send(const livekit::SignalRequest& request);
   void enqueue_ice(const livekit::SignalRequest& request) noexcept;
-  void flush_ice();
-  std::optional<std::string> receive(int timeout_ms);
+  Result<void> flush_ice();
+  Result<std::optional<std::string>> receive(int timeout_ms);
 
-  std::optional<std::string> receive_until(std::chrono::steady_clock::time_point deadline) {
+  Result<std::optional<std::string>> receive_until(std::chrono::steady_clock::time_point deadline) {
     return socket_.receive_until(deadline, stop_);
   }
 
-  std::optional<std::string> take_message() {
+  Result<std::optional<std::string>> take_message() {
     return socket_.take_message();
   }
-  bool recover(const SyncBuilder& sync, const ReconnectHandler& configure,
-               const MovedHandler& moved = {});
+
+  Result<bool> recover(const SyncBuilder& sync, const ReconnectHandler& configure,
+                       const MovedHandler& moved = {});
 
   size_t recovery_attempt() const noexcept {
     return recovery_attempt_;
@@ -77,9 +78,10 @@ class SignalSession {
   void close();
 
  private:
-  void connect_socket(const std::string& sid, std::chrono::steady_clock::time_point deadline);
-  bool select_initial_fallback(const livekit::sdk::SDKError& error);
-  void open_initial_socket();
+  Result<void> connect_socket(const std::string& sid,
+                              std::chrono::steady_clock::time_point deadline);
+  bool select_initial_fallback(const livekit::sdk::FailureInfo& error);
+  Result<void> open_initial_socket();
   livekit::SessionDescription initial_offer_;
   std::vector<livekit::AddTrackRequest> initial_tracks_;
   SignalingOptions options_;

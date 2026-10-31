@@ -5,7 +5,7 @@
 #include "livekit/streams.hpp"
 #include <variant>
 #include <functional>
-#include "livekit/error.hpp"
+#include "livekit/failure.hpp"
 
 namespace livekit::sdk::rtc {
 namespace detail {

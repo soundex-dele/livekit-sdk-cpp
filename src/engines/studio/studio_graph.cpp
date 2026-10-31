@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "studio_graph.hpp"
 #include "livekit/player.hpp"
 #include "engine/graph_engine.h"

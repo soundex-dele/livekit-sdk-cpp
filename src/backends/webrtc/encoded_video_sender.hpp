@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include "api/video_codecs/video_encoder_factory.h"
 #include "api/video_codecs/video_decoder_factory.h"
@@ -22,12 +23,17 @@ class EncodedVideoSender : public webrtc::VideoTrackSource {
   void set_demand(bool enabled);
   void close();
 
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
+
  protected:
   webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
     return &broadcaster_;
   }
 
  private:
+  Failure failure_;
   std::shared_ptr<VideoSenderState> state_;
 
   struct Broadcaster : webrtc::VideoBroadcaster {

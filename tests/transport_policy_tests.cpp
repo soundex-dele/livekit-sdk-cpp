@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "backends/webrtc/transport_policy.hpp"
 #include "backends/rtc/livekit/client_configuration.hpp"
 #include <iostream>

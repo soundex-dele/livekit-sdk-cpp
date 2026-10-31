@@ -1,6 +1,7 @@
 #include "rtc_blocking_bridge.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "rtc_result.hpp"
+#include "native_completion_wait.hpp"
 using livekit::sdk::app_support::require_result;
 #include "livekit/rtc/engine.hpp"
 #include "backends/rtc/room_transport.hpp"
@@ -23,6 +24,29 @@ void check(bool value, const char* message) {
     throw std::runtime_error(message);
 }
 
+void invalid_livekit_join() {
+  auto engine = create_livekit_engine();
+  LiveKitRoomOptions options;
+  options.url = "ws://127.0.0.1:1";
+  options.token = "test";
+  options.subscription_permissions.emplace();
+  // An allow-all policy cannot also contain participant overrides. Validation
+  // currently lives in the legacy adapter and must still complete explicitly.
+  options.subscription_permissions->participants.emplace_back();
+  livekit::sdk::test::PendingCompletion<RoomSnapshot> pending;
+  std::atomic<bool> notification_thread = false;
+  engine->join(options, [done = pending.callback(), &notification_thread](auto result) {
+    notification_thread = is_callback_thread();
+    done(std::move(result));
+  });
+  const auto result = pending.wait();
+  check(!result && result.error().code == livekit::sdk::ErrorCode::invalid_argument,
+        "Legacy join validation escaped the completion boundary");
+  check(notification_thread && pending.calls() == 1,
+        "Join failure did not complete once on the notification thread");
+  engine->close();
+}
+
 struct Wire {
   std::mutex mutex;
   RoomTransport::Events notify;
@@ -42,44 +66,49 @@ class Transport final : public RoomTransport {
  public:
   explicit Transport(std::shared_ptr<Wire> wire) : w(std::move(wire)) {}
 
-  void start(const RoomOptions&, Epoch) override {
+  livekit::sdk::Result<void> start(const RoomOptions&, Epoch) override {
     ++w->starts;
     {
       std::lock_guard lock(w->mutex);
       w->notify = [this](auto events) { notify_events(std::move(events)); };
     }
     w->emit({TransportEventKind::connected});
+    return livekit::sdk::Result<void>::success();
   }
 
   void stop() noexcept override {
     ++w->stops;
   }
 
-  void publish(const BindingToken& binding, const TrackDescriptor&) override {
+  livekit::sdk::Result<void> publish(const BindingToken& binding, const TrackDescriptor&) override {
     {
       std::lock_guard lock(w->mutex);
       w->publishers[binding.id] = binding;
     }
     if (w->acknowledge)
       w->emit({TransportEventKind::published, binding, "SID/" + binding.id});
+    return livekit::sdk::Result<void>::success();
   }
 
-  void subscribe(const BindingToken& binding, const TrackDescriptor& d,
-                 std::shared_ptr<QueueBudget>) override {
+  livekit::sdk::Result<void> subscribe(const BindingToken& binding, const TrackDescriptor& d,
+                                       std::shared_ptr<QueueBudget>) override {
     {
       std::lock_guard lock(w->mutex);
       w->subscribers[d.remote_sid.substr(4)] = binding;
     }
     w->emit({TransportEventKind::subscribed, binding, d.remote_sid});
+    return livekit::sdk::Result<void>::success();
   }
 
-  void remove(const BindingToken& binding, bool, Removed completed = {}) override {
+  livekit::sdk::Result<void> remove(const BindingToken& binding, bool,
+                                    Removed completed = {}) override {
     std::lock_guard lock(w->mutex);
     std::erase_if(w->subscribers, [&](const auto& item) { return item.second == binding; });
     std::erase_if(w->publishers, [&](const auto& item) { return item.second == binding; });
     if (completed) {
       completed({});
     }
+    return livekit::sdk::Result<void>::success();
   }
 
   SendResult send(const BindingToken& binding, const EncodedFrame& frame) override {
@@ -359,6 +388,7 @@ void media_leave_and_rejoin() {
 
 int main() {
   try {
+    invalid_livekit_join();
     std::cout << "multi_track" << std::endl;
     multi_track();
     std::cout << "media_leave_and_rejoin" << std::endl;

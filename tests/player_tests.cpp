@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "livekit/player.hpp"
 #include "media_graph/channel.hpp"
 #include <cmath>

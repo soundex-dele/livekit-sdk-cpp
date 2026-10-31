@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/error.hpp"
 #include "livekit/rtc/media_config.hpp"
 #include "livekit/rtc/frame_view.hpp"
 #include "livekit/rtc/video_nodes.hpp"

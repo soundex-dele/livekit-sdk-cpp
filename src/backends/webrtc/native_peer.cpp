@@ -3,53 +3,49 @@
 #include "api/stats/rtc_stats_collector_callback.h"
 #include <algorithm>
 #include <functional>
-#include <stdexcept>
 
 namespace livekit::sdk::rtc::detail {
 namespace {
 using PC = webrtc::PeerConnectionInterface;
 
-std::exception_ptr failure(webrtc::RTCError error) {
-  return std::make_exception_ptr(std::runtime_error(error.message()));
+Failure failure(webrtc::RTCError error) {
+  return make_failure(ErrorDomain::transport, ErrorCode::request_failed, error.message(), false,
+                      static_cast<int>(error.type()));
 }
 
 template <class T>
-struct Completion {
-  std::promise<T> promise;
-  std::function<void()> completed;
-
-  void notify() {
-    if (completed) {
-      completed();
-    }
-  }
+struct NativeCompletion {
+  Completion<T> callback;
   std::atomic<bool> settled{false};
 
-  void reject(std::exception_ptr error) {
+  void finish(Result<T> result) {
     if (!settled.exchange(true)) {
-      promise.set_exception(std::move(error));
-      notify();
+      auto done = std::move(callback);
+      if (done) {
+        done(std::move(result));
+      }
     }
   }
 
-  ~Completion() {
+  void reject(Failure error) {
+    finish(Result<T>::failure(std::move(error)));
+  }
+
+  ~NativeCompletion() {
     // Closing a PeerConnection may discard an observer without invoking it.
-    // Always settle the public operation with a lifecycle error in that case.
-    if (!settled.load())
-      reject(std::make_exception_ptr(
-          std::runtime_error("Native negotiation closed before completion")));
+    if (!settled.load()) {
+      reject(make_failure(ErrorDomain::lifecycle, ErrorCode::cancelled,
+                          "Native operation closed before completion"));
+    }
   }
 };
 
 class SetRemote : public webrtc::SetSessionDescriptionObserver {
  public:
-  Completion<void> completion;
+  NativeCompletion<void> completion;
 
   void OnSuccess() override {
-    if (!completion.settled.exchange(true)) {
-      completion.promise.set_value();
-      completion.notify();
-    }
+    completion.finish(Result<void>::success());
   }
 
   void OnFailure(webrtc::RTCError error) override {
@@ -59,11 +55,11 @@ class SetRemote : public webrtc::SetSessionDescriptionObserver {
 
 class StatisticsObserver : public webrtc::RTCStatsCollectorCallback {
  public:
-  Completion<TransportStatistics> completion;
+  NativeCompletion<TransportStatistics> completion;
 
   void OnStatsDelivered(
       const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
-    try {
+    {
       TransportStatistics result;
       result.timestamp_us = report->timestamp().us();
       result.json = "[";
@@ -75,30 +71,26 @@ class StatisticsObserver : public webrtc::RTCStatsCollectorCallback {
         if (result.json.size() > 1)
           result.json += ',';
         result.json += stat.ToJson();
-        if (result.json.size() > 1024 * 1024)
-          throw std::runtime_error("Native statistics report exceeds 1 MiB");
+        if (result.json.size() > 1024 * 1024) {
+          completion.reject(make_failure(ErrorDomain::transport, ErrorCode::resource_exhausted,
+                                         "Native statistics report exceeds 1 MiB"));
+          return;
+        }
       }
       result.json += ']';
-      if (!completion.settled.exchange(true)) {
-        completion.promise.set_value(std::move(result));
-        completion.notify();
-      }
-    } catch (...) {
-      completion.reject(std::current_exception());
+      completion.finish(Result<TransportStatistics>::success(std::move(result)));
     }
   }
 };
 
 class SetLocal : public webrtc::SetSessionDescriptionObserver {
  public:
-  SetLocal(std::shared_ptr<Completion<NativeDescription>> completion, NativeDescription description)
+  SetLocal(std::shared_ptr<NativeCompletion<NativeDescription>> completion,
+           NativeDescription description)
       : completion_(std::move(completion)), description_(std::move(description)) {}
 
   void OnSuccess() override {
-    if (!completion_->settled.exchange(true)) {
-      completion_->promise.set_value(std::move(description_));
-      completion_->notify();
-    }
+    completion_->finish(Result<NativeDescription>::success(std::move(description_)));
   }
 
   void OnFailure(webrtc::RTCError error) override {
@@ -106,26 +98,27 @@ class SetLocal : public webrtc::SetSessionDescriptionObserver {
   }
 
  private:
-  std::shared_ptr<Completion<NativeDescription>> completion_;
+  std::shared_ptr<NativeCompletion<NativeDescription>> completion_;
   NativeDescription description_;
 };
 
 class CreateLocal : public webrtc::CreateSessionDescriptionObserver {
  public:
   CreateLocal(webrtc::scoped_refptr<PC> pc,
-              std::shared_ptr<Completion<NativeDescription>> completion)
+              std::shared_ptr<NativeCompletion<NativeDescription>> completion)
       : pc_(std::move(pc)), completion_(std::move(completion)) {}
 
   void OnSuccess(webrtc::SessionDescriptionInterface* value) override {
     std::unique_ptr<webrtc::SessionDescriptionInterface> description(value);
-    try {
+    {
       NativeDescription result{description->GetType(), {}};
-      if (!description->ToString(&result.sdp))
-        throw std::runtime_error("Cannot serialize local SDP");
+      if (!description->ToString(&result.sdp)) {
+        completion_->reject(make_failure(ErrorDomain::transport, ErrorCode::processing_failed,
+                                         "Cannot serialize local SDP"));
+        return;
+      }
       auto setter = webrtc::make_ref_counted<SetLocal>(completion_, std::move(result));
       pc_->SetLocalDescription(setter.get(), description.release());
-    } catch (...) {
-      completion_->reject(std::current_exception());
     }
   }
 
@@ -135,7 +128,7 @@ class CreateLocal : public webrtc::CreateSessionDescriptionObserver {
 
  private:
   webrtc::scoped_refptr<PC> pc_;
-  std::shared_ptr<Completion<NativeDescription>> completion_;
+  std::shared_ptr<NativeCompletion<NativeDescription>> completion_;
 };
 }  // namespace
 
@@ -162,7 +155,7 @@ struct NativePeer::Channel : webrtc::DataChannelObserver {
   }
 
   void OnMessage(const webrtc::DataBuffer& buffer) override {
-    try {
+    {
       if (!buffer.binary || buffer.data.size() > 16384)
         return;
       std::lock_guard lock(peer.mutex_);
@@ -180,9 +173,6 @@ struct NativePeer::Channel : webrtc::DataChannelObserver {
       peer.data_.push_back({label, {buffer.data.begin(), buffer.data.end()}});
       peer.data_bytes_ += buffer.data.size();
       peer.notify();
-    } catch (...) {
-      peer.failed = true;
-      peer.notify();
     }
   }
 };
@@ -196,13 +186,26 @@ NativePeer::NativePeer(TransportRuntime& runtime, PC::RTCConfiguration configura
       budget_(std::move(budget)),
       max_events_(max_events),
       wakeup_(std::move(wakeup)) {
-  if (!max_events)
-    throw std::invalid_argument("Native peer needs a bounded event queue");
+  if (auto initialized = runtime.status(); !initialized) {
+    failure_ = initialized.failure_record();
+    failed = true;
+    return;
+  }
+  if (!max_events || !receive_limits.max_frames || !receive_limits.max_bytes ||
+      receive_limits.max_age.count() <= 0) {
+    failure_ = make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                            "Native peer needs bounded nonempty receive and event queues");
+    failed = true;
+    return;
+  }
   configuration.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
   auto created = runtime.factory->CreatePeerConnectionOrError(
       configuration, webrtc::PeerConnectionDependencies(this));
-  if (!created.ok())
-    throw std::runtime_error(created.error().message());
+  if (!created.ok()) {
+    failure_ = failure(created.error());
+    failed = true;
+    return;
+  }
   pc = created.MoveValue();
   pc->SetAudioPlayout(false);
   pc->SetAudioRecording(false);
@@ -212,18 +215,21 @@ NativePeer::~NativePeer() {
   close();
 }
 
-std::future<TransportStatistics> NativePeer::statistics(std::function<void()> completed) {
+void NativePeer::statistics(Completion<TransportStatistics> completion) {
   auto observer = webrtc::make_ref_counted<StatisticsObserver>();
-  observer->completion.completed = std::move(completed);
-  auto result = observer->completion.promise.get_future();
+  observer->completion.callback = std::move(completion);
+  if (failure_) {
+    observer->completion.reject(failure_);
+    return;
+  }
   runtime_.signaling->BlockingCall([&] {
     if (pc)
       pc->GetStats(observer.get());
     else
       observer->completion.reject(
-          std::make_exception_ptr(std::runtime_error("Native peer is closed")));
+          make_failure(ErrorDomain::lifecycle, ErrorCode::session_closed, "Native peer is closed"));
   });
-  return result;
+  return;
 }
 
 void NativePeer::close() {
@@ -249,14 +255,14 @@ void NativePeer::close() {
   connected = false;
 }
 
-std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_restart,
-                                                        std::function<void()> completed) {
-  auto completion = std::make_shared<Completion<NativeDescription>>();
-  completion->completed = std::move(completed);
-  auto future = completion->promise.get_future();
+void NativePeer::create_local(bool offer, bool ice_restart,
+                              Completion<NativeDescription> callback) {
+  auto completion = std::make_shared<NativeCompletion<NativeDescription>>();
+  completion->callback = std::move(callback);
   if (!pc) {
-    completion->reject(std::make_exception_ptr(std::runtime_error("Native peer is closed")));
-    return future;
+    completion->reject(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::session_closed, "Native peer is closed"));
+    return;
   }
   for (const auto& transceiver : pc->GetTransceivers()) {
     // WebRTC advertises receive-side FlexFEC even with its sending trial off.
@@ -271,7 +277,7 @@ std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_res
       const auto error = transceiver->SetCodecPreferences(codecs);
       if (!error.ok()) {
         completion->reject(failure(error));
-        return future;
+        return;
       }
     }
     auto extensions = transceiver->GetHeaderExtensionsToNegotiate();
@@ -283,7 +289,7 @@ std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_res
     const auto error = transceiver->SetHeaderExtensionsToNegotiate(extensions);
     if (!error.ok()) {
       completion->reject(failure(error));
-      return future;
+      return;
     }
   }
   auto observer = webrtc::make_ref_counted<CreateLocal>(pc, completion);
@@ -293,25 +299,25 @@ std::future<NativeDescription> NativePeer::create_local(bool offer, bool ice_res
     pc->CreateOffer(observer.get(), options);
   else
     pc->CreateAnswer(observer.get(), options);
-  return future;
+  return;
 }
 
-std::future<void> NativePeer::set_remote(NativeDescription description,
-                                         std::map<std::string, std::string> mid_to_track,
-                                         std::function<void()> completed) {
+void NativePeer::set_remote(NativeDescription description,
+                            std::map<std::string, std::string> mid_to_track,
+                            Completion<void> completion) {
   auto observer = webrtc::make_ref_counted<SetRemote>();
-  observer->completion.completed = std::move(completed);
-  auto future = observer->completion.promise.get_future();
+  observer->completion.callback = std::move(completion);
   webrtc::SdpParseError error;
   auto native = webrtc::CreateSessionDescription(description.type, description.sdp, &error);
   if (!pc || !native) {
-    observer->completion.reject(std::make_exception_ptr(std::runtime_error(
-        pc ? "Invalid remote SDP: " + error.description : "Native peer is closed")));
-    return future;
+    observer->completion.reject(make_failure(
+        ErrorDomain::transport, pc ? ErrorCode::malformed_message : ErrorCode::session_closed,
+        pc ? "Invalid remote SDP: " + error.description : "Native peer is closed"));
+    return;
   }
   runtime_.signaling->BlockingCall([&] { mids_ = std::move(mid_to_track); });
   pc->SetRemoteDescription(observer.get(), native.release());
-  return future;
+  return;
 }
 
 void NativePeer::refresh_receivers() {
@@ -329,16 +335,19 @@ void NativePeer::refresh_receivers() {
   });
 }
 
-void NativePeer::add_ice(const NativeIceCandidate& candidate) {
+Result<void> NativePeer::add_ice(const NativeIceCandidate& candidate) {
   if (candidate.sdp.empty())
-    return;
+    return Result<void>::success();
   if (!pc)
-    throw std::runtime_error("Native peer is closed");
+    return Result<void>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::session_closed, "Native peer is closed"));
   webrtc::SdpParseError error;
   std::unique_ptr<webrtc::IceCandidateInterface> native(
       webrtc::CreateIceCandidate(candidate.mid, candidate.mline_index, candidate.sdp, &error));
   if (!native || !pc->AddIceCandidate(native.get()))
-    throw std::runtime_error("Native peer rejected ICE candidate");
+    return Result<void>::failure(make_failure(ErrorDomain::transport, ErrorCode::malformed_message,
+                                              "Native peer rejected ICE candidate"));
+  return Result<void>::success();
 }
 
 void NativePeer::OnConnectionChange(PC::PeerConnectionState state) {
@@ -355,7 +364,7 @@ void NativePeer::OnIceGatheringChange(PC::IceGatheringState state) {
 }
 
 void NativePeer::OnIceCandidate(const webrtc::IceCandidateInterface* candidate) {
-  try {
+  {
     NativeIceCandidate value{candidate->sdp_mid(), candidate->sdp_mline_index(), {}};
     candidate->ToString(&value.sdp);
     std::lock_guard lock(mutex_);
@@ -367,9 +376,6 @@ void NativePeer::OnIceCandidate(const webrtc::IceCandidateInterface* candidate) 
       return;
     }
     ice_.push_back(std::move(value));
-    notify();
-  } catch (...) {
-    failed = true;
     notify();
   }
 }
@@ -385,7 +391,7 @@ void NativePeer::track_event(bool added, const std::string& sid) {
 }
 
 void NativePeer::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
-  try {
+  {
     auto receiver = transceiver->receiver();
     const auto parameters = receiver->GetParameters();
     if (std::none_of(parameters.encodings.begin(), parameters.encodings.end(),
@@ -421,9 +427,6 @@ void NativePeer::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> 
       old->second.output->close();
     remote_tracks_.insert_or_assign(sid, NativeRemoteTrack{sid, mid, kind, receiver, output});
     track_event(true, sid);
-  } catch (...) {
-    failed = true;
-    notify();
   }
 }
 
@@ -454,21 +457,29 @@ void NativePeer::OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterfac
   notify();
 }
 
-void NativePeer::create_data_channel(const std::string& label, bool reliable) {
+Result<void> NativePeer::create_data_channel(const std::string& label, bool reliable) {
+  if (!pc) {
+    return Result<void>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::session_closed, "Native peer is closed"));
+  }
+  auto result = Result<void>::success();
   runtime_.signaling->BlockingCall([&] {
     webrtc::DataChannelInit init;
     init.ordered = reliable;
     if (!reliable)
       init.maxRetransmits = 0;
     auto created = pc->CreateDataChannelOrError(label, &init);
-    if (!created.ok())
-      throw std::runtime_error(created.error().message());
+    if (!created.ok()) {
+      result = Result<void>::failure(failure(created.error()));
+      return;
+    }
     OnDataChannel(created.MoveValue());
   });
+  return result;
 }
 
 bool NativePeer::data_ready(const std::string& label, size_t bytes) {
-  if (bytes > 16384)
+  if (!pc || bytes > 16384)
     return false;
   return runtime_.signaling->BlockingCall([&] {
     for (const auto& channel : channels_)
@@ -480,8 +491,8 @@ bool NativePeer::data_ready(const std::string& label, size_t bytes) {
 }
 
 bool NativePeer::send_data(const std::string& label, std::span<const uint8_t> bytes) {
-  if (bytes.size() > 16384)
-    throw std::invalid_argument("Native data packet exceeds 16 KiB");
+  if (!pc || bytes.size() > 16384)
+    return false;
   return runtime_.signaling->BlockingCall([&] {
     for (const auto& channel : channels_) {
       if (channel->label != label)
@@ -561,17 +572,19 @@ void NativePeer::reset_receiver(const std::string& sid) {
   });
 }
 
-void NativePeer::request_keyframe(const std::string& sid) {
+Result<void> NativePeer::request_keyframe(const std::string& sid) {
   webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver;
   {
     std::lock_guard lock(mutex_);
     const auto found = remote_tracks_.find(sid);
     if (found == remote_tracks_.end() || found->second.kind != MediaKind::video)
-      throw std::invalid_argument("Video receiver is not subscribed");
+      return Result<void>::failure(make_failure(ErrorDomain::transport, ErrorCode::invalid_state,
+                                                "Video receiver is not subscribed"));
     receiver = found->second.receiver;
   }
   static_cast<webrtc::VideoTrackInterface*>(receiver->track().get())
       ->GetSource()
       ->GenerateKeyFrame();
+  return Result<void>::success();
 }
 }  // namespace livekit::sdk::rtc::detail

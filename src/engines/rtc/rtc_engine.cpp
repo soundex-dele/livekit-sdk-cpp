@@ -1,3 +1,4 @@
+#include "backends/rtc/legacy_control_boundary.hpp"
 #include "livekit/rtc/engine.hpp"
 #include "livekit/rtc/graph_api.hpp"
 #include "engines/rtc/media_graph_contract.hpp"

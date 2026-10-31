@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "data_event_mailbox.hpp"
 #include "utoolkit/task_queue/task_queue.h"
 #include "rtc_services_contract.hpp"

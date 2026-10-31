@@ -1,11 +1,9 @@
 #pragma once
 
 #include "livekit/rtc/types.hpp"
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include "support/wake_event.hpp"
 #include <stop_token>
-#include <exception>
-#include <future>
 #include <functional>
 #include <compare>
 
@@ -63,7 +61,7 @@ struct TransportEvent {
   bool muted = false;
   std::optional<SubscriptionPermissionChange> permission;
   std::shared_ptr<const TransportStatistics> statistics;
-  std::exception_ptr failure;
+  Failure failure;
 };
 
 struct ParticipantUpdateRequest {
@@ -118,11 +116,13 @@ class RoomTransport {
   // retains no room/adapter pointer and remains safe after transport shutdown.
   using Dispatch = std::function<void(std::function<void()>)>;
 
-  virtual void attach_notifications(Dispatch, std::function<void(std::exception_ptr)>) {}
+  virtual Result<void> attach_notifications(Dispatch, std::function<void(Failure)>) {
+    return Result<void>::success();
+  }
 
   virtual void set_queue_budget(std::shared_ptr<QueueBudget>) {}
 
-  virtual void start(const RoomOptions&, Epoch initial_epoch) = 0;
+  virtual Result<void> start(const RoomOptions&, Epoch initial_epoch) = 0;
 
   using Events = std::function<void(std::vector<TransportEvent>)>;
 
@@ -130,36 +130,52 @@ class RoomTransport {
     events_handler_ = std::move(handler);
   }
 
-  virtual void publish(const BindingToken&, const TrackDescriptor&) = 0;
-  virtual void subscribe(const BindingToken&, const TrackDescriptor&,
-                         std::shared_ptr<QueueBudget>) = 0;
+  virtual Result<void> publish(const BindingToken&, const TrackDescriptor&) = 0;
+  virtual Result<void> subscribe(const BindingToken&, const TrackDescriptor&,
+                                 std::shared_ptr<QueueBudget>) = 0;
   // Completion fences native detachment, not a server ACK. Do not wait on the
   // controller: other tracks and control requests must continue to progress.
-  using Removed = std::function<void(std::exception_ptr)>;
-  virtual void remove(const BindingToken&, bool publication, Removed = {}) = 0;
+  using Removed = std::function<void(Failure)>;
+  virtual Result<void> remove(const BindingToken&, bool publication, Removed = {}) = 0;
   // would_block requires a later writable event for this exact binding when
   // native capacity returns. Merely waking the room is not a track notification.
   virtual SendResult send(const BindingToken&, const EncodedFrame&) = 0;
   virtual void request_keyframe(const BindingToken&) = 0;
 
-  virtual void update_participant(ParticipantUpdateRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
-                   "Transport does not support participant updates");
+  virtual Result<void> update_participant(ParticipantUpdateRequest request) {
+    TransportEvent event{TransportEventKind::control_completed, BindingToken{{}, request.epoch}};
+    event.operation_id = request.id;
+    event.control_error = ErrorCode::unsupported;
+    event.error = "Transport does not support participant updates";
+    notify_events({std::move(event)});
+    return Result<void>::success();
   }
 
-  virtual void set_muted(MuteRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
-                   "Transport does not support publication mute");
+  virtual Result<void> set_muted(MuteRequest request) {
+    TransportEvent event{TransportEventKind::control_completed, request.binding};
+    event.operation_id = request.id;
+    event.control_error = ErrorCode::unsupported;
+    event.error = "Transport does not support publication mute";
+    notify_events({std::move(event)});
+    return Result<void>::success();
   }
 
-  virtual void set_receive_demand(ReceiveDemandRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
-                   "Transport does not support receive demand");
+  virtual Result<void> set_receive_demand(ReceiveDemandRequest request) {
+    TransportEvent event{TransportEventKind::control_completed, request.binding};
+    event.operation_id = request.id;
+    event.control_error = ErrorCode::unsupported;
+    event.error = "Transport does not support receive demand";
+    notify_events({std::move(event)});
+    return Result<void>::success();
   }
 
-  virtual void set_subscription_permissions(SubscriptionPermissionsRequest) {
-    throw SDKError(ErrorDomain::protocol, ErrorCode::unsupported,
-                   "Transport does not support subscription permissions");
+  virtual Result<void> set_subscription_permissions(SubscriptionPermissionsRequest request) {
+    TransportEvent event{TransportEventKind::control_completed, BindingToken{{}, request.epoch}};
+    event.operation_id = request.id;
+    event.control_error = ErrorCode::unsupported;
+    event.error = "Transport does not support subscription permissions";
+    notify_events({std::move(event)});
+    return Result<void>::success();
   }
 
   virtual void stop() noexcept = 0;

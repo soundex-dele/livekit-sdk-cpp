@@ -104,7 +104,7 @@ class Transport final : public RoomTransport {
  public:
   explicit Transport(std::shared_ptr<Wire> wire) : wire_(std::move(wire)) {}
 
-  void start(const RoomOptions&, Epoch) override {
+  Result<void> start(const RoomOptions&, Epoch) override {
     wire_->control_thread = std::this_thread::get_id();
     ++wire_->starts;
     {
@@ -116,24 +116,28 @@ class Transport final : public RoomTransport {
     if (wire_->auto_join) {
       notify_events({{TransportEventKind::connected}, roster});
     }
+    return Result<void>::success();
   }
 
-  void publish(const BindingToken& b, const TrackDescriptor&) override {
+  Result<void> publish(const BindingToken& b, const TrackDescriptor&) override {
     ready(b);
+    return Result<void>::success();
   }
 
-  void subscribe(const BindingToken& b, const TrackDescriptor&,
-                 std::shared_ptr<QueueBudget>) override {
+  Result<void> subscribe(const BindingToken& b, const TrackDescriptor&,
+                         std::shared_ptr<QueueBudget>) override {
     ready(b);
+    return Result<void>::success();
   }
 
-  void remove(const BindingToken&, bool, Removed done) override {
+  Result<void> remove(const BindingToken&, bool, Removed done) override {
     if (wire_->delay_remove) {
       std::lock_guard lock(wire_->mutex);
       wire_->removals.push_back(std::move(done));
     } else if (done) {
       done({});
     }
+    return Result<void>::success();
   }
 
   SendResult send(const BindingToken&, const EncodedFrame& frame) override {
@@ -149,11 +153,12 @@ class Transport final : public RoomTransport {
     ++wire_->keyframes;
   }
 
-  void set_muted(MuteRequest request) override {
+  Result<void> set_muted(MuteRequest request) override {
     ++wire_->mutes;
     TransportEvent event{TransportEventKind::control_completed, request.binding};
     event.operation_id = request.id;
     notify_events({event});
+    return Result<void>::success();
   }
 
   void stop() noexcept override {
@@ -288,7 +293,7 @@ void completion_contract() {
   Probe<void> unsupported;
   room.set_subscription_permissions({}, unsupported.callback());
   check(unsupported.get().error().code == ErrorCode::unsupported,
-        "Legacy backend exception is converted at the boundary");
+        "Unsupported transport control reports an explicit result");
 
   wire->auto_ready = false;
   Probe<std::shared_ptr<PublishedTrack>> failed;

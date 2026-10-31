@@ -2,6 +2,7 @@
 
 #include "backends/rtc/room_transport.hpp"
 #include "backends/rtc/queue_budget.hpp"
+#include "livekit/result.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -9,8 +10,9 @@
 
 namespace livekit::sdk::rtc::detail {
 
-void validate_descriptor(const TrackDescriptor&, size_t room_budget, bool publication = true);
-void validate_receive_demand(const ReceiveDemand&, MediaKind);
+Result<void> validate_descriptor(const TrackDescriptor&, size_t room_budget,
+                                 bool publication = true);
+Result<void> validate_receive_demand(const ReceiveDemand&, MediaKind);
 
 struct Endpoint {
   Endpoint(TrackDescriptor, BindingToken, std::shared_ptr<QueueBudget>);

@@ -1,3 +1,4 @@
+#include "livekit/error.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "livekit/rtc/engine.hpp"
@@ -41,25 +42,31 @@ void eventually(Predicate predicate) {
 
 class LocalTransport final : public detail::RoomTransport {
  public:
-  void start(const RoomOptions&, Epoch) override {
+  livekit::sdk::Result<void> start(const RoomOptions&, Epoch) override {
     notify_events({{detail::TransportEventKind::connected}});
+    return livekit::sdk::Result<void>::success();
   }
 
-  void publish(const detail::BindingToken& token, const TrackDescriptor&) override {
+  livekit::sdk::Result<void> publish(const detail::BindingToken& token,
+                                     const TrackDescriptor&) override {
     if (token.id != "pending") {
       notify_events({{detail::TransportEventKind::published, token, "sid"}});
     }
+    return livekit::sdk::Result<void>::success();
   }
 
-  void subscribe(const detail::BindingToken& token, const TrackDescriptor&,
-                 std::shared_ptr<detail::QueueBudget>) override {
+  livekit::sdk::Result<void> subscribe(const detail::BindingToken& token, const TrackDescriptor&,
+                                       std::shared_ptr<detail::QueueBudget>) override {
     notify_events({{detail::TransportEventKind::subscribed, token, "remote"}});
+    return livekit::sdk::Result<void>::success();
   }
 
-  void remove(const detail::BindingToken&, bool, Removed completed = {}) override {
+  livekit::sdk::Result<void> remove(const detail::BindingToken&, bool,
+                                    Removed completed = {}) override {
     if (completed) {
       completed({});
     }
+    return livekit::sdk::Result<void>::success();
   }
 
   detail::SendResult send(const detail::BindingToken&, const EncodedFrame&) override {

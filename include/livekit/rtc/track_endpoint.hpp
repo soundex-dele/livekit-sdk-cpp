@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/error.hpp"
+#include "livekit/failure.hpp"
 #include "livekit/rtc/types.hpp"
 #include <memory>
 #include <optional>

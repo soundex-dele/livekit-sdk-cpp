@@ -4,7 +4,7 @@
 #include "api/rtp_transceiver_interface.h"
 #include <functional>
 #include <deque>
-#include <future>
+#include "livekit/rtc/completion.hpp"
 #include <map>
 
 namespace livekit::sdk::rtc::detail {
@@ -52,29 +52,33 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   NativePeer(const NativePeer&) = delete;
   NativePeer& operator=(const NativePeer&) = delete;
 
-  std::future<NativeDescription> create_local(bool offer, bool ice_restart = false,
-                                              std::function<void()> completed = {});
-  std::future<TransportStatistics> statistics(std::function<void()> completed = {});
-  std::future<void> set_remote(NativeDescription description,
-                               std::map<std::string, std::string> mid_to_track = {},
-                               std::function<void()> completed = {});
+  // Exactly one result, including cancellation when WebRTC drops its observer.
+  // Runs on the completing native thread (or inline for local rejection).
+  // The session owner must enqueue the result onto its own execution sequence.
+  void create_local(bool offer, bool ice_restart, Completion<NativeDescription> completion);
+  void statistics(Completion<TransportStatistics> completion);
+  void set_remote(NativeDescription description, std::map<std::string, std::string> mid_to_track,
+                  Completion<void> completion);
   // Call when offer/answer negotiation is stable to bind reused/preallocated receivers.
   void refresh_receivers();
-  void add_ice(const NativeIceCandidate& candidate);
+  Result<void> add_ice(const NativeIceCandidate& candidate);
   std::vector<NativeIceCandidate> take_ice();
   std::vector<NativeTrackEvent> take_track_events();
   std::map<std::string, NativeRemoteTrack> remote_tracks() const;
-  void request_keyframe(const std::string& sid);
+  Result<void> request_keyframe(const std::string& sid);
   void reset_receiver(const std::string& sid);
   using ReceiverTransformFactory =
       std::function<EncodedReceiver::PayloadTransform(const std::string&, MediaKind)>;
   void set_receiver_transform(ReceiverTransformFactory);
-  void create_data_channel(const std::string& label, bool reliable);
+  Result<void> create_data_channel(const std::string& label, bool reliable);
   bool data_ready(const std::string& label, size_t bytes = 16384);
   bool send_data(const std::string& label, std::span<const uint8_t> bytes);
   std::vector<NativeDataMessage> take_data(size_t max_messages = 64);
   void close();
 
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
   std::atomic<bool> connected{false}, gathered{false}, failed{false};
 
@@ -88,6 +92,7 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   void OnRemoveTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) override;
 
  private:
+  Failure failure_;
   TransportRuntime& runtime_;
   QueueLimits receive_limits_;
   std::shared_ptr<QueueBudget> budget_;

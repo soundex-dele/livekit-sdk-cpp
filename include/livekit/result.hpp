@@ -1,6 +1,6 @@
 #pragma once
 
-#include "livekit/error.hpp"
+#include "livekit/failure.hpp"
 #include <cassert>
 #include <type_traits>
 #include <utility>
@@ -73,7 +73,7 @@ class [[nodiscard]] Result {
 
   const std::shared_ptr<const FailureInfo>& failure_record() const {
     assert(!has_value());
-    return std::get<1>(state_);
+    return *std::get_if<1>(&state_);
   }
 
  private:
