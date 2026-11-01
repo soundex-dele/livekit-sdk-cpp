@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <optional>
 #include <mutex>
+#include <atomic>
 
 namespace livekit::sdk::rtc {
 namespace detail {
@@ -19,12 +20,14 @@ struct TrackControl;
 struct Endpoint;
 struct QueueBudget;
 class RoomTransport;
-struct RtcExecution;
+struct RoomExecution;
 }  // namespace detail
 
-// Room state and transport requests run on control. Standalone observers run on
-// notification; RtcEngine shares these workers and uses lifecycle for its graphs.
-// leave() and observer replacement require an external owner thread.
+// Room state and transport requests run on control. All public completions and
+// observers run on notification. No media lifecycle worker or graph is created.
+// Requests are posted; results arrive through Completion. Dependent operations
+// should be chained from completion. leave() and observer replacement are
+// synchronous barriers and require an external owner thread.
 class RoomEngine {
  public:
   using TransportFactory = std::function<std::unique_ptr<detail::RoomTransport>()>;
@@ -51,9 +54,10 @@ class RoomEngine {
 
  private:
   friend class engine::RtcEngine;
-  RoomEngine(TransportFactory, std::shared_ptr<detail::RtcExecution>);
   void notify(std::function<void(RoomObserver&)>);
   void deliver(std::function<void()>);
+  template <class T, class F>
+  void post_request(Completion<T>, F);
 
   template <class T>
   void complete(Completion<T>& callback, Result<T> result) {
@@ -85,13 +89,15 @@ class RoomEngine {
   void request_keyframe(const std::shared_ptr<detail::Endpoint>&);
   void remove(const TrackId&, bool publication, Completion<void> = {});
   void removed(const detail::BindingToken&);
+  void subscribe_on_control(TrackDescriptor, Completion<std::shared_ptr<SubscribedTrack>>);
 
-  std::shared_ptr<detail::RtcExecution> execution_;
-  bool internal_observer_ = false;
+  std::shared_ptr<detail::RoomExecution> execution_;
+  std::atomic<bool> closing_{false};
   std::mutex leave_mutex_;
+  std::mutex request_mutex_;  // admission only; never held while waiting for a worker
   TransportFactory factory_;
   std::unique_ptr<detail::RoomTransport> transport_;
-  RoomObserver* observer_ = nullptr;
+  RoomObserver* observer_ = nullptr;  // control worker
   RoomSnapshot status_;
   std::shared_ptr<detail::QueueBudget> budget_;
   std::shared_ptr<detail::TrackControl> commands_;
@@ -110,4 +116,7 @@ class RoomEngine {
   uint64_t next_binding_ = 0;
   uint32_t next_control_ = 0;
 };
+
+// Requires LiveKit::RTCLiveKit, without GraphEngine or SDK capture/playout targets.
+std::unique_ptr<RoomEngine> create_livekit_room();
 }  // namespace livekit::sdk::rtc

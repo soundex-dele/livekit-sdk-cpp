@@ -34,3 +34,15 @@ file(READ "${SDK_SOURCE_DIR}/include/livekit/rtc/room_engine.hpp" room_header)
 if(room_header MATCHES "struct Impl|class Impl|impl_")
   message(FATAL_ERROR "RoomEngine must own its members directly, without PImpl")
 endif()
+
+# The standalone room cannot include a graph/media adapter or create its worker.
+foreach(path include/livekit/rtc/room_engine.hpp src/backends/rtc/room_engine.cpp
+             src/backends/rtc/execution.hpp)
+  file(READ "${SDK_SOURCE_DIR}/${path}" source)
+  if(source MATCHES "#include[^\n]*(engines/rtc|graphflow|livekit/rtc/(engine|media_config|graph_api))")
+    message(FATAL_ERROR "${path} couples room transport to media orchestration")
+  endif()
+  if(source MATCHES "rtc.lifecycle|internal_observer_")
+    message(FATAL_ERROR "${path} retains media-specific execution behavior")
+  endif()
+endforeach()

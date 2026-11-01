@@ -4,6 +4,8 @@
 using namespace livekit::sdk::rtc;
 using engine::RtcEngine;
 static_assert(!std::is_copy_constructible_v<RtcEngine>);
+static_assert(!std::is_constructible_v<RtcEngine, RoomEngine&>);
+static_assert(std::is_same_v<decltype(create_livekit_room()), std::unique_ptr<RoomEngine>>);
 static_assert(std::is_base_of_v<RoomObserver, RtcEngine>);
 static_assert(std::is_same_v<decltype(std::declval<RtcEngine&>().join({})), void>);
 static_assert(std::is_same_v<decltype(std::declval<RtcEngine&>().publish({})), void>);

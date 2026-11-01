@@ -68,6 +68,9 @@ if(LIVEKIT_BUILD_TESTS)
   target_link_libraries(livekit_rtc_backend_tests PRIVATE LiveKit::RTCBackend utoolkit_task_queue)
   add_test(NAME rtc_backend COMMAND livekit_rtc_backend_tests)
   set_tests_properties(rtc_backend PROPERTIES TIMEOUT 20)
+  add_test(NAME rtc_dependency_boundaries COMMAND "${CMAKE_COMMAND}"
+    "-DSDK_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rtc_dependency_boundaries.cmake")
   add_executable(livekit_rtc_signaling_policy_tests tests/rtc_signaling_policy_tests.cpp)
   target_include_directories(livekit_rtc_signaling_policy_tests PRIVATE src)
   target_link_libraries(livekit_rtc_signaling_policy_tests PRIVATE LiveKit::RTCBackend)
@@ -116,9 +119,6 @@ if(LIVEKIT_BUILD_RTC_GRAPH_NODES)
     target_compile_definitions(livekit_rtc_pipeline_tests PRIVATE LIVEKIT_TEST_RTC_NODES=1)
     target_link_libraries(livekit_rtc_pipeline_tests PRIVATE livekit_rtc_pipelines livekit_rtc_nodes graphflow::engine)
     add_test(NAME rtc_pipelines COMMAND livekit_rtc_pipeline_tests)
-    add_test(NAME rtc_dependency_boundaries COMMAND "${CMAKE_COMMAND}"
-      "-DSDK_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rtc_dependency_boundaries.cmake")
     set_tests_properties(rtc_pipelines PROPERTIES TIMEOUT 20)
   endif()
 endif()
@@ -233,8 +233,16 @@ endif()
 
 endif()
 if(LIVEKIT_BUILD_RTC_NATIVE)
-  add_library(livekit_rtc_livekit STATIC src/backends/rtc/livekit/livekit_transport.cpp)
+  add_library(livekit_rtc_livekit STATIC
+    src/backends/rtc/livekit/livekit_transport.cpp
+    src/backends/rtc/livekit/livekit_room.cpp)
   add_library(LiveKit::RTCLiveKit ALIAS livekit_rtc_livekit)
+  if(LIVEKIT_BUILD_TESTS)
+    add_executable(livekit_public_room_tests tests/public_room.cpp)
+    target_link_libraries(livekit_public_room_tests PRIVATE LiveKit::RTCLiveKit)
+    add_test(NAME public_room COMMAND livekit_public_room_tests)
+    set_tests_properties(public_room PROPERTIES TIMEOUT 15)
+  endif()
   if(LIVEKIT_BUILD_RTC_GRAPH_NODES)
     target_sources(livekit_rtc_pipelines PRIVATE src/engines/rtc/livekit_engine.cpp)
     target_link_libraries(livekit_rtc_pipelines PRIVATE LiveKit::RTCLiveKit)

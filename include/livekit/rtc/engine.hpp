@@ -6,6 +6,10 @@
 #include <atomic>
 #include <mutex>
 
+namespace livekit::sdk::rtc::detail {
+class SerialQueue;
+}
+
 namespace livekit::sdk::rtc::engine {
 class RtcGraphApi;
 class MediaResources;
@@ -19,9 +23,11 @@ class RtcObserver : public RoomObserver {
   ~RtcObserver() override = default;
 };
 
-// Three shared workers: control owns RoomEngine, lifecycle owns media graphs,
-// notification delivers callbacks. Local request setup is synchronous; native
-// results are asynchronous. Configure and leave from an external owner thread.
+// Exclusively owns its RoomEngine and media lifecycle worker.
+// RoomEngine owns control and notification. Requests are posted; chain dependent
+// operations from Completion (including track controls after publish/subscribe).
+// Construct, configure, leave and destroy from
+// an external owner thread.
 // Callbacks may submit requests, but must not wait for callbacks or destroy/leave
 // the engine. Backend and media-library threads are unchanged.
 class RtcEngine final : private RoomObserver {
@@ -68,6 +74,7 @@ class RtcEngine final : private RoomObserver {
   void on_published(TrackId, Result<std::shared_ptr<PublishedTrack>>, Completion<MediaPublication>);
   void on_subscribed(TrackId, Result<std::shared_ptr<SubscribedTrack>>,
                      Completion<MediaSubscription>);
+  void rollback(const TrackId&, bool publication, Failure, Completion<void>);
   void on_unpublished(const TrackId&);
   void on_unsubscribed(const TrackId&);
   void on_room_event(const RoomEvent&) override;
@@ -84,13 +91,19 @@ class RtcEngine final : private RoomObserver {
   }
 
   void deliver(std::function<void()>);
-  std::shared_ptr<detail::RtcExecution> execution_;
+  template <class T, class F>
+  void post_request(Completion<T>, F);
+  template <class T, class F>
+  void post_room_request(Completion<T>, F);
+  std::unique_ptr<RoomEngine> room_;
+  std::shared_ptr<detail::RoomExecution> execution_;
+  std::unique_ptr<detail::SerialQueue> lifecycle_;
   RtcObserver* observer_ = nullptr;  // notification worker
   std::atomic<bool> closing_{false};
   std::mutex leave_mutex_;
+  std::mutex request_mutex_;  // admission only; never held while waiting for a worker
   mutable std::mutex ingress_mutex_;
   std::map<TrackId, std::shared_ptr<PublishPipeline>> ingress_;
-  std::unique_ptr<RoomEngine> room_;
   std::unique_ptr<MediaResources> media_resources_;
   std::unique_ptr<MediaGraphBuilder> media_;
 

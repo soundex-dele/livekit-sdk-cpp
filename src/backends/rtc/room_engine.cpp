@@ -58,6 +58,10 @@ void RoomEngine::removed(const BindingToken& binding) {
   auto entry = std::move(it->second);
   tracks_.erase(it);
   entry.endpoint->finish(TrackState::closed);
+  // Notify dependent media owners before completions can reuse this track id.
+  RoomEvent value{RoomEventKind::track_removed, binding.id};
+  value.publication = binding.publication;
+  event(std::move(value));
   auto cancelled = detail::failure_result<void>(ErrorCode::cancelled, "Track removed before ready");
   complete(entry.publish_done,
            Result<std::shared_ptr<PublishedTrack>>::failure(cancelled.failure_record()));
@@ -78,9 +82,6 @@ void RoomEngine::removed(const BindingToken& binding) {
   for (auto& done : entry.remove_done) {
     complete(done, Result<void>::success());
   }
-  RoomEvent value{RoomEventKind::track_removed, binding.id};
-  value.publication = binding.publication;
-  event(std::move(value));
 }
 
 void RoomEngine::remove(const TrackId& id, bool publication, Completion<void> completion) {
@@ -132,15 +133,10 @@ void RoomEngine::remove(const TrackId& id, bool publication, Completion<void> co
 }
 
 void RoomEngine::deliver(std::function<void()> callback) {
-  // Only the private RtcEngine-owned room uses internal continuations on control.
-  if (internal_observer_) {
+  execution_->notification.post([callback = std::move(callback)] {
+    detail::CallbackScope scope;
     callback();
-  } else {
-    execution_->notification.post([callback = std::move(callback)] {
-      detail::CallbackScope scope;
-      callback();
-    });
-  }
+  });
 }
 
 void RoomEngine::fail_pending(std::shared_ptr<const FailureInfo> failure) {
@@ -161,13 +157,7 @@ void RoomEngine::fail_pending(std::shared_ptr<const FailureInfo> failure) {
 }
 
 RoomEngine::RoomEngine(TransportFactory factory)
-    : RoomEngine(std::move(factory), std::make_shared<detail::RtcExecution>()) {
-  internal_observer_ = false;
-}
-
-RoomEngine::RoomEngine(TransportFactory factory, std::shared_ptr<detail::RtcExecution> execution)
-    : execution_(std::move(execution)),
-      internal_observer_(true),
+    : execution_(std::make_shared<detail::RoomExecution>()),
       factory_(std::move(factory)),
       commands_(std::make_shared<detail::TrackControl>()) {
   commands_->send = [this](auto endpoint) {
@@ -200,21 +190,17 @@ RoomEngine::RoomEngine(TransportFactory factory, std::shared_ptr<detail::RtcExec
 RoomEngine::~RoomEngine() {
   (void)set_observer(nullptr);
   leave();
+  {
+    std::lock_guard admission(request_mutex_);
+    closing_ = true;
+  }
   commands_.reset();
   execution_->control.fence();
 }
 
 void RoomEngine::notify(std::function<void(RoomObserver&)> fn) {
-  if (!observer_) {
-    return;
-  }
-  if (internal_observer_) {
-    fn(*observer_);
-  } else {
-    execution_->notification.post([observer = observer_, fn = std::move(fn)] {
-      detail::CallbackScope scope;
-      fn(*observer);
-    });
+  if (observer_) {
+    deliver([observer = observer_, fn = std::move(fn)] { fn(*observer); });
   }
 }
 
@@ -227,9 +213,30 @@ ErrorCode RoomEngine::set_observer(RoomObserver* observer) {
   return ErrorCode::ok;
 }
 
+template <class T, class F>
+void RoomEngine::post_request(Completion<T> completion, F request) {
+  {
+    // Serialize admission with leave, without holding a lock while running work.
+    std::lock_guard lock(request_mutex_);
+    if (!closing_) {
+      execution_->control.post(
+          [this, completion = std::move(completion), request = std::move(request)]() mutable {
+            if (closing_) {
+              auto cancelled = detail::failure_result<T>(ErrorCode::cancelled, "Engine is leaving");
+              complete(completion, std::move(cancelled));
+              return;
+            }
+            request(std::move(completion));
+          });
+      return;
+    }
+  }
+  complete(completion, detail::failure_result<T>(ErrorCode::session_closed, "Engine is leaving"));
+}
+
 void RoomEngine::join(RoomOptions options, Completion<RoomSnapshot> completion) {
-  execution_->control.invoke(
-      [this, options = std::move(options), completion = std::move(completion)]() mutable {
+  post_request(
+      std::move(completion), [this, options = std::move(options)](auto completion) mutable {
         if (status_.state != ConnectionState::disconnected) {
           complete(completion, detail::failure_result<RoomSnapshot>(ErrorCode::invalid_state,
                                                                     "Leave before joining again"));
@@ -275,6 +282,10 @@ void RoomEngine::leave(Completion<void> completion) {
     return;
   }
   std::lock_guard lock(leave_mutex_);
+  {
+    std::lock_guard admission(request_mutex_);
+    closing_ = true;
+  }
   auto transport = execution_->control.invoke([this] {
     fail_pending(
         detail::failure_result<void>(ErrorCode::cancelled, "Room is leaving").failure_record());
@@ -298,12 +309,16 @@ void RoomEngine::leave(Completion<void> completion) {
         }
       });
   execution_->notification.fence();
+  {
+    std::lock_guard admission(request_mutex_);
+    closing_ = false;
+  }
 }
 
 void RoomEngine::publish(TrackDescriptor descriptor,
                          Completion<std::shared_ptr<PublishedTrack>> completion) {
-  execution_->control.invoke([this, descriptor = std::move(descriptor),
-                              completion = std::move(completion)]() mutable {
+  post_request(std::move(completion), [this, descriptor =
+                                                 std::move(descriptor)](auto completion) mutable {
     using Value = std::shared_ptr<PublishedTrack>;
     if (!transport_ || status_.state != ConnectionState::connected) {
       complete(completion,
@@ -335,65 +350,68 @@ void RoomEngine::publish(TrackDescriptor descriptor,
 
 void RoomEngine::subscribe(TrackDescriptor descriptor,
                            Completion<std::shared_ptr<SubscribedTrack>> completion) {
-  execution_->control.invoke([this, descriptor = std::move(descriptor),
-                              completion = std::move(completion)]() mutable {
-    using Value = std::shared_ptr<SubscribedTrack>;
-    if (!transport_ || status_.state != ConnectionState::connected) {
-      complete(completion,
-               detail::failure_result<Value>(ErrorCode::invalid_state, "Room is not connected"));
-      return;
+  post_request(std::move(completion),
+               [this, descriptor = std::move(descriptor)](auto completion) mutable {
+                 subscribe_on_control(std::move(descriptor), std::move(completion));
+               });
+}
+
+void RoomEngine::subscribe_on_control(TrackDescriptor descriptor,
+                                      Completion<std::shared_ptr<SubscribedTrack>> completion) {
+  using Value = std::shared_ptr<SubscribedTrack>;
+  if (!transport_ || status_.state != ConnectionState::connected) {
+    complete(completion,
+             detail::failure_result<Value>(ErrorCode::invalid_state, "Room is not connected"));
+    return;
+  }
+  const auto key = std::make_pair(descriptor.id, false);
+  if (tracks_.contains(key)) {
+    complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
+    return;
+  }
+  auto started = [&]() -> Result<void> {
+    if (auto valid = detail::validate_descriptor(descriptor, budget_->limit, false); !valid) {
+      return valid;
     }
-    const auto key = std::make_pair(descriptor.id, false);
-    if (tracks_.contains(key)) {
-      complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
-      return;
-    }
-    auto started = [&]() -> Result<void> {
-      if (auto valid = detail::validate_descriptor(descriptor, budget_->limit, false); !valid) {
-        return valid;
-      }
-      auto endpoint = make_endpoint(std::move(descriptor), false);
-      auto track = Value(new SubscribedTrack(endpoint, commands_));
-      tracks_.emplace(key, Entry{endpoint, {}, track});
-      return transport_->subscribe(endpoint->binding(), endpoint->descriptor,
-                                   endpoint->queue_budget());
-    }();
-    if (!started) {
-      tracks_.erase(key);
-      complete(completion, Result<Value>::failure(started.failure_record()));
-      return;
-    }
-    tracks_.find(key)->second.subscribe_done = std::move(completion);
-  });
+    auto endpoint = make_endpoint(std::move(descriptor), false);
+    auto track = Value(new SubscribedTrack(endpoint, commands_));
+    tracks_.emplace(key, Entry{endpoint, {}, track});
+    return transport_->subscribe(endpoint->binding(), endpoint->descriptor,
+                                 endpoint->queue_budget());
+  }();
+  if (!started) {
+    tracks_.erase(key);
+    complete(completion, Result<Value>::failure(started.failure_record()));
+    return;
+  }
+  tracks_.find(key)->second.subscribe_done = std::move(completion);
 }
 
 void RoomEngine::subscribe(const TrackId& id,
                            Completion<std::shared_ptr<SubscribedTrack>> completion) {
-  execution_->control.invoke([this, id, completion = std::move(completion)]() mutable {
+  post_request(std::move(completion), [this, id](auto completion) mutable {
     auto it = remote_tracks_.find(id);
     if (it == remote_tracks_.end()) {
       complete(completion, detail::failure_result<std::shared_ptr<SubscribedTrack>>(
                                ErrorCode::invalid_argument, "Unknown remote track"));
       return;
     }
-    subscribe(it->second, std::move(completion));
+    subscribe_on_control(it->second, std::move(completion));
   });
 }
 
 void RoomEngine::unpublish(const TrackId& id, Completion<void> completion) {
-  execution_->control.invoke([this, id, completion = std::move(completion)]() mutable {
-    remove(id, true, std::move(completion));
-  });
+  post_request(std::move(completion),
+               [this, id](auto completion) mutable { remove(id, true, std::move(completion)); });
 }
 
 void RoomEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
-  execution_->control.invoke([this, id, completion = std::move(completion)]() mutable {
-    remove(id, false, std::move(completion));
-  });
+  post_request(std::move(completion),
+               [this, id](auto completion) mutable { remove(id, false, std::move(completion)); });
 }
 
 void RoomEngine::set_muted(const TrackId& id, bool muted, Completion<void> completion) {
-  execution_->control.invoke([this, id, muted, completion = std::move(completion)]() mutable {
+  post_request(std::move(completion), [this, id, muted](auto completion) mutable {
     if (!transport_ || status_.state != ConnectionState::connected) {
       complete(completion,
                detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));
@@ -423,7 +441,7 @@ void RoomEngine::set_muted(const TrackId& id, bool muted, Completion<void> compl
 
 void RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                     Completion<void> completion) {
-  execution_->control.invoke([this, id, demand, completion = std::move(completion)]() mutable {
+  post_request(std::move(completion), [this, id, demand](auto completion) mutable {
     if (!transport_ || status_.state != ConnectionState::connected) {
       complete(completion,
                detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));
@@ -455,8 +473,8 @@ void RoomEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
 }
 
 void RoomEngine::update_local_participant(ParticipantUpdate update, Completion<void> completion) {
-  execution_->control.invoke(
-      [this, update = std::move(update), completion = std::move(completion)]() mutable {
+  post_request(
+      std::move(completion), [this, update = std::move(update)](auto completion) mutable {
         if (!transport_ || status_.state != ConnectionState::connected) {
           complete(completion,
                    detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));
@@ -479,8 +497,8 @@ void RoomEngine::update_local_participant(ParticipantUpdate update, Completion<v
 
 void RoomEngine::set_subscription_permissions(SubscriptionPermissions permissions,
                                               Completion<void> completion) {
-  execution_->control.invoke(
-      [this, permissions = std::move(permissions), completion = std::move(completion)]() mutable {
+  post_request(
+      std::move(completion), [this, permissions = std::move(permissions)](auto completion) mutable {
         if (!transport_ || status_.state != ConnectionState::connected) {
           complete(completion,
                    detail::failure_result<void>(ErrorCode::invalid_state, "Room is not connected"));

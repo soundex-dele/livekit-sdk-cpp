@@ -1,6 +1,6 @@
 # ImGui 多人会议观看客户端
 
-本示例使用新 `RtcEngine`：Room/信令由共享 backend 管理，每路发布和订阅分别创建独立 GraphEngine，输入、实际编解码、录制、预览和设备输出位于上层。已移除旧 Room API 和 `LiveKit::SDK` 链接依赖。2026-10-29 在关闭旧 SDK 的配置下通过无窗口渲染及真实 Go SFU 多流、动态增删、会话复用、录制、UDP/TCP 聚合需求回归；实际设备与桌面交互仍需人工验收。
+本示例使用新 `RtcEngine`：每个 RtcEngine 独占自己的 RoomEngine，负责房间、信令和传输，每路发布和订阅分别创建独立 GraphEngine，输入、实际编解码、录制、预览和设备输出位于上层。已移除旧 Room API 和 `LiveKit::SDK` 链接依赖。2026-10-29 在关闭旧 SDK 的配置下通过无窗口渲染及真实 Go SFU 多流、动态增删、会话复用、录制、UDP/TCP 聚合需求回归；实际设备与桌面交互仍需人工验收。
 
 基于 Dear ImGui v1.91.9b 和 SDL2 的桌面客户端，支持 Windows 和 macOS 构建，界面使用英文。客户端在可滚动的视频网格中展示多位参与者，并播放远端音频。同一参与者可同时发布多路生成的测试视频，以及独立的 440 Hz 测试音调，方便打开多个实例演示会议，无需摄像头、麦克风或 FFmpeg。界面不提供屏幕共享和聊天；网络恢复使用 backend 的整会话重新加入机制，终止性错误仍需手动重新加入。
 
@@ -145,13 +145,17 @@ python livekit-sdk-cpp/tests/demo_dynacast_integration.py `
 
 ## 架构与公开 API
 
-- `Session` 使用当前 SDK 的 `Room::join_with_token`、`RoomCallback`、`local_participant().publish_track()` 和类型化的 `ParticipantInfo` 快照。demo 的会话管理线程等待入会和发布操作返回的 future，SDK 自己管理原生会话工作线程，因此不会阻塞 UI 或媒体回调。
-- `RoomOptions.video_frame_handler` 与其他回调在 SDK 会话线程上串行执行。`VideoFrame` 自行持有已校正旋转方向的 I420 三平面数据、各平面的行步长、画面尺寸、轨道 SID 和微秒时间戳。若需在回调返回后继续使用，应复制该对象。回调抛出异常会终止会话，并由 `run` 或 `wait` 重新抛出。
-- 原生接收端为每条活动轨道最多保留一帧最新画面。只有注册视频回调后，才对实际交付的帧执行格式转换和像素复制。demo 同样只保留每条轨道的最新帧。SDK 公开头文件不暴露 WebRTC、SDL 或 ImGui 类型。
-- I420 纹理上传和 SDL/ImGui 渲染均由主线程执行。移除轨道、参与者离开或断开连接时会清理纹理；DPI 改变时会调整界面缩放。硬件加速不可用时回退到软件渲染。
-- 再次入会前会等待上一次会话清理完毕，并重置全部界面状态。`join_with_token` 的第四个可选参数为停止令牌，可取消连接过程和运行中的会话，也支持启动后立即取消。
+- `Session` 直接使用原生 `RtcEngine` 的 `join`、`publish_media`、`subscribe_media` 和撤销接口，结果由每次调用的 Completion 交付，不再使用 BlockingEngine、future 或 `require_result` 等待网络操作。
+- `RtcObserver` 事件与 Completion 结果进入同一个有容量上限的会话队列；会话线程消费结果，管理待完成/就绪/移除中的轨道，并更新 UI 快照。入会成功后才提交初始发布；初始发布全部成功后界面进入 Connected。动态视频操作在回调结果到达后结束忙碌状态，失败保留原始错误信息并脱敏。
+- 会话循环不等待入会、发布或订阅结果。停止令牌唤醒会话队列，由会话线程调用同步 `close` 屏障，取消未完成请求并停止媒体图，再释放观察者和回调状态。再次入会前先等待上一轮工作线程退出。
+- `track_removed` 表示引擎已经完成移除，示例只清理本地状态；远端撤销公告则发起一次异步 unsubscribe。晚到的完成结果不会重新插入已移除的轨道。
+- 视频输出回调仅替换每条轨道的最新 `shared_ptr<const VideoFrame>`。I420 纹理上传和 SDL/ImGui 渲染仍由主线程执行，移除轨道或离会时清理画面。
+- `Session::EngineFactory` 可注入原生 RtcEngine，用于无服务器测试延迟结果、失败和停止；正常构造使用 `create_livekit_engine(AudioOutputOptions{})`。
 
 ## 测试与验证
+
+`demo_session` 是不连接服务器的会话测试，覆盖延迟入会/发布时停止、构图失败回滚、动态视频增删与失败重试、待完成订阅撤销。`demo_render` 使用 SDL dummy 驱动验证 UI 渲染。这些自动化测试不代表实际音视频设备或真实 SFU 集成验收。
+
 
 2026-10-28 用户名入会版本：Windows Release 构建、Token 身份/房间权限检查及无窗口界面渲染通过；使用同一用户名签名函数连接从 `D:/workspace/livekit` 构建的 Go SFU，UDP/TCP 两组均通过三参与者入会、双路视频解码及聚合订阅启停检查。结果见工作区 `out/demo-username/validation/result.json`，入会界面程序截图见 `out/demo-username/demo.join.png`。以上为本机自动化验证。
 

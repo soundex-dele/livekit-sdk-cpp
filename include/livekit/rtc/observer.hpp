@@ -2,8 +2,8 @@
 #include "livekit/rtc/track_endpoint.hpp"
 
 namespace livekit::sdk::rtc {
-// One borrowed observer, kept alive until set_observer(nullptr) returns.
-// Standalone RoomEngine delivers notifications on its notification worker.
+// Borrowed until set_observer(nullptr) or replacement returns.
+// All room observers run on the room notification worker.
 // Callbacks may submit requests, but must not wait for other callbacks, leave,
 // replace the observer or destroy the room. Media callbacks keep their own model.
 class RoomObserver {

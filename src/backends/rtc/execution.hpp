@@ -20,7 +20,10 @@ class SerialQueue {
 
   template <class F>
   void post(F&& fn) {
-    queue_->postTask(std::forward<F>(fn));
+    queue_->postTask([fn = std::forward<F>(fn)]() mutable {
+      CallbackScope scope;
+      fn();
+    });
   }
 
   template <class F>
@@ -42,7 +45,7 @@ class SerialQueue {
     // synchronous helper borrows stack synchronization objects and can notify
     // after its waiting caller has already returned and destroyed them.
     auto state = std::make_shared<CompletionState>();
-    queue_->postTask([state, fn = std::forward<F>(fn)]() mutable {
+    post([state, fn = std::forward<F>(fn)]() mutable {
       if constexpr (std::is_void_v<Value>) {
         fn();
       } else {
@@ -69,13 +72,13 @@ class SerialQueue {
   std::unique_ptr<vi::TaskQueue> queue_;
 };
 
-struct RtcExecution {
+// A room needs no media lifecycle worker. Media owners create their own queue.
+struct RoomExecution {
   SerialQueue control{"rtc.control"};
-  SerialQueue lifecycle{"rtc.lifecycle"};
   SerialQueue notification{"rtc.notification"};
 
   bool external() const {
-    return !control.current() && !lifecycle.current() && !notification.current() && !callback_depth;
+    return !control.current() && !notification.current() && !callback_depth;
   }
 };
 }  // namespace livekit::sdk::rtc::detail

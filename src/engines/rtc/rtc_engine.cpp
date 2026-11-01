@@ -6,20 +6,26 @@
 
 namespace livekit::sdk::rtc::engine {
 RtcEngine::RtcEngine(TransportFactory factory)
-    : execution_(std::make_shared<detail::RtcExecution>()),
-      room_(new RoomEngine(std::move(factory), execution_)) {
+    : room_(std::make_unique<RoomEngine>(std::move(factory))),
+      execution_(room_->execution_),
+      lifecycle_(std::make_unique<detail::SerialQueue>("rtc.lifecycle")) {
   (void)room_->set_observer(this);
 }
 
 RtcEngine::~RtcEngine() {
   (void)set_observer(nullptr);
   leave();
+  {
+    std::lock_guard admission(request_mutex_);
+    closing_ = true;
+  }
   (void)room_->set_observer(nullptr);
-  room_.reset();
-  execution_->lifecycle.invoke([this] {
+  // Observer removal fences notification; drain work already handed to lifecycle.
+  lifecycle_->invoke([this] {
     media_.reset();
     media_resources_.reset();
   });
+  execution_->notification.fence();
 }
 
 ErrorCode RtcEngine::set_observer(RtcObserver* observer) {
@@ -45,10 +51,47 @@ void RtcEngine::notify(std::function<void(RtcObserver&)> fn) {
   });
 }
 
+template <class T, class F>
+void RtcEngine::post_request(Completion<T> completion, F request) {
+  {
+    // Serialize admission with leave, without holding a lock while running work.
+    std::lock_guard lock(request_mutex_);
+    if (!closing_) {
+      lifecycle_->post(
+          [this, completion = std::move(completion), request = std::move(request)]() mutable {
+            if (closing_) {
+              auto cancelled = detail::failure_result<T>(ErrorCode::cancelled, "Engine is leaving");
+              complete(std::move(completion), std::move(cancelled));
+              return;
+            }
+            request(std::move(completion));
+          });
+      return;
+    }
+  }
+  complete(std::move(completion),
+           detail::failure_result<T>(ErrorCode::session_closed, "Engine is leaving"));
+}
+
+template <class T, class F>
+void RtcEngine::post_room_request(Completion<T> completion, F enqueue) {
+  {
+    std::lock_guard lock(request_mutex_);
+    if (!closing_) {
+      // Room request methods only enqueue work; control never waits for media.
+      enqueue(std::move(completion));
+      return;
+    }
+  }
+  complete(std::move(completion),
+           detail::failure_result<T>(ErrorCode::session_closed, "RTC is leaving"));
+}
+
 void RtcEngine::join(RoomOptions options, Completion<RoomSnapshot> completion) {
-  room_->join(std::move(options), [this, completion = std::move(completion)](auto result) mutable {
-    complete(std::move(completion), std::move(result));
-  });
+  post_room_request(std::move(completion),
+                    [this, options = std::move(options)](auto completion) mutable {
+                      room_->join(std::move(options), std::move(completion));
+                    });
 }
 
 Result<void> RtcEngine::clear_tracks() {
@@ -92,13 +135,19 @@ void RtcEngine::leave(Completion<void> completion) {
     return;
   }
   std::lock_guard lock(leave_mutex_);
-  closing_ = true;
-  auto stopped = execution_->lifecycle.invoke([this] { return clear_tracks(); });
+  {
+    std::lock_guard admission(request_mutex_);
+    closing_ = true;
+  }
+  auto stopped = lifecycle_->invoke([this] { return clear_tracks(); });
   room_->leave();
-  execution_->lifecycle.fence();
-  closing_ = false;
+  lifecycle_->fence();
   complete(std::move(completion), std::move(stopped));
   execution_->notification.fence();
+  {
+    std::lock_guard admission(request_mutex_);
+    closing_ = false;
+  }
 }
 
 void RtcEngine::close(Completion<void> completion) {
@@ -114,7 +163,7 @@ std::shared_ptr<RoomServices> RtcEngine::services() const {
 }
 
 bool RtcEngine::media_enabled() const {
-  return execution_->lifecycle.invoke([this] { return bool(media_); });
+  return lifecycle_->invoke([this] { return bool(media_); });
 }
 
 void RtcEngine::publish(TrackDescriptor descriptor, Completion<MediaPublication> completion) {
@@ -128,12 +177,7 @@ void RtcEngine::subscribe(TrackDescriptor descriptor, Completion<MediaSubscripti
 }
 
 void RtcEngine::subscribe(const TrackId& id, Completion<MediaSubscription> completion) {
-  execution_->lifecycle.invoke([this, id, completion = std::move(completion)]() mutable {
-    if (closing_) {
-      complete(std::move(completion), detail::failure_result<MediaSubscription>(
-                                          ErrorCode::session_closed, "RTC is leaving"));
-      return;
-    }
+  post_request(std::move(completion), [this, id](auto completion) mutable {
     if (subscriptions_.contains(id)) {
       complete(std::move(completion), detail::failure_result<MediaSubscription>(
                                           ErrorCode::busy, "Subscription already exists"));
@@ -148,15 +192,8 @@ void RtcEngine::subscribe(const TrackId& id, Completion<MediaSubscription> compl
 
 void RtcEngine::publish_graph(TrackDescriptor descriptor, PublishGraphFactory factory,
                               Completion<MediaPublication> completion) {
-  execution_->lifecycle.invoke([this, descriptor = std::move(descriptor),
-                                factory = std::move(factory),
-                                completion = std::move(completion)]() mutable {
-    if (closing_) {
-      complete(std::move(completion), detail::failure_result<MediaPublication>(
-                                          ErrorCode::session_closed, "RTC is leaving"));
-      return;
-    }
-
+  post_request(std::move(completion), [this, descriptor = std::move(descriptor),
+                                       factory = std::move(factory)](auto completion) mutable {
     const auto id = descriptor.id;
     if (publications_.contains(id)) {
       complete(std::move(completion),
@@ -172,13 +209,7 @@ void RtcEngine::publish_graph(TrackDescriptor descriptor, PublishGraphFactory fa
 }
 
 void RtcEngine::publish_media(MediaPublishSpec spec, Completion<MediaPublication> completion) {
-  execution_->lifecycle.invoke([this, spec = std::move(spec),
-                                completion = std::move(completion)]() mutable {
-    if (closing_) {
-      complete(std::move(completion), detail::failure_result<MediaPublication>(
-                                          ErrorCode::session_closed, "RTC is leaving"));
-      return;
-    }
+  post_request(std::move(completion), [this, spec = std::move(spec)](auto completion) mutable {
     auto descriptor = spec.track;
     const auto id = descriptor.id;
     if (publications_.contains(id)) {
@@ -196,15 +227,8 @@ void RtcEngine::publish_media(MediaPublishSpec spec, Completion<MediaPublication
 
 void RtcEngine::subscribe_graph(TrackDescriptor descriptor, SubscribeGraphFactory factory,
                                 Completion<MediaSubscription> completion) {
-  execution_->lifecycle.invoke([this, descriptor = std::move(descriptor),
-                                factory = std::move(factory),
-                                completion = std::move(completion)]() mutable {
-    if (closing_) {
-      complete(std::move(completion), detail::failure_result<MediaSubscription>(
-                                          ErrorCode::session_closed, "RTC is leaving"));
-      return;
-    }
-
+  post_request(std::move(completion), [this, descriptor = std::move(descriptor),
+                                       factory = std::move(factory)](auto completion) mutable {
     const auto id = descriptor.id;
     if (subscriptions_.contains(id)) {
       complete(std::move(completion),
@@ -220,13 +244,7 @@ void RtcEngine::subscribe_graph(TrackDescriptor descriptor, SubscribeGraphFactor
 }
 
 void RtcEngine::subscribe_media(MediaSubscribeSpec spec, Completion<MediaSubscription> completion) {
-  execution_->lifecycle.invoke([this, spec = std::move(spec),
-                                completion = std::move(completion)]() mutable {
-    if (closing_) {
-      complete(std::move(completion), detail::failure_result<MediaSubscription>(
-                                          ErrorCode::session_closed, "RTC is leaving"));
-      return;
-    }
+  post_request(std::move(completion), [this, spec = std::move(spec)](auto completion) mutable {
     auto descriptor = spec.track;
     const auto id = descriptor.id;
     if (subscriptions_.contains(id)) {
@@ -254,7 +272,7 @@ void RtcEngine::publish_audio(MediaPublishSpec spec, Completion<MediaPublication
 
 Result<std::shared_ptr<SharedMediaInput>> RtcEngine::create_shared_input(TrackDescriptor descriptor,
                                                                          MediaInput input) {
-  return execution_->lifecycle.invoke(
+  return lifecycle_->invoke(
       [this, descriptor = std::move(descriptor), input = std::move(input)]() mutable {
         return detail::control_boundary([&]() -> Result<std::shared_ptr<SharedMediaInput>> {
           if (!media_) {
@@ -268,12 +286,7 @@ Result<std::shared_ptr<SharedMediaInput>> RtcEngine::create_shared_input(TrackDe
 }
 
 void RtcEngine::unpublish(const TrackId& id, Completion<void> completion) {
-  execution_->lifecycle.invoke([this, id, completion = std::move(completion)]() mutable {
-    if (closing_) {
-      complete(std::move(completion),
-               detail::failure_result<void>(ErrorCode::session_closed, "RTC is leaving"));
-      return;
-    }
+  post_request(std::move(completion), [this, id](auto completion) mutable {
     auto it = publications_.find(id);
     if (it != publications_.end() && it->second.pipeline) {
       auto stopped = detail::control_boundary([&]() -> Result<void> {
@@ -286,7 +299,7 @@ void RtcEngine::unpublish(const TrackId& id, Completion<void> completion) {
       }
     }
     room_->unpublish(id, [this, id, completion = std::move(completion)](auto result) mutable {
-      execution_->lifecycle.post(
+      lifecycle_->post(
           [this, id, completion = std::move(completion), result = std::move(result)]() mutable {
             if (result) {
               on_unpublished(id);
@@ -298,12 +311,7 @@ void RtcEngine::unpublish(const TrackId& id, Completion<void> completion) {
 }
 
 void RtcEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
-  execution_->lifecycle.invoke([this, id, completion = std::move(completion)]() mutable {
-    if (closing_) {
-      complete(std::move(completion),
-               detail::failure_result<void>(ErrorCode::session_closed, "RTC is leaving"));
-      return;
-    }
+  post_request(std::move(completion), [this, id](auto completion) mutable {
     auto it = subscriptions_.find(id);
     if (it != subscriptions_.end() && it->second.pipeline) {
       auto stopped = detail::control_boundary([&]() -> Result<void> {
@@ -316,7 +324,7 @@ void RtcEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
       }
     }
     room_->unsubscribe(id, [this, id, completion = std::move(completion)](auto result) mutable {
-      execution_->lifecycle.post(
+      lifecycle_->post(
           [this, id, completion = std::move(completion), result = std::move(result)]() mutable {
             if (result) {
               on_unsubscribed(id);
@@ -328,31 +336,30 @@ void RtcEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
 }
 
 void RtcEngine::set_muted(const TrackId& id, bool muted, Completion<void> completion) {
-  room_->set_muted(id, muted, [this, completion = std::move(completion)](auto result) mutable {
-    complete(std::move(completion), std::move(result));
+  post_room_request(std::move(completion), [this, id, muted](auto completion) mutable {
+    room_->set_muted(id, muted, std::move(completion));
   });
 }
 
 void RtcEngine::set_receive_demand(const TrackId& id, ReceiveDemand demand,
                                    Completion<void> completion) {
-  room_->set_receive_demand(id, demand,
-                            [this, completion = std::move(completion)](auto result) mutable {
-                              complete(std::move(completion), std::move(result));
-                            });
+  post_room_request(std::move(completion), [this, id, demand](auto completion) mutable {
+    room_->set_receive_demand(id, demand, std::move(completion));
+  });
 }
 
 void RtcEngine::update_local_participant(ParticipantUpdate update, Completion<void> completion) {
-  room_->update_local_participant(std::move(update),
-                                  [this, completion = std::move(completion)](auto result) mutable {
-                                    complete(std::move(completion), std::move(result));
-                                  });
+  post_room_request(std::move(completion),
+                    [this, update = std::move(update)](auto completion) mutable {
+                      room_->update_local_participant(std::move(update), std::move(completion));
+                    });
 }
 
 void RtcEngine::set_subscription_permissions(SubscriptionPermissions permissions,
                                              Completion<void> completion) {
-  room_->set_subscription_permissions(
-      std::move(permissions), [this, completion = std::move(completion)](auto result) mutable {
-        complete(std::move(completion), std::move(result));
+  post_room_request(
+      std::move(completion), [this, permissions = std::move(permissions)](auto completion) mutable {
+        room_->set_subscription_permissions(std::move(permissions), std::move(completion));
       });
 }
 
@@ -388,8 +395,8 @@ Result<SenderFeedback> RtcEngine::feedback(const TrackId& id) const {
 
 void RtcEngine::on_published(TrackId id, Result<std::shared_ptr<PublishedTrack>> result,
                              Completion<MediaPublication> completion) {
-  execution_->lifecycle.post([this, id = std::move(id), result = std::move(result),
-                              completion = std::move(completion)]() mutable {
+  lifecycle_->post([this, id = std::move(id), result = std::move(result),
+                    completion = std::move(completion)]() mutable {
     if (!result) {
       publications_.erase(id);
       complete(std::move(completion), Result<MediaPublication>::failure(result.failure_record()));
@@ -431,7 +438,12 @@ void RtcEngine::on_published(TrackId id, Result<std::shared_ptr<PublishedTrack>>
       return Result<void>::success();
     });
     if (!built) {
-      complete(std::move(completion), Result<MediaPublication>::failure(built.failure_record()));
+      rollback(id, true, built.failure_record(),
+               [completion = std::move(completion)](Result<void> result) mutable {
+                 if (completion) {
+                   completion(Result<MediaPublication>::failure(result.failure_record()));
+                 }
+               });
       return;
     }
     complete(std::move(completion),
@@ -441,8 +453,8 @@ void RtcEngine::on_published(TrackId id, Result<std::shared_ptr<PublishedTrack>>
 
 void RtcEngine::on_subscribed(TrackId id, Result<std::shared_ptr<SubscribedTrack>> result,
                               Completion<MediaSubscription> completion) {
-  execution_->lifecycle.post([this, id = std::move(id), result = std::move(result),
-                              completion = std::move(completion)]() mutable {
+  lifecycle_->post([this, id = std::move(id), result = std::move(result),
+                    completion = std::move(completion)]() mutable {
     if (!result) {
       subscriptions_.erase(id);
       complete(std::move(completion), Result<MediaSubscription>::failure(result.failure_record()));
@@ -481,12 +493,64 @@ void RtcEngine::on_subscribed(TrackId id, Result<std::shared_ptr<SubscribedTrack
       return Result<void>::success();
     });
     if (!built) {
-      complete(std::move(completion), Result<MediaSubscription>::failure(built.failure_record()));
+      rollback(id, false, built.failure_record(),
+               [completion = std::move(completion)](Result<void> result) mutable {
+                 if (completion) {
+                   completion(Result<MediaSubscription>::failure(result.failure_record()));
+                 }
+               });
       return;
     }
     complete(std::move(completion),
              Result<MediaSubscription>::success(MediaSubscription{id, entry.track}));
   });
+}
+
+void RtcEngine::rollback(const TrackId& id, bool publication, Failure failure,
+                         Completion<void> completion) {
+  // Stop any partially prepared graph before releasing its transport endpoint.
+  auto stopped = detail::control_boundary([&] {
+    if (publication) {
+      auto it = publications_.find(id);
+      if (it != publications_.end() && it->second.pipeline) {
+        (void)it->second.pipeline->close_locked();
+      }
+    } else {
+      auto it = subscriptions_.find(id);
+      if (it != subscriptions_.end() && it->second.pipeline) {
+        (void)it->second.pipeline->close_locked();
+      }
+    }
+  });
+  if (stopped != ErrorCode::ok) {
+    auto enriched = std::make_shared<FailureInfo>(*failure);
+    enriched->message +=
+        "; partial graph cleanup failed (code " + std::to_string(static_cast<int>(stopped)) + ")";
+    failure = std::move(enriched);
+  }
+  Completion<void> removed = [this, id, publication, failure = std::move(failure),
+                              completion = std::move(completion)](Result<void> removed) mutable {
+    lifecycle_->post([this, id, publication, failure = std::move(failure),
+                      completion = std::move(completion), removed = std::move(removed)]() mutable {
+      if (removed) {
+        if (publication) {
+          on_unpublished(id);
+        } else {
+          on_unsubscribed(id);
+        }
+      } else {
+        auto enriched = std::make_shared<FailureInfo>(*failure);
+        enriched->message += "; endpoint rollback failed: " + removed.error().message;
+        failure = std::move(enriched);
+      }
+      complete(std::move(completion), Result<void>::failure(std::move(failure)));
+    });
+  };
+  if (publication) {
+    room_->unpublish(id, std::move(removed));
+  } else {
+    room_->unsubscribe(id, std::move(removed));
+  }
 }
 
 void RtcEngine::on_unpublished(const TrackId& id) {
@@ -503,7 +567,7 @@ void RtcEngine::on_unsubscribed(const TrackId& id) {
 
 void RtcEngine::on_room_event(const RoomEvent& event) {
   if (event.kind == RoomEventKind::track_removed && event.publication) {
-    execution_->lifecycle.post([this, event] {
+    lifecycle_->post([this, event] {
       if (*event.publication) {
         on_unpublished(event.track_id);
       } else {

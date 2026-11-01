@@ -1,6 +1,6 @@
 #include "livekit/rtc/livekit.hpp"
 #pragma once
-#include <livekit/rtc/types.hpp>
+#include <livekit/rtc/engine.hpp>
 #include <livekit/media.hpp>
 #include "quality.hpp"
 #include <map>
@@ -9,6 +9,8 @@
 #include <thread>
 #include <filesystem>
 #include <set>
+#include <functional>
+#include <memory>
 
 namespace demo {
 namespace sdk = livekit::sdk;
@@ -60,7 +62,10 @@ std::vector<Tile> tiles(const Snapshot& snapshot);
 
 class Session {
  public:
+  using EngineFactory = std::function<sdk::Result<std::unique_ptr<rtc::engine::RtcEngine>>()>;
   Session();
+  // Factory runs on the session worker and returns an exclusively owned engine.
+  explicit Session(EngineFactory);
   ~Session();
   void start(SessionOptions options, bool pause_unused_video = false);
   void stop();
@@ -73,6 +78,7 @@ class Session {
   mutable std::mutex mutex_;
   Snapshot data_;
   std::jthread worker_;
+  EngineFactory engine_factory_;
 
   struct VideoCommand {
     std::string remove_sid;
