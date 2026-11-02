@@ -1,3 +1,4 @@
+#include "media_result.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "rtc_result.hpp"
@@ -20,8 +21,10 @@ using namespace std::chrono_literals;
 
 namespace {
 void check(bool value, const char* message) {
-  if (!value)
-    throw std::runtime_error(message);
+  if (!value) {
+    std::cerr << message << "\n";
+    std::abort();
+  }
 }
 
 void invalid_livekit_join() {
@@ -201,6 +204,8 @@ void multi_track() {
   config.output.video = [&](const VideoSample& frame) {
     check(frame.pixels->width == 64 && frame.pixels->height == 48, "Wrong decoded dimensions");
     ++frames;
+
+    return livekit::sdk::Result<void>::success();
   };
   auto rx = engine->subscribe_media(config);
   await(*engine, rx);
@@ -238,6 +243,8 @@ void raw_audio_and_encoded() {
   sub.output.audio = [&](const AudioSample& value) {
     check(value.pcm->sample_rate == 48000, "Wrong PCM rate");
     samples += int(value.pcm->samples_per_channel());
+
+    return livekit::sdk::Result<void>::success();
   };
   auto rx = engine->subscribe_media(sub);
   await(*engine, rx);
@@ -322,15 +329,21 @@ void shared_audio() {
                     [](int16_t s) { return s != 0; }))
       ++blocks;
   };
-  a.preview.audio = [&](const auto& sample) { count(sample, first_blocks); };
-  b.preview.audio = [&](const auto& sample) { count(sample, second_blocks); };
+  a.preview.audio = [&](const auto& sample) {
+    count(sample, first_blocks);
+    return livekit::sdk::Result<void>::success();
+  };
+  b.preview.audio = [&](const auto& sample) {
+    count(sample, second_blocks);
+    return livekit::sdk::Result<void>::success();
+  };
   auto first = engine->publish_audio(a), second = engine->publish_audio(b);
   await(*engine, first);
   await(*engine, second);
   livekit::sdk::PcmInputFrame frame;
   frame.samples.assign(882, 8000);
   until(*engine, [&] {
-    source->write(frame);
+    media_result(source->write(frame));
     return first_blocks >= 4 && second_blocks >= 4;
   });
   auto invalid = a;
@@ -344,7 +357,7 @@ void shared_audio() {
   require_result(engine->unpublish(a.track.id));
   const auto before = first_blocks.load(), remaining = second_blocks.load();
   until(*engine, [&] {
-    source->write(frame);
+    media_result(source->write(frame));
     return second_blocks >= remaining + 4;
   });
   check(first_blocks == before && source->stats().attached,
@@ -359,7 +372,10 @@ void media_leave_and_rejoin() {
   auto rtc = make_engine(wire);
   auto spec = video("reusable");
   std::atomic<int> callbacks = 0;
-  spec.preview.video = [&](const auto&) { ++callbacks; };
+  spec.preview.video = [&](const auto&) {
+    ++callbacks;
+    return livekit::sdk::Result<void>::success();
+  };
   auto active = rtc->publish_video(spec);
   await(*rtc, active);
   until(*rtc, [&] { return callbacks >= 2; });
@@ -387,21 +403,16 @@ void media_leave_and_rejoin() {
 }  // namespace
 
 int main() {
-  try {
-    invalid_livekit_join();
-    std::cout << "multi_track" << std::endl;
-    multi_track();
-    std::cout << "media_leave_and_rejoin" << std::endl;
-    media_leave_and_rejoin();
-    std::cout << "raw_audio_and_encoded" << std::endl;
-    raw_audio_and_encoded();
-    std::cout << "shared_capture" << std::endl;
-    shared_capture();
-    std::cout << "shared_audio" << std::endl;
-    shared_audio();
-    std::cout << "media engine contracts passed\n";
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+  invalid_livekit_join();
+  std::cout << "multi_track" << std::endl;
+  multi_track();
+  std::cout << "media_leave_and_rejoin" << std::endl;
+  media_leave_and_rejoin();
+  std::cout << "raw_audio_and_encoded" << std::endl;
+  raw_audio_and_encoded();
+  std::cout << "shared_capture" << std::endl;
+  shared_capture();
+  std::cout << "shared_audio" << std::endl;
+  shared_audio();
+  std::cout << "media engine contracts passed\n";
 }

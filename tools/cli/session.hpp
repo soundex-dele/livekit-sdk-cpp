@@ -1,6 +1,7 @@
 #pragma once
 #include "livekit/media.hpp"
 #include "livekit/json.hpp"
+#include "livekit/result.hpp"
 #include <filesystem>
 #include <stop_token>
 
@@ -15,6 +16,7 @@ struct SessionOptions {
   int duration = 0, connect_timeout = 30, stats_interval_ms = 0;
 };
 
-void run_session(const SessionOptions&, std::function<void(const sdk::Json&)>, std::stop_token);
-void doctor(std::function<void(const sdk::Json&)>);
+sdk::Result<void> run_session(const SessionOptions&, std::function<void(const sdk::Json&)>,
+                              std::stop_token);
+sdk::Result<void> doctor(std::function<void(const sdk::Json&)>);
 }  // namespace livekit::cli

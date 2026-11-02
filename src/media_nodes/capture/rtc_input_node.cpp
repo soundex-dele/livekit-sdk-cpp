@@ -1,4 +1,4 @@
-#include "livekit/error.hpp"
+#include "media_graph/failure.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "media_graph/raw_frame_queue.hpp"
@@ -21,27 +21,19 @@ namespace livekit::sdk::rtc::nodes {
 namespace {
 using namespace std::chrono_literals;
 
-MediaInputOptions resolve_microphone(MediaInputOptions options) {
-  if (options.microphone) {
-    if (options.audio_source)
-      throw std::invalid_argument("Choose microphone or application audio source");
-    options.audio_source = options.microphone->source();
-  }
-  return options;
-}
-
-std::string codec_name(Codec c) {
+Result<std::string> codec_name(Codec c) {
   switch (c) {
     case Codec::opus:
-      return "opus";
+      return Result<std::string>::success("opus");
     case Codec::vp8:
-      return "vp8";
+      return Result<std::string>::success("vp8");
     case Codec::h264:
-      return "h264";
+      return Result<std::string>::success("h264");
     case Codec::h265:
-      return "h265";
+      return Result<std::string>::success("h265");
   }
-  throw std::invalid_argument("Invalid input codec");
+  return Result<std::string>::failure(
+      make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Invalid input codec"));
 }
 
 std::vector<std::string> input_args(const std::string& input) {
@@ -69,7 +61,8 @@ std::vector<std::string> input_args(const std::string& input) {
 struct MediaInputNode::Impl {
   MediaInputNode& owner;
   const TrackDescriptor descriptor;
-  const MediaInputOptions options;
+  MediaInputOptions options;
+  Failure initialization_failure;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
   MediaInputSnapshot stats;
@@ -93,7 +86,24 @@ struct MediaInputNode::Impl {
   };
 
   Impl(MediaInputNode& owner, TrackDescriptor d, MediaInputOptions opts)
-      : owner(owner), descriptor(std::move(d)), options(resolve_microphone(std::move(opts))) {
+      : owner(owner), descriptor(std::move(d)), options(std::move(opts)) {
+    if (auto initialized = initialize(); !initialized) {
+      initialization_failure = initialized.failure_record();
+      stats.error = initialized.error().message;
+    }
+  }
+
+  Result<void> initialize() {
+    if (options.microphone) {
+      if (options.audio_source) {
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                  "Choose microphone or application audio source"));
+      }
+      options.audio_source = options.microphone->source();
+      if (auto valid = options.microphone->status(); !valid) {
+        return valid;
+      }
+    }
     const bool is_video = descriptor.kind == MediaKind::video;
     const int inputs = int(options.generated) + int(!options.input.empty()) +
                        int(options.capture != CaptureKind::input) +
@@ -112,49 +122,87 @@ struct MediaInputNode::Impl {
          options.capture != CaptureKind::screen) ||
         (options.capture != CaptureKind::input && !is_video) || options.device_index < 0 ||
         (options.loop && options.input.empty()))
-      throw std::invalid_argument("Invalid media input configuration");
-    codec_name(descriptor.format.codec);
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "Invalid media input configuration"));
+    auto codec = codec_name(descriptor.format.codec);
+    if (!codec) {
+      return Result<void>::failure(codec.failure_record());
+    }
     if (options.audio_processing && options.audio_processing->enabled) {
       if (is_video || options.encoded_source || options.shared_frames) {
-        throw std::invalid_argument("APM belongs on the raw capture before shared fanout");
+        return Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                         "APM belongs on the raw capture before shared fanout"));
       }
       audio_processor = std::make_unique<detail::AudioProcessor>(*options.audio_processing,
                                                                  options.echo_reference);
+      if (auto valid = audio_processor->status(); !valid) {
+        return valid;
+      }
     }
     if (descriptor.follow_subscriber_demand && (!is_video || !options.input.empty()))
-      throw std::invalid_argument("Subscriber demand requires a live video source");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "Subscriber demand requires a live video source"));
     if (options.video_source) {
       const auto format = options.video_source->options();
       if (!is_video || format.dynamic_dimensions || format.width != descriptor.format.width ||
           format.height != descriptor.format.height)
-        throw std::invalid_argument("Application video dimensions must match the published format");
+        return Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                         "Application video dimensions must match the published format"));
       video = std::make_unique<livekit::sdk::detail::I420SourceReader>(options.video_source);
+      if (auto valid = video->status(); !valid) {
+        return valid;
+      }
     }
     if (options.audio_source) {
       if (is_video || options.audio_source->options().channels != descriptor.format.channels)
-        throw std::invalid_argument("Application audio channels must match the published format");
+        return Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                         "Application audio channels must match the published format"));
       audio = std::make_unique<livekit::sdk::detail::PcmSourceReader>(options.audio_source);
+      if (auto valid = audio->status(); !valid) {
+        return valid;
+      }
     }
     if (options.encoded_source) {
       const auto format = options.encoded_source->options();
-      if (format.codec != codec_name(descriptor.format.codec) ||
-          (is_video &&
-           (format.width != descriptor.format.width || format.height != descriptor.format.height)))
-        throw std::invalid_argument("Application encoded format must match the published format");
+      if (format.codec != *codec || (is_video && (format.width != descriptor.format.width ||
+                                                  format.height != descriptor.format.height))) {
+        return Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                         "Application encoded format must match the published format"));
+      }
       encoded = std::make_unique<livekit::sdk::detail::EncodedSourceReader>(options.encoded_source);
+      if (auto valid = encoded->status(); !valid) {
+        return valid;
+      }
     }
+    return Result<void>::success();
   }
 
-  void start_readers() {
+  Result<void> start_readers() {
     if (options.shared_frames) {
-      options.shared_frames->start();
+      if (auto started = options.shared_frames->start(); !started) {
+        return started;
+      }
     }
-    if (video)
-      video->start();
-    if (audio)
-      audio->start();
-    if (encoded)
-      encoded->start();
+    if (video) {
+      if (auto started = video->start(); !started) {
+        return started;
+      }
+    }
+    if (audio) {
+      if (auto started = audio->start(); !started) {
+        return started;
+      }
+    }
+    if (encoded) {
+      if (auto started = encoded->start(); !started) {
+        return started;
+      }
+    }
+    return Result<void>::success();
   }
 
   void stop_readers() {
@@ -176,11 +224,11 @@ struct MediaInputNode::Impl {
     return value.epoch && encoding != value.encodings.end() && encoding->second.active;
   }
 
-  void update(const SenderFeedback& value) {
+  Result<void> update(const SenderFeedback& value) {
     std::lock_guard lock(mutex);
     if (closed || value.epoch < feedback.epoch ||
         (value.epoch == feedback.epoch && value.revision <= feedback.revision))
-      return;
+      return Result<void>::success();
     const bool reset = value.epoch != feedback.epoch ||
                        value.media_generation != feedback.media_generation ||
                        enabled(value) != enabled(feedback);
@@ -189,8 +237,11 @@ struct MediaInputNode::Impl {
       ++generation;
       if (stats.active) {
         stop_readers();
-        if (enabled(value))
-          start_readers();
+        if (enabled(value)) {
+          if (auto started = start_readers(); !started) {
+            return started;
+          }
+        }
       }
     }
     if (encoded) {
@@ -207,6 +258,7 @@ struct MediaInputNode::Impl {
       capture_stop = true;
     feedback = value;
     changed.notify_all();
+    return Result<void>::success();
   }
 
   Token token() const {
@@ -265,13 +317,14 @@ struct MediaInputNode::Impl {
     owner.publish(event);
   }
 
-  void device_frame(const webrtc::VideoFrame& frame) {
+  Result<void> device_frame(const webrtc::VideoFrame& frame) {
     const auto binding = token();
     const auto captured = SteadyClock::now() - std::chrono::microseconds(std::max<int64_t>(
                                                    0, webrtc::TimeMicros() - frame.timestamp_us()));
     auto buffer = frame.video_frame_buffer()->ToI420();
     if (!buffer)
-      throw std::runtime_error("Capture did not produce convertible video");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Capture did not produce convertible video"));
     if (frame.rotation() != webrtc::kVideoRotation_0)
       buffer = webrtc::I420Buffer::Rotate(*buffer, frame.rotation());
     if (buffer->width() != descriptor.format.width ||
@@ -294,18 +347,22 @@ struct MediaInputNode::Impl {
     copy(out->u, buffer->DataU(), buffer->StrideU(), out->stride_u, (out->height + 1) / 2);
     copy(out->v, buffer->DataV(), buffer->StrideV(), out->stride_v, (out->height + 1) / 2);
     pixels(std::move(out), captured, binding);
+    return Result<void>::success();
   }
 
-  void emit_audio(AudioFrameEvent& event, Token binding) {
+  Result<void> emit_audio(AudioFrameEvent& event, Token binding) {
     event.discontinuity = !audio_generation || *audio_generation != binding.generation;
     audio_generation = binding.generation;
     if (audio_processor) {
-      audio_processor->process(event);
+      if (auto processed = audio_processor->process(event); !processed) {
+        return processed;
+      }
     }
     owner.publish(event);
+    return Result<void>::success();
   }
 
-  void shared(std::stop_token cancel) {
+  Result<void> shared(std::stop_token cancel) {
     while (!stop && !cancel.stop_requested()) {
       if (!wait_enabled(cancel)) {
         break;
@@ -323,12 +380,15 @@ struct MediaInputNode::Impl {
         event.captured = sample->captured;
         event.epoch = binding.epoch;
         event.timestamp = sample->timestamp;
-        emit_audio(event, binding);
+        if (auto emitted = emit_audio(event, binding); !emitted) {
+          return emitted;
+        }
       }
     }
+    return Result<void>::success();
   }
 
-  void application(std::stop_token cancel) {
+  Result<void> application(std::stop_token cancel) {
     auto next = SteadyClock::now();
     std::optional<SteadyClock::time_point> audio_origin;
     uint64_t audio_base = 0, audio_generation = 0, rtp_unwrapped = 0, rtp_generation = 0;
@@ -383,7 +443,9 @@ struct MediaInputNode::Impl {
           event.epoch = binding.epoch;
           event.captured = input->captured;
           event.timestamp = audio_base + uint64_t((input->captured - *audio_origin) / 10ms) * 480;
-          emit_audio(event, binding);
+          if (auto emitted = emit_audio(event, binding); !emitted) {
+            return emitted;
+          }
         }
         next += 10ms;
       } else {
@@ -423,9 +485,10 @@ struct MediaInputNode::Impl {
         owner.publish(EncodedFrameEvent(std::move(frame)));
       }
     }
+    return Result<void>::success();
   }
 
-  void generated_or_file(std::stop_token cancel) {
+  Result<void> generated_or_file(std::stop_token cancel) {
     const bool is_video = descriptor.kind == MediaKind::video;
     std::shared_ptr<lk::Process> child;
     if (!options.generated) {
@@ -451,8 +514,11 @@ struct MediaInputNode::Impl {
                      "-ar", "48000", "-f", "s16le", "pipe:1"});
       std::lock_guard lock(mutex);
       if (stop)
-        return;
+        return Result<void>::success();
       process = child = std::make_shared<lk::Process>(args);
+      if (auto opened = child->status(); !opened) {
+        return opened;
+      }
     }
     const auto period = std::chrono::microseconds(is_video ? 1000000 / options.fps : 10000);
     auto next = SteadyClock::now(), first = next;
@@ -475,11 +541,25 @@ struct MediaInputNode::Impl {
         out->u.resize(size_t(out->stride_u) * ((out->height + 1) / 2));
         out->v.resize(out->u.size());
         if (child) {
-          if (!child->read_exact(out->y.data(), out->y.size()))
+          const auto y = child->read_exact(out->y.data(), out->y.size());
+          if (!y) {
+            return Result<void>::failure(y.failure_record());
+          }
+          if (!*y) {
             break;
-          if (!child->read_exact(out->u.data(), out->u.size()) ||
-              !child->read_exact(out->v.data(), out->v.size()))
-            throw std::runtime_error("Truncated I420 frame");
+          }
+          const auto u = child->read_exact(out->u.data(), out->u.size());
+          if (!u) {
+            return Result<void>::failure(u.failure_record());
+          }
+          const auto v = child->read_exact(out->v.data(), out->v.size());
+          if (!v) {
+            return Result<void>::failure(v.failure_record());
+          }
+          if (!*u || !*v) {
+            return Result<void>::failure(make_failure(
+                ErrorDomain::media, ErrorCode::processing_failed, "Truncated I420 frame"));
+          }
         } else {
           for (int y = 0; y < out->height; ++y)
             for (int x = 0; x < out->width; ++x)
@@ -497,14 +577,19 @@ struct MediaInputNode::Impl {
           while (used < bytes) {
             const auto n =
                 child->read(reinterpret_cast<char*>(pcm->samples.data()) + used, bytes - used);
-            if (!n)
+            if (!n) {
+              return Result<void>::failure(n.failure_record());
+            }
+            if (!*n) {
               break;
-            used += n;
+            }
+            used += *n;
           }
           if (!used)
             break;
           if (used % (sizeof(int16_t) * pcm->channels))
-            throw std::runtime_error("Truncated PCM sample frame");
+            return Result<void>::failure(make_failure(
+                ErrorDomain::media, ErrorCode::processing_failed, "Truncated PCM sample frame"));
         } else
           for (int i = 0; i < 480; ++i)
             for (uint16_t ch = 0; ch < pcm->channels; ++ch)
@@ -522,7 +607,9 @@ struct MediaInputNode::Impl {
                   std::chrono::duration_cast<std::chrono::milliseconds>(captured - first).count() /
                   10) *
                   480;
-          emit_audio(event, binding);
+          if (auto emitted = emit_audio(event, binding); !emitted) {
+            return emitted;
+          }
         }
       }
       ++sequence;
@@ -530,81 +617,100 @@ struct MediaInputNode::Impl {
       if (next < SteadyClock::now() - period * 5)
         next = SteadyClock::now();
     }
-    if (child && !stop && child->wait() != 0)
-      throw std::runtime_error("FFmpeg input failed");
+    if (child && !stop) {
+      auto exited = child->wait();
+      if (!exited) {
+        return Result<void>::failure(exited.failure_record());
+      }
+      if (*exited != 0) {
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                  "FFmpeg input failed", false, *exited));
+      }
+    }
     if (!stop && !sequence)
-      throw std::runtime_error("Input produced no media frames");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Input produced no media frames"));
+    return Result<void>::success();
   }
 
   void run(std::stop_token cancel) {
-    try {
+    auto completed = [&]() -> Result<void> {
       // No media is read or generated before the first binding feedback.
       {
         std::unique_lock lock(mutex);
         changed.wait(lock, cancel, [&] { return stop || feedback.epoch; });
       }
-      if (!stop && !cancel.stop_requested()) {
-        if (options.microphone)
-          options.microphone->start();
-        if (options.shared_frames) {
-          shared(cancel);
-        } else if (video || audio || encoded) {
-          application(cancel);
-        } else if (options.capture != CaptureKind::input) {
-          MediaSpec spec;
-          spec.capture = options.capture;
-          spec.device_index = options.device_index;
-          spec.screen_id = options.screen_id;
-          spec.width = descriptor.format.width;
-          spec.height = descriptor.format.height;
-          spec.fps = options.fps;
-          while (wait_enabled(cancel)) {
-            {
-              std::lock_guard lock(mutex);
-              if (stop || !enabled(feedback))
-                continue;
-              capture_stop = false;
-            }
-            lk::capture_device(spec, capture_stop,
-                               [this](const auto& frame) { device_frame(frame); });
-            if (!capture_stop)
-              throw std::runtime_error("Capture device stopped unexpectedly");
-          }
-        } else {
-          generated_or_file(cancel);
+      if (stop || cancel.stop_requested()) {
+        return Result<void>::success();
+      }
+      if (options.microphone) {
+        if (auto started = options.microphone->start(); !started) {
+          return started;
         }
       }
-    } catch (...) {
-      if (!stop) {
-        const auto error = normalized_failure(std::current_exception(),
-                                              {"capture", descriptor.id, owner.getName(), 0},
-                                              ErrorDomain::media, ErrorCode::processing_failed);
+      if (options.shared_frames) {
+        return shared(cancel);
+      }
+      if (video || audio || encoded) {
+        return application(cancel);
+      }
+      if (options.capture == CaptureKind::input) {
+        return generated_or_file(cancel);
+      }
+      MediaSpec spec;
+      spec.capture = options.capture;
+      spec.device_index = options.device_index;
+      spec.screen_id = options.screen_id;
+      spec.width = descriptor.format.width;
+      spec.height = descriptor.format.height;
+      spec.fps = options.fps;
+      while (wait_enabled(cancel)) {
         {
           std::lock_guard lock(mutex);
-          stats.error = describe_failure(error)->message;
+          if (stop || !enabled(feedback)) {
+            continue;
+          }
+          capture_stop = false;
         }
-        owner.reportFailure(error);
+        auto captured = lk::capture_device(
+            spec, capture_stop, [this](const auto& frame) { return device_frame(frame); });
+        if (!captured) {
+          return captured;
+        }
+        if (!capture_stop) {
+          return Result<void>::failure(make_failure(ErrorDomain::media,
+                                                    ErrorCode::processing_failed,
+                                                    "Capture device stopped unexpectedly"));
+        }
       }
+      return Result<void>::success();
+    }();
+    if (!completed && !stop) {
+      const auto failure =
+          with_context(completed.failure_record(), {"capture", descriptor.id, owner.getName(), 0});
+      {
+        std::lock_guard lock(mutex);
+        stats.error = failure->message;
+      }
+      owner.reportError(livekit::sdk::detail::graph_error(failure));
     }
     if (options.microphone) {
       options.microphone->stop();
     }
-    std::exception_ptr device_error;
+    Failure device_error;
     {
       std::lock_guard lock(mutex);
       if (options.microphone && stats.error.empty() && !stop) {
         const auto device = options.microphone->snapshot();
         stats.error = device.error;
-        if (device.failure) {
-          device_error = std::make_exception_ptr(SDKError(device.failure));
-        }
+        device_error = device.failure;
       }
       stats.finished = true;
       stats.active = false;
       stop_readers();
     }
     if (device_error) {
-      owner.reportFailure(device_error);
+      owner.reportError(livekit::sdk::detail::graph_error(device_error));
     }
   }
 };
@@ -619,7 +725,15 @@ MediaInputNode::~MediaInputNode() {
 }
 
 bool MediaInputNode::doInit() {
-  subscribe<SenderFeedbackEvent>([this](const auto& value) { impl_->update(value.feedback); });
+  if (auto valid = status(); !valid) {
+    reportError(livekit::sdk::detail::graph_error(valid.failure_record()));
+    return false;
+  }
+  subscribe<SenderFeedbackEvent>([this](const auto& value) {
+    if (auto updated = impl_->update(value.feedback); !updated) {
+      reportError(livekit::sdk::detail::graph_error(updated.failure_record()));
+    }
+  });
   return true;
 }
 
@@ -631,15 +745,24 @@ bool MediaInputNode::doStart() {
   return true;
 }
 
-void MediaInputNode::activate() {
+Result<void> MediaInputNode::activate() {
+  if (auto valid = status(); !valid) {
+    return valid;
+  }
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed || !impl_->started)
-    throw std::logic_error("Start media input graph before activation");
-  if (impl_->worker.joinable())
-    return;
-  impl_->start_readers();
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                                              "Start media input graph before activation"));
+  if (impl_->worker.joinable()) {
+    return Result<void>::success();
+  }
+  if (auto started = impl_->start_readers(); !started) {
+    return started;
+  }
   if (impl_->options.microphone) {
-    impl_->options.microphone->set_failure_handler(failureReporter());
+    impl_->options.microphone->set_failure_handler([report = errorReporter()](Failure failure) {
+      report(livekit::sdk::detail::graph_error(std::move(failure)));
+    });
     impl_->microphone_reporter = true;
   }
   impl_->stats.active = true;
@@ -647,6 +770,7 @@ void MediaInputNode::activate() {
     detail::CallbackScope worker_scope;
     impl_->run(cancel);
   });
+  return Result<void>::success();
 }
 
 void MediaInputNode::quiesce() {
@@ -684,9 +808,13 @@ MediaInputSnapshot MediaInputNode::snapshot() const {
   return impl_->stats;
 }
 
-void MediaInputNode::throw_if_failed() const {
-  if (auto error = failure()) {
-    std::rethrow_exception(error);
+Result<void> MediaInputNode::status() const {
+  if (impl_->initialization_failure) {
+    return Result<void>::failure(impl_->initialization_failure);
   }
+  if (auto reported = error()) {
+    return Result<void>::failure(livekit::sdk::detail::graph_failure(*reported));
+  }
+  return Result<void>::success();
 }
 }  // namespace livekit::sdk::rtc::nodes

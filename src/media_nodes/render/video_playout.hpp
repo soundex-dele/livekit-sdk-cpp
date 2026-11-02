@@ -17,7 +17,8 @@ class VideoPlayout {
   void remove_track(const std::string& id);
   void submit(const std::string& id, const webrtc::VideoFrame& frame);
   // False means the user closed a video window or pressed Escape.
-  bool poll();
+  livekit::sdk::Result<void> status() const;
+  livekit::sdk::Result<bool> poll();
 
  private:
   struct Impl;

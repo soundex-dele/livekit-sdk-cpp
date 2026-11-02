@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <climits>
 
 namespace livekit::sdk {
 ControlPermissions control_permissions() {
@@ -20,11 +21,21 @@ ControlPermissions control_permissions() {
   }
 }
 
-ControlLayout primary_control_layout() {
-  for (const auto& screen : screen_capture_devices())
-    if (screen.primary)
-      return {1, 0, 0, screen.width, screen.height};
-  throw std::runtime_error("主屏幕不可用");
+Result<ControlLayout> primary_control_layout() {
+  const auto display = CGMainDisplayID();
+  auto mode = CGDisplayCopyDisplayMode(display);
+  if (!mode) {
+    return Result<ControlLayout>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::processing_failed, "Primary screen unavailable"));
+  }
+  const auto width = CGDisplayModeGetPixelWidth(mode);
+  const auto height = CGDisplayModeGetPixelHeight(mode);
+  CGDisplayModeRelease(mode);
+  if (!width || !height || width > INT_MAX || height > INT_MAX) {
+    return Result<ControlLayout>::failure(make_failure(ErrorDomain::media, ErrorCode::unsupported,
+                                                       "Invalid primary screen dimensions"));
+  }
+  return Result<ControlLayout>::success({1, 0, 0, int(width), int(height)});
 }
 
 namespace {
@@ -40,12 +51,13 @@ class NativeMacInput : public detail::MacInputApi {
   }
 
   detail::MacDisplayGeometry display() noexcept override {
-    try {
+    {
       auto layout = primary_control_layout();
+      if (!layout) {
+        return {};
+      }
       auto b = CGDisplayBounds(CGMainDisplayID());
-      return {layout.width, layout.height, b.origin.x, b.origin.y, b.size.width, b.size.height};
-    } catch (...) {
-      return {};
+      return {layout->width, layout->height, b.origin.x, b.origin.y, b.size.width, b.size.height};
     }
   }
 
@@ -125,7 +137,7 @@ class NativeMacInput : public detail::MacInputApi {
 };
 }  // namespace
 
-std::shared_ptr<ControlInputSink> make_platform_control_input() {
+Result<std::shared_ptr<ControlInputSink>> make_platform_control_input() {
   return detail::mac_input_with_api(std::make_shared<NativeMacInput>());
 }
 }  // namespace livekit::sdk

@@ -1,5 +1,7 @@
 #include "audio_samples_macos.hpp"
 #include "internal.hpp"
+#include "support/utf8.hpp"
+#include <cmath>
 #import <AVFoundation/AVFoundation.h>
 #import <AppKit/AppKit.h>
 #import <AudioToolbox/AudioToolbox.h>
@@ -21,6 +23,7 @@ extern "C" {
 
 namespace {
 using namespace livekit::sdk;
+using livekit::sdk::studio_detail::failed;
 
 struct CaptureState {
   std::mutex mutex;
@@ -40,17 +43,18 @@ std::string message(NSError* error) {
   return error ? std::string(error.localizedDescription.UTF8String) : "macOS 采集失败";
 }
 
-void waitFor(dispatch_semaphore_t ready, const std::atomic<bool>* active = nullptr) {
+Result<void> waitFor(dispatch_semaphore_t ready, const std::atomic<bool>* active = nullptr) {
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (dispatch_semaphore_wait(ready, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC))) {
     if (active && !active->load())
-      throw std::runtime_error("采集已停止");
+      return failed("采集已停止");
     if (std::chrono::steady_clock::now() >= deadline)
-      throw std::runtime_error("系统设备请求超时，请检查权限后重试");
+      return failed("系统设备请求超时，请检查权限后重试");
   }
+  return Result<void>::success();
 }
 
-SCShareableContent* content(const std::atomic<bool>* active = nullptr) {
+Result<SCShareableContent*> content(const std::atomic<bool>* active = nullptr) {
   __block SCShareableContent* result = nil;
   __block NSError* failure = nil;
   auto ready = dispatch_semaphore_create(0);
@@ -62,13 +66,13 @@ SCShareableContent* content(const std::atomic<bool>* active = nullptr) {
                                  failure = error;
                                  dispatch_semaphore_signal(ready);
                                }];
-  waitFor(ready, active);
+  LK_STUDIO_TRY(waitFor(ready, active));
   if (!result)
-    throw std::runtime_error("屏幕录制权限或显示器不可用：" + message(failure));
-  return result;
+    return failed("屏幕录制权限或显示器不可用：" + message(failure));
+  return Result<SCShareableContent*>::success(result);
 }
 
-void authorize(AVMediaType type, const std::atomic<bool>* active) {
+Result<void> authorize(AVMediaType type, const std::atomic<bool>* active) {
   auto status = [AVCaptureDevice authorizationStatusForMediaType:type];
   if (status == AVAuthorizationStatusNotDetermined) {
     __block BOOL granted = NO;
@@ -80,10 +84,10 @@ void authorize(AVMediaType type, const std::atomic<bool>* active) {
                              }];
     waitFor(ready, active);
     if (granted)
-      return;
+      return Result<void>::success();
   } else if (status == AVAuthorizationStatusAuthorized)
-    return;
-  throw std::runtime_error("请在系统设置 → 隐私与安全性中允许摄像头或麦克风权限");
+    return Result<void>::success();
+  return failed("请在系统设置 → 隐私与安全性中允许摄像头或麦克风权限");
 }
 
 NSArray<AVCaptureDevice*>* cameras() {
@@ -136,12 +140,13 @@ void videoSample(const std::shared_ptr<CaptureState>& state, CMSampleBufferRef s
   state->image = std::move(image);
 }
 
-void audioSample(const std::shared_ptr<CaptureState>& state, CMSampleBufferRef sample) {
-  auto samples = state->converter.convert(sample);
+Result<void> audioSample(const std::shared_ptr<CaptureState>& state, CMSampleBufferRef sample) {
+  LK_STUDIO_ASSIGN(samples, state->converter.convert(sample));
   std::lock_guard lock(state->mutex);
   state->audio.insert(state->audio.end(), samples.begin(), samples.end());
   while (state->audio.size() > 19200)
     state->audio.pop_front();
+  return Result<void>::success();
 }
 
 }  // namespace
@@ -151,12 +156,12 @@ MacAudioSamples::~MacAudioSamples() {
   swr_free(&resampler);
 }
 
-std::vector<float> MacAudioSamples::convert(CMSampleBufferRef sample) {
+Result<std::vector<float>> MacAudioSamples::convert(CMSampleBufferRef sample) {
   auto* format =
       CMAudioFormatDescriptionGetStreamBasicDescription(CMSampleBufferGetFormatDescription(sample));
   if (!format || format->mFormatID != kAudioFormatLinearPCM || format->mChannelsPerFrame < 1 ||
       format->mChannelsPerFrame > 8)
-    throw std::runtime_error("不支持的音频格式");
+    return failed("不支持的音频格式");
   const bool planar = format->mFormatFlags & kAudioFormatFlagIsNonInterleaved;
   AVSampleFormat input = AV_SAMPLE_FMT_NONE;
   if ((format->mFormatFlags & kAudioFormatFlagIsFloat) && format->mBitsPerChannel == 32)
@@ -168,7 +173,7 @@ std::vector<float> MacAudioSamples::convert(CMSampleBufferRef sample) {
            format->mBitsPerChannel == 32)
     input = planar ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S32;
   if (input == AV_SAMPLE_FMT_NONE)
-    throw std::runtime_error("不支持的音频采样格式");
+    return failed("不支持的音频采样格式");
   size_t needed = 0;
   CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, &needed, nullptr, 0, nullptr,
                                                           nullptr, 0, nullptr);
@@ -178,7 +183,7 @@ std::vector<float> MacAudioSamples::convert(CMSampleBufferRef sample) {
   if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
           sample, nullptr, list, needed, nullptr, nullptr,
           kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &block) != noErr)
-    throw std::runtime_error("无法读取音频采样");
+    return failed("无法读取音频采样");
 
   struct Release {
     CMBlockBufferRef value;
@@ -192,7 +197,7 @@ std::vector<float> MacAudioSamples::convert(CMSampleBufferRef sample) {
   const int rate = int(format->mSampleRate), channels = int(format->mChannelsPerFrame),
             frames = int(CMSampleBufferGetNumSamples(sample));
   if (rate < 8000 || rate > 192000 || frames < 1 || frames > 192000)
-    throw std::runtime_error("无效音频采样参数");
+    return failed("无效音频采样参数");
   if (!resampler || inputRate != rate || inputChannels != channels || inputFormat != input) {
     swr_free(&resampler);
     AVChannelLayout in{}, out = AV_CHANNEL_LAYOUT_STEREO;
@@ -201,28 +206,30 @@ std::vector<float> MacAudioSamples::convert(CMSampleBufferRef sample) {
                                      0, nullptr);
     av_channel_layout_uninit(&in);
     if (result < 0 || swr_init(resampler) < 0)
-      throw std::runtime_error("音频重采样初始化失败");
+      return failed("音频重采样初始化失败");
     inputRate = rate;
     inputChannels = channels;
     inputFormat = input;
   }
   const uint8_t* source[8]{};
   if (list->mNumberBuffers != (planar ? unsigned(channels) : 1u))
-    throw std::runtime_error("无效音频缓冲布局");
+    return failed("无效音频缓冲布局");
   for (unsigned i = 0; i < list->mNumberBuffers; ++i) {
     if (list->mBuffers[i].mDataByteSize <
         size_t(frames) * (format->mBitsPerChannel / 8) * (planar ? 1 : channels))
-      throw std::runtime_error("音频缓冲不足");
+      return failed("音频缓冲不足");
     source[i] = static_cast<const uint8_t*>(list->mBuffers[i].mData);
   }
   int capacity = swr_get_out_samples(resampler, frames);
+  if (capacity < 0)
+    return failed("Invalid resampler output capacity");
   std::vector<float> samples(size_t(capacity) * 2);
   auto* destination = reinterpret_cast<uint8_t*>(samples.data());
   int count = swr_convert(resampler, &destination, capacity, source, frames);
   if (count < 0)
-    throw std::runtime_error("音频重采样失败");
+    return failed("音频重采样失败");
   samples.resize(size_t(count) * 2);
-  return samples;
+  return Result<std::vector<float>>::success(std::move(samples));
 }
 }  // namespace livekit::sdk::studio_detail
 
@@ -241,14 +248,12 @@ std::vector<float> MacAudioSamples::convert(CMSampleBufferRef sample) {
       !CMSampleBufferDataIsReady(sample))
     return;
   @autoreleasepool {
-    try {
-      if (audio)
-        audioSample(state, sample);
-      else
-        videoSample(state, sample);
-    } catch (const std::exception& e) {
-      state->fail(e.what());
-    }
+    if (audio) {
+      auto result = audioSample(state, sample);
+      if (!result)
+        state->fail(result.error().message);
+    } else
+      videoSample(state, sample);
   }
 }
 
@@ -302,18 +307,18 @@ class MacCapture {
   void configure(const StudioSource* source, bool system) {
     @autoreleasepool {
       bool configuring = false;
-      try {
+      auto run = [&]() -> Result<void> {
         if (!state->active)
-          return;
+          return Result<void>::success();
         queue = dispatch_queue_create("org.avplatform.studio.capture", DISPATCH_QUEUE_SERIAL);
         delegate = [AVStudioCaptureDelegate new];
         delegate->state = state;
         if ((source && (source->kind == StudioSourceKind::screen ||
                         source->kind == StudioSourceKind::window)) ||
             system) {
-          SCShareableContent* available = content(&state->active);
+          LK_STUDIO_ASSIGN(available, content(&state->active));
           if (!state->active)
-            return;
+            return Result<void>::success();
           SCContentFilter* filter = nil;
           int width = 2, height = 2;
           if (source && source->kind == StudioSourceKind::window) {
@@ -324,7 +329,7 @@ class MacCapture {
                 break;
               }
             if (!selected)
-              throw std::runtime_error("窗口已关闭，请重新选择");
+              return failed("窗口已关闭，请重新选择");
             filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:selected];
             width = int(selected.frame.size.width);
             height = int(selected.frame.size.height);
@@ -337,7 +342,7 @@ class MacCapture {
                 break;
               }
             if (!selected)
-              throw std::runtime_error("显示器不可用，请重新选择");
+              return failed("显示器不可用，请重新选择");
             filter = [[SCContentFilter alloc] initWithDisplay:selected excludingWindows:@[]];
             width = int(selected.width);
             height = int(selected.height);
@@ -360,7 +365,7 @@ class MacCapture {
                                   type:system ? SCStreamOutputTypeAudio : SCStreamOutputTypeScreen
                     sampleHandlerQueue:queue
                                  error:&error])
-            throw std::runtime_error(message(error));
+            return failed(message(error));
           auto ready = dispatch_semaphore_create(0);
           __block NSError* failure = nil;
           auto shared = state;
@@ -371,12 +376,12 @@ class MacCapture {
               [starting stopCaptureWithCompletionHandler:nil];
             dispatch_semaphore_signal(ready);
           }];
-          waitFor(ready, &state->active);
+          LK_STUDIO_TRY(waitFor(ready, &state->active));
           if (failure)
-            throw std::runtime_error(message(failure));
+            return failed(message(failure));
         } else {
           AVMediaType type = source ? AVMediaTypeVideo : AVMediaTypeAudio;
-          authorize(type, &state->active);
+          LK_STUDIO_TRY(authorize(type, &state->active));
           if (!state->active)
             return;
           AVCaptureDevice* device = nil;
@@ -389,16 +394,16 @@ class MacCapture {
           } else
             device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
           if (!device)
-            throw std::runtime_error("采集设备不可用，请重新选择");
+            return failed("采集设备不可用，请重新选择");
           NSError* error = nil;
           auto input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
           if (!input)
-            throw std::runtime_error(message(error));
+            return failed(message(error));
           session = [AVCaptureSession new];
           [session beginConfiguration];
           configuring = true;
           if (![session canAddInput:input])
-            throw std::runtime_error("无法连接采集设备");
+            return failed("无法连接采集设备");
           [session addInput:input];
           AVCaptureOutput* output = nil;
           if (source) {
@@ -425,7 +430,7 @@ class MacCapture {
             output = audio;
           }
           if (![session canAddOutput:output])
-            throw std::runtime_error("无法创建采集输出");
+            return failed("无法创建采集输出");
           [session addOutput:output];
           [session commitConfiguration];
           configuring = false;
@@ -439,11 +444,14 @@ class MacCapture {
                       }];
           [session startRunning];
           if (!session.running)
-            throw std::runtime_error("采集未启动，请检查设备和权限");
+            return failed("采集未启动，请检查设备和权限");
         }
-      } catch (const std::exception& e) {
+        return Result<void>::success();
+      };
+      auto result = run();
+      if (!result) {
         state->active = false;
-        state->fail(e.what());
+        state->fail(result.error().message);
         if (configuring)
           [session commitConfiguration];
         if (stream)
@@ -596,22 +604,24 @@ std::string Monitor::error() {
   return impl_->failure;
 }
 
-std::shared_ptr<StudioImage> load_image(const std::string& path) {
+Result<std::shared_ptr<StudioImage>> load_image(const std::string& path) {
   @autoreleasepool {
+    if (!detail::valid_utf8(path))
+      return failed("Invalid image path UTF-8", ErrorCode::invalid_argument);
     NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
     CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
     if (!source)
-      throw std::runtime_error("图片不可用：" + path);
+      return failed("图片不可用：" + path);
     CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
     CFRelease(source);
     if (!image)
-      throw std::runtime_error("无法解码图片");
+      return failed("无法解码图片");
     auto out = std::make_shared<StudioImage>();
     out->width = int(CGImageGetWidth(image));
     out->height = int(CGImageGetHeight(image));
     if (out->width < 1 || out->height < 1 || out->width > 8192 || out->height > 8192) {
       CGImageRelease(image);
-      throw std::runtime_error("图片尺寸超出限制");
+      return failed("图片尺寸超出限制");
     }
     out->rgba.resize(size_t(out->width) * out->height * 4);
     CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -621,7 +631,7 @@ std::shared_ptr<StudioImage> load_image(const std::string& path) {
     CGColorSpaceRelease(color);
     if (!context) {
       CGImageRelease(image);
-      throw std::runtime_error("无法创建图片画布");
+      return failed("无法创建图片画布");
     }
     CGContextDrawImage(context, CGRectMake(0, 0, out->width, out->height), image);
     CGContextRelease(context);
@@ -633,13 +643,18 @@ std::shared_ptr<StudioImage> load_image(const std::string& path) {
         for (int c = 0; c < 3; ++c)
           out->rgba[i + c] = uint8_t(std::min(255, int(out->rgba[i + c]) * 255 / alpha));
     }
-    return out;
+    return Result<std::shared_ptr<StudioImage>>::success(std::move(out));
   }
 }
 
-std::shared_ptr<StudioImage> text_image(const std::string& text,
-                                        const std::array<float, 4>& color) {
+Result<std::shared_ptr<StudioImage>> text_image(const std::string& text,
+                                                const std::array<float, 4>& color) {
   @autoreleasepool {
+    if (!detail::valid_utf8(text))
+      return failed("Invalid text UTF-8", ErrorCode::invalid_argument);
+    for (float channel : color)
+      if (!std::isfinite(channel) || channel < 0 || channel > 1)
+        return failed("Invalid text color", ErrorCode::invalid_argument);
     auto out = std::make_shared<StudioImage>();
     out->width = 1280;
     out->height = 180;
@@ -656,7 +671,7 @@ std::shared_ptr<StudioImage> text_image(const std::string& text,
                                                bytesPerRow:1280 * 4
                                               bitsPerPixel:32];
     if (!bitmap)
-      throw std::runtime_error("无法创建文字画布");
+      return failed("无法创建文字画布");
     memset(bitmap.bitmapData, 0, 1280 * 180 * 4);
     [NSGraphicsContext saveGraphicsState];
     [NSGraphicsContext
@@ -674,42 +689,44 @@ std::shared_ptr<StudioImage> text_image(const std::string& text,
         out->rgba[i + c] = uint8_t(color[c] * 255);
       out->rgba[i + 3] = uint8_t(bitmap.bitmapData[i + 3] * color[3]);
     }
-    return out;
+    return Result<std::shared_ptr<StudioImage>>::success(std::move(out));
   }
 }
 }  // namespace livekit::sdk::studio_detail
 
 namespace livekit::sdk {
-std::vector<StudioDevice> studio_windows() {
+Result<std::vector<StudioDevice>> studio_windows() {
   @autoreleasepool {
     std::vector<StudioDevice> out;
-    for (SCWindow* w in content().windows) {
+    LK_STUDIO_ASSIGN(available, content());
+    for (SCWindow* w in available.windows) {
       if (w.owningApplication.processID == NSProcessInfo.processInfo.processIdentifier ||
           !w.title.length)
         continue;
       out.push_back({std::to_string(w.windowID), std::string(w.title.UTF8String)});
     }
-    return out;
+    return Result<std::vector<StudioDevice>>::success(std::move(out));
   }
 }
 
-std::vector<StudioDevice> studio_screens() {
+Result<std::vector<StudioDevice>> studio_screens() {
   @autoreleasepool {
     std::vector<StudioDevice> out;
-    for (SCDisplay* d in content().displays)
+    LK_STUDIO_ASSIGN(available, content());
+    for (SCDisplay* d in available.displays)
       out.push_back({std::to_string(d.displayID), "显示器 " + std::to_string(d.displayID) + " · " +
                                                       std::to_string(d.width) + " × " +
                                                       std::to_string(d.height)});
-    return out;
+    return Result<std::vector<StudioDevice>>::success(std::move(out));
   }
 }
 
-std::vector<StudioDevice> studio_cameras() {
+Result<std::vector<StudioDevice>> studio_cameras() {
   @autoreleasepool {
     std::vector<StudioDevice> out;
     for (AVCaptureDevice* d in cameras())
       out.push_back({d.uniqueID.UTF8String, d.localizedName.UTF8String});
-    return out;
+    return Result<std::vector<StudioDevice>>::success(std::move(out));
   }
 }
 }  // namespace livekit::sdk

@@ -15,11 +15,12 @@ namespace livekit::sdk::rtc::engine {
 struct TrackGraphSpec {
   std::vector<std::shared_ptr<graphflow::core::GraphNode>> nodes;
   std::vector<graphflow::engine::NodeConnection> connections;
-  std::function<void()> activate;
+  Failure failure;  // Graph factory validation failure, checked before graph admission.
+  std::function<Result<void>()> activate;
   std::function<void()> quiesce;
   // Owner-thread notification before failed graph teardown. Must not throw or
-  // reenter graph lifecycle. Retain the exception for snapshots/application queries.
-  std::function<void(std::exception_ptr)> on_failure;
+  // reenter graph lifecycle. Retain the failure for snapshots/application queries.
+  std::function<void(Failure)> on_failure;
 
   template <class Event>
   static graphflow::engine::NodeConnection connect(

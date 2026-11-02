@@ -10,12 +10,15 @@
 #include <mutex>
 #include <thread>
 
+using namespace livekit::sdk;
+
 namespace {
 struct CaptureState {
   std::mutex mutex;
   bool active = true, started = false;
   std::string error;
-  std::function<void(const webrtc::VideoFrame&)> output;
+  std::function<Result<void>(const webrtc::VideoFrame&)> output;
+  Failure failure;
   int width = 0, height = 0;
 };
 
@@ -62,9 +65,10 @@ std::string errorText(NSError* e) {
   std::lock_guard lock(state->mutex);
   if (!state->active)
     return;
-  try {
+  auto delivered = [&]() -> Result<void> {
     if (CVPixelBufferLockBaseAddress(pixel, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
-      throw std::runtime_error("Cannot lock screen frame");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Cannot lock screen frame"));
 
     struct Unlock {
       CVPixelBufferRef p;
@@ -77,36 +81,42 @@ std::string errorText(NSError* e) {
     const int w = int(CVPixelBufferGetWidth(pixel)), h = int(CVPixelBufferGetHeight(pixel));
     auto* data = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(pixel));
     if (!data || w < 2 || h < 2 || w > 16384 || h > 16384)
-      throw std::runtime_error("Invalid screen frame");
+      return Result<void>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::processing_failed, "Invalid screen frame"));
     auto native = webrtc::I420Buffer::Create(w, h);
     if (libyuv::ARGBToI420(data, int(CVPixelBufferGetBytesPerRow(pixel)), native->MutableDataY(),
                            native->StrideY(), native->MutableDataU(), native->StrideU(),
                            native->MutableDataV(), native->StrideV(), w, h))
-      throw std::runtime_error("Screen conversion failed");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Screen conversion failed"));
     auto buffer = native;
     if (w != state->width || h != state->height) {
       buffer = webrtc::I420Buffer::Create(state->width, state->height);
       buffer->ScaleFrom(*native);
     }
-    state->output(webrtc::VideoFrame::Builder()
-                      .set_video_frame_buffer(buffer)
-                      .set_timestamp_us(webrtc::TimeMicros())
-                      .build());
-  } catch (const std::exception& e) {
-    state->error = e.what();
+    return state->output(webrtc::VideoFrame::Builder()
+                             .set_video_frame_buffer(buffer)
+                             .set_timestamp_us(webrtc::TimeMicros())
+                             .build());
+  }();
+  if (!delivered) {
+    state->failure = delivered.failure_record();
+    state->error = delivered.error().message;
   }
 }
 
 @end
 
 namespace lk {
-std::vector<livekit::sdk::ScreenCaptureDevice> mac_screen_devices() {
+Result<std::vector<livekit::sdk::ScreenCaptureDevice>> mac_screen_devices() {
   uint32_t count = 0;
   if (CGGetActiveDisplayList(0, nullptr, &count) != kCGErrorSuccess)
-    throw std::runtime_error("Cannot enumerate displays");
+    return Result<std::vector<ScreenCaptureDevice>>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::request_failed, "Cannot enumerate displays"));
   std::vector<CGDirectDisplayID> ids(count);
   if (CGGetActiveDisplayList(count, ids.data(), &count) != kCGErrorSuccess)
-    throw std::runtime_error("Cannot enumerate displays");
+    return Result<std::vector<ScreenCaptureDevice>>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::request_failed, "Cannot enumerate displays"));
   std::vector<livekit::sdk::ScreenCaptureDevice> out;
   for (uint32_t i = 0; i < count; ++i) {
     auto id = ids[i];
@@ -129,19 +139,29 @@ std::vector<livekit::sdk::ScreenCaptureDevice> mac_screen_devices() {
                    int(std::lround(bounds.origin.x)), int(std::lround(bounds.origin.y)), w, h,
                    id == CGMainDisplayID(), rotation, hz});
   }
-  return out;
+  return Result<std::vector<ScreenCaptureDevice>>::success(std::move(out));
 }
 
-void capture_screen_macos(const livekit::sdk::MediaSpec& spec, std::atomic<bool>& stop,
-                          const std::function<void(const webrtc::VideoFrame&)>& output) {
+Result<void> capture_screen_macos(
+    const livekit::sdk::MediaSpec& spec, std::atomic<bool>& stop,
+    const std::function<Result<void>(const webrtc::VideoFrame&)>& output) {
   @autoreleasepool {
     if (stop)
-      return;
+      return Result<void>::success();
     if (!CGPreflightScreenCaptureAccess())
-      throw std::runtime_error("Screen recording permission denied");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::request_failed,
+                                                "Screen recording permission denied"));
     if (spec.width < 2 || spec.height < 2 || spec.fps < 1)
-      throw std::runtime_error("Invalid screen capture settings");
-    auto selected = select_screen(mac_screen_devices(), spec.screen_id);
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::request_failed,
+                                                "Invalid screen capture settings"));
+    auto devices = mac_screen_devices();
+    if (!devices) {
+      return Result<void>::failure(devices.failure_record());
+    }
+    auto selected = select_screen(*devices, spec.screen_id);
+    if (!selected) {
+      return Result<void>::failure(selected.failure_record());
+    }
     auto result = std::make_shared<ContentResult>();
     [SCShareableContent
         getShareableContentExcludingDesktopWindows:NO
@@ -159,25 +179,28 @@ void capture_screen_macos(const livekit::sdk::MediaSpec& spec, std::atomic<bool>
         std::lock_guard lock(result->mutex);
         if (result->done) {
           if (!result->error.empty())
-            throw std::runtime_error(result->error);
+            return Result<void>::failure(
+                make_failure(ErrorDomain::media, ErrorCode::request_failed, result->error));
           content = result->content;
           break;
         }
       }
       if (std::chrono::steady_clock::now() > deadline)
-        throw std::runtime_error("Screen content request timed out");
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::request_failed,
+                                                  "Screen content request timed out"));
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (stop)
-      return;
+      return Result<void>::success();
     SCDisplay* display = nil;
     for (SCDisplay* d in content.displays)
-      if (std::to_string(d.displayID) == selected.id) {
+      if (std::to_string(d.displayID) == selected->id) {
         display = d;
         break;
       }
     if (!display)
-      throw std::runtime_error("Selected display unavailable");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::request_failed,
+                                                "Selected display unavailable"));
     auto shared = std::make_shared<CaptureState>();
     shared->output = output;
     shared->width = spec.width;
@@ -205,7 +228,8 @@ void capture_screen_macos(const livekit::sdk::MediaSpec& spec, std::atomic<bool>
                             type:SCStreamOutputTypeScreen
               sampleHandlerQueue:queue
                            error:&error])
-      throw std::runtime_error(errorText(error));
+      return Result<void>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::request_failed, errorText(error)));
     [stream startCaptureWithCompletionHandler:^(NSError* failure) {
       bool abandoned;
       {
@@ -221,23 +245,35 @@ void capture_screen_macos(const livekit::sdk::MediaSpec& spec, std::atomic<bool>
         [stream stopCaptureWithCompletionHandler:^(NSError*){
         }];
     }];
-    std::string failure;
+    Failure failure;
     const auto startDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    try {
-      while (!stop) {
-        {
-          std::lock_guard lock(shared->mutex);
-          if (!shared->error.empty())
-            throw std::runtime_error(shared->error);
-          if (!shared->started && std::chrono::steady_clock::now() > startDeadline)
-            throw std::runtime_error("Screen capture start timed out");
+    while (!stop) {
+      {
+        std::lock_guard lock(shared->mutex);
+        if (!shared->error.empty()) {
+          failure = shared->failure ? shared->failure
+                                    : make_failure(ErrorDomain::media, ErrorCode::request_failed,
+                                                   shared->error);
+          break;
         }
-        validate_screen(selected, mac_screen_devices());
-        for (int i = 0; i < 10 && !stop; ++i)
-          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (!shared->started && std::chrono::steady_clock::now() > startDeadline) {
+          failure = make_failure(ErrorDomain::media, ErrorCode::timeout,
+                                 "Screen capture start timed out");
+          break;
+        }
       }
-    } catch (const std::exception& e) {
-      failure = e.what();
+      auto current = mac_screen_devices();
+      if (!current) {
+        failure = current.failure_record();
+        break;
+      }
+      if (auto valid = validate_screen(*selected, *current); !valid) {
+        failure = valid.failure_record();
+        break;
+      }
+      for (int i = 0; i < 10 && !stop; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
     }
     {
       std::lock_guard lock(shared->mutex);
@@ -254,8 +290,10 @@ void capture_screen_macos(const livekit::sdk::MediaSpec& spec, std::atomic<bool>
     [stream removeStreamOutput:delegate type:SCStreamOutputTypeScreen error:nil];
     dispatch_sync(queue, ^{
                   });
-    if (!failure.empty())
-      throw std::runtime_error(failure);
+    if (failure) {
+      return Result<void>::failure(failure);
+    }
+    return Result<void>::success();
   }
 }
 }  // namespace lk

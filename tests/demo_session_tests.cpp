@@ -1,3 +1,4 @@
+#include "server_result.hpp"
 #include "session.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include <atomic>
@@ -172,14 +173,14 @@ void cancel_pending() {
   auto wire = std::make_shared<Wire>();
   wire->auto_join = false;
   demo::Session session(factory(wire));
-  session.start(options());
+  server_result(session.start(options()));
   until([&] { return wire->starts == 1; }, "Join submitted");
   stop(session);
   check(wire->stops == 1, "Pending join transport stopped");
 
   wire->auto_join = true;
   wire->hold_publish = true;
-  session.start(options(true));
+  server_result(session.start(options(true)));
   until([&] { return wire->publishes == 1; }, "Publish submitted");
   check(session.snapshot().state == demo::State::Connecting,
         "Startup waits for publish completion");
@@ -190,7 +191,7 @@ void cancel_pending() {
 void initial_graph_failure() {
   auto wire = std::make_shared<Wire>();
   demo::Session session(factory(wire, false));
-  session.start(options(true));
+  server_result(session.start(options(true)));
   until([&] { return session.snapshot().finished; }, "Initial graph failure settles session");
   check(session.snapshot().state == demo::State::Error &&
             session.snapshot().error.find("Media is not enabled") != std::string::npos,
@@ -201,7 +202,7 @@ void initial_graph_failure() {
 void dynamic_video() {
   auto wire = std::make_shared<Wire>();
   demo::Session session(factory(wire));
-  session.start(options(true));
+  server_result(session.start(options(true)));
   until([&] { return session.snapshot().state == demo::State::Connected; }, "Initial media ready");
   check(session.remove_video("TR_local-1"), "Remove video queued");
   until([&] { return !session.snapshot().changing_video; }, "Remove completion delivered");
@@ -232,8 +233,9 @@ void remove_pending_subscription() {
     if (event.value("event", "") == "media-graph-stats") {
       ++reports;
     }
+    return Result<void>::success();
   };
-  session.start(std::move(config));
+  server_result(session.start(std::move(config)));
   until([&] { return session.snapshot().state == demo::State::Connected; }, "Subscriber joined");
   TrackDescriptor descriptor;
   descriptor.id = "remote";

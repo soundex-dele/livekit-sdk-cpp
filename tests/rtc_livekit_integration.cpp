@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
@@ -22,7 +23,7 @@ uint64_t sfu_video_blank_frames = 0;
 
 void check(bool ok, const char* message) {
   if (!ok)
-    throw std::runtime_error(message);
+    livekit::sdk::test::fail(message);
 }
 
 template <class T>
@@ -48,7 +49,7 @@ void eventually(F check_state, const char* message) {
 std::string env(const char* key) {
   const auto value = std::getenv(key);
   if (!value || !*value)
-    throw std::runtime_error(std::string("Missing ") + key);
+    livekit::sdk::test::fail(std::string("Missing ") + key);
   return value;
 }
 
@@ -69,7 +70,7 @@ Codec video_codec() {
     if (name == "h265") {
       return Codec::h265;
     }
-    throw std::runtime_error("LIVEKIT_TEST_VIDEO_CODEC must be vp8, h264 or h265");
+    livekit::sdk::test::fail("LIVEKIT_TEST_VIDEO_CODEC must be vp8, h264 or h265");
   }
   return media_encrypted() ? Codec::h264 : Codec::vp8;
 }
@@ -177,7 +178,7 @@ void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
           for (auto byte : read.frame->buffer.bytes())
             std::cerr << std::hex << unsigned(byte) << ',';
           std::cerr << std::dec << '\n';
-          throw std::runtime_error("Received payload routed to wrong track or altered");
+          livekit::sdk::test::fail("Received payload routed to wrong track or altered");
         }
         check(read.frame->epoch == rx[i]->snapshot().epoch, "Received stale epoch");
         ++received[n];
@@ -191,7 +192,7 @@ void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
   std::cerr << "Transmit timed out at integration line " << caller.line() << '\n';
   for (size_t n = 0; n < indices.size(); ++n)
     std::cerr << "track " << indices[n] << " received " << received[n] << '\n';
-  throw std::runtime_error("Encoded media did not cross SFU");
+  livekit::sdk::test::fail("Encoded media did not cross SFU");
 }
 
 void verify_receive_pause(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
@@ -227,7 +228,7 @@ void verify_receive_pause(const std::vector<std::shared_ptr<PublishedTrack>>& tx
 }  // namespace
 
 int main() {
-  try {
+  {
     auto publisher = require_result(livekit::sdk::app_support::create_blocking_room()),
          subscriber = require_result(livekit::sdk::app_support::create_blocking_room());
     livekit::sdk::app_support::RtcEventMailbox subscriber_events(*subscriber);
@@ -242,7 +243,7 @@ int main() {
     std::shared_ptr<livekit::sdk::ExternalKeyProvider> rx_keys;
     if (media_encrypted()) {
       auto keys = std::make_shared<livekit::sdk::ExternalKeyProvider>();
-      keys->set_passphrase(0, "encoded-media-secret");
+      require_result(keys->set_passphrase(0, "encoded-media-secret"));
       options.encryption.keys = keys;
       options.encryption.media = true;
     }
@@ -254,7 +255,7 @@ int main() {
     options.subscription_permissions.reset();
     if (media_encrypted()) {
       rx_keys = std::make_shared<livekit::sdk::ExternalKeyProvider>();
-      rx_keys->set_passphrase(0, "wrong-media-secret");
+      require_result(rx_keys->set_passphrase(0, "wrong-media-secret"));
       options.encryption.keys = rx_keys;
     }
     options.token = env("LIVEKIT_SUBSCRIBE_TOKEN");
@@ -294,12 +295,8 @@ int main() {
                  remote.metadata == "updated metadata";
         },
         "Attribute deletion or unchanged scalar semantics failed");
-    bool denied = false;
-    try {
-      await(subscriber->update_local_participant({"forbidden", {}, {}}));
-    } catch (const livekit::sdk::SDKError& error) {
-      denied = error.code() == livekit::sdk::ErrorCode::permission_denied;
-    }
+    const auto rejected = subscriber->update_local_participant({"forbidden", {}, {}});
+    const bool denied = rejected == livekit::sdk::ErrorCode::permission_denied;
     check(denied, "Metadata update ignored server permission rejection");
     std::cerr << "joined both rooms\n";
     std::vector<std::shared_ptr<PublishedTrack>> tx;
@@ -311,7 +308,7 @@ int main() {
     size_t discovered = 0;
     const auto deadline = SteadyClock::now() + 10s;
     while (discovered != 4 && SteadyClock::now() < deadline) {
-      auto event = subscriber_events.take_event(100ms);
+      auto event = require_result(subscriber_events.take_event(100ms));
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 4; ++i)
@@ -361,7 +358,7 @@ int main() {
                       .muted;
         },
         "Unmute did not reach remote roster");
-    while (auto notification = publisher_events.take_event(0ms))
+    while (auto notification = require_result(publisher_events.take_event(0ms)))
       check(notification->kind != RoomEventKind::remote_track_added,
             "Local publication appeared as remote discovery");
     remote[3].receive_demand.disabled = true;
@@ -375,7 +372,7 @@ int main() {
     auto permission_change = [&](bool allowed) {
       const auto deadline = SteadyClock::now() + 5s;
       while (SteadyClock::now() < deadline) {
-        const auto event = subscriber_events.take_event(100ms);
+        const auto event = require_result(subscriber_events.take_event(100ms));
         if (event && event->permission && event->permission->track_sid == remote[3].remote_sid &&
             event->permission->allowed == allowed) {
           check(event->permission->participant_sid == publisher_sid,
@@ -383,7 +380,7 @@ int main() {
           return;
         }
       }
-      throw std::runtime_error("Subscription permission transition not observed");
+      livekit::sdk::test::fail("Subscription permission transition not observed");
     };
     permission_change(false);
     check(pending_denied.wait_for(0ms) != std::future_status::ready,
@@ -411,11 +408,11 @@ int main() {
         std::this_thread::sleep_for(20ms);
       }
       bool rejected = false;
-      while (auto notification = subscriber_events.take_event(0ms))
+      while (auto notification = require_result(subscriber_events.take_event(0ms)))
         if (notification->encryption && !notification->encryption->ok)
           rejected = true;
       check(rejected, "Media authentication failure was not observable");
-      rx_keys->set_passphrase(0, "encoded-media-secret");
+      require_result(rx_keys->set_passphrase(0, "encoded-media-secret"));
     }
     verify_receive_pause(tx, rx, sequence);
     ReceiveDemand demand;
@@ -496,8 +493,5 @@ int main() {
               << sfu_silence_frames << ",\"sfuVideoBlankFrames\":" << sfu_video_blank_frames
               << "}\n";
     return 0;
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
   }
 }

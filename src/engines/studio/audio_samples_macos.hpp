@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include <CoreMedia/CoreMedia.h>
 #include <vector>
 struct SwrContext;
@@ -12,7 +13,7 @@ class MacAudioSamples {
   ~MacAudioSamples();
   MacAudioSamples(const MacAudioSamples&) = delete;
   MacAudioSamples& operator=(const MacAudioSamples&) = delete;
-  std::vector<float> convert(CMSampleBufferRef sample);
+  Result<std::vector<float>> convert(CMSampleBufferRef sample);
 
  private:
   SwrContext* resampler = nullptr;

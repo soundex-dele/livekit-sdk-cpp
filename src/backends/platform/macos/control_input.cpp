@@ -1,7 +1,7 @@
 #include "control_input.hpp"
 #include "scenarios/remote_control/text.hpp"
 #include <map>
-#include <stdexcept>
+
 
 namespace livekit::sdk::detail {
 std::optional<int> mac_key_code(const std::string& code) {
@@ -140,7 +140,7 @@ class MacInput final : public ControlInputSink {
   }
 
   bool apply(const ControlInput& in) noexcept override {
-    try {
+    {
       if (in.type == "text_release" && pending_text_.empty())
         return true;
       if (!api_->available())
@@ -231,15 +231,13 @@ class MacInput final : public ControlInputSink {
           buttons_.erase(in.button);
       }
       return true;
-    } catch (...) {
-      return false;
     }
   }
 };
 
-std::shared_ptr<ControlInputSink> mac_input_with_api(std::shared_ptr<MacInputApi> a) {
+Result<std::shared_ptr<ControlInputSink>> mac_input_with_api(std::shared_ptr<MacInputApi> a) {
   if (!a)
-    throw std::invalid_argument("Mac input API required");
-  return std::make_shared<MacInput>(std::move(a));
+    return Result<std::shared_ptr<ControlInputSink>>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Mac input API required"));
+  return Result<std::shared_ptr<ControlInputSink>>::success(std::make_shared<MacInput>(std::move(a)));
 }
 }  // namespace livekit::sdk::detail

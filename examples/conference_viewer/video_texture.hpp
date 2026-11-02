@@ -1,5 +1,6 @@
 #pragma once
 #include <livekit/media.hpp>
+#include <livekit/result.hpp>
 #include <SDL.h>
 
 namespace demo {
@@ -9,7 +10,7 @@ class VideoTexture {
   VideoTexture() = default;
   VideoTexture(const VideoTexture&) = delete;
   VideoTexture& operator=(const VideoTexture&) = delete;
-  void upload(SDL_Renderer* renderer, const livekit::sdk::VideoFrame& frame);
+  livekit::sdk::Result<void> upload(SDL_Renderer* renderer, const livekit::sdk::VideoFrame& frame);
 
   SDL_Texture* get() const {
     return texture_;

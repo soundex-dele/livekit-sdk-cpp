@@ -55,11 +55,19 @@ if(LIVEKIT_BUILD_TESTS)
   add_library(livekit_public_engine_header OBJECT tests/public_engine_header.cpp)
   target_link_libraries(livekit_public_engine_header PRIVATE LiveKit::RTCBackend)
   add_executable(livekit_result_tests tests/result_tests.cpp)
+  livekit_without_exceptions(livekit_result_tests)
   target_include_directories(livekit_result_tests PRIVATE src)
   target_link_libraries(livekit_result_tests PRIVATE LiveKit::RTCBackend)
   add_test(NAME result COMMAND livekit_result_tests)
   set_tests_properties(result PROPERTIES TIMEOUT 20)
+  add_executable(livekit_support_result_tests tests/support_result_tests.cpp src/support/process.cpp)
+  target_include_directories(livekit_support_result_tests PRIVATE src include)
+  target_link_libraries(livekit_support_result_tests PRIVATE Threads::Threads)
+  livekit_without_exceptions(livekit_support_result_tests)
+  add_test(NAME support_result COMMAND livekit_support_result_tests)
+  set_tests_properties(support_result PROPERTIES TIMEOUT 30)
   add_executable(livekit_async_result_tests tests/async_result_tests.cpp)
+  livekit_without_exceptions(livekit_async_result_tests)
   target_link_libraries(livekit_async_result_tests PRIVATE LiveKit::RTCBackend)
   add_test(NAME async_result COMMAND livekit_async_result_tests)
   set_tests_properties(async_result PROPERTIES TIMEOUT 20)
@@ -130,12 +138,14 @@ if(LIVEKIT_BUILD_RTC_NATIVE OR LIVEKIT_BUILD_SERVER_SDK)
   find_package(OpenSSL REQUIRED)
   include(cmake/Dependencies.cmake)
   add_library(livekit_wire STATIC src/support/encoding.cpp)
+  livekit_without_exceptions(livekit_wire)
   target_include_directories(livekit_wire PUBLIC include)
   target_link_libraries(livekit_wire PRIVATE OpenSSL::Crypto)
   if(LIVEKIT_BUILD_SERVER_SDK)
   add_library(livekit_server_sdk STATIC src/server_sdk/auth.cpp src/server_sdk/api.cpp
     src/server_sdk/services.cpp src/server_sdk/room_service.cpp)
   add_library(LiveKit::ServerSDK ALIAS livekit_server_sdk)
+  livekit_without_exceptions(livekit_server_sdk)
   target_compile_features(livekit_server_sdk PUBLIC cxx_std_20)
   target_include_directories(livekit_server_sdk PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>" PRIVATE src)
   target_include_directories(livekit_server_sdk PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/public>")
@@ -192,6 +202,7 @@ target_include_directories(livekit_protocol PUBLIC "${PROTO_DIR}")
 target_link_libraries(livekit_protocol PUBLIC protobuf::libprotobuf-lite)
 if(LIVEKIT_BUILD_TESTS)
   add_executable(livekit_rtc_session_tests tests/rtc_session_tests.cpp)
+  livekit_without_exceptions(livekit_rtc_session_tests)
   target_include_directories(livekit_rtc_session_tests PRIVATE include src)
   target_link_libraries(livekit_rtc_session_tests PRIVATE livekit_protocol)
   add_test(NAME rtc_session COMMAND livekit_rtc_session_tests)
@@ -212,10 +223,12 @@ add_library(livekit_rtc_services STATIC
   src/backends/rtc/livekit/room_services.cpp src/backends/rtc/livekit/rpc_session.cpp src/backends/rtc/livekit/stream_session.cpp
   src/backends/rtc/livekit/data_track_session.cpp src/backends/rtc/livekit/encryption.cpp)
 add_library(LiveKit::RTCServices ALIAS livekit_rtc_services)
+livekit_without_exceptions(livekit_rtc_services)
 target_include_directories(livekit_rtc_services PUBLIC include PRIVATE src)
 target_link_libraries(livekit_rtc_services PRIVATE livekit_protocol nlohmann_json::nlohmann_json ${_sdk_zlib} OpenSSL::Crypto Threads::Threads)
 if(LIVEKIT_BUILD_TESTS)
   add_executable(livekit_rtc_services_tests tests/rtc_services_tests.cpp)
+  livekit_without_exceptions(livekit_rtc_services_tests)
   target_include_directories(livekit_rtc_services_tests PRIVATE src)
   target_link_libraries(livekit_rtc_services_tests PRIVATE LiveKit::RTCServices livekit_protocol ${_sdk_zlib} utoolkit_task_queue)
   add_test(NAME rtc_services COMMAND livekit_rtc_services_tests)
@@ -237,6 +250,7 @@ if(LIVEKIT_BUILD_RTC_NATIVE)
     src/backends/rtc/livekit/livekit_transport.cpp
     src/backends/rtc/livekit/livekit_room.cpp)
   add_library(LiveKit::RTCLiveKit ALIAS livekit_rtc_livekit)
+  livekit_without_exceptions(livekit_rtc_livekit)
   if(LIVEKIT_BUILD_TESTS)
     add_executable(livekit_public_room_tests tests/public_room.cpp)
     target_link_libraries(livekit_public_room_tests PRIVATE LiveKit::RTCLiveKit)
@@ -399,7 +413,13 @@ if(LIVEKIT_BUILD_CLI)
   if(NOT LIVEKIT_BUILD_RTC_MEDIA OR NOT TARGET LiveKit::ServerSDK)
     message(FATAL_ERROR "CLI requires RTC_MEDIA, RTC_NATIVE, RTC_GRAPH_NODES and SERVER_SDK")
   endif()
-  add_executable(lk tools/cli/main.cpp tools/cli/session.cpp)
+  # CLI11 reports parse failures with exceptions. Keep only its adapter enabled.
+  add_library(livekit_cli_parser OBJECT tools/cli/main.cpp)
+  target_include_directories(livekit_cli_parser PRIVATE src)
+  target_link_libraries(livekit_cli_parser PRIVATE LiveKit::RTCMediaEngine livekit_media_display
+    LiveKit::ServerSDK CLI11::CLI11 WebRTC::webrtc)
+  add_executable(lk tools/cli/session.cpp $<TARGET_OBJECTS:livekit_cli_parser>)
+  livekit_without_exceptions(lk)
   set_target_properties(lk PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")
   target_include_directories(lk PRIVATE src)
   target_link_libraries(lk PRIVATE LiveKit::RTCMediaEngine livekit_media_display LiveKit::ServerSDK CLI11::CLI11 WebRTC::webrtc)
@@ -408,6 +428,7 @@ if(LIVEKIT_BUILD_CLI)
   endif()
   if(WIN32)
     target_compile_definitions(lk PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(livekit_cli_parser PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(lk PRIVATE shell32)
   endif()
   install(TARGETS lk RUNTIME DESTINATION bin)
@@ -467,6 +488,7 @@ if(LIVEKIT_BUILD_TESTS AND LIVEKIT_BUILD_RTC_NATIVE)
     --protoc $<TARGET_FILE:protobuf::protoc>
     --protobuf-includes "${protobuf_SOURCE_DIR}/src")
   add_executable(livekit_transport_policy_tests tests/transport_policy_tests.cpp)
+  livekit_without_exceptions(livekit_transport_policy_tests)
   target_include_directories(livekit_transport_policy_tests PRIVATE src)
   target_link_libraries(livekit_transport_policy_tests PRIVATE LiveKit::RTCLiveKit WebRTC::webrtc livekit_protocol)
   if(LIVEKIT_BUILD_SERVER_SDK)
@@ -524,3 +546,33 @@ foreach(_rtc_host_target
     target_link_libraries(${_rtc_host_target} PRIVATE utoolkit_task_queue)
   endif()
 endforeach()
+
+# Business targets propagate explicit results. Third-party parser/WinRT adapters
+# are separate exception-enabled object targets.
+foreach(target IN ITEMS
+    livekit_rtc_nodes livekit_rtc_pipelines
+    livekit_encoded_media livekit_media_inputs livekit_media_display
+    livekit_rtc_media livekit_rtc_inputs livekit_rtc_outputs
+    livekit_rtc_media_graphs livekit_rtc_media_engine livekit_remote_control
+    livekit_remote_control_tests livekit_screen_capture_tests lk_video_tests livekit_ffmpeg_codec_tests
+    livekit_rtc_architecture_tests livekit_rtc_media_engine_tests
+    livekit_rtc_input_tests livekit_rtc_output_tests livekit_rtc_audio_nodes_tests
+    livekit_rtc_video_nodes_tests livekit_rtc_backend_tests livekit_rtc_pipeline_tests
+    livekit_rtc_native_tests livekit_rtc_rejoin_integration
+    livekit_rtc_engine_integration livekit_rtc_livekit_integration
+    livekit_rtc_flexfec_tests livekit_uav_requirements
+    livekit_sdk_example livekit_automatic_session_example
+    livekit_audio_source_example livekit_audio_stream_example
+    livekit_video_source_example livekit_video_stream_example)
+  if(TARGET ${target})
+    livekit_without_exceptions(${target})
+  endif()
+endforeach()
+
+if(LIVEKIT_BUILD_TESTS)
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME no_exceptions_contract
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/no_exceptions_contract.py")
+  endif()
+endif()

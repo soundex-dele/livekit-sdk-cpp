@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #include "native_completion_wait.hpp"
 #include "backends/webrtc/encoded_audio_sender.hpp"
 #include "backends/webrtc/encoded_receiver.hpp"
@@ -27,7 +28,7 @@ using livekit::sdk::ErrorCode;
 namespace {
 void check(bool value, const char* message) {
   if (!value)
-    throw std::runtime_error(message);
+    livekit::sdk::test::fail(message);
 }
 
 template <class Result>
@@ -598,7 +599,7 @@ void video_loopback(Codec codec) {
         return frames.back().timestamp;
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    throw std::runtime_error("Timed video frame missing");
+    livekit::sdk::test::fail("Timed video frame missing");
   };
   const auto first_timestamp = timed_frame(1000001);
   std::this_thread::sleep_for(std::chrono::milliseconds(35));
@@ -621,7 +622,7 @@ void video_loopback(Codec codec) {
 }  // namespace
 
 int main() {
-  try {
+  {
     webrtc::LogMessage::LogToDebug(webrtc::LS_ERROR);
     shared_audio_budget();
     audio_frame_ownership();
@@ -632,8 +633,5 @@ int main() {
       video_loopback(codec);
     pending_native_close();
     std::cout << "Native encoded transport tests passed\n";
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
   }
 }

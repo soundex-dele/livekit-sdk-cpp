@@ -13,6 +13,9 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <charconv>
+#include <limits>
+#include <cmath>
 
 namespace livekit::sdk::studio_detail {
 using Microsoft::WRL::ComPtr;
@@ -22,8 +25,36 @@ using namespace winrt::Windows::Graphics::DirectX;
 using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 using ::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 
-static std::wstring wide(const std::string& s) {
-  return std::filesystem::u8path(s).wstring();
+static Result<std::wstring> wide(const std::string& s) {
+  if (s.empty())
+    return Result<std::wstring>::success({});
+  if (s.size() > size_t(INT_MAX))
+    return failed("Text too long", ErrorCode::invalid_argument);
+  int count =
+      MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), int(s.size()), nullptr, 0);
+  if (!count)
+    return failed("Invalid UTF-8", ErrorCode::invalid_argument);
+  std::wstring result(size_t(count), L'\0');
+  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), int(s.size()), result.data(),
+                           count))
+    return failed("UTF-8 conversion failed");
+  return Result<std::wstring>::success(std::move(result));
+}
+
+static Result<void> check(HRESULT hr) {
+  if (FAILED(hr))
+    return failed("Windows capture failed: " + std::to_string(uint32_t(hr)),
+                  ErrorCode::processing_failed, int(hr));
+  return Result<void>::success();
+}
+
+template <class T>
+Result<T> parse_id(const std::string& text) {
+  T value{};
+  auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (ec != std::errc{} || end != text.data() + text.size())
+    return failed("Invalid capture device id", ErrorCode::invalid_argument);
+  return Result<T>::success(value);
 }
 
 struct Capture::Impl {
@@ -40,53 +71,62 @@ struct Capture::Impl {
   explicit Impl(StudioSource s) {
     worker = std::jthread([this, s] {
       bool apartment = false;
-      try {
+      auto run = [&]() -> Result<void> {
         init_apartment(apartment_type::multi_threaded);
         apartment = true;
         if (s.kind == StudioSourceKind::camera) {
           MediaSpec spec;
           spec.capture = CaptureKind::camera;
-          spec.device_index = std::stoi(s.input);
+          LK_STUDIO_ASSIGN(index, parse_id<int>(s.input));
+          if (index < 0)
+            return failed("Invalid camera index", ErrorCode::invalid_argument);
+          spec.device_index = index;
           spec.width = 1280;
           spec.height = 720;
           spec.fps = 30;
-          lk::capture_device(spec, stop, [p = state](const webrtc::VideoFrame& v) {
-            auto b = v.video_frame_buffer()->ToI420();
-            VideoFrame f;
-            f.width = b->width();
-            f.height = b->height();
-            f.stride_y = b->StrideY();
-            f.stride_u = b->StrideU();
-            f.stride_v = b->StrideV();
-            f.y.assign(b->DataY(), b->DataY() + size_t(f.stride_y) * f.height);
-            f.u.assign(b->DataU(), b->DataU() + size_t(f.stride_u) * ((f.height + 1) / 2));
-            f.v.assign(b->DataV(), b->DataV() + size_t(f.stride_v) * ((f.height + 1) / 2));
-            auto img = from_i420(f);
-            std::lock_guard lock(p->mutex);
-            p->image = std::move(img);
-          });
+          auto captured = lk::capture_device(
+              spec, stop, [p = state](const webrtc::VideoFrame& v) -> Result<void> {
+                auto b = v.video_frame_buffer()->ToI420();
+                if (!b)
+                  return failed("Camera frame conversion failed");
+                VideoFrame f;
+                f.width = b->width();
+                f.height = b->height();
+                f.stride_y = b->StrideY();
+                f.stride_u = b->StrideU();
+                f.stride_v = b->StrideV();
+                f.y.assign(b->DataY(), b->DataY() + size_t(f.stride_y) * f.height);
+                f.u.assign(b->DataU(), b->DataU() + size_t(f.stride_u) * ((f.height + 1) / 2));
+                f.v.assign(b->DataV(), b->DataV() + size_t(f.stride_v) * ((f.height + 1) / 2));
+                LK_STUDIO_ASSIGN(img, from_i420(f));
+                std::lock_guard lock(p->mutex);
+                p->image = std::move(img);
+                return Result<void>::success();
+              });
+          LK_STUDIO_TRY(captured);
         } else {
           ComPtr<ID3D11Device> device;
           ComPtr<ID3D11DeviceContext> context;
-          check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                          D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                                          D3D11_SDK_VERSION, &device, nullptr, &context));
+          LK_STUDIO_TRY(check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                                D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                                D3D11_SDK_VERSION, &device, nullptr, &context)));
           ComPtr<IDXGIDevice> dxgi;
-          check_hresult(device.As(&dxgi));
+          LK_STUDIO_TRY(check(device.As(&dxgi)));
           com_ptr<IInspectable> inspectable;
-          check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi.Get(), inspectable.put()));
+          LK_STUDIO_TRY(check(CreateDirect3D11DeviceFromDXGIDevice(dxgi.Get(), inspectable.put())));
           auto direct = inspectable.as<IDirect3DDevice>();
           auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
           GraphicsCaptureItem item{nullptr};
           if (s.kind == StudioSourceKind::window) {
-            auto hwnd = reinterpret_cast<HWND>(std::stoull(s.input));
+            LK_STUDIO_ASSIGN(handle, parse_id<uintptr_t>(s.input));
+            auto hwnd = reinterpret_cast<HWND>(handle);
             if (!IsWindow(hwnd))
-              throw std::runtime_error("窗口已关闭");
-            check_hresult(
-                interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(), put_abi(item)));
+              return failed("窗口已关闭");
+            LK_STUDIO_TRY(check(
+                interop->CreateForWindow(hwnd, guid_of<GraphicsCaptureItem>(), put_abi(item))));
           } else {
             HMONITOR monitor = nullptr;
-            auto target = wide(s.input);
+            LK_STUDIO_ASSIGN(target, wide(s.input));
             struct Find {
               std::wstring target;
               HMONITOR found = nullptr;
@@ -108,9 +148,9 @@ struct Capture::Impl {
                 reinterpret_cast<LPARAM>(&find));
             monitor = find.found;
             if (!monitor)
-              throw std::runtime_error("显示器不可用");
-            check_hresult(
-                interop->CreateForMonitor(monitor, guid_of<GraphicsCaptureItem>(), put_abi(item)));
+              return failed("显示器不可用");
+            LK_STUDIO_TRY(check(
+                interop->CreateForMonitor(monitor, guid_of<GraphicsCaptureItem>(), put_abi(item))));
           }
           auto pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
               direct, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, item.Size());
@@ -119,13 +159,13 @@ struct Capture::Impl {
           auto arrived = pool.FrameArrived(
               auto_revoke,
               [p = state, device, context](const Direct3D11CaptureFramePool& sender, auto&&) {
-                try {
+                auto capture_frame = [&]() -> Result<void> {
                   auto frame = sender.TryGetNextFrame();
                   if (!frame)
-                    return;
+                    return Result<void>::success();
                   auto access = frame.Surface().as<IDirect3DDxgiInterfaceAccess>();
                   ComPtr<ID3D11Texture2D> texture;
-                  check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
+                  LK_STUDIO_TRY(check(access->GetInterface(IID_PPV_ARGS(&texture))));
                   D3D11_TEXTURE2D_DESC d{};
                   texture->GetDesc(&d);
                   d.Usage = D3D11_USAGE_STAGING;
@@ -133,10 +173,10 @@ struct Capture::Impl {
                   d.MiscFlags = 0;
                   d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
                   ComPtr<ID3D11Texture2D> staging;
-                  check_hresult(device->CreateTexture2D(&d, nullptr, &staging));
+                  LK_STUDIO_TRY(check(device->CreateTexture2D(&d, nullptr, &staging)));
                   context->CopyResource(staging.Get(), texture.Get());
                   D3D11_MAPPED_SUBRESOURCE map{};
-                  check_hresult(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map));
+                  LK_STUDIO_TRY(check(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map)));
                   auto img = std::make_shared<StudioImage>();
                   img->width = std::min(int(d.Width), frame.ContentSize().Width);
                   img->height = std::min(int(d.Height), frame.ContentSize().Height);
@@ -156,12 +196,18 @@ struct Capture::Impl {
                   context->Unmap(staging.Get(), 0);
                   std::lock_guard lock(p->mutex);
                   p->image = std::move(img);
+                  return Result<void>::success();
+                };
+                Result<void> result = Result<void>::success();
+                try {
+                  result = capture_frame();
                 } catch (const hresult_error& e) {
+                  result =
+                      failed(to_string(e.message()), ErrorCode::processing_failed, int(e.code()));
+                }
+                if (!result) {
                   std::lock_guard lock(p->mutex);
-                  p->error = to_string(e.message());
-                } catch (const std::exception& e) {
-                  std::lock_guard lock(p->mutex);
-                  p->error = e.what();
+                  p->error = result.error().message;
                 }
               });
           auto closed = item.Closed(auto_revoke, [p = state](auto&&, auto&&) {
@@ -182,12 +228,17 @@ struct Capture::Impl {
           session.Close();
           pool.Close();
         }
+        return Result<void>::success();
+      };
+      Result<void> result = Result<void>::success();
+      try {
+        result = run();
       } catch (const hresult_error& e) {
+        result = failed(to_string(e.message()), ErrorCode::processing_failed, int(e.code()));
+      }
+      if (!result) {
         std::lock_guard lock(state->mutex);
-        state->error = to_string(e.message());
-      } catch (const std::exception& e) {
-        std::lock_guard lock(state->mutex);
-        state->error = e.what();
+        state->error = result.error().message;
       }
       if (apartment)
         uninit_apartment();
@@ -215,40 +266,44 @@ std::string Capture::error() {
   return impl_->state->error;
 }
 
-std::shared_ptr<StudioImage> load_image(const std::string& path) try {
+Result<std::shared_ptr<StudioImage>> load_image(const std::string& path) {
+  LK_STUDIO_ASSIGN(filename, wide(path));
   ComPtr<IWICImagingFactory> factory;
-  check_hresult(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                 IID_PPV_ARGS(&factory)));
+  LK_STUDIO_TRY(check(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&factory))));
   ComPtr<IWICBitmapDecoder> decoder;
-  check_hresult(factory->CreateDecoderFromFilename(wide(path).c_str(), nullptr, GENERIC_READ,
-                                                   WICDecodeMetadataCacheOnLoad, &decoder));
+  LK_STUDIO_TRY(check(factory->CreateDecoderFromFilename(filename.c_str(), nullptr, GENERIC_READ,
+                                                         WICDecodeMetadataCacheOnLoad, &decoder)));
   ComPtr<IWICBitmapFrameDecode> frame;
-  check_hresult(decoder->GetFrame(0, &frame));
+  LK_STUDIO_TRY(check(decoder->GetFrame(0, &frame)));
   ComPtr<IWICFormatConverter> convert;
-  check_hresult(factory->CreateFormatConverter(&convert));
-  check_hresult(convert->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA,
-                                    WICBitmapDitherTypeNone, nullptr, 0,
-                                    WICBitmapPaletteTypeCustom));
+  LK_STUDIO_TRY(check(factory->CreateFormatConverter(&convert)));
+  LK_STUDIO_TRY(
+      check(convert->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
+                                nullptr, 0, WICBitmapPaletteTypeCustom)));
   UINT w, h;
-  check_hresult(convert->GetSize(&w, &h));
+  LK_STUDIO_TRY(check(convert->GetSize(&w, &h)));
   if (w < 1 || h < 1 || w > 8192 || h > 8192)
-    throw std::runtime_error("图片尺寸超出限制");
+    return failed("图片尺寸超出限制");
   auto image = std::make_shared<StudioImage>();
   image->width = w;
   image->height = h;
   image->rgba.resize(size_t(w) * h * 4);
-  check_hresult(convert->CopyPixels(nullptr, w * 4, UINT(image->rgba.size()), image->rgba.data()));
-  return image;
-} catch (const hresult_error& e) {
-  throw std::runtime_error("图片不可用: " + to_string(e.message()));
+  LK_STUDIO_TRY(
+      check(convert->CopyPixels(nullptr, w * 4, UINT(image->rgba.size()), image->rgba.data())));
+  return Result<std::shared_ptr<StudioImage>>::success(std::move(image));
 }
 
-std::shared_ptr<StudioImage> text_image(const std::string& text,
-                                        const std::array<float, 4>& color) {
+Result<std::shared_ptr<StudioImage>> text_image(const std::string& text,
+                                                const std::array<float, 4>& color) {
+  LK_STUDIO_ASSIGN(str, wide(text));
+  for (float channel : color)
+    if (!std::isfinite(channel) || channel < 0 || channel > 1)
+      return failed("Invalid text color", ErrorCode::invalid_argument);
   const int w = 1280, h = 180;
   HDC dc = CreateCompatibleDC(nullptr);
   if (!dc)
-    throw std::runtime_error("无法创建文字画布");
+    return failed("无法创建文字画布");
   BITMAPINFO bi{};
   bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
   bi.bmiHeader.biWidth = w;
@@ -259,7 +314,7 @@ std::shared_ptr<StudioImage> text_image(const std::string& text,
   HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &pixels, nullptr, 0);
   if (!bitmap) {
     DeleteDC(dc);
-    throw std::runtime_error("无法分配文字画布");
+    return failed("无法分配文字画布");
   }
   auto old = SelectObject(dc, bitmap);
   memset(pixels, 0, size_t(w) * h * 4);
@@ -270,7 +325,6 @@ std::shared_ptr<StudioImage> text_image(const std::string& text,
   SetBkMode(dc, TRANSPARENT);
   SetTextColor(dc, RGB(255, 255, 255));
   RECT rect{4, 4, w - 4, h - 4};
-  auto str = wide(text);
   DrawTextW(dc, str.c_str(), int(str.size()), &rect, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
   GdiFlush();
   auto img = std::make_shared<StudioImage>();
@@ -289,12 +343,12 @@ std::shared_ptr<StudioImage> text_image(const std::string& text,
   SelectObject(dc, old);
   DeleteObject(bitmap);
   DeleteDC(dc);
-  return img;
+  return Result<std::shared_ptr<StudioImage>>::success(std::move(img));
 }
 }  // namespace livekit::sdk::studio_detail
 
 namespace livekit::sdk {
-std::vector<StudioDevice> studio_windows() {
+Result<std::vector<StudioDevice>> studio_windows() {
   std::vector<StudioDevice> out;
   EnumWindows(
       [](HWND hwnd, LPARAM p) -> BOOL {
@@ -306,30 +360,40 @@ std::vector<StudioDevice> studio_windows() {
           return TRUE;
         wchar_t title[1024]{};
         GetWindowTextW(hwnd, title, 1024);
-        auto str = std::filesystem::path(title).u8string();
+        const int length = int(wcslen(title));
+        const int size =
+            WideCharToMultiByte(CP_UTF8, 0, title, length, nullptr, 0, nullptr, nullptr);
+        std::string str(size, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, title, length, str.data(), size, nullptr, nullptr);
         reinterpret_cast<std::vector<StudioDevice>*>(p)->push_back(
             {std::to_string(reinterpret_cast<uintptr_t>(hwnd)),
              std::string(str.begin(), str.end())});
         return TRUE;
       },
       reinterpret_cast<LPARAM>(&out));
-  return out;
+  return Result<std::vector<StudioDevice>>::success(std::move(out));
 }
 }  // namespace livekit::sdk
 
 namespace livekit::sdk {
-std::vector<StudioDevice> studio_screens() {
+Result<std::vector<StudioDevice>> studio_screens() {
   std::vector<StudioDevice> out;
-  for (auto& d : screen_capture_devices())
+  auto devices = screen_capture_devices();
+  if (!devices)
+    return Result<std::vector<StudioDevice>>::failure(devices.failure_record());
+  for (auto& d : *devices)
     out.push_back({d.id, d.name});
-  return out;
+  return Result<std::vector<StudioDevice>>::success(std::move(out));
 }
 
-std::vector<StudioDevice> studio_cameras() {
+Result<std::vector<StudioDevice>> studio_cameras() {
   std::vector<StudioDevice> out;
   int i = 0;
-  for (auto& d : video_capture_devices())
+  auto devices = video_capture_devices();
+  if (!devices)
+    return Result<std::vector<StudioDevice>>::failure(devices.failure_record());
+  for (auto& d : *devices)
     out.push_back({std::to_string(i++), d.name});
-  return out;
+  return Result<std::vector<StudioDevice>>::success(std::move(out));
 }
 }  // namespace livekit::sdk

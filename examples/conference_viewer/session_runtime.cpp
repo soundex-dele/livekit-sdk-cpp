@@ -116,14 +116,17 @@ Session::~Session() {
     worker_.join();
 }
 
-void Session::start(SessionOptions options, bool pause_unused_video) {
+sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video) {
   if (std::count_if(options.media.begin(), options.media.end(),
                     [](const auto& m) { return m.video; }) > max_test_videos)
-    throw std::invalid_argument("Demo supports up to 8 test videos");
+    return sdk::Result<void>::failure(sdk::make_failure(sdk::ErrorDomain::lifecycle,
+                                                        sdk::ErrorCode::invalid_argument,
+                                                        "Demo supports up to 8 test videos"));
   {
     std::lock_guard lock(mutex_);
     if (!data_.finished)
-      throw std::logic_error("Session already active");
+      return sdk::Result<void>::failure(sdk::make_failure(
+          sdk::ErrorDomain::lifecycle, sdk::ErrorCode::invalid_state, "Session already active"));
   }
   if (worker_.joinable())
     worker_.join();
@@ -136,7 +139,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
     data_.room = options.room;
     data_.pause_unused_video = pause_unused_video;
   }
-  try {
+  {
     worker_ = std::jthread([this, options = std::move(options),
                             pause_unused_video](std::stop_token stop) mutable {
       std::string error;
@@ -147,7 +150,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
             message.replace(pos, token.size(), "[redacted]");
         return message;
       };
-      try {
+      {
         const auto run = [&]() -> std::string {
           auto inbox = std::make_shared<SessionInbox>();
           std::map<TrackId, std::shared_ptr<Track>> tracks;
@@ -189,8 +192,12 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
               if (data_.state != State::Disconnecting)
                 data_.quality.update(event);
             }
-            if (options.log_sink)
-              options.log_sink(event);
+            if (options.log_sink) {
+              auto logged = options.log_sink(event);
+              if (!logged && failure.empty()) {
+                failure = logged.error().message;
+              }
+            }
           };
           options.connection.subscribe = false;
           options.connection.subscribe_tracks.clear();
@@ -253,6 +260,7 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
                   data_.frames[sid] = frame.pixels;
                   ++data_.received_frames;
                 }
+                return sdk::Result<void>::success();
               };
             else {
               config.output.playout = options.audio_playout;
@@ -494,10 +502,11 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
                       changed = added || it->second != enabled;
                       it->second = enabled;
                     }
-                    if (changed && options.log_sink)
-                      options.log_sink({{"event", "source-demand"},
-                                        {"sid", track->sid()},
-                                        {"enabled", enabled}});
+                    if (changed && options.log_sink) {
+                      report({{"event", "source-demand"},
+                              {"sid", track->sid()},
+                              {"enabled", enabled}});
+                    }
                   }
                 }
               report(graph);
@@ -529,12 +538,8 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
           }
           return failure;
         };
-        // Compatibility boundary for legacy media helpers and application log sinks.
+        // Media failures are returned explicitly by the supervisor.
         error = redact(run());
-      } catch (const std::exception& e) {
-        error = redact(e.what());
-      } catch (...) {
-        error = "Unknown session failure";
       }
       std::lock_guard lock(mutex_);
       if (stop.stop_requested())
@@ -544,12 +549,8 @@ void Session::start(SessionOptions options, bool pause_unused_video) {
       data_.error = std::move(error);
       video_command_.reset();
     });
-  } catch (...) {
-    std::lock_guard lock(mutex_);
-    data_.finished = true;
-    data_.state = State::Error;
-    throw;
   }
+  return sdk::Result<void>::success();
 }
 
 void Session::stop() {

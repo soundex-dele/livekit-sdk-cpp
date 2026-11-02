@@ -2,7 +2,7 @@
 #include "backends/platform/windows/control_input_win.hpp"
 #include "scenarios/remote_control/text.hpp"
 #include <array>
-#include <stdexcept>
+
 #include <algorithm>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -83,7 +83,7 @@ class WindowsInput final : public ControlInputSink {
     if (event.type == "text") {
       if (pending_unicode_up_)
         return false;
-      try {
+      {
         const auto units = detail::control_text_utf16(event.text);
         if (!units)
           return false;
@@ -109,8 +109,6 @@ class WindowsInput final : public ControlInputSink {
         if (sent < used && (sent % 2))
           pending_unicode_up_ = text_inputs[sent - 1].ki.wScan;
         return sent == used;
-      } catch (...) {
-        return false;
       }
     }
     if (event.type == "key") {
@@ -157,18 +155,20 @@ class WindowsInput final : public ControlInputSink {
 };
 }  // namespace
 
-std::shared_ptr<ControlInputSink> detail::windows_input_with_api(
+Result<std::shared_ptr<ControlInputSink>> detail::windows_input_with_api(
     std::shared_ptr<detail::WindowsInputApi> api) {
   if (!api)
-    throw std::invalid_argument("Windows input API required");
-  return std::make_shared<WindowsInput>(std::move(api));
+    return Result<std::shared_ptr<ControlInputSink>>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::invalid_argument, "Windows input API required"));
+  return Result<std::shared_ptr<ControlInputSink>>::success(
+      std::make_shared<WindowsInput>(std::move(api)));
 }
 
-std::shared_ptr<ControlInputSink> make_windows_control_input() {
+Result<std::shared_ptr<ControlInputSink>> make_windows_control_input() {
   return detail::windows_input_with_api(std::make_shared<SystemInputApi>());
 }
 
-std::shared_ptr<ControlInputSink> make_platform_control_input() {
+Result<std::shared_ptr<ControlInputSink>> make_platform_control_input() {
   return make_windows_control_input();
 }
 
@@ -177,25 +177,30 @@ ControlPermissions control_permissions() {
   return {true, true, api.desktop_available()};
 }
 
-ControlLayout primary_control_layout() {
+Result<ControlLayout> primary_control_layout() {
   const auto old = set_dpi(reinterpret_cast<HANDLE>(-4));
   MONITORINFO info{};
   info.cbSize = sizeof(info);
   POINT point{};
   bool ok = GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTOPRIMARY), &info) != 0;
+  const auto error = ok ? ERROR_SUCCESS : GetLastError();
   if (old)
     set_dpi(old);
   if (!ok)
-    throw std::runtime_error("Primary screen unavailable");
-  return {1, info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right - info.rcMonitor.left,
-          info.rcMonitor.bottom - info.rcMonitor.top};
+    return Result<ControlLayout>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::processing_failed, "Primary screen unavailable",
+                     false, int(error)));
+  return Result<ControlLayout>::success({1, info.rcMonitor.left, info.rcMonitor.top,
+                                         info.rcMonitor.right - info.rcMonitor.left,
+                                         info.rcMonitor.bottom - info.rcMonitor.top});
 }
 #else
-std::shared_ptr<ControlInputSink> make_windows_control_input() {
-  throw std::runtime_error("Windows input unavailable");
+Result<std::shared_ptr<ControlInputSink>> make_windows_control_input() {
+  return Result<std::shared_ptr<ControlInputSink>>::failure(
+      make_failure(ErrorDomain::media, ErrorCode::unsupported, "Windows input unavailable"));
 }
 #ifndef __APPLE__
-std::shared_ptr<ControlInputSink> make_platform_control_input() {
+Result<std::shared_ptr<ControlInputSink>> make_platform_control_input() {
   return make_windows_control_input();
 }
 
@@ -203,8 +208,9 @@ ControlPermissions control_permissions() {
   return {};
 }
 
-ControlLayout primary_control_layout() {
-  throw std::runtime_error("Screen unavailable");
+Result<ControlLayout> primary_control_layout() {
+  return Result<ControlLayout>::failure(
+      make_failure(ErrorDomain::media, ErrorCode::unsupported, "Screen unavailable"));
 }
 #endif
 #endif

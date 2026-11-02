@@ -1,25 +1,19 @@
 #pragma once
 #include "backends/rtc/control_context.hpp"
-#include "livekit/error.hpp"
+#include <type_traits>
+#include <utility>
 
 namespace livekit::sdk::rtc::detail {
-// Temporary adapter for media/data implementations still being migrated.
+// Preserve the old call shape while implementations migrate to explicit results.
+// This adapter performs no exception conversion; callbacks report their failure.
 template <class Function>
 auto control_boundary(Function&& function) {
   using Value = std::invoke_result_t<Function>;
-  try {
-    if constexpr (std::is_void_v<Value>) {
-      function();
-      return ErrorCode::ok;
-    } else {
-      return function();
-    }
-  } catch (...) {
-    if constexpr (std::is_void_v<Value> || std::is_same_v<Value, ErrorCode>) {
-      return describe_failure(std::current_exception())->code;
-    } else {
-      return Value::failure(describe_failure(std::current_exception()));
-    }
+  if constexpr (std::is_void_v<Value>) {
+    std::forward<Function>(function)();
+    return ErrorCode::ok;
+  } else {
+    return std::forward<Function>(function)();
   }
 }
 }  // namespace livekit::sdk::rtc::detail

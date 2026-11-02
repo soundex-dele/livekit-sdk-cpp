@@ -28,5 +28,5 @@ class MacInputApi {
 };
 
 std::optional<int> mac_key_code(const std::string& code);
-std::shared_ptr<ControlInputSink> mac_input_with_api(std::shared_ptr<MacInputApi> api);
+Result<std::shared_ptr<ControlInputSink>> mac_input_with_api(std::shared_ptr<MacInputApi> api);
 }  // namespace livekit::sdk::detail

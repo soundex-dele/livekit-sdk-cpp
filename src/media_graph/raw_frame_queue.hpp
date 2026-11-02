@@ -21,17 +21,26 @@ class RawFrameQueue final {
 
   explicit RawFrameQueue(QueueLimits limits) : limits_(limits) {
     if (!limits.max_frames || !limits.max_bytes || limits.max_age.count() <= 0) {
-      throw std::invalid_argument("Invalid shared raw-frame queue limits");
+      failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                              "Invalid shared raw-frame queue limits");
     }
   }
 
-  void start() {
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
+
+  Result<void> start() {
+    if (auto valid = status(); !valid) {
+      return valid;
+    }
     std::lock_guard lock(mutex_);
     queue_.clear();
     bytes_ = 0;
     ++generation_;
     active_ = true;
     changed_.notify_all();
+    return Result<void>::success();
   }
 
   void stop() {
@@ -91,6 +100,7 @@ class RawFrameQueue final {
     }
   }
 
+  Failure failure_;
   const QueueLimits limits_;
   mutable std::mutex mutex_;
   std::condition_variable_any changed_;

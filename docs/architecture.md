@@ -1,17 +1,52 @@
 # Current SDK architecture
 
+Source-aligned on 2026-11-02. Current entry points and examples are in
+[the media API guide](rtc-media-engine.md); dated refactor reports describe their
+recorded revisions, not additional guarantees of this implementation.
+
 The public configuration API is `rtc/engine.hpp`. It does not include GraphFlow,
 WebRTC or FFmpeg headers. `rtc/graph_api.hpp` is an explicit advanced extension:
 `engine.graph().publish_graph(...)` and `engine.graph().subscribe(...)` share the
-same registry and lifecycle as ordinary media operations.
+same publication/subscription maps and lifecycle as ordinary media operations.
 
 ## Ownership and dependencies
 
-`RtcEngine` directly owns its state and methods (no PImpl), execution resources,
-an internal RoomEngine, a per-track pipeline coordinator and an optional
-media module. RoomEngine owns transport state and encoded endpoints, never media
-graphs or devices. Each track graph owns its nodes; source/codec/output workers
-quiesce before graph teardown. Removing a track does not close the room.
+`RtcEngine` directly owns its state (no PImpl), one RoomEngine, a lifecycle
+queue, publication/subscription maps, an optional MediaGraphBuilder and optional
+MediaResources. RoomEngine owns RoomExecution (control and notification queues),
+which RtcEngine shares. There is no separate TrackGraphRegistry,
+RtcPipelineEngine or RtcMediaEngine class in this path. RTCMediaEngine is a CMake
+target combining the facade with media assembly.
+
+RoomEngine owns transport state and encoded endpoints, never media graphs or
+devices. It is also public through `rtc/room_engine.hpp` and
+`create_livekit_room()` for callers that need encoded endpoints without graphs.
+RtcMediaGraphBuilder borrows RtcMediaResources and returns a PreparedMediaGraph;
+RtcEngine creates and starts each PublishPipeline / SubscribePipeline. Each
+pipeline owns a GraphEngine. Removing one track does not close the room.
+
+```mermaid
+flowchart TB
+    App["Application Session: business decisions and UI handoff"] --> RTC["RtcEngine"]
+    RTC --> Room["RoomEngine: endpoints and transport"]
+    RTC --> Maps["Publication / Subscription maps"]
+    Maps --> Pipelines["Per-track Pipeline / GraphEngine"]
+    RTC --> Builder["MediaGraphBuilder: optional"]
+    RTC --> Resources["MediaResources: optional"]
+    Builder -. borrows .-> Resources
+    Builder -. returns PreparedMediaGraph .-> RTC
+    Room --> Execution["RoomExecution: control + notification"]
+    RTC -. shares .-> Execution
+    RTC --> Lifecycle["lifecycle queue"]
+```
+
+The facade coordinates endpoint creation, graph startup and rollback. Ordinary
+applications choose sources, subscriptions, output callbacks and business error
+handling; they do not construct GraphNodes or manage endpoint/graph teardown.
+Current MediaPublishSpec still requires codec/clock/channel configuration through
+TrackDescriptor. Typed sources, independent preview and separate business versus
+graph diagnostic snapshots are potential API improvements, not existing facade
+features. See [current API boundaries](rtc-media-engine.md#客户端边界与当前限制).
 
 `RTCNodeApi` supplies common node contracts and GraphFlow core. Codec, capture and
 output targets depend on it, not RTCEngine. RTCMediaEngine links these lower-layer
@@ -28,9 +63,11 @@ RtcEngine and its internal RoomEngine share exactly three TaskQueue workers:
 | lifecycle | Graph construction, startup, shutdown and media resource ownership |
 | notification | Public operation completions and continuous Observer notifications |
 
-Local request setup runs synchronously on its owning worker. Native success
-arrives asynchronously, and publication/subscription callbacks follow graph
-startup. Public controls remain void and accept per-call Completion<T> callbacks.
+Join, publication/subscription and track/member controls enqueue work on their
+owning queues. Native success arrives asynchronously; facade publication/
+subscription completions follow graph startup. Snapshot queries, media assembly,
+shared-input creation, Observer replacement and leave have synchronous paths.
+Public controls remain void and accept per-call Completion<T> callbacks.
 Continuous state events use RoomObserver / RtcObserver. Data writes use the existing pipeline and bounded endpoint queues.
 
 The execution adapter only provides FIFO post, synchronous invoke and drain.
@@ -39,14 +76,27 @@ RTC deadline scheduler, reserved terminal slot,
 extra media sender worker or graph recovery state machine. Existing backend and
 media-library workers and their own error/queue handling remain unchanged.
 
-Control never waits for lifecycle or application callbacks. Application callbacks
-may submit requests but must not wait for other callbacks or synchronously leave.
+Control does not synchronously wait for lifecycle or application callbacks.
+However, RoomEngine completions and events (including continuations into
+RtcEngine) pass through notification before posting to lifecycle. Slow public
+callbacks can therefore delay internal continuations and teardown. Application
+callbacks may submit requests but must not wait for other callbacks or synchronously leave.
 Graph factories and lifecycle hooks must not wait for notification callbacks.
 The external owner stops application callers before leave/destruction. leave
 stops graphs, stops transport, then drains lifecycle and notification work; close
-is an alias for leave and permits an explicit subsequent join.
+is an alias for leave and permits an explicit subsequent join. A supplied leave
+completion runs on notification and has been delivered when a valid owner-thread
+leave call returns. Observer removal does not cancel pending completions.
 
-See [three-thread contract](rtc-hardening-20261031.md) and
+Graph construction/start failures are translated into Result and trigger endpoint
+rollback. Runtime graph observations are not a general automatic recovery loop:
+RtcEngine does not install a graph-stopped callback that scans/rebuilds failed
+graphs. Applications should inspect MediaTrack status and explicitly remove failed
+tracks or leave. Backend track events and media graph failure observations must
+not be assumed to be identical notification channels. RoomServices retains its
+own future-based operations and service executors.
+
+See [three-thread historical baseline](rtc-hardening-20261031.md) and
 [public callback usage](rtc-simple-observer.md).
 
 ## Frame ownership and timing
@@ -64,8 +114,9 @@ branch's capture lease. Application-owned source objects are not closed by SDK
 unpublish. Frame timing is separate from storage, so reconnect retags a branch's
 new input without modifying a buffer shared by another room. Shared audio keeps
 the source sample clock, including gaps, rather than recomputing RTP time from
-callback arrival. Invalid shared queue limits fail synchronously without attaching
-a consumer; graph startup errors are logged at the lifecycle task boundary.
+callback arrival. Invalid shared branch queue limits fail during media graph construction; the
+publication completion reports failure and the endpoint is rolled back.
+create_shared_input itself returns a synchronous Result for source validation.
 
 ## Audio and synchronization
 

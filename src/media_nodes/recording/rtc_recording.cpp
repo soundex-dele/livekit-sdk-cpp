@@ -1,4 +1,5 @@
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
+#include "media_graph/failure.hpp"
 #include "livekit/rtc/recording_node.hpp"
 #include <condition_variable>
 #include <cstdio>
@@ -31,6 +32,7 @@ struct RecordingNode::Impl {
   std::deque<Item> queue;
   std::thread worker;
   RecordingSnapshot stats;
+  Failure initialization_failure;
   bool active = false, closed = false;
   std::ofstream file;
   uint64_t bytes = 0;
@@ -40,27 +42,28 @@ struct RecordingNode::Impl {
   Impl(RecordingNode& owner, std::filesystem::path path, TrackId id, MediaKind kind)
       : owner(owner), directory(std::move(path)), id(std::move(id)), kind(kind) {
     if (directory.empty() || this->id.empty())
-      throw std::invalid_argument("Recording needs directory and track ID");
+      initialization_failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                            "Recording needs directory and track ID");
   }
 
-  void fail(std::string message) {
-    std::exception_ptr error;
+  void fail(Failure error) {
     {
       std::lock_guard lock(mutex);
       if (!stats.error.empty()) {
         return;
       }
-      stats.error = message;
-      error = normalized_failure(
-          std::current_exception() ? std::current_exception()
-                                   : std::make_exception_ptr(std::runtime_error(message)),
-          {"record", id, owner.getName(), 0}, ErrorDomain::media, ErrorCode::processing_failed);
+      stats.error = error->message;
       closed = true;
       queue.clear();
       stats.queued_bytes = stats.queued_frames = 0;
       changed.notify_all();
     }
-    owner.reportFailure(error);
+    owner.reportError(livekit::sdk::detail::graph_error(
+        with_context(std::move(error), {"record", id, owner.getName(), 0})));
+  }
+
+  void fail(std::string message) {
+    fail(make_failure(ErrorDomain::media, ErrorCode::processing_failed, std::move(message)));
   }
 
   void enqueue(Item item) {
@@ -79,9 +82,9 @@ struct RecordingNode::Impl {
     changed.notify_one();
   }
 
-  void finish() {
+  Result<void> finish() {
     if (!file.is_open())
-      return;
+      return livekit::sdk::Result<void>::success();
     if (kind == MediaKind::audio) {
       file.seekp(4);
       le(file, uint32_t(bytes + 36), 4);
@@ -90,12 +93,16 @@ struct RecordingNode::Impl {
     }
     file.flush();
     if (!file)
-      throw std::runtime_error("Recording finalization failed");
+      return livekit::sdk::Result<void>::failure(make_failure(
+          ErrorDomain::media, ErrorCode::processing_failed, "Recording finalization failed"));
     file.close();
+    return livekit::sdk::Result<void>::success();
   }
 
-  void open(const char* extension) {
-    finish();
+  Result<void> open(const char* extension) {
+    if (auto result = finish(); !result) {
+      return result;
+    }
     bytes = 0;
     std::string safe;
     for (unsigned char c : id)
@@ -113,19 +120,25 @@ struct RecordingNode::Impl {
     reserved = std::fopen(path.c_str(), "wbx");
 #endif
     if (!reserved)
-      throw std::runtime_error("Cannot reserve recording path (already exists or inaccessible)");
+      return livekit::sdk::Result<void>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                       "Cannot reserve recording path (already exists or inaccessible)"));
     std::fclose(reserved);
     file.open(path, std::ios::binary);
     if (!file)
-      throw std::runtime_error("Cannot open recording file");
+      return livekit::sdk::Result<void>::failure(make_failure(
+          ErrorDomain::media, ErrorCode::processing_failed, "Cannot open recording file"));
+    return livekit::sdk::Result<void>::success();
   }
 
-  void write(const AudioFrameEvent& event) {
+  Result<void> write(const AudioFrameEvent& event) {
     const auto& pcm = *event.pcm;
     const auto count = pcm.samples.size() * 2;
     if (!file.is_open() || epoch != event.epoch || rate != pcm.sample_rate ||
         channels != pcm.channels || bytes + count > 0xffff0000ULL) {
-      open(".wav");
+      if (auto result = open(".wav"); !result) {
+        return result;
+      }
       epoch = event.epoch;
       rate = pcm.sample_rate;
       channels = pcm.channels;
@@ -145,13 +158,16 @@ struct RecordingNode::Impl {
     for (auto sample : pcm.samples)
       le(file, uint16_t(sample), 2);
     bytes += count;
+    return livekit::sdk::Result<void>::success();
   }
 
-  void write(const VideoFrameEvent& event) {
+  Result<void> write(const VideoFrameEvent& event) {
     const auto& pixels = *event.pixels;
     if (!file.is_open() || epoch != event.epoch || width != pixels.width ||
         height != pixels.height) {
-      open(".y4m");
+      if (auto result = open(".y4m"); !result) {
+        return result;
+      }
       epoch = event.epoch;
       width = pixels.width;
       height = pixels.height;
@@ -165,10 +181,11 @@ struct RecordingNode::Impl {
     plane(pixels.y, pixels.stride_y, pixels.width, pixels.height);
     plane(pixels.u, pixels.stride_u, (pixels.width + 1) / 2, (pixels.height + 1) / 2);
     plane(pixels.v, pixels.stride_v, (pixels.width + 1) / 2, (pixels.height + 1) / 2);
+    return livekit::sdk::Result<void>::success();
   }
 
   void run() {
-    try {
+    const auto result = [&]() -> Result<void> {
       while (true) {
         Item item;
         {
@@ -181,21 +198,22 @@ struct RecordingNode::Impl {
           stats.queued_bytes -= item.bytes;
           stats.queued_frames = queue.size();
         }
-        std::visit([&](const auto& frame) { write(frame); }, item.frame);
+        auto result = std::visit([&](const auto& frame) { return write(frame); }, item.frame);
+        if (!result) {
+          return result;
+        }
         if (!file)
-          throw std::runtime_error("Recording write failed");
+          return livekit::sdk::Result<void>::failure(make_failure(
+              ErrorDomain::media, ErrorCode::processing_failed, "Recording write failed"));
         std::lock_guard lock(mutex);
         ++stats.written;
       }
-      finish();
-    } catch (const std::exception& e) {
-      fail(e.what());
-      try {
-        finish();
-      } catch (...) {
-      }
-    } catch (...) {
-      fail("Unknown recording failure");
+      return finish();
+    }();
+    if (!result) {
+      fail(result.failure_record());
+      (void)finish();
+      file.close();
     }
   }
 };
@@ -211,6 +229,10 @@ RecordingNode::~RecordingNode() {
 }
 
 bool RecordingNode::doInit() {
+  if (impl_->initialization_failure) {
+    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
+    return false;
+  }
   if (impl_->kind == MediaKind::audio)
     subscribe<AudioFrameEvent>([this](const auto& event) {
       if (!event.pcm || !event.epoch)
@@ -246,10 +268,16 @@ bool RecordingNode::doInit() {
 }
 
 bool RecordingNode::doStart() {
-  std::lock_guard lock(impl_->mutex);
+  std::unique_lock lock(impl_->mutex);
   if (impl_->closed)
     return false;
-  std::filesystem::create_directories(impl_->directory);
+  std::error_code error;
+  std::filesystem::create_directories(impl_->directory, error);
+  if (error) {
+    lock.unlock();
+    impl_->fail("Cannot create recording directory: " + error.message());
+    return false;
+  }
   impl_->active = true;
   impl_->worker = std::thread([this] { impl_->run(); });
   return true;
@@ -275,9 +303,13 @@ RecordingSnapshot RecordingNode::snapshot() const {
   return impl_->stats;
 }
 
-void RecordingNode::throw_if_failed() const {
-  if (auto error = failure()) {
-    std::rethrow_exception(error);
+Result<void> RecordingNode::status() const {
+  if (impl_->initialization_failure) {
+    return livekit::sdk::Result<void>::failure(impl_->initialization_failure);
   }
+  if (auto value = error()) {
+    return livekit::sdk::Result<void>::failure(livekit::sdk::detail::graph_failure(*value));
+  }
+  return livekit::sdk::Result<void>::success();
 }
 }  // namespace livekit::sdk::rtc::nodes

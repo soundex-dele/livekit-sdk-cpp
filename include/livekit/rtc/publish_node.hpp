@@ -15,14 +15,15 @@ class RtcPublishNode final : public graphflow::core::GraphNode {
   ~RtcPublishNode() override;
   // Start the feedback worker after graph start; returns after initial feedback
   // has been delivered on that worker. Then activate upstream media producers.
-  void activate();
+  Result<void> activate();
   void quiesce();
 
   // Install before activate; invoked on the source worker, never during quiesce.
   void set_terminal_handler(std::function<void()> handler) {
     terminal_ = std::move(handler);
   }
-  void throw_if_failed() const;
+
+  Result<void> status() const;
 
   WriteStatus last_write() const {
     return last_write_.load();
@@ -51,7 +52,7 @@ class RtcPublishNode final : public graphflow::core::GraphNode {
   std::atomic<WriteStatus> last_write_{WriteStatus::not_ready};
   std::atomic<uint64_t> accepted_{0}, rejected_{0};
   mutable std::mutex failure_mutex_;
-  std::exception_ptr failure_;
+  Failure failure_;
   std::jthread worker_;
   std::function<void()> terminal_;
 };

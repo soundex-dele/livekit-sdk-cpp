@@ -6,7 +6,6 @@
 #include <mutex>
 #include <set>
 #include <thread>
-#include <stdexcept>
 
 namespace livekit::sdk {
 unsigned control_key_scan_code(const std::string& key) {
@@ -118,6 +117,7 @@ unsigned control_key_scan_code(const std::string& key) {
 
 struct RemoteControlSession::Impl {
   std::shared_ptr<ControlInputSink> sink;
+  Failure failure;
   mutable std::mutex mutex;
   ControlGrant grant;
   ControlLayout layout;
@@ -190,8 +190,12 @@ struct RemoteControlSession::Impl {
 
 RemoteControlSession::RemoteControlSession(std::shared_ptr<ControlInputSink> sink, bool watchdog)
     : impl_(std::make_unique<Impl>()) {
-  if (!sink)
-    throw std::invalid_argument("input sink required");
+  if (!sink) {
+    impl_->failure =
+        make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_argument, "input sink required");
+    impl_->stopped = "input_sink_required";
+    return;
+  }
   impl_->sink = std::move(sink);
   if (watchdog)
     impl_->watchdog = std::jthread([this](std::stop_token stop) {
@@ -209,15 +213,24 @@ RemoteControlSession::~RemoteControlSession() {
   stop();
 }
 
-void RemoteControlSession::authorize(ControlGrant grant, ControlLayout layout,
-                                     ControlClock::time_point now) {
+Result<void> RemoteControlSession::check() const {
+  return impl_->failure ? Result<void>::failure(impl_->failure) : Result<void>::success();
+}
+
+Result<void> RemoteControlSession::authorize(ControlGrant grant, ControlLayout layout,
+                                             ControlClock::time_point now) {
   std::lock_guard lock(impl_->mutex);
+  if (impl_->failure) {
+    return Result<void>::failure(impl_->failure);
+  }
   impl_->stop("replaced");
   if (!impl_->keys.empty() || !impl_->buttons.empty() || impl_->text_pending_release)
-    throw std::runtime_error("Previous input could not be released");
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                              "Previous input could not be released"));
   if (grant.id.empty() || grant.controller_identity.empty() || !grant.epoch ||
       grant.deadline <= now || layout.width <= 0 || layout.height <= 0 || !layout.version)
-    throw std::invalid_argument("invalid grant or layout");
+    return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                              "invalid grant or layout"));
   impl_->grant = std::move(grant);
   impl_->layout = layout;
   impl_->enabled = true;
@@ -229,6 +242,7 @@ void RemoteControlSession::authorize(ControlGrant grant, ControlLayout layout,
   impl_->text_id = 0;
   impl_->text_accepted = false;
   impl_->text_reason.clear();
+  return Result<void>::success();
 }
 
 bool RemoteControlSession::renew(const ControlGrant& grant, ControlClock::time_point now) {
@@ -241,14 +255,22 @@ bool RemoteControlSession::renew(const ControlGrant& grant, ControlClock::time_p
   return true;
 }
 
-void RemoteControlSession::set_layout(ControlLayout layout) {
+Result<void> RemoteControlSession::set_layout(ControlLayout layout) {
   std::lock_guard lock(impl_->mutex);
   if (layout.width <= 0 || layout.height <= 0 || layout.version <= impl_->layout.version)
-    throw std::invalid_argument("layout version must increase");
-  if (!impl_->release())
+    return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                                              "layout version must increase"));
+  if (impl_->failure) {
+    return Result<void>::failure(impl_->failure);
+  }
+  if (!impl_->release()) {
     impl_->stop("input_release_failed");
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                              "Previous input could not be released"));
+  }
   impl_->layout = layout;
   impl_->acknowledged = false;
+  return Result<void>::success();
 }
 
 bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,
@@ -259,8 +281,14 @@ bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,
   if (!s.enabled || !params.reliable || params.topic != remote_control_topic ||
       params.sender_identity != s.grant.controller_identity || bytes.size() > 4096)
     return false;
-  try {
-    auto v = Json::parse(bytes);
+  {
+    auto v = Json::parse(bytes, nullptr, false);
+    if (!v.is_object() || !v.contains("v") || !v["v"].is_number_integer() ||
+        !v.contains("grant_id") || !v["grant_id"].is_string() || !v.contains("epoch") ||
+        !v["epoch"].is_number_unsigned() || !v.contains("seq") || !v.contains("type") ||
+        !v["type"].is_string()) {
+      return false;
+    }
     if (v.at("v") != 1 || v.at("grant_id") != s.grant.id || v.at("epoch") != s.grant.epoch)
       return false;
     if (!v.at("seq").is_number_unsigned())
@@ -287,7 +315,8 @@ bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,
     // may activate control before the authenticated peer's first heartbeat.
     if (!s.heartbeat_received)
       return false;
-    if (v.at("layout_version") != s.layout.version)
+    if (!v.contains("layout_version") || !v["layout_version"].is_number_unsigned() ||
+        v.at("layout_version") != s.layout.version)
       return false;
     if (type == "layout_ack") {
       s.sequence = seq;
@@ -299,6 +328,9 @@ bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,
     ControlInput event;
     event.type = type;
     if (type == "text") {
+      if (!v.contains("text_id")) {
+        return false;
+      }
       const auto& id = v.at("text_id");
       if (!id.is_number_unsigned() || id == 0 || id > 9007199254740991ULL ||
           id.get<uint64_t>() <= s.text_id)
@@ -334,6 +366,9 @@ bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,
       return true;
     }
     if (type == "move" || type == "button" || type == "wheel") {
+      if (!v.contains("x") || !v["x"].is_number() || !v.contains("y") || !v["y"].is_number()) {
+        return false;
+      }
       double x = v.at("x").get<double>(), y = v.at("y").get<double>();
       if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 || y > 1)
         return false;
@@ -342,17 +377,27 @@ bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,
       event.positioned = true;
     }
     if (type == "button") {
+      if (!v.contains("button") || !v.contains("down") || !v["down"].is_boolean()) {
+        return false;
+      }
       const auto& button = v.at("button");
       if (!button.is_number_integer() || button < 0 || button > 2)
         return false;
       event.button = button.get<int>();
       event.down = v.at("down").get<bool>();
     } else if (type == "key") {
+      if (!v.contains("code") || !v["code"].is_string() || !v.contains("down") ||
+          !v["down"].is_boolean()) {
+        return false;
+      }
       event.code = v.at("code").get<std::string>();
       event.down = v.at("down").get<bool>();
       if (!control_key_scan_code(event.code))
         return false;
     } else if (type == "wheel") {
+      if (!v.contains("delta")) {
+        return false;
+      }
       const auto& delta = v.at("delta");
       if (!delta.is_number_integer() || delta < -1200 || delta > 1200)
         return false;
@@ -374,8 +419,6 @@ bool RemoteControlSession::receive(const std::vector<uint8_t>& bytes,
     if (type == "button" && !event.down)
       s.buttons.erase(event.button);
     return true;
-  } catch (const Json::exception&) {
-    return false;
   }
 }
 
@@ -410,7 +453,7 @@ Json RemoteControlSession::status() const {
               {"width", s.layout.width},
               {"height", s.layout.height},
               {"active", s.enabled},
-              {"text_input", s.sink->supports_text()},
+              {"text_input", s.sink && s.sink->supports_text()},
               {"text_result",
                {{"id", s.text_id}, {"accepted", s.text_accepted}, {"reason", s.text_reason}}}};
 }

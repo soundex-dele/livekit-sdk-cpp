@@ -1,3 +1,4 @@
+#include "server_result.hpp"
 #define SDL_MAIN_HANDLED
 #include "ui.hpp"
 #include "connection.hpp"
@@ -8,10 +9,13 @@
 #include <filesystem>
 #include <iostream>
 #include <cmath>
+#include <cstdlib>
 
 static void check(bool ok, const char* text) {
-  if (!ok)
-    throw std::runtime_error(text);
+  if (!ok) {
+    std::cerr << text << "\n";
+    std::exit(1);
+  }
 }
 
 static demo::sdk::Json quality_report(int target, double time, double bytes) {
@@ -349,7 +353,7 @@ static std::shared_ptr<demo::sdk::VideoFrame> pixels(const std::string& id, int 
 }
 
 int main(int argc, char** argv) {
-  try {
+  {
     test_repair_rates();
     test_transport_track_mappings();
     const auto quality_fixture = test_quality();
@@ -370,7 +374,7 @@ int main(int argc, char** argv) {
     {
       demo::VideoTexture texture;
       auto frame = pixels("TR_one");
-      texture.upload(renderer, *frame);
+      server_result(texture.upload(renderer, *frame));
       SDL_RenderCopy(renderer, texture.get(), nullptr, nullptr);
       std::vector<uint32_t> buffer(1100 * 720);
       check(SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888, buffer.data(),
@@ -379,20 +383,16 @@ int main(int argc, char** argv) {
       auto center = buffer[360 * 1100 + 550];
       check(((center >> 16) & 255) > 220 && ((center >> 8) & 255) < 35 && (center & 255) < 35,
             "I420 red: planes/colors swapped");
-      texture.upload(renderer, *pixels("TR_one", 181, 321));
+      server_result(texture.upload(renderer, *pixels("TR_one", 181, 321)));
       check(texture.width() == 181, "resolution recreation");
       auto fit = demo::fit_video(0, 0, 500, 500, 640, 360);
       check(std::abs(fit.w - 500) < .01f && std::abs(fit.h - 281.25f) < .01f && fit.y > 100,
             "aspect ratio");
       auto invalid = *frame;
       invalid.v.clear();
-      bool rejected = false;
-      try {
-        texture.upload(renderer, invalid);
-      } catch (...) {
-        rejected = true;
-      }
-      check(rejected, "invalid buffer validation");
+      auto rejected = texture.upload(renderer, invalid);
+      check(!rejected && rejected.error().code == demo::sdk::ErrorCode::invalid_argument,
+            "invalid buffer validation");
       demo::Snapshot state;
       state.state = demo::State::Connected;
       state.finished = false;
@@ -422,41 +422,31 @@ int main(int argc, char** argv) {
       check(demo::tiles(state).size() == 3, "roster tile count");
       state.frames["TR_two"] = pixels("TR_two");
       demo::View view;
-      bool missing_username = false;
-      try {
-        view.options();
-      } catch (const std::invalid_argument&) {
-        missing_username = true;
-      }
-      check(missing_username, "Blank username must be rejected");
+      check(!view.options(), "Blank username must be rejected");
       std::snprintf(view.username.data(), view.username.size(), " alice ");
       view.video_count = 3;
       view.tone = true;
-      auto publishing = view.options();
+      auto publishing = server_result(view.options());
       const auto first_dot = publishing.connection.token.find('.'),
                  last_dot = publishing.connection.token.rfind('.');
-      const auto claims = demo::sdk::Json::parse(demo::sdk::base64_decode(
-          publishing.connection.token.substr(first_dot + 1, last_dot - first_dot - 1)));
+      const auto claims = demo::sdk::Json::parse(server_result(demo::sdk::base64_decode(
+          publishing.connection.token.substr(first_dot + 1, last_dot - first_dot - 1))));
       check(claims.at("sub") == "alice" && claims.at("name") == "alice" &&
                 claims.at("video").at("room") == "demo" &&
                 claims.at("video").at("roomJoin") == true &&
                 claims.at("video").at("canPublish") == true &&
                 claims.at("video").at("canSubscribe") == true,
             "Username must produce a room-scoped publish/subscribe token");
-      bool whitespace_rejected = false;
-      try {
-        demo::username_options(view.url.data(), " \t", "alice");
-      } catch (const std::invalid_argument&) {
-        whitespace_rejected = true;
-      }
-      check(whitespace_rejected, "Whitespace room must be rejected");
+      check(!demo::username_options(view.url.data(), " \t", "alice"),
+            "Whitespace room must be rejected");
       check(publishing.media.size() == 4 && publishing.media[0].video &&
                 publishing.media[2].video && !publishing.media[3].video,
             "Multiple videos and independent tone");
       view.video_count = -1;
-      check(view.options().media.size() == 1, "Negative video count");
+      check(server_result(view.options()).media.size() == 1, "Negative video count");
       view.video_count = 99;
-      check(view.options().media.size() == demo::max_test_videos + 1, "Video count limit");
+      check(server_result(view.options()).media.size() == demo::max_test_videos + 1,
+            "Video count limit");
       view.video_count = 2;
       view.tone = false;
       auto extra = t;
@@ -492,7 +482,7 @@ int main(int argc, char** argv) {
         ImGui::Render();
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
-        demo::render_draw_data(renderer);
+        server_result(demo::render_draw_data(renderer));
       };
       render(state);
       render(state);
@@ -638,8 +628,5 @@ int main(int argc, char** argv) {
     SDL_DestroyWindow(window);
     SDL_Quit();
     std::cout << "Demo model, I420 and ImGui renderer tests passed\n";
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
   }
 }

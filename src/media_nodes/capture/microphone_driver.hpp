@@ -17,7 +17,7 @@ class MicrophoneDriver {
   virtual ~MicrophoneDriver() = default;
   // Callbacks are serialized, may begin inside start(), and must not escape stop().
   // stop() must also clean up a partially failed start().
-  virtual void start(const MicrophoneOptions&, Callback) = 0;
+  virtual Result<void> start(const MicrophoneOptions&, Callback) = 0;
   virtual void stop() noexcept = 0;
 };
 

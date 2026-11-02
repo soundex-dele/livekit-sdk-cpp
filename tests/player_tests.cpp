@@ -1,4 +1,4 @@
-#include "livekit/error.hpp"
+#include "service_test_result.hpp"
 #include "livekit/player.hpp"
 #include "media_graph/channel.hpp"
 #include <cmath>
@@ -8,31 +8,33 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <source_location>
 
 using namespace livekit::sdk;
 using namespace std::chrono_literals;
 
 namespace {
 void require(bool value, const char* message) {
-  if (!value)
-    throw std::runtime_error(message);
+  if (!value) {
+    std::cerr << message << "\n";
+    std::abort();
+  }
 }
 
 template <class T>
-T get(AsyncResult<T> future) {
+T get(AsyncResult<T> future, std::source_location where = std::source_location::current()) {
   require(future.wait_for(5s) == std::future_status::ready, "control operation timed out");
-  return future.get();
+  auto result = future.get();
+  if (!result) {
+    std::cerr << where.file_name() << ":" << where.line() << ": " << result.error().message << "\n";
+    std::abort();
+  }
+  return service_value(std::move(result));
 }
 
 template <class F>
 void fails(F&& operation) {
-  bool failed = false;
-  try {
-    operation();
-  } catch (const std::exception&) {
-    failed = true;
-  }
-  require(failed, "expected operation to fail");
+  require(!operation(), "expected operation to fail");
 }
 
 struct Counts {
@@ -72,6 +74,7 @@ class Collector {
         ++count.video;
       }
       changed_.notify_all();
+      return Result<void>::success();
     };
     callbacks.audio = [this](const media::AudioFrame& frame) {
       require(frame.sample_rate == 48000 && frame.channels == 2 && frame.pcm &&
@@ -91,17 +94,19 @@ class Collector {
       ++count.audio;
       count.samples += frame.samples;
       changed_.notify_all();
+      return Result<void>::success();
     };
     callbacks.state = [this](const PlayerSnapshot& state) {
       std::lock_guard lock(mutex_);
       state_ = state;
       changed_.notify_all();
+      return Result<void>::success();
     };
-    player_.set_callbacks(std::move(callbacks), options);
+    service_value(player_.set_callbacks(std::move(callbacks), options));
   }
 
   ~Collector() {
-    player_.set_callbacks({});
+    service_value(player_.set_callbacks({}));
   }
 
   Counts drain(int64_t lower_bound = 0) {
@@ -125,7 +130,7 @@ class Collector {
     std::unique_lock lock(mutex_);
     require(changed_.wait_for(lock, 3s, [&] { return previews_.contains(generation); }),
             "paused seek did not deliver preview");
-    return previews_.at(generation);
+    return previews_.find(generation)->second;
   }
 
   uint64_t calls() const {
@@ -150,6 +155,23 @@ class Collector {
   uint64_t calls_ = 0;
 };
 
+void check_invalid_options() {
+  PlayerOptions invalid;
+  invalid.video_queue_frames = 0;
+  Player rejected(invalid);
+  const auto opened = rejected.open("unused").get();
+  require(!opened && opened.error().code == ErrorCode::invalid_argument,
+          "invalid player options must report through completion");
+  Player player;
+  PlayerOutputOptions output;
+  output.audio_ahead = -1us;
+  const auto callbacks = player.set_callbacks({}, output);
+  require(!callbacks && callbacks.error().code == ErrorCode::invalid_argument,
+          "invalid callback options must return a failure");
+  require(player.snapshot().state == PlayerState::closed,
+          "callback validation changed player state");
+}
+
 void check_demand(const std::string& path) {
   std::mutex mutex;
   std::condition_variable changed;
@@ -160,8 +182,9 @@ void check_demand(const std::string& path) {
     std::lock_guard lock(mutex);
     ++delivered;
     changed.notify_all();
+    return Result<void>::success();
   };
-  player.set_callbacks(std::move(callbacks), {PlayerAudioDelivery::on_demand});
+  service_value(player.set_callbacks(std::move(callbacks), {PlayerAudioDelivery::on_demand}));
   get(player.open(path));
   get(player.play());
   auto generation = player.snapshot().generation;
@@ -185,7 +208,7 @@ void check_demand(const std::string& path) {
   require(!player.request_audio(generation), "seek retained stale audio credit");
   // The outstanding audio branch cannot prevent lifecycle progress.
   get(player.close());
-  player.set_callbacks({});
+  service_value(player.set_callbacks({}));
 }
 
 void check_callback_fences(const std::string& path) {
@@ -196,15 +219,17 @@ void check_callback_fences(const std::string& path) {
     Player player;
     PlayerCallbacks callbacks;
     callbacks.video = [&](const auto&) {
-      player.set_callbacks({});  // Self-removal does not erase the active invocation fence.
+      service_value(
+          player.set_callbacks({}));  // Self-removal does not erase the active invocation fence.
       entered.set_value();
       require(release_result.wait_for(3s) == std::future_status::ready, "callback release timeout");
+      return Result<void>::success();
     };
-    player.set_callbacks(std::move(callbacks));
+    service_value(player.set_callbacks(std::move(callbacks)));
     get(player.open(path));
     get(player.play());
     require(entered_result.wait_for(3s) == std::future_status::ready, "callback did not start");
-    auto removal = std::async(std::launch::async, [&] { player.set_callbacks({}); });
+    auto removal = std::async(std::launch::async, [&] { service_value(player.set_callbacks({})); });
     auto lifecycle = close ? player.close() : player.pause();
     const bool removal_waited = removal.wait_for(40ms) == std::future_status::timeout;
     const bool lifecycle_waited = lifecycle.wait_for(40ms) == std::future_status::timeout;
@@ -219,156 +244,159 @@ void check_callback_fences(const std::string& path) {
 void check_callback_failure(const std::string& path) {
   std::promise<PlayerSnapshot> failed;
   auto result = failed.get_future();
-  const SDKError cause(ErrorDomain::media, ErrorCode::callback_failed, "consumer failed");
+  const auto cause =
+      make_failure(ErrorDomain::media, ErrorCode::callback_failed, "consumer failed");
   Player player;
   PlayerCallbacks callbacks;
-  callbacks.video = [cause](const auto&) { throw cause; };
+  callbacks.video = [cause](const auto&) { return Result<void>::failure(cause); };
   callbacks.state = [&](const auto& state) {
     if (state.state == PlayerState::failed) {
       failed.set_value(state);
     }
+    return Result<void>::success();
   };
-  player.set_callbacks(std::move(callbacks));
+  service_value(player.set_callbacks(std::move(callbacks)));
   get(player.open(path));
   get(player.play());
   require(result.wait_for(3s) == std::future_status::ready, "callback failure was not reported");
   const auto state = result.get();
-  require(state.failure && state.failure->id == cause.failure()->id &&
+  require(state.failure && state.failure->id == cause->id &&
               player.snapshot().failure->id == state.failure->id,
           "callback failure correlation lost");
-  player.set_callbacks({});
+  service_value(player.set_callbacks({}));
   get(player.close());
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-  try {
-    require(argc == 2, "fixture directory required");
-    const std::filesystem::path root = argv[1];
-    const auto file = [&](const char* name) {
-      auto text = (root / name).u8string();
-      return std::string(text.begin(), text.end());
-    };
-    PlayerOptions options;
-    options.video_queue_frames = 2;
-    options.audio_queue_frames = 3;
-    Player player(options);
-    Collector collected(player);
-    fails([&] { get(player.play()); });
-    fails([&] { get(player.open(file("missing.mp4"))); });
-    require(player.snapshot().state == PlayerState::failed, "open failure state");
-    fails([&] { get(player.open(file("invalid.mp4"))); });
-    fails([&] { get(player.open("https://example.invalid/video.mp4")); });
-    auto info = get(player.open(file("av.mp4")));
-    require(info.has_audio && info.has_video && info.width == 160 && info.height == 90,
-            "probe failed");
-    require(info.duration_us >= 2300000 && info.duration_us <= 2500000, "incorrect duration");
-    get(player.play());
-    std::this_thread::sleep_for(150ms);  // Playback progresses without calling a media-read API.
-    auto buffered = player.snapshot();
-    require(buffered.queued_video <= 2 && buffered.queued_audio <= 3, "unbounded queue");
-    get(player.pause());
-    auto paused = player.snapshot().position_us;
-    const auto paused_calls = collected.calls();
-    std::this_thread::sleep_for(40ms);
-    require(player.snapshot().position_us == paused, "clock advanced while paused");
-    require(collected.calls() == paused_calls, "output while paused");
-    fails([&] { get(player.seek(-1us)); });
-    fails([&] { get(player.seek(10s)); });
-    require(player.snapshot().state == PlayerState::paused, "invalid seek changed state");
-    auto first = player.seek(1500ms);
-    auto second = player.seek(400ms);
-    auto third = player.seek(1800ms);
-    get(std::move(first));
-    get(std::move(second));
-    get(std::move(third));
-    require(player.snapshot().generation > buffered.generation, "seek did not advance generation");
-    const auto preview = collected.preview(player.snapshot().generation);
-    require(preview.timestamp_us >= 1800000 && preview.timestamp_us < 1840000,
-            "paused seek did not deliver target frame");
-    require(preview.generation == player.snapshot().generation, "stale preview generation");
-    const auto preview_calls = collected.calls();
-    std::this_thread::sleep_for(40ms);
-    require(player.snapshot().position_us == 1800000 && collected.calls() == preview_calls,
-            "preview advanced clock or delivered more than one frame");
-    get(player.play());
-    auto tail = collected.drain(1800000);
-    require(tail.video == 15 && tail.audio > 0, "seek did not drain final B frames/audio");
-    get(player.play());  // replay at EOS
-    auto full = collected.drain();
-    require(full.video == 60 && full.audio > 0 && full.energy > 1, "full playback decode mismatch");
-    require(full.samples >= 115000 && full.samples <= 117000, "resampled audio duration mismatch");
-    get(player.stop());
-    require(player.snapshot().state == PlayerState::ready && player.snapshot().position_us == 0,
-            "stop failed");
-    get(player.play());
-    get(player.seek(2s));  // preserve the playing state across seek
-    require(player.snapshot().state == PlayerState::playing, "playing seek paused unexpectedly");
-    const auto playing_tail = collected.drain(2000000);
-    if (playing_tail.video != 10)
-      throw std::runtime_error("playing seek tail mismatch: " + std::to_string(playing_tail.video) +
-                               " first=" + std::to_string(playing_tail.first_video));
-    const auto end_calls = collected.calls();
-    get(player.seek(std::chrono::microseconds(info.duration_us)));
-    std::this_thread::sleep_for(40ms);
-    require(collected.calls() == end_calls && player.snapshot().state == PlayerState::paused,
-            "end preview returned stale output or changed state");
-    get(player.play());
-    require(collected.drain(info.duration_us).video == 0, "seek to duration returned old frames");
-    get(player.close());
-    get(player.close());
-    require(player.snapshot().state == PlayerState::closed, "idempotent close failed");
-    for (const char* name : {"audio.wav", "video.mp4", "offset.ts"}) {
-      auto stream = get(player.open(file(name)));
-      get(player.seek(0us));
-      get(player.play());
-      auto count = collected.drain();
-      if ((count.video > 0) != stream.has_video || (count.audio > 0) != stream.has_audio)
-        throw std::runtime_error(std::string("single-stream playback failed: ") + name +
-                                 " video=" + std::to_string(count.video) +
-                                 " audio=" + std::to_string(count.audio));
-      if (stream.has_video)
-        require(count.video == 10 && count.first_video == 0,
-                "start timestamp normalization/B-frame drain failed");
-      if (stream.has_audio)
-        require(std::abs(count.samples - 16800) <= 1, "resampler tail lost");
-    }
-    auto unicode = root / std::filesystem::u8path("本地 播放.wav");
-    std::filesystem::copy_file(root / "audio.wav", unicode,
-                               std::filesystem::copy_options::overwrite_existing);
-    auto utf8 = unicode.u8string();
-    get(player.open(std::string(utf8.begin(), utf8.end())));
-    get(player.play());
-    player.cancel_pending_io();
-    std::this_thread::sleep_for(50ms);
-    get(player.close());
-    // Control responsiveness while backpressured, and independent session ownership.
-    Player other;
-    Collector other_collected(other);
-    get(other.open(file("audio.wav")));
-    get(other.play());
-    get(player.open(file("av.mp4")));
-    get(player.play());
-    std::this_thread::sleep_for(100ms);
-    get(player.close());
-    require(other_collected.drain().audio > 0, "closing one player affected another");
-    PlayerOptions tiny;
-    tiny.queue_bytes = 16;
-    Player limited(tiny);
-    Collector limited_collected(limited);
-    get(limited.open(file("video.mp4")));
-    get(limited.play());
-    limited_collected.wait_state(PlayerState::failed);
-    require(limited.snapshot().state == PlayerState::failed,
-            "oversized frame did not fail boundedly");
-    check_demand(file("audio.wav"));
-    check_callback_fences(file("video.mp4"));
-    check_callback_failure(file("video.mp4"));
-    std::cout << "PASS: probe, controls, bounded queues, seek generations, EOS, B frames, PCM, "
-                 "UTF-8, errors, session isolation\n";
-    return 0;
-  } catch (const std::exception& error) {
-    std::cerr << "FAIL: " << error.what() << '\n';
-    return 1;
+  require(argc == 2, "fixture directory required");
+  check_invalid_options();
+  const std::filesystem::path root = argv[1];
+  const auto file = [&](const char* name) {
+    auto text = (root / name).u8string();
+    return std::string(text.begin(), text.end());
+  };
+  PlayerOptions options;
+  options.video_queue_frames = 2;
+  options.audio_queue_frames = 3;
+  Player player(options);
+  Collector collected(player);
+  fails([&] { return player.play().get(); });
+  fails([&] { return player.open(file("missing.mp4")).get(); });
+  require(player.snapshot().state == PlayerState::failed, "open failure state");
+  fails([&] { return player.open(file("invalid.mp4")).get(); });
+  fails([&] { return player.open("https://example.invalid/video.mp4").get(); });
+  auto info = get(player.open(file("av.mp4")));
+  require(info.has_audio && info.has_video && info.width == 160 && info.height == 90,
+          "probe failed");
+  require(info.duration_us >= 2300000 && info.duration_us <= 2500000, "incorrect duration");
+  get(player.play());
+  std::this_thread::sleep_for(150ms);  // Playback progresses without calling a media-read API.
+  auto buffered = player.snapshot();
+  require(buffered.queued_video <= 2 && buffered.queued_audio <= 3, "unbounded queue");
+  get(player.pause());
+  auto paused = player.snapshot().position_us;
+  const auto paused_calls = collected.calls();
+  std::this_thread::sleep_for(40ms);
+  require(player.snapshot().position_us == paused, "clock advanced while paused");
+  require(collected.calls() == paused_calls, "output while paused");
+  fails([&] { return player.seek(-1us).get(); });
+  fails([&] { return player.seek(10s).get(); });
+  require(player.snapshot().state == PlayerState::paused, "invalid seek changed state");
+  auto first = player.seek(1500ms);
+  auto second = player.seek(400ms);
+  auto third = player.seek(1800ms);
+  get(std::move(first));
+  get(std::move(second));
+  get(std::move(third));
+  require(player.snapshot().generation > buffered.generation, "seek did not advance generation");
+  const auto preview = collected.preview(player.snapshot().generation);
+  require(preview.timestamp_us >= 1800000 && preview.timestamp_us < 1840000,
+          "paused seek did not deliver target frame");
+  require(preview.generation == player.snapshot().generation, "stale preview generation");
+  const auto preview_calls = collected.calls();
+  std::this_thread::sleep_for(40ms);
+  require(player.snapshot().position_us == 1800000 && collected.calls() == preview_calls,
+          "preview advanced clock or delivered more than one frame");
+  get(player.play());
+  auto tail = collected.drain(1800000);
+  require(tail.video == 15 && tail.audio > 0, "seek did not drain final B frames/audio");
+  get(player.play());  // replay at EOS
+  auto full = collected.drain();
+  require(full.video == 60 && full.audio > 0 && full.energy > 1, "full playback decode mismatch");
+  require(full.samples >= 115000 && full.samples <= 117000, "resampled audio duration mismatch");
+  get(player.stop());
+  require(player.snapshot().state == PlayerState::ready && player.snapshot().position_us == 0,
+          "stop failed");
+  get(player.play());
+  get(player.seek(2s));  // preserve the playing state across seek
+  require(player.snapshot().state == PlayerState::playing, "playing seek paused unexpectedly");
+  const auto playing_tail = collected.drain(2000000);
+  if (playing_tail.video != 10) {
+    require(false, ("playing seek tail mismatch: " + std::to_string(playing_tail.video) +
+                    " first=" + std::to_string(playing_tail.first_video))
+                       .c_str());
   }
+  const auto end_calls = collected.calls();
+  get(player.seek(std::chrono::microseconds(info.duration_us)));
+  std::this_thread::sleep_for(40ms);
+  require(collected.calls() == end_calls && player.snapshot().state == PlayerState::paused,
+          "end preview returned stale output or changed state");
+  get(player.play());
+  require(collected.drain(info.duration_us).video == 0, "seek to duration returned old frames");
+  get(player.close());
+  get(player.close());
+  require(player.snapshot().state == PlayerState::closed, "idempotent close failed");
+  for (const char* name : {"audio.wav", "video.mp4", "offset.ts"}) {
+    auto stream = get(player.open(file(name)));
+    get(player.seek(0us));
+    get(player.play());
+    auto count = collected.drain();
+    if ((count.video > 0) != stream.has_video || (count.audio > 0) != stream.has_audio) {
+      require(false, (std::string("single-stream playback failed: ") + name + " video=" +
+                      std::to_string(count.video) + " audio=" + std::to_string(count.audio))
+                         .c_str());
+    }
+    if (stream.has_video) {
+      require(count.video == 10 && count.first_video == 0,
+              "start timestamp normalization/B-frame drain failed");
+    }
+    if (stream.has_audio) {
+      require(std::abs(count.samples - 16800) <= 1, "resampler tail lost");
+    }
+  }
+  auto unicode = root / std::filesystem::u8path("本地 播放.wav");
+  std::filesystem::copy_file(root / "audio.wav", unicode,
+                             std::filesystem::copy_options::overwrite_existing);
+  auto utf8 = unicode.u8string();
+  get(player.open(std::string(utf8.begin(), utf8.end())));
+  get(player.play());
+  player.cancel_pending_io();
+  std::this_thread::sleep_for(50ms);
+  get(player.close());
+  // Control responsiveness while backpressured, and independent session ownership.
+  Player other;
+  Collector other_collected(other);
+  get(other.open(file("audio.wav")));
+  get(other.play());
+  get(player.open(file("av.mp4")));
+  get(player.play());
+  std::this_thread::sleep_for(100ms);
+  get(player.close());
+  require(other_collected.drain().audio > 0, "closing one player affected another");
+  PlayerOptions tiny;
+  tiny.queue_bytes = 16;
+  Player limited(tiny);
+  Collector limited_collected(limited);
+  get(limited.open(file("video.mp4")));
+  get(limited.play());
+  limited_collected.wait_state(PlayerState::failed);
+  require(limited.snapshot().state == PlayerState::failed,
+          "oversized frame did not fail boundedly");
+  check_demand(file("audio.wav"));
+  check_callback_fences(file("video.mp4"));
+  check_callback_failure(file("video.mp4"));
+  std::cout << "PASS: probe, controls, bounded queues, seek generations, EOS, B frames, PCM, "
+               "UTF-8, errors, session isolation\n";
+  return 0;
 }

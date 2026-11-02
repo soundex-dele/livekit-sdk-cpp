@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -12,11 +13,12 @@ class Process {
   ~Process();
   Process(const Process&) = delete;
   Process& operator=(const Process&) = delete;
-  std::size_t read(void* dst, std::size_t size);
-  bool read_exact(void* dst, std::size_t size);
-  int wait();
+  livekit::sdk::Result<void> status() const;
+  livekit::sdk::Result<std::size_t> read(void* dst, std::size_t size);
+  livekit::sdk::Result<bool> read_exact(void* dst, std::size_t size);
+  livekit::sdk::Result<int> wait();
   void terminate();
-  static std::string capture(const std::vector<std::string>& args);
+  static livekit::sdk::Result<std::string> capture(const std::vector<std::string>& args);
 
  private:
   struct Impl;

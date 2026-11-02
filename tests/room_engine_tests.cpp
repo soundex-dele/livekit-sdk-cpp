@@ -1,3 +1,5 @@
+#include "test_failure.hpp"
+#include "rtc_result.hpp"
 #include "livekit/rtc/room_engine.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include "backends/rtc/execution.hpp"
@@ -20,7 +22,7 @@ using namespace std::chrono_literals;
 namespace {
 void check(bool ok, const char* message) {
   if (!ok) {
-    throw std::runtime_error(message);
+    livekit::sdk::test::fail(message);
   }
 }
 
@@ -656,7 +658,7 @@ void three_thread_contract() {
 }  // namespace
 
 int main() {
-  try {
+  {
     room_contract();
     observer_thread_contract();
     completion_contract();
@@ -671,8 +673,5 @@ int main() {
     rollback_failure_contract();
 #endif
     std::cout << "RTC room/media ownership contracts passed\n";
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
   }
 }

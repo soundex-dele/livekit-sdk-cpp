@@ -1,14 +1,13 @@
 #pragma once
 #include "livekit/transport_options.hpp"
+#include "livekit/result.hpp"
 #include "api/peer_connection_interface.h"
 #include "p2p/base/port_allocator.h"
 
 namespace livekit::sdk::detail {
-inline void apply_media_transport(webrtc::PeerConnectionInterface::RTCConfiguration& config,
-                                  MediaTransport transport, bool disable_turn) {
+inline Result<void> apply_media_transport(webrtc::PeerConnectionInterface::RTCConfiguration& config,
+                                          MediaTransport transport, bool disable_turn) {
   using PC = webrtc::PeerConnectionInterface;
-  if (disable_turn || transport != MediaTransport::automatic)
-    config.port_allocator_config.flags |= webrtc::PORTALLOCATOR_DISABLE_RELAY;
   switch (transport) {
     case MediaTransport::automatic:
       break;
@@ -22,7 +21,12 @@ inline void apply_media_transport(webrtc::PeerConnectionInterface::RTCConfigurat
           webrtc::PORTALLOCATOR_DISABLE_UDP | webrtc::PORTALLOCATOR_DISABLE_STUN;
       break;
     default:
-      throw std::invalid_argument("Invalid media_transport");
+      return Result<void>::failure(make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                                                "Invalid media_transport"));
   }
+  if (disable_turn || transport != MediaTransport::automatic) {
+    config.port_allocator_config.flags |= webrtc::PORTALLOCATOR_DISABLE_RELAY;
+  }
+  return Result<void>::success();
 }
 }  // namespace livekit::sdk::detail

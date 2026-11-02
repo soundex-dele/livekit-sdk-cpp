@@ -1,6 +1,6 @@
 #pragma once
 #include "backends/rtc/livekit/rpc_session.hpp"
-#include "livekit/error.hpp"
+#include "service_test_result.hpp"
 #include "support/compression.hpp"
 #include "support/wake_event.hpp"
 #include <atomic>
@@ -12,8 +12,10 @@ using namespace livekit::sdk;
 using namespace std::chrono_literals;
 
 inline void check(bool ok, const std::source_location at = std::source_location::current()) {
-  if (!ok)
-    throw std::runtime_error("RPC contract failed at line " + std::to_string(at.line()));
+  if (!ok) {
+    std::cerr << "RPC contract failed at line " << at.line() << '\n';
+    std::abort();
+  }
 }
 
 template <class T>
@@ -21,26 +23,16 @@ void ready(std::future<T>& future) {
   check(future.wait_for(2s) == std::future_status::ready);
 }
 
-inline void rpc_error(std::future<std::string>& future, RpcErrorCode code) {
+inline void rpc_error(std::future<Result<std::string>>& future, RpcErrorCode code) {
   ready(future);
-  bool caught = false;
-  try {
-    future.get();
-  } catch (const RpcError& e) {
-    caught = e.code() == static_cast<uint32_t>(code);
-  }
-  check(caught);
+  const auto result = future.get();
+  check(!result && result.error().backend_reason == static_cast<int>(code));
 }
 
-inline void sdk_error(std::future<std::string>& future, ErrorCode code) {
+inline void sdk_error(std::future<Result<std::string>>& future, ErrorCode code) {
   ready(future);
-  bool caught = false;
-  try {
-    future.get();
-  } catch (const SDKError& e) {
-    caught = e.code() == code;
-  }
-  check(caught);
+  const auto result = future.get();
+  check(!result && result.error().code == code);
 }
 
 inline livekit::DataPacket request(std::string id, std::string method = "echo",
@@ -78,7 +70,8 @@ inline livekit::RpcResponse read_response(detail::RpcSession& session, const std
     }
     wake->wait(observed, {}, end);
   }
-  throw std::runtime_error("RPC response deadline: " + id);
+  std::cerr << "RPC response deadline: " << id << '\n';
+  std::abort();
 }
 
 inline void indexed_deadlines() {
@@ -89,7 +82,7 @@ inline void indexed_deadlines() {
   RpcCallOptions call{"peer", "echo", "indexed"};
   call.response_timeout = 5min;
   std::vector<std::stop_source> stops(128);
-  std::vector<std::future<std::string>> pending;
+  std::vector<std::future<Result<std::string>>> pending;
   const auto observed = wake->revision();
   for (auto& stop : stops) {
     call.stop = stop.get_token();
@@ -146,7 +139,7 @@ inline void indexed_deadlines() {
   check(result.wait_for(0ms) == std::future_status::timeout);
   session.receive(response(packets[0]));
   ready(result);
-  check(result.get() == "reply");
+  check(service_value(result.get()) == "reply");
   check(session.snapshot().scheduled_deadlines == 0);
   session.disconnect();
 }
@@ -168,7 +161,7 @@ inline void run() {
   reply.set_kind(0);
   session.receive(reply);
   ready(result);
-  check(result.get() == "reply");
+  check(service_value(result.get()) == "reply");
   session.receive(reply);
   result = session.call(call);
   packets = session.take_packets();
@@ -179,10 +172,11 @@ inline void run() {
   result = session.call(call);
   packets = session.take_packets();
   reply = response(packets[0]);
-  reply.mutable_rpc_response()->set_compressed_payload(detail::deflate_raw("compressed reply"));
+  reply.mutable_rpc_response()->set_compressed_payload(
+      service_value(detail::deflate_raw("compressed reply")));
   session.receive(reply);
   ready(result);
-  check(result.get() == "compressed reply");
+  check(service_value(result.get()) == "compressed reply");
   // Error payload is retained exactly.
   result = session.call(call);
   packets = session.take_packets();
@@ -192,12 +186,10 @@ inline void run() {
   reply.mutable_rpc_response()->mutable_error()->set_data("reason");
   session.receive(reply);
   ready(result);
-  try {
-    result.get();
-    check(false);
-  } catch (const RpcError& e) {
-    check(e.code() == 2010 && e.data() == "reason" && std::string(e.what()) == "拒绝");
-  }
+  const auto rejected = result.get();
+  check(!rejected && rejected.error().backend_reason == 2010 &&
+        rejected.error().backend_data == "reason" &&
+        rejected.error().message == reply.rpc_response().error().message());
   // Cancelled work must never be taken, and responses cannot win after stop was requested.
   std::stop_source before;
   call.stop = before.get_token();
@@ -242,12 +234,12 @@ inline void run() {
   session.connect();
   // Request/ACK/response round trip, duplicate requests and duplicate completion.
   std::atomic<int> handled = 0;
-  session.register_method("echo", [&](RpcInvocation invocation, RpcCompletion done) {
+  service_value(session.register_method("echo", [&](RpcInvocation invocation, RpcCompletion done) {
     check(invocation.caller_identity == "peer");
     ++handled;
     done({invocation.payload, {}});
     done({"ignored", {}});
-  });
+  }));
   auto req = request("one");
   session.receive(req);
   check(read_response(session, "one").payload() == "hello 世界");
@@ -265,18 +257,20 @@ inline void run() {
   check(read_response(session, "compressed").error().code() == 1402);
   req = request("compressed-valid");
   req.mutable_rpc_request()->clear_payload();
-  req.mutable_rpc_request()->set_compressed_payload(detail::deflate_raw("hello 世界"));
+  req.mutable_rpc_request()->set_compressed_payload(
+      service_value(detail::deflate_raw("hello 世界")));
   session.receive(req);
   check(read_response(session, "compressed-valid").payload() == "hello 世界");
   session.receive(request("large", "echo", std::string(15361, 'x')));
   check(read_response(session, "large").error().code() == 1402);
-  session.register_method(
-      "throw", [](auto, auto) { throw std::runtime_error("private application secret"); });
-  session.receive(request("exception", "throw"));
-  auto error = read_response(session, "exception").error();
+  service_value(session.register_method("application-failure", [](auto, RpcCompletion done) {
+    done({{}, RpcError(RpcErrorCode::application_error, "RPC application error")});
+  }));
+  session.receive(request("failure", "application-failure"));
+  auto error = read_response(session, "failure").error();
   check(error.code() == 1500 && error.message().find("secret") == std::string::npos);
-  session.register_method("huge",
-                          [](auto, RpcCompletion done) { done({std::string(15361, 'x'), {}}); });
+  service_value(session.register_method(
+      "huge", [](auto, RpcCompletion done) { done({std::string(15361, 'x'), {}}); }));
   session.receive(request("huge", "huge"));
   check(read_response(session, "huge").error().code() == 1504);
   session.unregister_method("echo");
@@ -286,9 +280,9 @@ inline void run() {
   std::promise<std::pair<RpcInvocation, RpcCompletion>> first, second;
   auto f1 = first.get_future(), f2 = second.get_future();
   int generation = 0;
-  session.register_method("hold", [&](auto invocation, auto done) {
+  service_value(session.register_method("hold", [&](auto invocation, auto done) {
     (generation++ == 0 ? first : second).set_value({invocation, done});
-  });
+  }));
   session.receive(request("reused", "hold"));
   ready(f1);
   auto old = f1.get();
@@ -306,25 +300,29 @@ inline void run() {
   // Deadline cancellation works independently of application completion.
   std::promise<RpcInvocation> incoming;
   auto invocation = incoming.get_future();
-  session.register_method("timeout", [&](auto info, auto) { incoming.set_value(info); });
+  service_value(
+      session.register_method("timeout", [&](auto info, auto) { incoming.set_value(info); }));
   req = request("timeout", "timeout");
   req.mutable_rpc_request()->set_response_timeout_ms(200);
   session.receive(req);
   ready(invocation);
   auto timed = invocation.get();
   check(read_response(session, "timeout").error().code() == 1502);
-  for (int i = 0; i < 100 && !timed.stop.stop_requested(); ++i)
+  for (int i = 0; i < 100 && !timed.stop.stop_requested(); ++i) {
     std::this_thread::sleep_for(1ms);
+  }
   check(timed.stop.stop_requested());
   // Bounded outbound work and ACK timeout (one real seven-second wait).
-  std::vector<std::future<std::string>> pending;
-  for (int i = 0; i < 128; ++i)
+  std::vector<std::future<Result<std::string>>> pending;
+  for (int i = 0; i < 128; ++i) {
     pending.push_back(session.call(call));
+  }
   result = session.call(call);
   sdk_error(result, ErrorCode::resource_exhausted);
   session.disconnect();
-  for (auto& future : pending)
+  for (auto& future : pending) {
     rpc_error(future, RpcErrorCode::recipient_disconnected);
+  }
   session.connect();
   result = session.call(call);
   session.take_packets();
@@ -335,27 +333,30 @@ inline void run() {
   auto cancellation = cancel_observed.get_future();
   using Callback = std::stop_callback<std::function<void()>>;
   std::vector<std::unique_ptr<Callback>> cancellation_callbacks;
-  session.register_method("capacity", [&](RpcInvocation invocation, RpcCompletion) {
-    if (cancellation_callbacks.empty())
+  service_value(session.register_method("capacity", [&](RpcInvocation invocation, RpcCompletion) {
+    if (cancellation_callbacks.empty()) {
       cancellation_callbacks.push_back(
           std::make_unique<Callback>(invocation.stop, std::function<void()>([&] {
-                                       session.unregister_method("throw");
+                                       session.unregister_method("application-failure");
                                        cancel_observed.set_value();
                                      })));
-  });
+    }
+  }));
   session.disconnect();
   session.connect();
   // Wait for each starter to run to avoid testing the separate dispatch queue bound here.
   std::atomic<int> started = 0;
-  session.register_method("count", [&](auto, auto) { ++started; });
+  service_value(session.register_method("count", [&](auto, auto) { ++started; }));
   for (int i = 0; i < 128; ++i) {
     auto pending = request("capacity-" + std::to_string(i), i ? "count" : "capacity");
     pending.mutable_rpc_request()->set_response_timeout_ms(300000);
     session.receive(pending);
     session.take_packets();
-    if (i)
-      for (int spins = 0; started < i && spins < 2000; ++spins)
+    if (i) {
+      for (int spins = 0; started < i && spins < 2000; ++spins) {
         std::this_thread::sleep_for(1ms);
+      }
+    }
   }
   check(started == 127);
   session.receive(request("overflow"));
@@ -369,9 +370,9 @@ inline void run() {
   std::promise<RpcCompletion> cached_first, cached_second;
   auto c1 = cached_first.get_future(), c2 = cached_second.get_future();
   std::atomic<int> cache_generation = 0;
-  session.register_method("cache", [&](auto, auto done) {
+  service_value(session.register_method("cache", [&](auto, auto done) {
     (cache_generation++ == 0 ? cached_first : cached_second).set_value(done);
-  });
+  }));
   session.receive(request("evicted", "cache"));
   ready(c1);
   auto stale = c1.get();

@@ -13,7 +13,7 @@ class AudioOutputDriver {
   using Render = std::function<void(std::span<int16_t>)>;
   using Failure = std::function<void(std::string)>;
   virtual ~AudioOutputDriver() = default;
-  virtual void start(const AudioOutputOptions&, Render, Failure) = 0;
+  virtual Result<void> start(const AudioOutputOptions&, Render, Failure) = 0;
   virtual void stop() noexcept = 0;
 };
 

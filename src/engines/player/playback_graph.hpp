@@ -10,8 +10,8 @@ class PlaybackGraph {
   enum class Step { progress, backpressured, end };
   PlaybackGraph(std::atomic<bool>& cancel, const PlayerOptions& options);
   ~PlaybackGraph();
-  PlayerMediaInfo open(const std::string& path);
-  Step step();  // One bounded executor sweep; media travels through subscriptions.
+  Result<PlayerMediaInfo> open(const std::string& path);
+  Result<Step> step();  // One bounded executor sweep; media travels through subscriptions.
   int64_t end_us() const;
   std::shared_ptr<PlaybackOutputs> outputs() const;
 
@@ -24,9 +24,9 @@ class PlaybackGraph {
 
   std::vector<NodeInfo> nodes() const;
   std::vector<graphflow::core::GraphEdge> edges() const;
-  void seek(int64_t position);
-  void start();
-  void pause();
+  Result<void> seek(int64_t position);
+  Result<void> start();
+  Result<void> pause();
 
  private:
   class Impl;

@@ -1,6 +1,6 @@
 #pragma once
 #include "livekit/audio_source.hpp"
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include <functional>
 
 namespace livekit::sdk {
@@ -38,16 +38,16 @@ class MicrophoneSession final {
   std::shared_ptr<PcmAudioSource> source() const;
   // Attach/start the source reader before start(). Calls are serialized internally.
   // stop() fences device callbacks and permits a subsequent start().
-  void start();
+  Result<void> start();
   void stop();
   MicrophoneSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> status() const;
 
  private:
   friend struct detail::MicrophoneFactory;
   friend class rtc::nodes::MediaInputNode;
   // The exclusive reader installs a retainable node failure reporter.
-  void set_failure_handler(std::function<void(std::exception_ptr)>);
+  void set_failure_handler(std::function<void(Failure)>);
   MicrophoneSession(MicrophoneOptions, std::unique_ptr<detail::MicrophoneDriver>);
   struct Impl;
   std::unique_ptr<Impl> impl_;

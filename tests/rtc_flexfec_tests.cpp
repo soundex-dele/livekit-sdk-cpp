@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #include "native_completion_wait.hpp"
 #include "backends/webrtc/encoded_video_sender.hpp"
 #include "backends/webrtc/native_peer.hpp"
@@ -26,7 +27,7 @@ using namespace livekit::sdk::test;
 namespace {
 void check(bool value, const char* message) {
   if (!value) {
-    throw std::runtime_error(message);
+    livekit::sdk::test::fail(message);
   }
 }
 
@@ -605,10 +606,10 @@ void sfu_case(Codec codec, bool discard_fec, bool downstream, bool receiver_fec)
             "SFU FlexFEC recovery assertion failed");
       return;
     } else {
-      throw std::runtime_error("Unknown SFU test command");
+      livekit::sdk::test::fail("Unknown SFU test command");
     }
   }
-  throw std::runtime_error("SFU fixture ended before finish");
+  livekit::sdk::test::fail("SFU fixture ended before finish");
 }
 
 void options_and_selection() {
@@ -642,7 +643,7 @@ void options_and_selection() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  try {
+  {
     webrtc::LogMessage::LogToDebug(webrtc::LS_ERROR);
     if (argc >= 3 && std::string(argv[1]) == "--sfu") {
       const std::string codec(argv[2]);
@@ -664,8 +665,5 @@ int main(int argc, char** argv) {
     video_case(Codec::h265, true, true);
     video_case(Codec::h265, false, false);
     std::cout << "FlexFEC negotiation, SRTP loss recovery and fallback passed\n";
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
   }
 }

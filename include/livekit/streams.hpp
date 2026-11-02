@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/operation.hpp"
 #include <chrono>
 #include <filesystem>
@@ -40,14 +41,15 @@ struct StreamInfo {
 };
 
 // Reads may block only the caller. EOF is nullopt; timeout, cancellation and
-// abnormal completion throw SDKError. An acquired chunk owns its storage.
+// abnormal completion returns a failure. An acquired chunk owns its storage.
 class StreamReader {
  public:
   StreamInfo info() const;
-  std::optional<std::vector<uint8_t>> read(
+  Result<std::optional<std::vector<uint8_t>>> read(
       std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
-  std::vector<uint8_t> read_all(size_t max_bytes = 16 * 1024 * 1024, std::stop_token stop = {});
-  std::string read_all_text(size_t max_bytes = 16 * 1024 * 1024, std::stop_token stop = {});
+  Result<std::vector<uint8_t>> read_all(size_t max_bytes = 16 * 1024 * 1024,
+                                        std::stop_token stop = {});
+  Result<std::string> read_all_text(size_t max_bytes = 16 * 1024 * 1024, std::stop_token stop = {});
   void close();
 
  private:
@@ -69,9 +71,11 @@ class StreamWriter {
     return info_;
   }
 
-  std::future<void> write(std::span<const uint8_t> bytes, const OperationOptions& operation = {});
-  std::future<void> write(const std::string& text, const OperationOptions& operation = {});
-  std::future<void> close(const std::string& reason = {}, const OperationOptions& operation = {});
+  std::future<Result<void>> write(std::span<const uint8_t> bytes,
+                                  const OperationOptions& operation = {});
+  std::future<Result<void>> write(const std::string& text, const OperationOptions& operation = {});
+  std::future<Result<void>> close(const std::string& reason = {},
+                                  const OperationOptions& operation = {});
 
  private:
   StreamWriter(std::weak_ptr<detail::StreamSession> session, uint64_t generation, StreamInfo info)
@@ -89,5 +93,6 @@ using TextStreamWriter = StreamWriter;
 using ByteStreamWriter = StreamWriter;
 // Runs outside the signaling thread. Consume the reader or hand it to another
 // application thread; handlers must return after cancellation/reader closure.
-using StreamHandler = std::function<void(std::shared_ptr<StreamReader>)>;
+// A failed handler completes its reader with the same diagnostic record.
+using StreamHandler = std::function<Result<void>(std::shared_ptr<StreamReader>)>;
 }  // namespace livekit::sdk

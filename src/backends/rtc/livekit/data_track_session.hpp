@@ -1,4 +1,5 @@
 #pragma once
+#include "backends/rtc/livekit/service_result.hpp"
 #include "livekit/data_track.hpp"
 #include "livekit/encryption.hpp"
 #include "livekit.pb.h"
@@ -16,37 +17,38 @@ struct DataFrameQueue {
   std::deque<DataFrame> frames;
   size_t bytes = 0, capacity = 8;
   bool closed = false;
-  std::exception_ptr error;
+  Failure error;
   DataTrackStats stats;
-  void close(std::exception_ptr failure = {});
+  void close(Failure failure = {});
 };
 
 class DataTrackSession : public std::enable_shared_from_this<DataTrackSession> {
  public:
   void connect();
-  void configure(EncryptionOptions encryption);
+  Result<void> configure(EncryptionOptions encryption);
   void disconnect();
   void resume();
   void rejoin();
   std::vector<LocalDataTrack> local_tracks();
   void packet_sent(std::span<const uint8_t> packet, bool success);
-  std::future<LocalDataTrack> publish(std::string name, DataTrackOptions options,
+  std::future<Result<LocalDataTrack>> publish(std::string name, DataTrackOptions options,
+                                              OperationOptions operation);
+  std::future<Result<void>> unpublish(uint64_t generation, uint16_t handle,
                                       OperationOptions operation);
-  std::future<void> unpublish(uint64_t generation, uint16_t handle, OperationOptions operation);
-  DataTrackInfo info(uint64_t generation, uint16_t handle);
-  DataTrackStats stats(uint64_t generation, uint16_t handle);
-  void write(uint64_t generation, uint16_t handle, DataFrame frame);
+  Result<DataTrackInfo> info(uint64_t generation, uint16_t handle);
+  Result<DataTrackStats> stats(uint64_t generation, uint16_t handle);
+  Result<void> write(uint64_t generation, uint16_t handle, DataFrame frame);
   std::vector<RemoteDataTrack> remote_tracks();
-  std::future<std::shared_ptr<DataTrackStream>> subscribe(uint64_t generation,
-                                                          const std::string& sid,
-                                                          DataSubscribeOptions options,
-                                                          OperationOptions operation);
+  std::future<Result<std::shared_ptr<DataTrackStream>>> subscribe(uint64_t generation,
+                                                                  const std::string& sid,
+                                                                  DataSubscribeOptions options,
+                                                                  OperationOptions operation);
   void participant(const livekit::ParticipantInfo& participant);
-  void receive_signal(const livekit::SignalResponse& response);
-  void receive_packet(std::span<const uint8_t> packet);
-  bool needs_publisher();
-  std::vector<livekit::SignalRequest> take_signals();
-  std::optional<std::vector<uint8_t>> take_packet();
+  Result<void> receive_signal(const livekit::SignalResponse& response);
+  Result<void> receive_packet(std::span<const uint8_t> packet);
+  Result<bool> needs_publisher();
+  Result<std::vector<livekit::SignalRequest>> take_signals();
+  Result<std::optional<std::vector<uint8_t>>> take_packet();
   void sync(livekit::SyncState& state);
 
  private:
@@ -64,8 +66,8 @@ class DataTrackSession : public std::enable_shared_from_this<DataTrackSession> {
     DataTrackStats stats;
     uint16_t sequence = 0, frame_number = 0;
     std::deque<std::vector<uint8_t>> sending, latest;
-    std::shared_ptr<std::promise<LocalDataTrack>> publish;
-    std::shared_ptr<std::promise<void>> unpublish;
+    std::shared_ptr<livekit::sdk::detail::ServicePromise<LocalDataTrack>> publish;
+    std::shared_ptr<livekit::sdk::detail::ServicePromise<void>> unpublish;
     Pending pending;
     bool restoring = false;
   };
@@ -83,7 +85,7 @@ class DataTrackSession : public std::enable_shared_from_this<DataTrackSession> {
   };
 
   struct Waiter {
-    std::shared_ptr<std::promise<std::shared_ptr<DataTrackStream>>> promise;
+    std::shared_ptr<livekit::sdk::detail::ServicePromise<std::shared_ptr<DataTrackStream>>> promise;
     std::shared_ptr<DataFrameQueue> queue;
     Pending pending;
   };
@@ -101,8 +103,8 @@ class DataTrackSession : public std::enable_shared_from_this<DataTrackSession> {
     DataTrackStats stats;
   };
 
-  void tick();
-  void clear_remote(Remote& remote, std::exception_ptr failure);
+  Result<void> tick();
+  void clear_remote(Remote& remote, Failure failure);
   void subscription_signal(const std::string& sid, bool subscribe,
                            std::optional<uint32_t> fps = {});
   mutable std::mutex mutex_;

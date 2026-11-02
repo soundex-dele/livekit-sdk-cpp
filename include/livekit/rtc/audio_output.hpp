@@ -1,5 +1,5 @@
 #pragma once
-#include <exception>
+#include "livekit/result.hpp"
 #include <functional>
 #include "livekit/rtc/audio_nodes.hpp"
 #include "livekit/rtc/audio_output_options.hpp"
@@ -43,10 +43,10 @@ class AudioOutputSession final : public std::enable_shared_from_this<AudioOutput
   // Construct the session with shared ownership before opening tracks.
   // Failure callbacks run on the device reporting thread, outside mixer locks.
   // They must enqueue lifecycle work and must not stop the device themselves.
-  using FailureHandler = std::function<void(std::exception_ptr)>;
-  std::shared_ptr<AudioOutputTrack> open_track(TrackId, FailureHandler = {});
+  using FailureHandler = std::function<void(Failure)>;
+  Result<std::shared_ptr<AudioOutputTrack>> open_track(TrackId, FailureHandler = {});
   AudioOutputSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> status() const;
 
  private:
   friend class AudioOutputTrack;
@@ -65,7 +65,7 @@ class AudioOutputTrack final {
   // Gaps produce silence. Late/overlapping frames are dropped. Overflow or a
   // timestamp jump beyond max_latency flushes this track and reanchors it.
   bool write(const nodes::AudioFrameEvent&);
-  void set_gain(float);  // 0..4; saturation happens after mixing all tracks.
+  Result<void> set_gain(float);  // 0..4; saturation happens after mixing all tracks.
   void set_muted(bool);  // Clears only this track's queue on each transition.
   void close();          // Fences this track out of subsequent render callbacks.
   AudioOutputTrackSnapshot snapshot() const;
@@ -85,10 +85,10 @@ class AudioOutputNode final : public graphflow::core::GraphNode {
   AudioOutputNode(std::string name, TrackId, std::shared_ptr<AudioOutputSession>);
   ~AudioOutputNode() override;
   void quiesce();
-  void set_gain(float);
+  Result<void> set_gain(float);
   void set_muted(bool);
   AudioOutputTrackSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> status() const;
 
  protected:
   bool doInit() override;

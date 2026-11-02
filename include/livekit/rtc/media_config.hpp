@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include <mutex>
 #include "livekit/media_core/frame_view.hpp"
 #include "livekit/rtc/audio_processing.hpp"
@@ -52,9 +52,10 @@ struct MediaOutput {
   // Runs on this output's bounded dispatcher. Slow callbacks drop only this
   // branch's backlog. Never wait for engine lifecycle operations from callbacks:
   // shutdown waits for the in-flight callback. Retained samples own their data.
-  std::function<void(const VideoSample&)> video;
-  std::function<void(const AudioSample&)> audio;
-  std::function<void(const media::FrameView&)> frame;
+  // Return a failure to fail this branch. Callbacks must not raise exceptions.
+  std::function<Result<void>(const VideoSample&)> video;
+  std::function<Result<void>(const AudioSample&)> audio;
+  std::function<Result<void>(const media::FrameView&)> frame;
   bool playout = false;
   std::filesystem::path recording;
   QueueLimits queue{4, 32 * 1024 * 1024, std::chrono::milliseconds(250)};
@@ -92,9 +93,9 @@ struct MediaPublishSpec {
   std::shared_ptr<SharedMediaInput> shared_input;  // Replaces input; raw format must match track.
   // Optional replacement for an encoded H265 input. Called on the control worker
   // after the old graph has stopped; return an H264 encoded or raw input. Must
-  // return promptly, must not call engine controls, and may throw to fail the
+  // return promptly, must not call engine controls, and return a failure to fail the
   // replacement. Without this callback an encoded source cannot be downgraded.
-  std::function<MediaInput()> h264_fallback_input;
+  std::function<Result<MediaInput>()> h264_fallback_input;
 };
 
 struct MediaSubscribeSpec {

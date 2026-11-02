@@ -19,7 +19,6 @@ class PacketEventLog final : public webrtc::RtcEventLog {
   void StopLogging() override {}
 
   void Log(std::unique_ptr<webrtc::RtcEvent> event) override {
-    try {
       switch (event->GetType()) {
         case webrtc::RtcEvent::Type::RtpPacketIncoming:
           rtp(static_cast<const webrtc::RtcEventRtpPacketIncoming&>(*event), true);
@@ -36,8 +35,6 @@ class PacketEventLog final : public webrtc::RtcEventLog {
         default:
           break;
       }
-    } catch (...) { /* Observer allocation failure must not unwind native transport. */
-    }
   }
 
  private:

@@ -1,4 +1,5 @@
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
+#include "media_graph/failure.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
 #include "backends/webrtc/pcm_resampler.hpp"
@@ -36,6 +37,7 @@ struct AudioCodecNode::Impl {
     size_t bytes;
   };
 
+  Failure initialization_failure;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
   std::deque<Job> jobs;
@@ -62,7 +64,8 @@ struct AudioCodecNode::Impl {
         options.jitter_min_delay.count() < 0 ||
         options.jitter_max_delay < options.jitter_min_delay ||
         (options.jitter_buffer && options.jitter_max_delay > options.max_age)) {
-      throw std::invalid_argument("Invalid audio codec node configuration");
+      initialization_failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                            "Invalid audio codec node configuration");
     }
   }
 
@@ -73,24 +76,23 @@ struct AudioCodecNode::Impl {
     ++generation;
   }
 
-  void fail(std::string message) {
-    std::exception_ptr error;
+  void fail(Failure error) {
     {
       std::lock_guard lock(mutex);
       if (!stats.error.empty()) {
         return;
       }
-      stats.error = message;
-      error = normalized_failure(std::current_exception()
-                                     ? std::current_exception()
-                                     : std::make_exception_ptr(std::runtime_error(message)),
-                                 {"codec", descriptor.id, owner.getName(), epoch},
-                                 ErrorDomain::media, ErrorCode::processing_failed);
+      stats.error = error->message;
       active = false;
       discard_locked();
       changed.notify_all();
     }
-    owner.reportFailure(error);
+    owner.reportError(livekit::sdk::detail::graph_error(
+        with_context(std::move(error), {"codec", descriptor.id, owner.getName(), epoch})));
+  }
+
+  void fail(std::string message) {
+    fail(make_failure(ErrorDomain::media, ErrorCode::processing_failed, std::move(message)));
   }
 
   void update(const SenderFeedback& value) {
@@ -214,7 +216,8 @@ struct AudioCodecNode::Impl {
     ++stats.dropped;
   }
 
-  void decode_realtime(std::stop_token stop, std::promise<void>& started, bool& ready) {
+  Result<void> decode_realtime(std::stop_token stop,
+                               std::promise<livekit::sdk::Result<void>>& started, bool& ready) {
     using namespace std::chrono_literals;
     const auto env = webrtc::CreateEnvironment();
     auto factory = webrtc::CreateBuiltinAudioDecoderFactory();
@@ -244,10 +247,12 @@ struct AudioCodecNode::Impl {
 
     std::deque<Reservation> reservations;
     size_t retained_bytes = 0;
-    const auto reset = [&](const Timing& timing) {
+    const auto reset = [&](const Timing& timing) -> Result<void> {
       neteq = neteq_factory.Create(env, config, factory);
       if (!neteq || !neteq->RegisterPayloadType(111, format)) {
-        throw std::runtime_error("Unable to create Opus jitter decoder");
+        return livekit::sdk::Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         "Unable to create Opus jitter decoder"));
       }
       binding = timing;
       reference_timestamp = output_timestamp = timing.timestamp;
@@ -258,8 +263,9 @@ struct AudioCodecNode::Impl {
       playing = true;
       boundary = true;
       discontinuity();
+      return livekit::sdk::Result<void>::success();
     };
-    started.set_value();
+    started.set_value(livekit::sdk::Result<void>::success());
     ready = true;
     while (!stop.stop_requested()) {
       std::deque<Job> incoming;
@@ -291,7 +297,9 @@ struct AudioCodecNode::Impl {
           }
         }
         if (!playing) {
-          reset(job.timing);
+          if (auto result = reset(job.timing); !result) {
+            return result;
+          }
         }
         const auto& packet = std::get<EncodedFrame>(job.frame);
         if (packet.buffer.size() > options.max_bytes ||
@@ -299,7 +307,9 @@ struct AudioCodecNode::Impl {
             reservations.size() >= options.max_frames) {
           // Flush NetEq's internal copies too; clearing the ingress queue alone
           // would not enforce the configured receive memory budget.
-          reset(job.timing);
+          if (auto result = reset(job.timing); !result) {
+            return result;
+          }
         }
         webrtc::RTPHeader header;
         header.payloadType = 111;
@@ -385,14 +395,14 @@ struct AudioCodecNode::Impl {
       output_timestamp += 480;
       next += 10ms;
     }
+    return livekit::sdk::Result<void>::success();
   }
 
-  void run(std::stop_token stop, std::promise<void> started) {
+  void run(std::stop_token stop, std::promise<livekit::sdk::Result<void>> started) {
     bool ready = false;
-    try {
+    const auto outcome = [&]() -> Result<void> {
       if (!encode && options.jitter_buffer) {
-        decode_realtime(stop, started, ready);
-        return;
+        return decode_realtime(stop, started, ready);
       }
       // Keep the environment and factories alive until codec destruction.
       const auto env = webrtc::CreateEnvironment();
@@ -411,14 +421,18 @@ struct AudioCodecNode::Impl {
         encoder = encoder_factory->Create(env, format, codec_options);
         if (!encoder || encoder->SampleRateHz() != 48000 ||
             encoder->NumChannels() != descriptor.format.channels)
-          throw std::runtime_error("Opus encoder configuration failed");
+          return livekit::sdk::Result<void>::failure(
+              make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                           "Opus encoder configuration failed"));
       } else {
         decoder = decoder_factory->Create(env, format, {});
         if (!decoder || decoder->SampleRateHz() != 48000 ||
             decoder->Channels() != descriptor.format.channels)
-          throw std::runtime_error("Opus decoder configuration failed");
+          return livekit::sdk::Result<void>::failure(
+              make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                           "Opus decoder configuration failed"));
       }
-      started.set_value();
+      started.set_value(livekit::sdk::Result<void>::success());
       ready = true;
       Epoch codec_epoch = 0;
       uint64_t codec_generation = 0;
@@ -492,22 +506,29 @@ struct AudioCodecNode::Impl {
             input_samples = converted;
           }
           const auto normalized = resampler->process(input_samples);
+          if (!normalized) {
+            return livekit::sdk::Result<void>::failure(normalized.failure_record());
+          }
           if (!packet_start) {
             packet_start = timing;
             packet_chunks = 0;
             packet_length = encoder->Num10MsFramesInNextPacket();
             if (!packet_length || packet_length > 12)
-              throw std::runtime_error("Invalid Opus packet duration");
+              return livekit::sdk::Result<void>::failure(
+                  make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                               "Invalid Opus packet duration"));
           }
           webrtc::Buffer bytes;
           const auto result = encoder->Encode(uint32_t(timing.timestamp),
-                                              {normalized.data(), normalized.size()}, &bytes);
+                                              {normalized->data(), normalized->size()}, &bytes);
           ++packet_chunks;
           expected = timing.timestamp + 480;
           if (result.encoded_bytes) {
             if (result.encoded_timestamp != uint32_t(packet_start->timestamp) ||
                 bytes.size() != result.encoded_bytes)
-              throw std::runtime_error("Opus encoder lost packet timing");
+              return livekit::sdk::Result<void>::failure(
+                  make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                               "Opus encoder lost packet timing"));
             if (bytes.size() <= options.max_bytes && output_allowed(*packet_start)) {
               EncodedFrame frame;
               frame.buffer =
@@ -565,14 +586,12 @@ struct AudioCodecNode::Impl {
         codec_epoch = timing.epoch;
         codec_generation = timing.generation;
       }
-    } catch (const std::exception& error) {
+      return livekit::sdk::Result<void>::success();
+    }();
+    if (!outcome) {
       if (!ready)
-        started.set_exception(std::current_exception());
-      fail(error.what());
-    } catch (...) {
-      if (!ready)
-        started.set_exception(std::current_exception());
-      fail("Unknown audio codec error");
+        started.set_value(outcome);
+      fail(outcome.failure_record());
     }
   }
 };
@@ -588,6 +607,10 @@ AudioCodecNode::~AudioCodecNode() {
 }
 
 bool AudioCodecNode::doInit() {
+  if (impl_->initialization_failure) {
+    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
+    return false;
+  }
   if (impl_->encode) {
     subscribe<AudioFrameEvent>([this](const auto& value) { impl_->raw(value); });
     subscribe<SenderFeedbackEvent>([this](const auto& value) { impl_->update(value.feedback); });
@@ -603,19 +626,18 @@ bool AudioCodecNode::doStart() {
       return false;
     impl_->active = true;
   }
-  std::promise<void> started;
+  std::promise<livekit::sdk::Result<void>> started;
   auto result = started.get_future();
   impl_->worker = std::jthread([this, started = std::move(started)](std::stop_token stop) mutable {
     detail::CallbackScope worker_scope;
     impl_->run(stop, std::move(started));
   });
-  try {
-    result.get();
-    return true;
-  } catch (...) {
+  auto status = result.get();
+  if (!status) {
     quiesce();
-    throw;
+    return false;
   }
+  return true;
 }
 
 void AudioCodecNode::quiesce() {
@@ -640,9 +662,13 @@ AudioCodecSnapshot AudioCodecNode::snapshot() const {
   return impl_->stats;
 }
 
-void AudioCodecNode::throw_if_failed() const {
-  if (auto error = failure()) {
-    std::rethrow_exception(error);
+Result<void> AudioCodecNode::status() const {
+  if (impl_->initialization_failure) {
+    return livekit::sdk::Result<void>::failure(impl_->initialization_failure);
   }
+  if (auto value = error()) {
+    return livekit::sdk::Result<void>::failure(livekit::sdk::detail::graph_failure(*value));
+  }
+  return livekit::sdk::Result<void>::success();
 }
 }  // namespace livekit::sdk::rtc::nodes

@@ -10,17 +10,45 @@
 #include "libyuv/convert_argb.h"
 
 namespace livekit::sdk {
-void studio_mix(std::vector<float>& a, const std::vector<float>& b, float gain) {
+using studio_detail::failed;
+
+Result<void> studio_detail::validate_layers(const Layers& layers) {
+  for (const auto& [source, image] : layers) {
+    if (!source.visible || !image)
+      continue;
+    if (image->width < 1 || image->height < 1 || image->width > 8192 || image->height > 8192 ||
+        image->rgba.size() < size_t(image->width) * image->height * 4)
+      return failed("Invalid layer image", ErrorCode::invalid_argument);
+    const auto& t = source.transform;
+    for (float value :
+         {t.x, t.y, t.width, t.height, t.rotation, t.crop_left, t.crop_top, t.crop_right,
+          t.crop_bottom, source.chroma.similarity, source.chroma.smoothness, source.chroma.spill})
+      if (!std::isfinite(value))
+        return failed("Invalid layer parameter", ErrorCode::invalid_argument);
+    if (t.width <= 0 || t.height <= 0 || t.width > 8 || t.height > 8 || std::abs(t.x) > 8 ||
+        std::abs(t.y) > 8 || t.crop_left < 0 || t.crop_top < 0 || t.crop_right < 0 ||
+        t.crop_bottom < 0 || t.crop_left + t.crop_right >= 1 || t.crop_top + t.crop_bottom >= 1)
+      return failed("Invalid layer transform", ErrorCode::invalid_argument);
+    for (float value : source.chroma.color)
+      if (!std::isfinite(value) || value < 0 || value > 1)
+        return failed("Invalid chroma color", ErrorCode::invalid_argument);
+  }
+  return Result<void>::success();
+}
+
+Result<void> studio_mix(std::vector<float>& a, const std::vector<float>& b, float gain) {
   if (!std::isfinite(gain) || gain < 0 || gain > 4)
-    throw std::invalid_argument("Invalid audio gain");
+    return failed("Invalid audio gain", ErrorCode::invalid_argument);
   for (size_t i = 0; i < std::min(a.size(), b.size()); ++i)
     if (std::isfinite(b[i]))
       a[i] += b[i] * gain;
+  return Result<void>::success();
 }
 
-StudioImage studio_composite_cpu(int w, int h, const studio_detail::Layers& layers) {
+Result<StudioImage> studio_composite_cpu(int w, int h, const studio_detail::Layers& layers) {
   if (w < 2 || h < 2 || w > 3840 || h > 3840)
-    throw std::invalid_argument("Invalid canvas");
+    return failed("Invalid canvas", ErrorCode::invalid_argument);
+  LK_STUDIO_TRY(studio_detail::validate_layers(layers));
   StudioImage out{w, h, std::vector<uint8_t>(size_t(w) * h * 4)};
   for (size_t i = 3; i < out.rgba.size(); i += 4)
     out.rgba[i] = 255;
@@ -62,16 +90,19 @@ StudioImage studio_composite_cpu(int w, int h, const studio_detail::Layers& laye
         q[2] = uint8_t(std::clamp(b * 255 * alpha + q[2] * (1 - alpha), 0.f, 255.f));
       }
   }
-  return out;
+  return Result<StudioImage>::success(std::move(out));
 }
 
 namespace studio_detail {
 #ifdef _WIN32
 using Microsoft::WRL::ComPtr;
 
-static void check(HRESULT hr) {
-  if (FAILED(hr))
-    throw std::runtime_error("Studio D3D11 error: " + std::to_string(uint32_t(hr)));
+static Result<void> check(HRESULT hr) {
+  if (FAILED(hr)) {
+    return failed("Studio D3D11 error: " + std::to_string(uint32_t(hr)),
+                  ErrorCode::processing_failed, static_cast<int>(hr));
+  }
+  return Result<void>::success();
 }
 
 static const char* shader = R"(
@@ -95,14 +126,26 @@ struct Compositor::Impl {
   ComPtr<ID3D11BlendState> blend;
   ComPtr<ID3D11RasterizerState> raster;
 
+  Failure failure;
+
   Impl(int width, int height, bool software) : w(width), h(height) {
+    auto initialized = initialize(software);
+    if (!initialized) {
+      failure = initialized.failure_record();
+    }
+  }
+
+  Result<void> initialize(bool software) {
+    if (w < 2 || h < 2 || w > 3840 || h > 3840) {
+      return failed("Invalid canvas", ErrorCode::invalid_argument);
+    }
     auto hr = D3D11CreateDevice(nullptr, software ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
                                 nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
                                 D3D11_SDK_VERSION, &d, nullptr, &c);
     if (FAILED(hr))
-      check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
-                              D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &d,
-                              nullptr, &c));
+      LK_STUDIO_TRY(check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                                            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                            D3D11_SDK_VERSION, &d, nullptr, &c)));
     D3D11_TEXTURE2D_DESC td{};
     td.Width = w;
     td.Height = h;
@@ -110,29 +153,31 @@ struct Compositor::Impl {
     td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.BindFlags = D3D11_BIND_RENDER_TARGET;
-    check(d->CreateTexture2D(&td, nullptr, &output));
-    check(d->CreateRenderTargetView(output.Get(), nullptr, &target));
+    LK_STUDIO_TRY(check(d->CreateTexture2D(&td, nullptr, &output)));
+    LK_STUDIO_TRY(check(d->CreateRenderTargetView(output.Get(), nullptr, &target)));
     td.BindFlags = 0;
     td.Usage = D3D11_USAGE_STAGING;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    check(d->CreateTexture2D(&td, nullptr, &read));
+    LK_STUDIO_TRY(check(d->CreateTexture2D(&td, nullptr, &read)));
     ComPtr<ID3DBlob> v, p, error;
-    check(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "vs", "vs_4_0", 0, 0, &v,
-                     &error));
-    check(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "ps", "ps_4_0", 0, 0, &p,
-                     &error));
-    check(d->CreateVertexShader(v->GetBufferPointer(), v->GetBufferSize(), nullptr, &vs));
-    check(d->CreatePixelShader(p->GetBufferPointer(), p->GetBufferSize(), nullptr, &ps));
+    LK_STUDIO_TRY(check(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "vs",
+                                   "vs_4_0", 0, 0, &v, &error)));
+    LK_STUDIO_TRY(check(D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "ps",
+                                   "ps_4_0", 0, 0, &p, &error)));
+    LK_STUDIO_TRY(
+        check(d->CreateVertexShader(v->GetBufferPointer(), v->GetBufferSize(), nullptr, &vs)));
+    LK_STUDIO_TRY(
+        check(d->CreatePixelShader(p->GetBufferPointer(), p->GetBufferSize(), nullptr, &ps)));
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = 80;
     bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    check(d->CreateBuffer(&bd, nullptr, &settings));
+    LK_STUDIO_TRY(check(d->CreateBuffer(&bd, nullptr, &settings)));
     D3D11_SAMPLER_DESC sd{};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
-    check(d->CreateSamplerState(&sd, &sampler));
+    LK_STUDIO_TRY(check(d->CreateSamplerState(&sd, &sampler)));
     D3D11_BLEND_DESC b{};
     auto& rt = b.RenderTarget[0];
     rt.BlendEnable = TRUE;
@@ -143,15 +188,20 @@ struct Compositor::Impl {
     rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
     rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    check(d->CreateBlendState(&b, &blend));
+    LK_STUDIO_TRY(check(d->CreateBlendState(&b, &blend)));
     D3D11_RASTERIZER_DESC rd{};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = TRUE;
-    check(d->CreateRasterizerState(&rd, &raster));
+    LK_STUDIO_TRY(check(d->CreateRasterizerState(&rd, &raster)));
+    return Result<void>::success();
   }
 
-  StudioImage render(const Layers& layers) {
+  Result<StudioImage> render(const Layers& layers) {
+    if (failure) {
+      return failed(failure);
+    }
+    LK_STUDIO_TRY(validate_layers(layers));
     float black[]{0, 0, 0, 1};
     c->ClearRenderTargetView(target.Get(), black);
     c->OMSetRenderTargets(1, target.GetAddressOf(), nullptr);
@@ -178,8 +228,8 @@ struct Compositor::Impl {
       D3D11_SUBRESOURCE_DATA data{img->rgba.data(), UINT(img->width * 4), 0};
       ComPtr<ID3D11Texture2D> tex;
       ComPtr<ID3D11ShaderResourceView> view;
-      check(d->CreateTexture2D(&td, &data, &tex));
-      check(d->CreateShaderResourceView(tex.Get(), nullptr, &view));
+      LK_STUDIO_TRY(check(d->CreateTexture2D(&td, &data, &tex)));
+      LK_STUDIO_TRY(check(d->CreateShaderResourceView(tex.Get(), nullptr, &view)));
       const auto& t = s.transform;
       auto& k = s.chroma;
       float values[]{t.x,
@@ -210,13 +260,13 @@ struct Compositor::Impl {
     }
     c->CopyResource(read.Get(), output.Get());
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    check(c->Map(read.Get(), 0, D3D11_MAP_READ, 0, &mapped));
+    LK_STUDIO_TRY(check(c->Map(read.Get(), 0, D3D11_MAP_READ, 0, &mapped)));
     StudioImage out{w, h, std::vector<uint8_t>(size_t(w) * h * 4)};
     for (int y = 0; y < h; ++y)
       memcpy(out.rgba.data() + size_t(y) * w * 4,
              static_cast<uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, size_t(w) * 4);
     c->Unmap(read.Get(), 0);
-    return out;
+    return Result<StudioImage>::success(std::move(out));
   }
 };
 
@@ -224,23 +274,38 @@ Compositor::Compositor(int w, int h, bool soft) : impl_(std::make_unique<Impl>(w
 
 Compositor::~Compositor() = default;
 
-StudioImage Compositor::render(const Layers& l) {
+Result<void> Compositor::status() const {
+  return impl_->failure ? Result<void>::failure(impl_->failure) : Result<void>::success();
+}
+
+Result<StudioImage> Compositor::render(const Layers& l) {
   return impl_->render(l);
 }
 
 #endif
-std::shared_ptr<StudioImage> from_i420(const VideoFrame& f) {
+Result<std::shared_ptr<StudioImage>> from_i420(const VideoFrame& f) {
+  if (f.width < 1 || f.height < 1 || f.width > 3840 || f.height > 3840 || f.stride_y < f.width ||
+      f.stride_u < (f.width + 1) / 2 || f.stride_v < (f.width + 1) / 2 ||
+      f.y.size() < size_t(f.stride_y) * f.height ||
+      f.u.size() < size_t(f.stride_u) * ((f.height + 1) / 2) ||
+      f.v.size() < size_t(f.stride_v) * ((f.height + 1) / 2)) {
+    return failed("Invalid I420 frame", ErrorCode::invalid_argument);
+  }
   auto img = std::make_shared<StudioImage>();
   img->width = f.width;
   img->height = f.height;
   img->rgba.resize(size_t(f.width) * f.height * 4);
   if (libyuv::I420ToABGR(f.y.data(), f.stride_y, f.u.data(), f.stride_u, f.v.data(), f.stride_v,
                          img->rgba.data(), f.width * 4, f.width, f.height) != 0)
-    throw std::runtime_error("Invalid I420 frame");
-  return img;
+    return failed("Invalid I420 frame", ErrorCode::invalid_argument);
+  return Result<std::shared_ptr<StudioImage>>::success(std::move(img));
 }
 
-VideoFrame to_i420(const StudioImage& i) {
+Result<VideoFrame> to_i420(const StudioImage& i) {
+  if (i.width < 1 || i.height < 1 || i.width > 3840 || i.height > 3840 ||
+      i.rgba.size() < size_t(i.width) * i.height * 4) {
+    return failed("Invalid RGBA frame", ErrorCode::invalid_argument);
+  }
   VideoFrame f;
   f.width = i.width;
   f.height = i.height;
@@ -251,8 +316,8 @@ VideoFrame to_i420(const StudioImage& i) {
   f.v.resize(f.u.size());
   if (libyuv::ABGRToI420(i.rgba.data(), i.width * 4, f.y.data(), f.stride_y, f.u.data(), f.stride_u,
                          f.v.data(), f.stride_v, f.width, f.height) != 0)
-    throw std::runtime_error("RGBA conversion failed");
-  return f;
+    return failed("RGBA conversion failed");
+  return Result<VideoFrame>::success(std::move(f));
 }
 }  // namespace studio_detail
 }  // namespace livekit::sdk

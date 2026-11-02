@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -59,18 +60,18 @@ struct CaptureSize {
   int width, height;
 };
 
-std::vector<ScreenCaptureDevice> screen_capture_devices();
+Result<std::vector<ScreenCaptureDevice>> screen_capture_devices();
 // Fit landscape into 1920x1080 or portrait into 1080x1920, without upscaling.
-CaptureSize screen_capture_size(int width, int height);
+Result<CaptureSize> screen_capture_size(int width, int height);
 
 struct VideoCaptureDevice {
   std::string name, id;
 };
 
-std::vector<VideoCaptureDevice> video_capture_devices();
+Result<std::vector<VideoCaptureDevice>> video_capture_devices();
 // probe_media also accepts camera://<index> and screen://primary without FFmpeg.
 // File/network inputs require external ffprobe and ffmpeg. Generated sources do not.
-std::vector<MediaSpec> probe_media(const std::string& input, const std::string& ffmpeg = "ffmpeg",
-                                   bool loop = false, int width = 640, int height = 360,
-                                   int fps = 30);
+Result<std::vector<MediaSpec>> probe_media(const std::string& input,
+                                           const std::string& ffmpeg = "ffmpeg", bool loop = false,
+                                           int width = 640, int height = 360, int fps = 30);
 }  // namespace livekit::sdk

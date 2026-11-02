@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -44,8 +45,9 @@ class EncodedMediaSource {
   explicit EncodedMediaSource(EncodedSourceOptions options = {});
   ~EncodedMediaSource();
   EncodedSourceOptions options() const;
-  EncodedWriteStatus write(EncodedMediaFrame frame);
+  Result<EncodedWriteStatus> write(EncodedMediaFrame frame);
   EncodedMediaStats stats() const;
+  Result<void> status() const;
   // Signal a lost access unit: discard queued reference frames and require a keyframe.
   void request_keyframe();
   void close();
@@ -63,10 +65,11 @@ class EncodedMediaStream {
  public:
   explicit EncodedMediaStream(size_t max_frames = 64, size_t max_bytes = 16 * 1024 * 1024);
   ~EncodedMediaStream();
-  std::shared_ptr<const EncodedMediaFrame> read(
+  Result<std::shared_ptr<const EncodedMediaFrame>> read(
       std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
   void close();
   EncodedMediaStats stats() const;
+  Result<void> status() const;
 
  private:
   struct Impl;

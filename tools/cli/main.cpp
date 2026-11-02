@@ -51,13 +51,24 @@ int run(int argc, char** argv) {
   app.add_option("--api-key", key, "API key; LIVEKIT_API_KEY");
   app.add_option("--api-secret", secret, "API secret; LIVEKIT_API_SECRET");
   app.add_option("--token", token, "Pre-issued bearer JWT; LIVEKIT_TOKEN");
+  lk::Failure failure;
+  auto fail = [&](std::string message) {
+    failure = lk::make_failure(lk::ErrorDomain::lifecycle, lk::ErrorCode::invalid_argument,
+                               std::move(message));
+  };
   bool json_output = false;
   app.add_flag("--json", json_output, "JSON output (already the default)");
   auto service = [&] {
     resolve_credentials();
     return lk::LiveKitAPI({url, {key, secret, token}, false}).room();
   };
-  auto output = [](const lk::Json& value) { std::cout << value.dump(2) << '\n'; };
+  auto output = [&](lk::Result<lk::Json> value) {
+    if (!value) {
+      failure = value.failure_record();
+      return;
+    }
+    std::cout << value->dump(2) << '\n';
+  };
   auto token_cmd =
       app.add_subcommand("token", "Access tokens")->require_subcommand()->fallthrough();
   auto create_token =
@@ -74,14 +85,18 @@ int run(int argc, char** argv) {
   create_token->add_flag("--no-subscribe", no_subscribe);
   create_token->callback([&] {
     resolve_credentials();
-    std::cout << lk::make_token(key, secret, token_identity,
-                                {{"roomJoin", true},
-                                 {"room", token_room},
-                                 {"canPublish", !no_publish},
-                                 {"canSubscribe", !no_subscribe},
-                                 {"canPublishData", !no_publish}},
-                                ttl, token_name)
-              << '\n';
+    auto created = lk::make_token(key, secret, token_identity,
+                                  {{"roomJoin", true},
+                                   {"room", token_room},
+                                   {"canPublish", !no_publish},
+                                   {"canSubscribe", !no_subscribe},
+                                   {"canPublishData", !no_publish}},
+                                  ttl, token_name);
+    if (!created) {
+      failure = created.failure_record();
+      return;
+    }
+    std::cout << *created << '\n';
   });
   auto room = app.add_subcommand("room", "Manage rooms and publish/subscribe to media")
                   ->require_subcommand()
@@ -174,40 +189,72 @@ int run(int argc, char** argv) {
     join->add_option("--topic", options.topic);
     join->callback([&, command = std::string(command)] {
       resolve_credentials();
-      if (width % 2 || height % 2)
-        throw std::runtime_error("Width and height must be even");
-      if (options.identity.empty() && token.empty())
-        throw std::runtime_error("--identity is required when generating a room token");
-      if (!options.subscribe_tracks.empty() && no_auto_subscribe)
-        throw std::runtime_error("--subscribe-track conflicts with --no-subscribe");
-      if (options.video_playout && no_auto_subscribe)
-        throw std::runtime_error("--video-playout conflicts with --no-subscribe");
+      if (width % 2 || height % 2) {
+        fail("Width and height must be even");
+        return;
+      }
+      if (options.identity.empty() && token.empty()) {
+        fail("--identity is required when generating a room token");
+        return;
+      }
+      if (!options.subscribe_tracks.empty() && no_auto_subscribe) {
+        fail("--subscribe-track conflicts with --no-subscribe");
+        return;
+      }
+      if (options.video_playout && no_auto_subscribe) {
+        fail("--video-playout conflicts with --no-subscribe");
+        return;
+      }
       if (options.exit_after_publish &&
-          (demo || tone || loop || options.microphone || publish.empty()))
-        throw std::runtime_error(
+          (demo || tone || loop || options.microphone || publish.empty())) {
+        fail(
             "--exit-after-publish requires finite --publish inputs without "
             "--loop/demo/tone/microphone");
+        return;
+      }
       if (command == "publish" && publish.empty() && !demo && !tone && !options.microphone &&
-          options.publish_data.empty())
-        throw std::runtime_error("room publish requires a media or data source");
-      if (command == "subscribe" &&
-          (!publish.empty() || demo || tone || options.microphone || !options.publish_data.empty()))
-        throw std::runtime_error("Use room join/publish to publish media");
-      options.url = lk::endpoint(url, true);
+          options.publish_data.empty()) {
+        fail("room publish requires a media or data source");
+        return;
+      }
+      if (command == "subscribe" && (!publish.empty() || demo || tone || options.microphone ||
+                                     !options.publish_data.empty())) {
+        fail("Use room join/publish to publish media");
+        return;
+      }
+      auto normalized = lk::endpoint(url, true);
+      if (!normalized) {
+        failure = normalized.failure_record();
+        return;
+      }
+      options.url = std::move(*normalized);
       options.subscribe = !no_auto_subscribe;
       options.record = std::filesystem::u8path(record);
-      if (!record.empty() && !options.subscribe)
-        throw std::runtime_error("--record requires subscriptions");
-      options.token = token.empty() ? lk::make_token(key, secret, options.identity,
-                                                     {{"roomJoin", true},
-                                                      {"room", options.room},
-                                                      {"canPublish", true},
-                                                      {"canSubscribe", true},
-                                                      {"canPublishData", true}})
-                                    : token;
+      if (!record.empty() && !options.subscribe) {
+        fail("--record requires subscriptions");
+        return;
+      }
+      options.token = token;
+      if (options.token.empty()) {
+        auto created = lk::make_token(key, secret, options.identity,
+                                      {{"roomJoin", true},
+                                       {"room", options.room},
+                                       {"canPublish", true},
+                                       {"canSubscribe", true},
+                                       {"canPublishData", true}});
+        if (!created) {
+          failure = created.failure_record();
+          return;
+        }
+        options.token = std::move(*created);
+      }
       for (const auto& input : publish) {
         auto streams = lk::probe_media(input, ffmpeg, loop, width, height, fps);
-        options.media.insert(options.media.end(), streams.begin(), streams.end());
+        if (!streams) {
+          failure = streams.failure_record();
+          return;
+        }
+        options.media.insert(options.media.end(), streams->begin(), streams->end());
       }
       if (demo)
         options.media.push_back({"", ffmpeg, true, true, false, width, height, fps});
@@ -225,18 +272,29 @@ int run(int argc, char** argv) {
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
       });
-      livekit::cli::run_session(options, print_event, session_stop.get_token());
+      auto completed = livekit::cli::run_session(options, print_event, session_stop.get_token());
+      if (!completed) {
+        failure = completed.failure_record();
+      }
     });
   }
   auto doctor =
       app.add_subcommand("doctor", "Create a transport-only native WebRTC peer and generate SDP");
-  doctor->callback([] { livekit::cli::doctor(print_event); });
+  doctor->callback([&] {
+    auto checked = livekit::cli::doctor(print_event);
+    if (!checked) {
+      failure = checked.failure_record();
+    }
+  });
+  // CLI11 reports parse/help/version outcomes as ParseError. This translation
+  // unit is the third-party exception boundary; business callbacks return results.
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
     return app.exit(e);
-  } catch (const std::exception& e) {
-    std::cerr << "error: " << e.what() << '\n';
+  }
+  if (failure) {
+    std::cerr << "error: " << failure->message << '\n';
     return 1;
   }
   return interrupted ? 130 : 0;

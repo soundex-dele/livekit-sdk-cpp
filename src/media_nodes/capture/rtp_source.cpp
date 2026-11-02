@@ -1,5 +1,5 @@
 #include "livekit/rtp.hpp"
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -14,22 +14,30 @@ struct PacketStream::Impl {
   size_t capacity;
   std::deque<PacketEvent> queue;
   uint64_t dropped = 0;
+  Failure failure;
   bool closed = false;
 };
 
 PacketStream::PacketStream(size_t capacity) {
-  if (!capacity || capacity > 4096)
-    throw std::invalid_argument("Invalid packet observer capacity");
   impl_ = std::make_unique<Impl>(capacity);
+  if (!capacity || capacity > 4096) {
+    impl_->failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                  "Invalid packet observer capacity");
+  }
 }
 
 PacketStream::~PacketStream() = default;
 
+Result<void> PacketStream::status() const {
+  return impl_->failure ? Result<void>::failure(impl_->failure) : Result<void>::success();
+}
+
 void PacketStream::push(PacketEvent event) {
   auto& s = *impl_;
   std::lock_guard lock(s.mutex);
-  if (s.closed)
+  if (s.closed || s.failure) {
     return;
+  }
   if (s.queue.size() == s.capacity) {
     s.queue.pop_front();
     ++s.dropped;
@@ -51,27 +59,35 @@ uint64_t PacketStream::dropped() const {
   return impl_->dropped;
 }
 
-std::optional<PacketEvent> PacketStream::read(std::chrono::milliseconds timeout,
-                                              std::stop_token stop) {
+Result<std::optional<PacketEvent>> PacketStream::read(std::chrono::milliseconds timeout,
+                                                      std::stop_token stop) {
+  using ReadResult = Result<std::optional<PacketEvent>>;
+  if (impl_->failure) {
+    return ReadResult::failure(impl_->failure);
+  }
   if (timeout.count() < 0)
-    throw std::invalid_argument("Negative packet read timeout");
+    return ReadResult::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                            "Negative packet read timeout"));
   auto& s = *impl_;
   std::unique_lock lock(s.mutex);
   bool ready = s.ready.wait_for(lock, stop, timeout, [&] { return s.closed || !s.queue.empty(); });
   if (stop.stop_requested())
-    throw SDKError(ErrorDomain::media, ErrorCode::cancelled, "Packet read cancelled");
+    return ReadResult::failure(
+        make_failure(ErrorDomain::media, ErrorCode::cancelled, "Packet read cancelled"));
   if (!ready)
-    throw SDKError(ErrorDomain::media, ErrorCode::timeout, "Packet read timeout");
+    return ReadResult::failure(
+        make_failure(ErrorDomain::media, ErrorCode::timeout, "Packet read timeout"));
   if (s.queue.empty())
-    return {};
+    return ReadResult::success({});
   auto event = std::move(s.queue.front());
   s.queue.pop_front();
-  return event;
+  return ReadResult::success(std::move(event));
 }
 
 RtpClock::RtpClock(uint32_t rate) : rate_(rate) {
   if (!rate || rate > 1000000)
-    throw std::invalid_argument("Invalid RTP clock rate");
+    failure_ =
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Invalid RTP clock rate");
 }
 
 void RtpClock::sender_report(uint32_t rtp, uint64_t ntp) {
@@ -81,8 +97,9 @@ void RtpClock::sender_report(uint32_t rtp, uint64_t ntp) {
 }
 
 std::optional<std::chrono::nanoseconds> RtpClock::ntp_time(uint32_t rtp) const {
-  if (!ntp_)
+  if (failure_ || !ntp_) {
     return {};
+  }
   return *ntp_ + std::chrono::nanoseconds(int64_t(int32_t(rtp - rtp_)) * 1000000000 / rate_);
 }
 
@@ -104,6 +121,7 @@ struct RtpMediaSource::Impl {
   std::mutex mutex;
   std::shared_ptr<EncodedMediaSource> source;
   EncodedSourceOptions options;
+  Failure failure;
   uint8_t pt;
   uint32_t ssrc;
   std::optional<uint16_t> next;
@@ -124,15 +142,23 @@ struct RtpMediaSource::Impl {
 RtpMediaSource::RtpMediaSource(EncodedSourceOptions options, uint8_t pt, uint32_t ssrc)
     : impl_(std::make_unique<Impl>()) {
   if (pt > 127 || !ssrc)
-    throw std::invalid_argument("Invalid RTP payload type/SSRC");
+    impl_->failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                  "Invalid RTP payload type/SSRC");
   auto& s = *impl_;
   s.source = std::make_shared<EncodedMediaSource>(options);
+  if (auto result = s.source->status(); !result && !s.failure) {
+    s.failure = result.failure_record();
+  }
   s.options = std::move(options);
   s.pt = pt;
   s.ssrc = ssrc;
 }
 
 RtpMediaSource::~RtpMediaSource() = default;
+
+Result<void> RtpMediaSource::status() const {
+  return impl_->failure ? Result<void>::failure(impl_->failure) : Result<void>::success();
+}
 
 std::shared_ptr<EncodedMediaSource> RtpMediaSource::source() const {
   return impl_->source;
@@ -145,8 +171,11 @@ void RtpMediaSource::reset() {
   impl_->base.reset();
 }
 
-EncodedWriteStatus RtpMediaSource::write(std::span<const uint8_t> p) {
+Result<EncodedWriteStatus> RtpMediaSource::write(std::span<const uint8_t> p) {
   auto& s = *impl_;
+  if (s.failure) {
+    return Result<EncodedWriteStatus>::failure(s.failure);
+  }
   std::lock_guard lock(s.mutex);
   const auto stats = s.source->stats();
   if (stats.generation != s.generation) {
@@ -156,29 +185,35 @@ EncodedWriteStatus RtpMediaSource::write(std::span<const uint8_t> p) {
     s.generation = stats.generation;
   }
   if (stats.closed)
-    return EncodedWriteStatus::closed;
+    return Result<EncodedWriteStatus>::success(EncodedWriteStatus::closed);
   if (!stats.accepting)
-    return EncodedWriteStatus::backpressure;
+    return Result<EncodedWriteStatus>::success(EncodedWriteStatus::backpressure);
   if (p.size() < 12 || p.size() > 65535 || (p[0] >> 6) != 2 || (p[1] & 127) != s.pt ||
       read32(p, 8) != s.ssrc)
-    throw std::invalid_argument("Invalid RTP header or unmapped PT/SSRC");
+    return Result<EncodedWriteStatus>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::invalid_argument, "Invalid RTP header or unmapped PT/SSRC"));
   size_t offset = 12 + 4 * (p[0] & 15), end = p.size();
   if (offset > end)
-    throw std::invalid_argument("Truncated RTP CSRC");
+    return Result<EncodedWriteStatus>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Truncated RTP CSRC"));
   if (p[0] & 16) {
     if (offset + 4 > end)
-      throw std::invalid_argument("Truncated RTP extension");
+      return Result<EncodedWriteStatus>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Truncated RTP extension"));
     offset += 4 + 4 * size_t(read16(p, offset + 2));
   }
   if (offset > end)
-    throw std::invalid_argument("Truncated RTP extension data");
+    return Result<EncodedWriteStatus>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::invalid_argument, "Truncated RTP extension data"));
   if (p[0] & 32) {
     if (!p.back() || p.back() > end - offset)
-      throw std::invalid_argument("Invalid RTP padding");
+      return Result<EncodedWriteStatus>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Invalid RTP padding"));
     end -= p.back();
   }
   if (offset >= end)
-    throw std::invalid_argument("Empty RTP payload");
+    return Result<EncodedWriteStatus>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Empty RTP payload"));
   const auto seq = read16(p, 2);
   const auto ts = read32(p, 4);
   bool gap = s.next && seq != *s.next;
@@ -190,9 +225,9 @@ EncodedWriteStatus RtpMediaSource::write(std::span<const uint8_t> p) {
   }
   s.timestamp = ts;
   auto data = p.subspan(offset, end - offset);
-  auto invalid = [&]() -> EncodedWriteStatus {
+  auto invalid = [&]() -> Result<EncodedWriteStatus> {
     s.clear();
-    return EncodedWriteStatus::keyframe_required;
+    return Result<EncodedWriteStatus>::success(EncodedWriteStatus::keyframe_required);
   };
   auto annex = [&] { s.unit.insert(s.unit.end(), {0, 0, 0, 1}); };
   if (s.options.codec == "opus") {
@@ -277,7 +312,7 @@ EncodedWriteStatus RtpMediaSource::write(std::span<const uint8_t> p) {
   if (s.unit.size() > s.options.max_bytes)
     return invalid();
   if (!(p[1] & 128) && s.options.codec != "opus")
-    return EncodedWriteStatus::accepted;
+    return Result<EncodedWriteStatus>::success(EncodedWriteStatus::accepted);
   if (s.fragment)
     return invalid();
   if (s.wait_key && !s.key)

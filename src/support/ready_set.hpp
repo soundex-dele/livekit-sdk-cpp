@@ -2,7 +2,7 @@
 #include "support/wake_event.hpp"
 #include <memory>
 #include <set>
-#include <stdexcept>
+#include "livekit/result.hpp"
 
 namespace livekit::sdk::detail {
 // Coalesced work notifications, bounded by explicitly registered identities.
@@ -12,13 +12,18 @@ template <class Key>
 class ReadySet : public std::enable_shared_from_this<ReadySet<Key>> {
  public:
   ReadySet(std::shared_ptr<WakeEvent> owner, size_t capacity)
-      : owner_(std::move(owner)), capacity_(capacity) {
-    if (!owner_ || !capacity_) {
-      throw std::invalid_argument("Ready-set requires an owner and positive capacity");
-    }
-  }
+      : owner_(std::move(owner)), capacity_(capacity) {}
 
-  std::shared_ptr<WakeEvent> watch(const Key& key) {
+  Result<std::shared_ptr<WakeEvent>> watch(const Key& key) {
+    using Watch = Result<std::shared_ptr<WakeEvent>>;
+    if (!owner_ || !capacity_) {
+      return Watch::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_argument,
+                                         "Ready-set requires an owner and positive capacity"));
+    }
+    if (this->weak_from_this().expired()) {
+      return Watch::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_state,
+                                         "Ready-set watches require shared ownership"));
+    }
     auto signal = std::make_shared<WakeEvent>([weak = this->weak_from_this(), key] {
       if (auto state = weak.lock()) {
         state->mark(key);
@@ -26,13 +31,15 @@ class ReadySet : public std::enable_shared_from_this<ReadySet<Key>> {
     });
     std::lock_guard lock(mutex_);
     if (registered_.contains(key)) {
-      throw std::logic_error("Duplicate ready-set registration");
+      return Watch::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_state,
+                                         "Duplicate ready-set registration"));
     }
     if (registered_.size() >= capacity_) {
-      throw std::length_error("Ready-set registration capacity exhausted");
+      return Watch::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::resource_exhausted,
+                                         "Ready-set registration capacity exhausted"));
     }
     registered_.insert(key);
-    return signal;
+    return Watch::success(std::move(signal));
   }
 
   void mark(const Key& key) {

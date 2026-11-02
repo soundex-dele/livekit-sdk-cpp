@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
-#include <stdexcept>
+#include "livekit/result.hpp"
 #include <utility>
 
 namespace livekit::sdk::detail {
@@ -13,18 +13,30 @@ template <class T>
 class MediaChannel {
  public:
   MediaChannel(size_t capacity, size_t max_bytes) : capacity_(capacity), max_bytes_(max_bytes) {
-    if (!capacity || !max_bytes)
-      throw std::invalid_argument("media_graph: zero queue limit");
+    if (!capacity || !max_bytes) {
+      failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                              "media_graph: zero queue limit");
+    }
   }
 
-  bool push(T& frame, size_t bytes) {
-    if (bytes > max_bytes_)
-      throw std::runtime_error("media_graph/output: frame exceeds queue byte limit");
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
+
+  Result<bool> push(T& frame, size_t bytes) {
+    if (failure_) {
+      return Result<bool>::failure(failure_);
+    }
+    if (bytes > max_bytes_) {
+      return Result<bool>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::resource_exhausted,
+                       "media_graph/output: frame exceeds queue byte limit"));
+    }
     if (queue_.size() >= capacity_ || bytes > max_bytes_ - bytes_)
-      return false;
+      return Result<bool>::success(false);
     queue_.emplace_back(std::move(frame), bytes);
     bytes_ += bytes;
-    return true;
+    return Result<bool>::success(true);
   }
 
   std::optional<T> pop_due(int64_t time, uint64_t generation) {
@@ -57,6 +69,7 @@ class MediaChannel {
     return std::move(result.first);
   }
 
+  Failure failure_;
   size_t capacity_, max_bytes_, bytes_ = 0;
   std::deque<std::pair<T, size_t>> queue_;
 };

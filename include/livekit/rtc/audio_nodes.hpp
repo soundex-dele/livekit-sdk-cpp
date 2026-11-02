@@ -28,7 +28,7 @@ class AudioCodecNode final : public graphflow::core::GraphNode {
   AudioCodecNode(std::string name, TrackDescriptor, bool encode, AudioCodecOptions = {});
   ~AudioCodecNode() override;
   AudioCodecSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> status() const;
   void quiesce();  // Close admission and join worker before stopping downstream.
  protected:
   bool doInit() override;

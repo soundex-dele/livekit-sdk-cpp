@@ -6,9 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <exception>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -25,10 +23,12 @@ class OutputTransport final : public DeviceOutputTransport {
     return 0;
   }
 
-  void render(size_t frames, size_t channels, uint32_t rate, void* output) {
+  Result<void> render(size_t frames, size_t channels, uint32_t rate, void* output) {
     if (!output || (channels != 1 && channels != 2) || rate < 8000 || rate > 96000 || rate % 100 ||
         frames != rate / 100) {
-      throw std::runtime_error("Audio device requested unsupported playout format");
+      return livekit::sdk::Result<void>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                       "Audio device requested unsupported playout format"));
     }
     std::array<int16_t, 960> stereo{};
     if (render_) {
@@ -39,7 +39,7 @@ class OutputTransport final : public DeviceOutputTransport {
       channels_ = channels;
       resampler_.reset();
       std::memcpy(output, stereo.data(), sizeof(stereo));
-      return;
+      return livekit::sdk::Result<void>::success();
     }
     std::array<int16_t, 480> mono{};
     if (channels == 1) {
@@ -57,8 +57,11 @@ class OutputTransport final : public DeviceOutputTransport {
                                                channels),
         webrtc::InterleavedView<int16_t>(static_cast<int16_t*>(output), frames, channels));
     if (result != int(frames * channels)) {
-      throw std::runtime_error("Audio device resampler returned incomplete playout block");
+      return livekit::sdk::Result<void>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                       "Audio device resampler returned incomplete playout block"));
     }
+    return livekit::sdk::Result<void>::success();
   }
 
   int32_t NeedMorePlayData(size_t frames, size_t bytes_per_frame, size_t channels, uint32_t rate,
@@ -73,29 +76,21 @@ class OutputTransport final : public DeviceOutputTransport {
     if (samples) {
       std::memset(samples, 0, frames * bytes_per_frame);
     }
-    try {
-      if (bytes_per_frame != channels * sizeof(int16_t)) {
-        throw std::runtime_error("Audio device requested non-PCM16 playout");
-      }
-      render(frames, channels, rate, samples);
-      return 0;
-    } catch (const std::exception& e) {
+    Result<void> result =
+        bytes_per_frame == channels * sizeof(int16_t)
+            ? render(frames, channels, rate, samples)
+            : Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                 "Audio device requested non-PCM16 playout"));
+    if (!result) {
       if (samples) {
         std::memset(samples, 0, frames * bytes_per_frame);
       }
       if (failure_) {
-        failure_(e.what());
-      }
-      return -1;
-    } catch (...) {
-      if (samples) {
-        std::memset(samples, 0, frames * bytes_per_frame);
-      }
-      if (failure_) {
-        failure_("Unknown audio device playout failure");
+        failure_(result.failure_record()->message);
       }
       return -1;
     }
+    return 0;
   }
 
   void PullRenderData(int bits, int rate, size_t channels, size_t frames, void* samples,
@@ -132,55 +127,81 @@ class NativeAudioOutput final : public AudioOutputDriver {
     }
   }
 
-  void start(const AudioOutputOptions& options, Render render, Failure failure) override {
+  Result<void> start(const AudioOutputOptions& options, Render render, Failure failure) override {
     if (!thread_) {
       thread_ = webrtc::Thread::Create();
       if (!thread_->Start()) {
         thread_.reset();
-        throw std::runtime_error("Cannot start audio output control thread");
+        return livekit::sdk::Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         "Cannot start audio output control thread"));
       }
     }
-    const auto error = thread_->BlockingCall([&]() -> std::exception_ptr {
-      try {
+    auto result = Result<void>::success();
+    thread_->BlockingCall([&] {
+      result = [&]() -> Result<void> {
         if (adm_) {
-          throw std::logic_error("Audio output device already started");
+          return livekit::sdk::Result<void>::failure(
+              make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                           "Audio output device already started"));
         }
         transport_ = create_audio_output_transport(std::move(render), std::move(failure));
         queues_ = webrtc::CreateDefaultTaskQueueFactory();
         adm_ = webrtc::AudioDeviceModule::Create(webrtc::AudioDeviceModule::kPlatformDefaultAudio,
                                                  queues_.get());
         if (!adm_) {
-          throw std::runtime_error("Cannot create audio output device");
+          return livekit::sdk::Result<void>::failure(
+              make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                           "Cannot create audio output device"));
         }
-        require(adm_->Init(), "initialize audio output device");
-        require(adm_->RegisterAudioCallback(transport_.get()), "register audio output callback");
+        if (auto checked = require(adm_->Init(), "initialize audio output device"); !checked) {
+          return checked;
+        }
+        if (auto checked = require(adm_->RegisterAudioCallback(transport_.get()),
+                                   "register audio output callback");
+            !checked) {
+          return checked;
+        }
         if (options.device_index) {
-          require(adm_->SetPlayoutDevice(*options.device_index), "select audio output device");
+          if (auto checked = require(adm_->SetPlayoutDevice(*options.device_index),
+                                     "select audio output device");
+              !checked) {
+            return checked;
+          }
         } else {
 #ifdef _WIN32
           // Match the system's default playback destination. The communications
           // endpoint can be a different headset or HDMI monitor with no speakers.
-          require(adm_->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice),
-                  "select default audio output device");
+          if (auto checked =
+                  require(adm_->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice),
+                          "select default audio output device");
+              !checked)
+            return checked;
 #else
-          require(adm_->SetPlayoutDevice(uint16_t(0)), "select default audio output device");
+          if (auto checked = require(adm_->SetPlayoutDevice(uint16_t(0)),
+                                     "select default audio output device");
+              !checked)
+            return checked;
 #endif
         }
-        require(adm_->InitSpeaker(), "initialize speaker mixer");
+        if (auto checked = require(adm_->InitSpeaker(), "initialize speaker mixer"); !checked)
+          return checked;
         bool stereo = false;
         adm_->StereoPlayoutIsAvailable(&stereo);
-        require(adm_->SetStereoPlayout(stereo), "configure speaker channels");
-        require(adm_->InitPlayout(), "initialize audio playout");
-        require(adm_->StartPlayout(), "start audio playout");
-        return {};
-      } catch (...) {
-        return std::current_exception();
-      }
+        if (auto checked = require(adm_->SetStereoPlayout(stereo), "configure speaker channels");
+            !checked)
+          return checked;
+        if (auto checked = require(adm_->InitPlayout(), "initialize audio playout"); !checked)
+          return checked;
+        if (auto checked = require(adm_->StartPlayout(), "start audio playout"); !checked)
+          return checked;
+        return livekit::sdk::Result<void>::success();
+      }();
     });
-    if (error) {
+    if (!result) {
       stop();
-      std::rethrow_exception(error);
     }
+    return result;
   }
 
   void stop() noexcept override {
@@ -200,10 +221,12 @@ class NativeAudioOutput final : public AudioOutputDriver {
   }
 
  private:
-  static void require(int32_t result, const char* operation) {
+  static Result<void> require(int32_t result, const char* operation) {
     if (result) {
-      throw std::runtime_error(std::string("Cannot ") + operation);
+      return livekit::sdk::Result<void>::failure(make_failure(
+          ErrorDomain::media, ErrorCode::processing_failed, std::string("Cannot ") + operation));
     }
+    return livekit::sdk::Result<void>::success();
   }
 
   std::unique_ptr<webrtc::Thread> thread_;

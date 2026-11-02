@@ -24,7 +24,10 @@ class TaskExecutor {
 
  public:
   explicit TaskExecutor(size_t workers = 4, size_t capacity = 64) : capacity_(capacity) {
-    try {
+    if (!workers) {
+      state_->stopped = true;
+      return;
+    }
       for (size_t i = 0; i < workers; ++i)
         workers_.emplace_back([s = state_] {
           for (;;) {
@@ -37,16 +40,10 @@ class TaskExecutor {
               task = std::move(s->tasks.front());
               s->tasks.pop_front();
             }
-            try {
-              task();
-            } catch (...) { /* task owns its error channel */
-            }
+            // Tasks own their explicit error/completion channel.
+            task();
           }
         });
-    } catch (...) {
-      stop();
-      throw;
-    }
   }
 
   ~TaskExecutor() {
@@ -55,7 +52,7 @@ class TaskExecutor {
 
   bool post(std::function<void()> task) {
     std::lock_guard lock(state_->mutex);
-    if (state_->stopped || state_->tasks.size() >= capacity_)
+    if (!task || state_->stopped || state_->tasks.size() >= capacity_)
       return false;
     state_->tasks.push_back(std::move(task));
     state_->ready.notify_one();
@@ -63,12 +60,15 @@ class TaskExecutor {
   }
 
   void stop() {
+    std::deque<std::function<void()>> abandoned;
     {
       std::lock_guard lock(state_->mutex);
       state_->stopped = true;
-      state_->tasks.clear();
+      abandoned.swap(state_->tasks);
       state_->ready.notify_all();
     }
+    // Completion destruction may synchronously dispatch a cancellation callback.
+    abandoned.clear();
     for (auto& t : workers_)
       if (t.joinable()) {
         if (t.get_id() == std::this_thread::get_id())

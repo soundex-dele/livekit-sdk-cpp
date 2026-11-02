@@ -1,3 +1,4 @@
+#include "server_result.hpp"
 #include "session.hpp"
 #include "connection.hpp"
 #include <fstream>
@@ -10,8 +11,10 @@ using namespace std::chrono_literals;
 namespace sdk = livekit::sdk;
 
 static void check(bool value, const char* text) {
-  if (!value)
-    throw std::runtime_error(text);
+  if (!value) {
+    std::cerr << text << "\n";
+    std::exit(1);
+  }
 }
 
 template <class F>
@@ -65,10 +68,10 @@ int main(int argc, char** argv) {
   const std::filesystem::path out(argv[4]);
   std::filesystem::create_directories(out);
   sdk::Json report{{"ok", false}, {"checks", sdk::Json::array()}};
-  try {
+  {
     std::ofstream events(out / "demo-publisher.jsonl");
     auto options = [&](const std::string& identity) {
-      auto o = demo::username_options(argv[1], "uav-requirements", identity);
+      auto o = server_result(demo::username_options(argv[1], "uav-requirements", identity));
       o.connection.media_transport = std::string(argv[5]) == "tcp" ? sdk::MediaTransport::tcp_only
                                                                    : sdk::MediaTransport::udp_only;
       return o;
@@ -82,8 +85,9 @@ int main(int argc, char** argv) {
       const auto type = e.value("event", "");
       if (type == "source-demand" || type == "rtc-stats" || type == "media-graph-stats")
         events << e.dump() << '\n';
+      return sdk::Result<void>::success();
     };
-    publisher.start(pub, true);
+    server_result(publisher.start(pub, true));
     until([&] { return tracks(publisher.snapshot()).size() == 1; },
           "Initial demo publication missing");
     const auto first = tracks(publisher.snapshot());
@@ -126,9 +130,9 @@ int main(int argc, char** argv) {
              std::all_of(published.begin(), published.end(),
                          [&](const auto& sid) { return snapshot.frames.contains(sid); });
     };
-    a.start(ao);
+    server_result(a.start(ao));
     until([&] { return decoded(a); }, "First viewer did not decode both sources");
-    b.start(bo);
+    server_result(b.start(bo));
     until([&] { return decoded(b); }, "Second viewer did not decode both sources");
     a.stop();
     until([&] { return a.snapshot().finished; }, "Viewer A stop");
@@ -142,7 +146,7 @@ int main(int argc, char** argv) {
     until([&] { return b.snapshot().finished; }, "Viewer B stop");
     paused();
 
-    a.start(ao);
+    server_result(a.start(ao));
     until([&] { return decoded(a); }, "Video failed to resume");
     check(tracks(publisher.snapshot()) == published, "Resume republished instead of retaining SID");
     a.stop();
@@ -158,9 +162,6 @@ int main(int argc, char** argv) {
                                   {"same_sids", published},
                                   {"remaining_viewer_seconds", 6},
                                   {"source_encoder_and_rtp_paused", true}}}});
-  } catch (const std::exception& e) {
-    report["error"] = e.what();
-    std::cerr << e.what() << '\n';
   }
   std::ofstream(out / "client-result.json") << report.dump(2);
   std::cout << report.dump() << '\n';

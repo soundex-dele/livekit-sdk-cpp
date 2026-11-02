@@ -5,48 +5,63 @@
 #include <cmath>
 #include <memory>
 #include <set>
-#include <stdexcept>
+#include "livekit/result.hpp"
 
 namespace livekit::sdk::rtc::detail {
 // Session-worker-owned reducer. Never exposes protobuf/native types publicly.
 // A disconnected SID is terminal for this session, including delayed updates.
 class SessionRoster {
  public:
-  SessionRoster(const livekit::JoinResponse& join, uint64_t epoch) {
-    state_.epoch = epoch;
-    room(join.room());
-    state_.local.sid = join.participant().sid();
-    if (state_.local.sid.empty())
-      throw std::runtime_error("Join has no participant SID");
-    participant(join.participant());
+  static Result<SessionRoster> create(const livekit::JoinResponse& join, uint64_t epoch) {
+    SessionRoster roster;
+    roster.state_.epoch = epoch;
+    if (auto updated = roster.room(join.room()); !updated) {
+      return Result<SessionRoster>::failure(updated.failure_record());
+    }
+    roster.state_.local.sid = join.participant().sid();
+    if (auto updated = roster.participant(join.participant()); !updated) {
+      return Result<SessionRoster>::failure(updated.failure_record());
+    }
+    return Result<SessionRoster>::success(std::move(roster));
   }
 
   std::shared_ptr<const SessionInfo> snapshot() const {
     return std::make_shared<const SessionInfo>(state_);
   }
 
-  bool participant(const livekit::ParticipantInfo& p) {
+  Result<bool> participant(const livekit::ParticipantInfo& p) {
     if (p.sid().empty() || p.identity().empty())
-      throw std::runtime_error("Participant has no SID/identity");
+      return Result<bool>::failure(make_failure(ErrorDomain::protocol, ErrorCode::malformed_message,
+                                                "Participant has no SID/identity", false, 0,
+                                                {"session_roster"}));
     if (departed_.contains(p.sid()))
-      return false;
+      return Result<bool>::success(false);
     const auto version = versions_.find(p.sid());
     if (version != versions_.end() && p.version() < version->second)
-      return false;
+      return Result<bool>::success(false);
     if (version == versions_.end() && versions_.size() >= 16384)
-      throw std::runtime_error("Session participant history exhausted");
+      return Result<bool>::failure(
+          make_failure(ErrorDomain::protocol, ErrorCode::resource_exhausted,
+                       "Session participant history exhausted", false, 0, {"session_roster"}));
     const bool local = p.sid() == state_.local.sid;
     if (!local && p.state() != 3 && !state_.remote.contains(p.sid()) &&
         state_.remote.size() >= 4096 &&
         std::none_of(state_.remote.begin(), state_.remote.end(),
                      [&](const auto& row) { return row.second.identity == p.identity(); }))
-      throw std::runtime_error("Session roster exhausted");
+      return Result<bool>::failure(
+          make_failure(ErrorDomain::protocol, ErrorCode::resource_exhausted,
+                       "Session roster exhausted", false, 0, {"session_roster"}));
+    // Validate the complete update before changing version/history or replacing an identity.
+    auto parsed = parse(p);
+    if (!parsed) {
+      return Result<bool>::failure(parsed.failure_record());
+    }
     versions_[p.sid()] = p.version();
     if (p.state() == 3 && !local) {
       departed_.insert(p.sid());
       state_.remote.erase(p.sid());
       ++state_.revision;
-      return true;
+      return Result<bool>::success(true);
     }
     if (!local) {
       // A rapid rejoin may replace an identity before its old SID's disconnect
@@ -60,7 +75,7 @@ class SessionRoster {
           ++it;
       }
     }
-    auto next = parse(p);
+    auto next = std::move(*parsed);
     const auto previous = find(p.sid());
     if (previous) {
       next.speaking = previous->speaking;
@@ -82,14 +97,17 @@ class SessionRoster {
     else
       state_.remote[p.sid()] = std::move(next);
     ++state_.revision;
-    return true;
+    return Result<bool>::success(true);
   }
 
-  void room(const livekit::Room& value) {
+  Result<void> room(const livekit::Room& value) {
     if (!state_.room.sid.empty() && state_.room.sid != value.sid())
-      throw std::runtime_error("Room update changed session identity");
+      return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::malformed_message,
+                                                "Room update changed session identity", false, 0,
+                                                {"session_roster"}));
     state_.room = {value.sid(), value.name(), value.metadata(), value.active_recording()};
     ++state_.revision;
+    return Result<void>::success();
   }
 
   bool local_publication(const livekit::TrackInfo& value) {
@@ -100,16 +118,18 @@ class SessionRoster {
     return true;
   }
 
-  bool local_unpublished(const std::string& sid) {
+  Result<bool> local_unpublished(const std::string& sid) {
     if (sid.empty())
-      return false;
+      return Result<bool>::success(false);
     if (!unpublished_.contains(sid) && unpublished_.size() >= 16384)
-      throw std::runtime_error("Session publication history exhausted");
+      return Result<bool>::failure(
+          make_failure(ErrorDomain::protocol, ErrorCode::resource_exhausted,
+                       "Session publication history exhausted", false, 0, {"session_roster"}));
     unpublished_.insert(sid);
     if (!state_.local.publications.erase(sid))
-      return false;
+      return Result<bool>::success(false);
     ++state_.revision;
-    return true;
+    return Result<bool>::success(true);
   }
 
   bool local_muted(const std::string& sid, bool muted) {
@@ -169,6 +189,7 @@ class SessionRoster {
   }
 
  private:
+  SessionRoster() = default;
   SessionInfo state_;
   std::map<std::string, uint32_t> versions_;
   std::set<std::string> departed_;
@@ -193,7 +214,7 @@ class SessionRoster {
             t.height()};
   }
 
-  static ParticipantSnapshot parse(const livekit::ParticipantInfo& p) {
+  static Result<ParticipantSnapshot> parse(const livekit::ParticipantInfo& p) {
     ParticipantSnapshot value;
     value.sid = p.sid();
     value.identity = p.identity();
@@ -206,7 +227,9 @@ class SessionRoster {
     value.attributes.insert(p.attributes().begin(), p.attributes().end());
     for (const auto& t : p.tracks()) {
       if (t.sid().empty() || !value.publications.emplace(t.sid(), parse(t)).second)
-        throw std::runtime_error("Participant has invalid publication SID");
+        return Result<ParticipantSnapshot>::failure(
+            make_failure(ErrorDomain::protocol, ErrorCode::malformed_message,
+                         "Participant has invalid publication SID", false, 0, {"session_roster"}));
     }
     if (p.has_permission()) {
       const auto& permission = p.permission();
@@ -216,7 +239,7 @@ class SessionRoster {
       for (const auto source : permission.can_publish_sources())
         value.permissions->can_publish_sources.push_back(PublicationSource(source));
     }
-    return value;
+    return Result<ParticipantSnapshot>::success(std::move(value));
   }
 };
 }  // namespace livekit::sdk::rtc::detail

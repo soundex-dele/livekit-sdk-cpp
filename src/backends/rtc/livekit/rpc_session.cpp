@@ -1,6 +1,7 @@
+#include "backends/rtc/livekit/service_result.hpp"
 #include "backends/rtc/livekit/rpc_session.hpp"
 #include "backends/rtc/livekit/data_message_wire.hpp"
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include "support/compression.hpp"
 #include "support/deadline_index.hpp"
 #include "support/ready_set.hpp"
@@ -10,7 +11,7 @@
 #include <iomanip>
 #include <map>
 #include <mutex>
-#include <random>
+#include <openssl/rand.h>
 #include <sstream>
 #include <thread>
 #include <set>
@@ -29,12 +30,25 @@ bool identifier(const std::string& s, size_t limit) {
   return !s.empty() && s.size() <= limit && s.find('\0') == std::string::npos && valid_utf8(s);
 }
 
-std::string request_id() {
-  std::random_device random;
+Result<std::string> request_id() {
+  std::array<unsigned char, 16> random{};
+  if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) {
+    return Result<std::string>::failure(make_failure(
+        ErrorDomain::data, ErrorCode::processing_failed, "RPC request ID generation failed"));
+  }
   std::ostringstream text;
-  for (int i = 0; i < 4; ++i)
-    text << std::hex << std::setw(8) << std::setfill('0') << random();
-  return text.str();
+  for (const auto byte : random) {
+    text << std::hex << std::setw(2) << std::setfill('0') << unsigned(byte);
+  }
+  return Result<std::string>::success(text.str());
+}
+
+Failure rpc_failure(const RpcError& error) {
+  auto result = std::make_shared<FailureInfo>(
+      *make_failure(ErrorDomain::data, ErrorCode::request_failed, error.what(), false,
+                    static_cast<int>(error.code()), {"rpc"}));
+  result->backend_data = error.data();
+  return result;
 }
 
 RpcError failure(RpcErrorCode code) {
@@ -73,8 +87,9 @@ RpcError failure(RpcErrorCode code) {
 std::string truncate_utf8(std::string value, size_t limit) {
   if (value.size() > limit) {
     value.resize(limit);
-    while (!valid_utf8(value))
+    while (!valid_utf8(value)) {
       value.pop_back();
+    }
   }
   return value;
 }
@@ -83,7 +98,7 @@ std::string truncate_utf8(std::string value, size_t limit) {
 struct RpcSession::State {
   struct Outgoing {
     std::string destination;
-    std::promise<std::string> promise;
+    livekit::sdk::detail::ServicePromise<std::string> promise;
     Clock::time_point deadline, ack_deadline;
     std::stop_token stop;
     std::unique_ptr<std::stop_callback<std::function<void()>>> cancellation;
@@ -145,20 +160,24 @@ struct RpcSession::State {
   }
 
   bool enqueue(livekit::DataPacket packet) {
-    if (!active || closed || packets.size() >= max_packets)
+    if (!active || closed || packets.size() >= max_packets) {
       return false;
+    }
     packets.push_back(std::move(packet));
     wake_transport();
     return true;
   }
 
   void respond(const Key& key, Incoming& request, RpcResult result) {
-    if (request.completed || !active || request.epoch != epoch)
+    if (request.completed || !active || request.epoch != epoch) {
       return;
-    if (result.payload.size() > max_payload)
+    }
+    if (result.payload.size() > max_payload) {
       result.error = failure(RpcErrorCode::response_payload_too_large);
-    if (!valid_utf8(result.payload))
+    }
+    if (!valid_utf8(result.payload)) {
       result.error = failure(RpcErrorCode::application_error);
+    }
     livekit::DataPacket packet;
     packet.add_destination_identities(key.first);
     auto* response = packet.mutable_rpc_response();
@@ -174,8 +193,9 @@ struct RpcSession::State {
       wire->set_code(error.code());
       wire->set_message(truncate_utf8(std::move(message), 256));
       wire->set_data(truncate_utf8(std::move(data), max_payload));
-    } else
+    } else {
       response->set_payload(std::move(result.payload));
+    }
     request.completed = true;
     request.expires = Clock::now() + 60s;
     request.response = packet;
@@ -232,19 +252,18 @@ RpcSession::RpcSession()
           }
           ++state->requests_serviced;
           auto& request = *found->second;
-          std::exception_ptr error;
+          Failure error;
           if (request.stop.stop_requested()) {
-            error = std::make_exception_ptr(
-                SDKError(ErrorDomain::lifecycle,
-                         request.sent ? ErrorCode::outcome_unknown : ErrorCode::cancelled,
-                         "RPC cancelled; remote execution may already have occurred"));
+            error = make_failure(ErrorDomain::lifecycle,
+                                 request.sent ? ErrorCode::outcome_unknown : ErrorCode::cancelled,
+                                 "RPC cancelled; remote execution may already have occurred");
           } else if (now >= request.deadline) {
-            error = std::make_exception_ptr(failure(RpcErrorCode::response_timeout));
+            error = rpc_failure(failure(RpcErrorCode::response_timeout));
           } else if (!request.acknowledged && now >= request.ack_deadline) {
-            error = std::make_exception_ptr(failure(RpcErrorCode::connection_timeout));
+            error = rpc_failure(failure(RpcErrorCode::connection_timeout));
           }
           if (error) {
-            request.promise.set_exception(error);
+            request.promise.set_failure(error);
             state->erase_outgoing(found);
           }
         }
@@ -263,15 +282,13 @@ RpcSession::RpcSession()
       {
         std::unique_lock lock(state->mutex);
         state->changed.wait(lock, stop, [&] { return state->closed || !state->handlers.empty(); });
-        if (stop.stop_requested() || state->closed)
+        if (stop.stop_requested() || state->closed) {
           break;
+        }
         handler = std::move(state->handlers.front());
         state->handlers.pop_front();
       }
-      try {
-        handler();
-      } catch (...) { /* Application/allocator failure must not terminate the native process. */
-      }
+      handler();
     }
   });
 }
@@ -315,12 +332,14 @@ void RpcSession::disconnect() {
     std::lock_guard lock(state_->mutex);
     state_->active = false;
     ++state_->epoch;
-    for (auto& [id, request] : state_->outgoing)
-      request->promise.set_exception(
-          std::make_exception_ptr(failure(RpcErrorCode::recipient_disconnected)));
-    for (auto& [key, request] : state_->incoming)
-      if (!request.completed)
+    for (auto& [id, request] : state_->outgoing) {
+      request->promise.set_failure(rpc_failure(failure(RpcErrorCode::recipient_disconnected)));
+    }
+    for (auto& [key, request] : state_->incoming) {
+      if (!request.completed) {
         stops.push_back(request.stop);
+      }
+    }
     state_->deadlines.clear();
     state_->cancellations->clear();
     state_->timer_wakeup->signal();
@@ -329,45 +348,57 @@ void RpcSession::disconnect() {
     state_->packets.clear();
     state_->handlers.clear();
   }
-  for (auto& stop : stops)
+  for (auto& stop : stops) {
     stop.request_stop();
+  }
 }
 
 void RpcSession::participant_left(const std::string& identity) {
   std::vector<std::stop_source> stops;
   {
     std::lock_guard lock(state_->mutex);
-    for (auto it = state_->outgoing.begin(); it != state_->outgoing.end();)
+    for (auto it = state_->outgoing.begin(); it != state_->outgoing.end();) {
       if (it->second->destination == identity) {
-        it->second->promise.set_exception(
-            std::make_exception_ptr(failure(RpcErrorCode::recipient_disconnected)));
+        it->second->promise.set_failure(rpc_failure(failure(RpcErrorCode::recipient_disconnected)));
         it = state_->erase_outgoing(it);
-      } else
+      } else {
         ++it;
-    for (auto it = state_->incoming.begin(); it != state_->incoming.end();)
+      }
+    }
+    for (auto it = state_->incoming.begin(); it != state_->incoming.end();) {
       if (it->first.first == identity) {
         stops.push_back(it->second.stop);
         it = state_->erase_incoming(it);
-      } else
+      } else {
         ++it;
+      }
+    }
     std::erase_if(state_->packets, [&](const auto& packet) {
       return packet.destination_identities_size() == 1 &&
              packet.destination_identities(0) == identity;
     });
   }
-  for (auto& stop : stops)
+  for (auto& stop : stops) {
     stop.request_stop();
+  }
 }
 
-void RpcSession::register_method(const std::string& method, RpcHandler handler) {
-  if (!identifier(method, 256) || !handler)
-    throw std::invalid_argument("RPC method and handler required");
+Result<void> RpcSession::register_method(const std::string& method, RpcHandler handler) {
+  if (!identifier(method, 256) || !handler) {
+    return Result<void>::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
+                                              "RPC method and handler required"));
+  }
   std::lock_guard lock(state_->mutex);
-  if (state_->methods.contains(method))
-    throw std::invalid_argument("RPC method already registered");
-  if (state_->methods.size() >= 64)
-    throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "RPC method limit");
+  if (state_->methods.contains(method)) {
+    return Result<void>::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
+                                              "RPC method already registered"));
+  }
+  if (state_->methods.size() >= 64) {
+    return Result<void>::failure(
+        make_failure(ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "RPC method limit"));
+  }
   state_->methods.emplace(method, std::move(handler));
+  return Result<void>::success();
 }
 
 void RpcSession::unregister_method(const std::string& method) {
@@ -375,25 +406,37 @@ void RpcSession::unregister_method(const std::string& method) {
   state_->methods.erase(method);
 }
 
-std::future<std::string> RpcSession::call(const RpcCallOptions& options) {
+std::future<Result<std::string>> RpcSession::call(const RpcCallOptions& options) {
   auto request = std::make_shared<State::Outgoing>();
   auto result = request->promise.get_future();
-  try {
+  auto submitted = [&]() -> Result<void> {
     if (!identifier(options.destination_identity, 1024) || !identifier(options.method, 256) ||
-        !valid_utf8(options.payload))
-      throw std::invalid_argument("Invalid RPC identity, method or UTF-8 payload");
-    if (options.payload.size() > max_payload)
-      throw failure(RpcErrorCode::request_payload_too_large);
-    if (options.response_timeout <= 0ms || options.response_timeout > 5min)
-      throw std::invalid_argument("RPC timeout must be positive and at most five minutes");
-    if (options.stop.stop_requested())
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::cancelled, "RPC cancelled before sending");
+        !valid_utf8(options.payload)) {
+      return Result<void>::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
+                                                "Invalid RPC identity, method or UTF-8 payload"));
+    }
+    if (options.payload.size() > max_payload) {
+      return Result<void>::failure(rpc_failure(failure(RpcErrorCode::request_payload_too_large)));
+    }
+    if (options.response_timeout <= 0ms || options.response_timeout > 5min) {
+      return Result<void>::failure(
+          make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
+                       "RPC timeout must be positive and at most five minutes"));
+    }
+    if (options.stop.stop_requested()) {
+      return Result<void>::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::cancelled,
+                                                "RPC cancelled before sending"));
+    }
     const auto now = Clock::now();
     request->destination = options.destination_identity;
     request->deadline = now + options.response_timeout;
     request->ack_deadline = now + 7s;
     request->stop = options.stop;
-    const auto id = request_id();
+    const auto generated_id = request_id();
+    if (!generated_id) {
+      return Result<void>::failure(generated_id.failure_record());
+    }
+    const auto& id = *generated_id;
     livekit::DataPacket packet;
     packet.add_destination_identities(options.destination_identity);
     auto* wire = packet.mutable_rpc_request();
@@ -403,19 +446,33 @@ std::future<std::string> RpcSession::call(const RpcCallOptions& options) {
     wire->set_version(1);
     if (options.compress) {
       wire->clear_payload();
-      wire->set_compressed_payload(deflate_raw(options.payload));
+      auto compressed = deflate_raw(options.payload);
+      if (!compressed) {
+        return Result<void>::failure(compressed.failure_record());
+      }
+      wire->set_compressed_payload(std::move(*compressed));
     }
     wire->set_response_timeout_ms(
         static_cast<uint32_t>(std::max(1000ms, options.response_timeout - 7000ms).count()));
     std::lock_guard lock(state_->mutex);
-    if (!state_->active)
-      throw failure(RpcErrorCode::recipient_disconnected);
-    if (state_->outgoing.size() >= max_pending || state_->packets.size() >= max_packets)
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "RPC pending limit");
-    if (!state_->outgoing.emplace(id, request).second)
-      throw std::runtime_error("RPC request ID collision");
-    try {
-      const auto wake = state_->cancellations->watch(id);
+    if (!state_->active) {
+      return Result<void>::failure(rpc_failure(failure(RpcErrorCode::recipient_disconnected)));
+    }
+    if (state_->outgoing.size() >= max_pending || state_->packets.size() >= max_packets) {
+      return Result<void>::failure(
+          make_failure(ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "RPC pending limit"));
+    }
+    if (!state_->outgoing.emplace(id, request).second) {
+      return Result<void>::failure(
+          make_failure(ErrorDomain::data, ErrorCode::internal_error, "RPC request ID collision"));
+    }
+    {
+      const auto watched = state_->cancellations->watch(id);
+      if (!watched) {
+        state_->erase_outgoing(state_->outgoing.find(id));
+        return Result<void>::failure(watched.failure_record());
+      }
+      const auto wake = *watched;
       // This callback takes no session lock, including when registration invokes
       // it synchronously or its destructor fences a concurrent request_stop().
       request->cancellation = std::make_unique<std::stop_callback<std::function<void()>>>(
@@ -423,43 +480,46 @@ std::future<std::string> RpcSession::call(const RpcCallOptions& options) {
       state_->schedule(id, *request);
       state_->packets.push_back(std::move(packet));
       state_->wake_transport();
-    } catch (...) {
-      state_->erase_outgoing(state_->outgoing.find(id));
-      throw;
     }
-  } catch (...) {
-    request->promise.set_exception(std::current_exception());
+    return Result<void>::success();
+  }();
+  if (!submitted) {
+    request->promise.set_failure(submitted.failure_record());
   }
   return result;
 }
 
 void RpcSession::receive(const livekit::DataPacket& packet) {
   if (packet.kind() != 0 || !identifier(packet.participant_identity(), 1024) ||
-      packet.ByteSizeLong() > 16384)
+      packet.ByteSizeLong() > 16384) {
     return;
+  }
   const auto& sender = packet.participant_identity();
   std::lock_guard lock(state_->mutex);
-  if (!state_->active)
+  if (!state_->active) {
     return;
+  }
   if (packet.has_rpc_ack() || packet.has_rpc_response()) {
     const auto& id =
         packet.has_rpc_ack() ? packet.rpc_ack().request_id() : packet.rpc_response().request_id();
     auto found = state_->outgoing.find(id);
-    if (found == state_->outgoing.end() || found->second->destination != sender)
+    if (found == state_->outgoing.end() || found->second->destination != sender) {
       return;
+    }
     auto& request = *found->second;
     const auto now = Clock::now();
-    std::exception_ptr terminal;
-    if (request.stop.stop_requested())
-      terminal = std::make_exception_ptr(SDKError(
-          ErrorDomain::lifecycle, request.sent ? ErrorCode::outcome_unknown : ErrorCode::cancelled,
-          "RPC cancelled; remote execution may already have occurred"));
-    else if (now >= request.deadline)
-      terminal = std::make_exception_ptr(failure(RpcErrorCode::response_timeout));
-    else if (!request.acknowledged && now >= request.ack_deadline)
-      terminal = std::make_exception_ptr(failure(RpcErrorCode::connection_timeout));
+    Failure terminal;
+    if (request.stop.stop_requested()) {
+      terminal = make_failure(ErrorDomain::lifecycle,
+                              request.sent ? ErrorCode::outcome_unknown : ErrorCode::cancelled,
+                              "RPC cancelled; remote execution may already have occurred");
+    } else if (now >= request.deadline) {
+      terminal = rpc_failure(failure(RpcErrorCode::response_timeout));
+    } else if (!request.acknowledged && now >= request.ack_deadline) {
+      terminal = rpc_failure(failure(RpcErrorCode::connection_timeout));
+    }
     if (terminal) {
-      request.promise.set_exception(terminal);
+      request.promise.set_failure(terminal);
       state_->erase_outgoing(found);
       return;
     }
@@ -469,44 +529,44 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
       return;
     }
     auto response = packet.rpc_response();
-    if (response.has_compressed_payload())
-      try {
-        response.set_payload(inflate_raw(response.compressed_payload(), max_payload));
-      } catch (...) {
-        request.promise.set_exception(
-            std::make_exception_ptr(failure(RpcErrorCode::response_payload_too_large)));
+    if (response.has_compressed_payload()) {
+      auto inflated = inflate_raw(response.compressed_payload(), max_payload);
+      if (!inflated) {
+        request.promise.set_failure(rpc_failure(failure(RpcErrorCode::response_payload_too_large)));
         state_->erase_outgoing(found);
         return;
       }
+      response.set_payload(std::move(*inflated));
+    }
     if (response.has_error()) {
       const auto& error = response.error();
       if (error.message().size() > 256 || error.data().size() > max_payload ||
-          !valid_utf8(error.message()) || !valid_utf8(error.data()))
+          !valid_utf8(error.message()) || !valid_utf8(error.data())) {
         return;
-      request.promise.set_exception(
-          std::make_exception_ptr(RpcError(error.code(), error.message(), error.data())));
-    } else if (response.has_compressed_payload())
-      request.promise.set_exception(
-          std::make_exception_ptr(failure(RpcErrorCode::unsupported_version)));
-    else if (response.has_payload() && response.payload().size() <= max_payload &&
-             valid_utf8(response.payload()))
+      }
+      request.promise.set_failure(
+          rpc_failure(RpcError(error.code(), error.message(), error.data())));
+    } else if (response.has_compressed_payload()) {
+      request.promise.set_failure(rpc_failure(failure(RpcErrorCode::unsupported_version)));
+    } else if (response.has_payload() && response.payload().size() <= max_payload &&
+               valid_utf8(response.payload())) {
       request.promise.set_value(response.payload());
-    else
-      request.promise.set_exception(
-          std::make_exception_ptr(failure(RpcErrorCode::response_payload_too_large)));
+    } else {
+      request.promise.set_failure(rpc_failure(failure(RpcErrorCode::response_payload_too_large)));
+    }
     state_->erase_outgoing(found);
     return;
   }
-  if (!packet.has_rpc_request())
+  if (!packet.has_rpc_request()) {
     return;
+  }
   auto wire = packet.rpc_request();
-  if (!identifier(wire.id(), 128))
+  if (!identifier(wire.id(), 128)) {
     return;
-  if (!wire.compressed_payload().empty())
-    try {
-      wire.set_payload(inflate_raw(wire.compressed_payload(), max_payload));
-      wire.clear_compressed_payload();
-    } catch (...) {
+  }
+  if (!wire.compressed_payload().empty()) {
+    auto inflated = inflate_raw(wire.compressed_payload(), max_payload);
+    if (!inflated) {
       livekit::DataPacket rejected;
       rejected.add_destination_identities(sender);
       auto* response = rejected.mutable_rpc_response();
@@ -516,29 +576,37 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
       state_->enqueue(std::move(rejected));
       return;
     }
+    wire.set_payload(std::move(*inflated));
+    wire.clear_compressed_payload();
+  }
   const Key key{sender, wire.id()};
   livekit::DataPacket ack;
   ack.add_destination_identities(sender);
   ack.mutable_rpc_ack()->set_request_id(wire.id());
-  if (!state_->enqueue(std::move(ack)))
+  if (!state_->enqueue(std::move(ack))) {
     return;
+  }
   if (auto found = state_->incoming.find(key); found != state_->incoming.end()) {
-    if (found->second.method != wire.method() || found->second.payload != wire.payload())
+    if (found->second.method != wire.method() || found->second.payload != wire.payload()) {
       return;
-    if (found->second.completed)
+    }
+    if (found->second.completed) {
       state_->enqueue(found->second.response);
+    }
     return;
   }
   if (state_->incoming.size() >= max_pending) {
     // Evict only completed calls. In-flight requests are never replaced.
     auto oldest = state_->incoming.end();
-    for (auto it = state_->incoming.begin(); it != state_->incoming.end(); ++it)
+    for (auto it = state_->incoming.begin(); it != state_->incoming.end(); ++it) {
       if (it->second.completed &&
-          (oldest == state_->incoming.end() || it->second.expires < oldest->second.expires))
+          (oldest == state_->incoming.end() || it->second.expires < oldest->second.expires)) {
         oldest = it;
-    if (oldest != state_->incoming.end())
+      }
+    }
+    if (oldest != state_->incoming.end()) {
       state_->erase_incoming(oldest);
-    else {
+    } else {
       livekit::DataPacket busy;
       busy.add_destination_identities(sender);
       auto* response = busy.mutable_rpc_response();
@@ -590,31 +658,29 @@ void RpcSession::receive(const livekit::DataPacket& packet) {
       std::lock_guard lock(state->mutex);
       auto found = state->incoming.find(key);
       if (found != state->incoming.end() && found->second.epoch == epoch &&
-          found->second.incarnation == incarnation && Clock::now() < found->second.deadline)
+          found->second.incarnation == incarnation && Clock::now() < found->second.deadline) {
         state->respond(key, found->second, std::move(result));
+      }
     }
   };
   state_->handlers.push_back([handler = method->second, invocation = std::move(invocation),
                               done = std::move(done)]() mutable {
-    if (invocation.stop.stop_requested() || Clock::now() >= invocation.deadline)
+    if (invocation.stop.stop_requested() || Clock::now() >= invocation.deadline) {
       return;
-    try {
-      handler(std::move(invocation), done);
-    } catch (const RpcError& error) {
-      done({{}, error});
-    } catch (...) {
-      done({{}, failure(RpcErrorCode::application_error)});
     }
+    handler(std::move(invocation), done);
   });
   state_->changed.notify_all();
 }
 
 bool RpcSession::sendable(const livekit::DataPacket& packet) const {
   std::lock_guard lock(state_->mutex);
-  if (!state_->active)
+  if (!state_->active) {
     return false;
-  if (!packet.has_rpc_request())
+  }
+  if (!packet.has_rpc_request()) {
     return true;
+  }
   auto found = state_->outgoing.find(packet.rpc_request().id());
   return found != state_->outgoing.end() && !found->second->stop.stop_requested() &&
          Clock::now() < found->second->deadline;
@@ -641,8 +707,9 @@ std::vector<livekit::DataPacket> RpcSession::take_packets(size_t count) {
     if (packet.has_rpc_request()) {
       auto found = state_->outgoing.find(packet.rpc_request().id());
       if (found == state_->outgoing.end() || found->second->stop.stop_requested() ||
-          Clock::now() >= found->second->deadline)
+          Clock::now() >= found->second->deadline) {
         continue;
+      }
       found->second->sent = true;
     }
     result.push_back(std::move(packet));
@@ -651,13 +718,15 @@ std::vector<livekit::DataPacket> RpcSession::take_packets(size_t count) {
 }
 
 void RpcSession::send_failed(const livekit::DataPacket& packet) {
-  if (!packet.has_rpc_request())
+  if (!packet.has_rpc_request()) {
     return;
+  }
   std::lock_guard lock(state_->mutex);
   auto found = state_->outgoing.find(packet.rpc_request().id());
-  if (found == state_->outgoing.end())
+  if (found == state_->outgoing.end()) {
     return;
-  found->second->promise.set_exception(std::make_exception_ptr(failure(RpcErrorCode::send_failed)));
+  }
+  found->second->promise.set_failure(rpc_failure(failure(RpcErrorCode::send_failed)));
   state_->erase_outgoing(found);
 }
 }  // namespace livekit::sdk::detail

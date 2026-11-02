@@ -4,7 +4,6 @@
 #include <condition_variable>
 #include <list>
 #include <mutex>
-#include <stdexcept>
 
 namespace livekit::sdk {
 using namespace std::chrono_literals;
@@ -13,6 +12,7 @@ struct PcmAudioSource::Impl {
   explicit Impl(PcmSourceOptions value) : options(value) {}
 
   const PcmSourceOptions options;
+  Failure failure;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
   AudioSourceStats stats;
@@ -54,7 +54,7 @@ struct PcmAudioSource::Impl {
   }
 };
 
-PcmAudioSource::PcmAudioSource(PcmSourceOptions options) {
+PcmAudioSource::PcmAudioSource(PcmSourceOptions options) : impl_(std::make_unique<Impl>(options)) {
   const std::vector<int> rates{8000, 16000, 24000, 32000, 44100, 48000, 96000};
   if (std::find(rates.begin(), rates.end(), options.sample_rate) == rates.end() ||
       (options.channels != 1 && options.channels != 2) ||
@@ -65,29 +65,36 @@ PcmAudioSource::PcmAudioSource(PcmSourceOptions options) {
       options.max_bytes < static_cast<size_t>(options.sample_rate / 100) * options.channels * 2 ||
       options.max_bytes > 64u * 1024 * 1024 || options.max_drift_ppm < 0 ||
       options.max_drift_ppm > 5000)
-    throw std::invalid_argument("Invalid PCM source rate, channels, format or queue capacity");
-  impl_ = std::make_unique<Impl>(options);
+    impl_->failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                  "Invalid PCM source rate, channels, format or queue capacity");
 }
 
 PcmAudioSource::~PcmAudioSource() = default;
+
+Result<void> PcmAudioSource::status() const {
+  return impl_->failure ? Result<void>::failure(impl_->failure) : Result<void>::success();
+}
 
 PcmSourceOptions PcmAudioSource::options() const {
   return impl_->options;
 }
 
-AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame) {
+Result<AudioWriteStatus> PcmAudioSource::write(const PcmInputFrame& frame) {
   return write(frame, {});
 }
 
-AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame,
-                                       std::optional<uint64_t> expected_generation) {
+Result<AudioWriteStatus> PcmAudioSource::write(const PcmInputFrame& frame,
+                                               std::optional<uint64_t> expected_generation) {
+  if (auto valid = status(); !valid) {
+    return Result<AudioWriteStatus>::failure(valid.failure_record());
+  }
   auto& s = *impl_;
   std::lock_guard lock(s.mutex);
   if (s.stats.closed)
-    return AudioWriteStatus::closed;
+    return Result<AudioWriteStatus>::success(AudioWriteStatus::closed);
   if (expected_generation && *expected_generation != s.stats.generation) {
     ++s.stats.rejected_writes;
-    return AudioWriteStatus::backpressure;
+    return Result<AudioWriteStatus>::success(AudioWriteStatus::backpressure);
   }
   const bool floating = s.options.format == AudioSampleFormat::float32;
   const auto input_count = floating ? frame.float_samples.size() : frame.samples.size();
@@ -95,10 +102,13 @@ AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame,
   const auto block_samples = s.samples() * s.options.channels;
   if ((floating ? !frame.samples.empty() : !frame.float_samples.empty()) || !count ||
       count % s.options.channels || count > block_samples * 10)
-    throw std::invalid_argument("PCM input requires complete interleaved samples, at most 100ms");
+    return Result<AudioWriteStatus>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                     "PCM input requires complete interleaved samples, at most 100ms"));
   if (floating && !std::all_of(frame.float_samples.begin(), frame.float_samples.end(),
                                [](float v) { return std::isfinite(v) && v >= -1 && v <= 1; }))
-    throw std::invalid_argument("Invalid float PCM sample");
+    return Result<AudioWriteStatus>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Invalid float PCM sample"));
   const auto now = std::chrono::steady_clock::now();
   auto captured = frame.capture_time.value_or(s.written_end.value_or(s.next_capture.value_or(now)));
   if (s.remainder.empty() && !frame.capture_time && s.next_capture && captured < *s.next_capture)
@@ -106,7 +116,8 @@ AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame,
   if (frame.capture_time &&
       (captured < now - 5s || captured > now + 100ms ||
        (!s.options.drift_compensation && s.written_end && captured + 1us < *s.written_end)))
-    throw std::invalid_argument("Invalid PCM capture time");
+    return Result<AudioWriteStatus>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Invalid PCM capture time"));
   std::vector<int16_t> samples;
   samples.reserve(input_count);
   if (floating)
@@ -121,7 +132,8 @@ AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame,
       const double elapsed =
           std::chrono::duration<double>(*frame.capture_time - *s.previous_input_time).count();
       if (elapsed <= 0)
-        throw std::invalid_argument("Non-monotonic PCM capture clock");
+        return Result<AudioWriteStatus>::failure(make_failure(
+            ErrorDomain::media, ErrorCode::invalid_argument, "Non-monotonic PCM capture clock"));
       const double observed = elapsed * s.options.sample_rate / s.previous_input_frames;
       if (observed > .95 && observed < 1.05) {
         const double bound = s.options.max_drift_ppm / 1000000.0;
@@ -148,13 +160,15 @@ AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame,
       captured = *s.written_end;
   }
   if (!s.remainder.empty() && s.written_end && std::chrono::abs(captured - *s.written_end) > 1ms)
-    throw std::invalid_argument("Discontinuous PCM input with partial block");
+    return Result<AudioWriteStatus>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                     "Discontinuous PCM input with partial block"));
   const size_t max_samples = size_t(s.options.sample_rate) * s.options.channels *
                              s.options.max_queue_duration.count() / 1000;
   if (!s.stats.accepting || count > max_samples || s.stats.queued_bytes / 2 > max_samples - count ||
       count > s.options.max_bytes / 2 || s.stats.queued_bytes > s.options.max_bytes - count * 2) {
     ++s.stats.rejected_writes;
-    return AudioWriteStatus::backpressure;
+    return Result<AudioWriteStatus>::success(AudioWriteStatus::backpressure);
   }
   auto combined = s.remainder;
   combined.reserve(combined.size() + count);
@@ -188,7 +202,7 @@ AudioWriteStatus PcmAudioSource::write(const PcmInputFrame& frame,
                               (int64_t(combined.size() / s.options.channels) * 1000000000) /
                               s.options.sample_rate);
   s.changed.notify_one();
-  return AudioWriteStatus::accepted;
+  return Result<AudioWriteStatus>::success(AudioWriteStatus::accepted);
 }
 
 AudioSourceStats PcmAudioSource::stats() const {
@@ -197,6 +211,9 @@ AudioSourceStats PcmAudioSource::stats() const {
 }
 
 void PcmAudioSource::close() {
+  if (!status()) {
+    return;
+  }
   auto& s = *impl_;
   std::lock_guard lock(s.mutex);
   s.stats.closed = true;
@@ -208,17 +225,31 @@ void PcmAudioSource::close() {
 namespace detail {
 PcmSourceReader::PcmSourceReader(std::shared_ptr<PcmAudioSource> source)
     : source_(std::move(source)) {
-  if (!source_)
-    throw std::invalid_argument("PCM source is required");
+  if (!source_) {
+    failure_ =
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "PCM source is required");
+    return;
+  }
+  if (auto valid = source_->status(); !valid) {
+    failure_ = valid.failure_record();
+    return;
+  }
   auto& s = *source_->impl_;
   std::lock_guard lock(s.mutex);
-  if (s.stats.attached || s.stats.closed)
-    throw std::invalid_argument("PCM source is already published or closed");
+  if (s.stats.attached || s.stats.closed) {
+    failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                            "PCM source is already published or closed");
+    return;
+  }
   s.clear();
   s.stats.attached = true;
+  attached_ = true;
 }
 
 PcmSourceReader::~PcmSourceReader() {
+  if (!attached_) {
+    return;
+  }
   auto& s = *source_->impl_;
   std::lock_guard lock(s.mutex);
   s.stats.accepting = false;
@@ -227,16 +258,27 @@ PcmSourceReader::~PcmSourceReader() {
   s.changed.notify_all();
 }
 
-void PcmSourceReader::start() {
+Result<void> PcmSourceReader::status() const {
+  return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+}
+
+Result<void> PcmSourceReader::start() {
+  if (auto valid = status(); !valid) {
+    return valid;
+  }
   auto& s = *source_->impl_;
   std::lock_guard lock(s.mutex);
   s.clear();
   ++s.stats.generation;
   s.stats.accepting = !s.stats.closed;
   s.changed.notify_all();
+  return Result<void>::success();
 }
 
 void PcmSourceReader::stop() {
+  if (!attached_) {
+    return;
+  }
   auto& s = *source_->impl_;
   std::lock_guard lock(s.mutex);
   s.stats.accepting = false;
@@ -245,6 +287,9 @@ void PcmSourceReader::stop() {
 }
 
 std::optional<PcmSourceBlock> PcmSourceReader::read(std::stop_token stop) {
+  if (!attached_) {
+    return {};
+  }
   auto& s = *source_->impl_;
   std::unique_lock lock(s.mutex);
   s.changed.wait(lock, stop,
@@ -277,6 +322,9 @@ std::optional<PcmSourceBlock> PcmSourceReader::read(std::stop_token stop) {
 }
 
 void PcmSourceReader::skip(size_t blocks) {
+  if (!attached_) {
+    return;
+  }
   auto& s = *source_->impl_;
   std::lock_guard lock(s.mutex);
   if (!s.stats.accepting || !s.next_capture)

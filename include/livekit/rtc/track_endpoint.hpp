@@ -12,8 +12,6 @@ class RtcSubscribeNode;
 
 namespace engine {
 class RtcEngine;
-class PublishPipeline;
-class SubscribePipeline;
 }  // namespace engine
 
 namespace detail {
@@ -47,8 +45,6 @@ class PublishedTrack {
  private:
   friend class RoomEngine;
   friend class engine::RtcEngine;
-  friend class engine::PublishPipeline;
-  [[nodiscard]] ErrorCode close_locked();
   PublishedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::TrackControl>);
   std::shared_ptr<detail::Endpoint> endpoint_;
   std::weak_ptr<detail::TrackControl> session_;
@@ -73,10 +69,8 @@ class SubscribedTrack {
  private:
   friend class RoomEngine;
   friend class engine::RtcEngine;
-  friend class engine::SubscribePipeline;
   friend class nodes::RtcSubscribeNode;
   void request_keyframe_async();
-  [[nodiscard]] ErrorCode close_locked();
   SubscribedTrack(std::shared_ptr<detail::Endpoint>, std::weak_ptr<detail::TrackControl>);
   std::shared_ptr<detail::Endpoint> endpoint_;
   std::weak_ptr<detail::TrackControl> session_;

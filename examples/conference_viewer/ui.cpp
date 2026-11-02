@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <set>
-#include <stdexcept>
 
 namespace demo {
 View::View() {
@@ -13,19 +12,22 @@ View::View() {
   std::snprintf(room.data(), room.size(), "demo");
 }
 
-SessionOptions View::options() const {
+sdk::Result<SessionOptions> View::options() const {
   auto o = username_options(url.data(), room.data(), username.data());
-  o.audio_playout = audio;
+  if (!o) {
+    return o;
+  }
+  o->audio_playout = audio;
   for (int i = 0; i < std::clamp(video_count, 0, max_test_videos); ++i) {
     sdk::MediaSpec m;
     m.demo = true;
-    o.media.push_back(m);
+    o->media.push_back(m);
   }
   if (tone) {
     sdk::MediaSpec m;
     m.demo = true;
     m.video = false;
-    o.media.push_back(m);
+    o->media.push_back(m);
   }
   return o;
 }
@@ -57,13 +59,15 @@ void apply_style(float scale, float pixel_density) {
   io.FontGlobalScale = 1.0f / pixel_density;
 }
 
-void render_draw_data(SDL_Renderer* renderer) {
+sdk::Result<void> render_draw_data(SDL_Renderer* renderer) {
   // SDL's ImGui backend scales clipping, but expects the application to scale
   // vertex coordinates via the renderer (as in the upstream SDL example).
   const auto& io = ImGui::GetIO();
   if (SDL_RenderSetScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y) != 0)
-    throw std::runtime_error(SDL_GetError());
+    return sdk::Result<void>::failure(sdk::make_failure(
+        sdk::ErrorDomain::media, sdk::ErrorCode::processing_failed, SDL_GetError()));
   ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+  return sdk::Result<void>::success();
 }
 
 void View::draw_quality(const Snapshot& snapshot) {
@@ -455,7 +459,10 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
       if (tile.frame) {
         auto& cached = textures_[tile.id];
         if (cached.last != tile.frame) {
-          cached.texture.upload(renderer, *tile.frame);
+          auto uploaded = cached.texture.upload(renderer, *tile.frame);
+          if (!uploaded) {
+            error = uploaded.error().message;
+          }
           cached.last = tile.frame;
         }
         const auto fit = fit_video(pos.x, pos.y, area.x, area.y, cached.texture.width(),

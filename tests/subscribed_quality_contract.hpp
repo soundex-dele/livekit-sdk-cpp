@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #pragma once
 #include "backends/rtc/livekit/subscribed_quality.hpp"
 #include <stdexcept>
@@ -6,7 +7,7 @@ inline void subscribed_quality_contract() {
   using livekit::sdk::detail::subscribed_video_enabled;
   auto check = [](bool ok) {
     if (!ok)
-      throw std::runtime_error("Subscribed quality contract failed");
+      livekit::sdk::test::fail("Subscribed quality contract failed");
   };
   livekit::SignalResponse response;
   // Upstream field 14, track T, H264 HIGH disabled. Not a self-serialization test.

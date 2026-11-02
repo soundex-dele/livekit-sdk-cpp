@@ -19,7 +19,7 @@ class View {
   std::string error;
   View();
   Action draw(SDL_Renderer* renderer, const Snapshot& snapshot);
-  SessionOptions options() const;
+  sdk::Result<SessionOptions> options() const;
 
  private:
   void draw_quality(const Snapshot& snapshot);
@@ -33,5 +33,5 @@ class View {
 };
 
 void apply_style(float scale, float pixel_density = 1.0f);
-void render_draw_data(SDL_Renderer* renderer);
+sdk::Result<void> render_draw_data(SDL_Renderer* renderer);
 }  // namespace demo

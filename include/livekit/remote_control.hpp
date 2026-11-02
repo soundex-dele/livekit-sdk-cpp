@@ -1,6 +1,7 @@
 #pragma once
 #include <livekit/data_messages.hpp>
 #include <livekit/json.hpp>
+#include <livekit/result.hpp>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -40,9 +41,9 @@ class ControlInputSink {
 };
 
 // Windows ordinary interactive desktop only. These functions never elevate.
-std::shared_ptr<ControlInputSink> make_windows_control_input();
+Result<std::shared_ptr<ControlInputSink>> make_windows_control_input();
 // Platform factory does not request permissions or inject input on construction.
-std::shared_ptr<ControlInputSink> make_platform_control_input();
+Result<std::shared_ptr<ControlInputSink>> make_platform_control_input();
 
 struct ControlPermissions {
   bool screen = false, input = false, interactive = false;
@@ -53,7 +54,7 @@ struct ControlPermissions {
 };
 
 ControlPermissions control_permissions();
-ControlLayout primary_control_layout();
+Result<ControlLayout> primary_control_layout();
 // Portable browser KeyboardEvent.code -> PC set-1 scan code (bit 8 = extended).
 unsigned control_key_scan_code(const std::string& code);
 
@@ -65,9 +66,11 @@ class RemoteControlSession {
   RemoteControlSession& operator=(const RemoteControlSession&) = delete;
   // Trusted application supplies an ONLINE verified business grant; never call
   // this from a data-message handler. Deadlines are monotonic and include HTTP RTT.
-  void authorize(ControlGrant, ControlLayout, ControlClock::time_point now = ControlClock::now());
+  Result<void> check() const;
+  Result<void> authorize(ControlGrant, ControlLayout,
+                         ControlClock::time_point now = ControlClock::now());
   bool renew(const ControlGrant&, ControlClock::time_point now = ControlClock::now());
-  void set_layout(ControlLayout);
+  Result<void> set_layout(ControlLayout);
   bool receive(const std::vector<uint8_t>&, const DataReceiveParams&,
                ControlClock::time_point now = ControlClock::now());
   void tick(ControlClock::time_point now = ControlClock::now());

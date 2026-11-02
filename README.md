@@ -1,10 +1,10 @@
 # livekit-sdk-cpp
 
-当前 RTC 接口见 [完成回调与持续 Observer](docs/rtc-simple-observer.md)。RtcEngine 和 RoomEngine 的控制接口返回 `void`，每次调用通过 `Completion<T>` 接收 `Result<T>`；持续状态交给 Observer。RtcEngine 在对应 GraphEngine 启动后交付发布/订阅结果。两层共用 control、lifecycle、notification 三线程，应用无需调用 `poll()`；leave/close 保持同步。
+当前 RTC 接口见 [完成回调与持续 Observer](docs/rtc-simple-observer.md)。RtcEngine 和 RoomEngine 的控制接口返回 `void`，每次调用通过 `Completion<T>` 接收 `Result<T>`；持续状态交给 Observer。RtcEngine 在对应 GraphEngine 启动后交付发布/订阅结果。RtcEngine 与其 RoomEngine 共使用 control、lifecycle、notification 三线程（独立 RoomEngine 仅有 control 与 notification），应用无需调用 `poll()`；leave/close 保持同步。
 
 C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
 
-普通媒体会话通过 RtcEngine 装配可选的内部 RtcMediaEngine：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
+普通媒体会话通过 RtcEngine 装配可选的 RtcMediaGraphBuilder 与 RtcMediaResources：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
 
 旧 Room、Participant、TrackPublication、VideoFrameStream、AudioFrameStream API 和 LiveKit::SDK 目标已移除，没有兼容层。调用方与测试入口已迁移，支持边界与验证记录见 [实施清单](docs/rtc-backend-refactor.md)。
 
@@ -15,7 +15,7 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 | 使用方式 | 公共头文件 | 链接目标 |
 | --- | --- | --- |
 | 配置采集、编解码、预览、播放、录制与共享采集 | livekit/rtc/engine.hpp | LiveKit::RTCMediaEngine |
-| 只入会、收发编码帧 | livekit/rtc/livekit.hpp | LiveKit::RTCLiveKit |
+| 只入会、收发编码帧 | livekit/rtc/room_engine.hpp、livekit.hpp | LiveKit::RTCLiveKit |
 | 统一入口：编码传输与高级 GraphEngine 扩展 | livekit/rtc/engine.hpp、graph_api.hpp | LiveKit::RTCEngine |
 | 自行组合发布/订阅节点 | livekit/rtc/publish_node.hpp、subscribe_node.hpp | LiveKit::RTCNodes |
 | 上层 VP8/H264/H265/Opus 编解码 | livekit/rtc/video_nodes.hpp、audio_nodes.hpp | LiveKit::RTCMedia |
@@ -24,7 +24,7 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 | Token 与可信服务端管理 API | livekit/auth.hpp、api.hpp | LiveKit::ServerSDK |
 | 本地文件播放 / 直播合成 | livekit/player.hpp、studio.hpp | LiveKit::Player / LiveKit::Studio |
 
-完整的 [编码媒体 API](docs/rtc-encoded-api.md) 包含后端直接收发、图组合、生命周期、静音、订阅需求、权限及线程契约。后端不依赖实际编解码器或采集、渲染设备。
+当前 [编码媒体 API](docs/rtc-encoded-api.md) 包含后端直接收发、图组合、生命周期、静音、订阅需求、权限及线程契约。后端不依赖实际编解码器或采集、渲染设备。
 
 普通 Session 的入口、共享源示例及所有权规则见 [媒体引擎 API](docs/rtc-media-engine.md)。
 
@@ -37,19 +37,19 @@ C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 轨道以稳定本地 TrackId 路由，服务端 SID 是当前会话绑定。每轨拥有独立队列、预算、反馈和关闭屏障。停止一条轨道不退出房间。已有编码帧可直接写入 PublishedTrack；SubscribedTrack::read() 返回拥有数据的完整编码帧。
 
-RtcEngine 独占 RoomEngine，以两个 map 保存发布和订阅媒体图。上层回调沿底层通知调用栈执行，`on_left` 在 `leave()` 调用栈执行。底层 WebRTC、媒体节点和设备的线程仍由对应模块管理。不在底层回调中阻塞等待结果、退会或销毁引擎。
+RtcEngine 独占 RoomEngine，以两个 map 保存发布和订阅媒体图。控制 Completion 与 Observer 在 notification 队列执行，媒体输出使用独立有界 dispatcher。leave/close 是外部拥有者调用的同步屏障，close 是 leave 的别名，返回后可重新 join。回调不能阻塞等待其他回调、退会或销毁引擎；客户端负责 UI 线程交接。当前职责与所有权图见 [架构说明](docs/architecture.md)。
 
 ## RTC 后端目录
 
 公共入口为 `rtc::engine::RtcEngine`，头文件为 `livekit/rtc/engine.hpp`，状态和逻辑直接定义在该类中。
 RoomEngine 的公共头文件为 `livekit/rtc/room_engine.hpp`，可注入 RoomTransport 工厂做无窗口测试；普通应用使用 `create_livekit_engine()`。
-RoomEngine 通过 RoomTransport 发起协议请求，所有成功结果和持续事件统一经 Observer 传给 RtcEngine。
+RoomEngine 通过 RoomTransport 发起协议请求；单次结果经 Completion、持续事件经 Observer 传给 RtcEngine，两者均经过 notification 队列。
 详细边界见 [房间状态机设计](docs/rtc-room-state-machine.md)。
 
 ```text
 src/backends/
 ├── rtc/
-│   ├── room_engine.cpp       # 无线程的房间协议状态机
+│   ├── room_engine.cpp       # control 队列上的房间与端点状态
 │   ├── room_transport.hpp     # 内部适配接口
 │   ├── endpoint.cpp
 │   ├── queue_budget.hpp

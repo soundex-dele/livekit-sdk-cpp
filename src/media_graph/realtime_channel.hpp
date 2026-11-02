@@ -3,7 +3,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
+#include "livekit/result.hpp"
 
 namespace livekit::sdk::detail {
 // Cross-thread channel for owned payloads. Raw video may discard oldest;
@@ -14,12 +14,17 @@ class RealtimeChannel {
   RealtimeChannel(size_t capacity, size_t bytes, bool latest)
       : capacity_(capacity), max_bytes_(bytes), latest_(latest) {
     if (!capacity || !bytes)
-      throw std::invalid_argument("media_graph: zero queue limit");
+      failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                              "media_graph: zero queue limit");
+  }
+
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
   }
 
   bool push(T value, size_t bytes, uint64_t generation) {
     std::lock_guard lock(mutex_);
-    if (closed_ || generation != generation_ || bytes > max_bytes_) {
+    if (failure_ || closed_ || generation != generation_ || bytes > max_bytes_) {
       ++dropped_;
       return false;
     }
@@ -40,7 +45,7 @@ class RealtimeChannel {
 
   std::optional<T> wait_pop() {
     std::unique_lock lock(mutex_);
-    ready_.wait(lock, [&] { return closed_ || !queue_.empty(); });
+    ready_.wait(lock, [&] { return failure_ || closed_ || !queue_.empty(); });
     if (queue_.empty())
       return {};
     auto item = std::move(queue_.front());
@@ -90,6 +95,7 @@ class RealtimeChannel {
   std::deque<Item> queue_;
   size_t capacity_, max_bytes_, bytes_ = 0, dropped_ = 0;
   uint64_t generation_ = 0;
+  Failure failure_;
   bool latest_, closed_ = false;
 };
 }  // namespace livekit::sdk::detail

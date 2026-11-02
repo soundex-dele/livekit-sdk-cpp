@@ -1,4 +1,6 @@
-#include "livekit/error.hpp"
+#include <future>
+#include "media_result.hpp"
+#include "media_graph/failure.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "livekit/rtc/engine.hpp"
@@ -27,7 +29,8 @@ using namespace std::chrono_literals;
 namespace {
 void check(bool condition, const char* message) {
   if (!condition) {
-    throw std::runtime_error(message);
+    std::cerr << message << "\n";
+    std::abort();
   }
 }
 
@@ -102,12 +105,12 @@ void independent_builder_contract() {
     MediaPublishSpec spec;
     spec.track = descriptor;
     spec.input.generated = true;
-    publication = builder.build_publish(
-        spec, std::make_shared<nodes::RtcPublishNode>("builder.sink", endpoint));
+    publication = media_result(builder.build_publish(
+        spec, std::make_shared<nodes::RtcPublishNode>("builder.sink", endpoint)));
     MediaSubscribeSpec receive;
     receive.track = descriptor;
-    subscription = builder.build_subscribe(
-        receive, std::make_shared<nodes::RtcSubscribeNode>("builder.source", receiver));
+    subscription = media_result(builder.build_subscribe(
+        receive, std::make_shared<nodes::RtcSubscribeNode>("builder.source", receiver)));
   }
   check(publication.track && subscription.track && !publication.graph.nodes.empty() &&
             !subscription.graph.nodes.empty(),
@@ -118,9 +121,9 @@ void independent_builder_contract() {
   check(publication.track->check() == livekit::sdk::ErrorCode::ok &&
             subscription.track->check() == livekit::sdk::ErrorCode::ok,
         "Healthy media track returned a failure code");
-  const auto failure = std::make_exception_ptr(
-      livekit::sdk::SDKError(livekit::sdk::ErrorDomain::media,
-                             livekit::sdk::ErrorCode::processing_failed, "media contract failure"));
+  const auto failure = livekit::sdk::make_failure(livekit::sdk::ErrorDomain::media,
+                                                  livekit::sdk::ErrorCode::processing_failed,
+                                                  "media contract failure");
   publication.graph.on_failure(failure);
   subscription.graph.on_failure(failure);
   check(publication.track->check() == livekit::sdk::ErrorCode::processing_failed &&
@@ -138,8 +141,8 @@ void independent_builder_contract() {
 
 void shared_storage_and_clock() {
   detail::RawFrameQueue fast({2, 4096, 1s}), slow({1, 4096, 1s});
-  fast.start();
-  slow.start();
+  media_result(fast.start());
+  media_result(slow.start());
   auto pcm =
       std::make_shared<const PcmAudioFrame>(*rtc_audio_test::tone(1, 0, 48000, 1, false).pcm);
   const auto now = SteadyClock::now();
@@ -231,6 +234,7 @@ void callback_isolation() {
     entered = true;
     std::unique_lock lock(mutex);
     changed.wait(lock, [&] { return release; });
+    return livekit::sdk::Result<void>::success();
   };
   auto source = std::make_shared<Source>();
   auto output = std::make_shared<ApplicationOutput>(options);
@@ -273,9 +277,11 @@ class FakeSpeaker final : public detail::AudioOutputDriver {
   Render render;
   Failure fail;
 
-  void start(const AudioOutputOptions&, Render callback, Failure failure) override {
+  livekit::sdk::Result<void> start(const AudioOutputOptions&, Render callback,
+                                   Failure failure) override {
     render = std::move(callback);
     fail = std::move(failure);
+    return livekit::sdk::Result<void>::success();
   }
 
   void stop() noexcept override {
@@ -290,10 +296,12 @@ void active_device_failure() {
   auto session = detail::AudioOutputFactory::create({}, std::move(driver));
   auto first = std::make_shared<nodes::AudioOutputNode>("speaker.first", "first", session);
   auto second = std::make_shared<nodes::AudioOutputNode>("speaker.second", "second", session);
-  std::promise<std::exception_ptr> a, b;
+  std::promise<livekit::sdk::Failure> a, b;
   auto ra = a.get_future(), rb = b.get_future();
-  first->setFailureHandler([&](auto error) { a.set_value(error); });
-  second->setFailureHandler([&](auto error) { b.set_value(error); });
+  first->setErrorHandler(
+      [&](auto error) { a.set_value(livekit::sdk::detail::graph_failure(error)); });
+  second->setErrorHandler(
+      [&](auto error) { b.set_value(livekit::sdk::detail::graph_failure(error)); });
   check(first->init() && second->init() && first->start() && second->start(),
         "Unable to start shared device sinks");
   // No PCM is delivered: idle sinks must still learn of device failure.
@@ -301,8 +309,8 @@ void active_device_failure() {
   check(
       ra.wait_for(1s) == std::future_status::ready && rb.wait_for(1s) == std::future_status::ready,
       "Idle shared sinks required a health scan to observe device failure");
-  const auto fa = livekit::sdk::describe_failure(ra.get());
-  const auto fb = livekit::sdk::describe_failure(rb.get());
+  const auto fa = ra.get();
+  const auto fb = rb.get();
   check(fa->id == fb->id && fa->id == session->snapshot().failure->id,
         "Shared device failure lost correlation between sinks");
   first->quiesce();
@@ -310,29 +318,37 @@ void active_device_failure() {
 }
 
 void retained_failure_reporter() {
-  graphflow::core::GraphNode::FailureHandler report;
-  std::promise<std::exception_ptr> result;
+  graphflow::core::GraphNode::ErrorHandler report;
+  std::promise<livekit::sdk::Failure> result;
   auto ready = result.get_future();
   {
     auto node = std::make_unique<graphflow::core::GraphNode>("external.device", nullptr);
-    report = node->failureReporter();
-    node->setFailureHandler([&](auto error) { result.set_value(error); });
+    report = node->errorReporter();
+    node->setErrorHandler(
+        [&](auto error) { result.set_value(livekit::sdk::detail::graph_failure(error)); });
   }
-  const auto cause = std::make_exception_ptr(std::runtime_error("late device callback"));
-  report(cause);
-  report(cause);
-  check(ready.wait_for(1s) == std::future_status::ready && ready.get() == cause,
+  const auto cause = livekit::sdk::make_failure(livekit::sdk::ErrorDomain::media,
+                                                livekit::sdk::ErrorCode::processing_failed,
+                                                "late device callback");
+  report(livekit::sdk::detail::graph_error(cause));
+  report(livekit::sdk::detail::graph_error(cause));
+  check(ready.wait_for(1s) == std::future_status::ready && ready.get()->id == cause->id,
         "Retained reporter required a live node or delivered the failure twice");
 }
 
 void active_output_failure() {
   MediaOutput options;
-  options.audio = [](const auto&) { throw std::runtime_error("consumer failed"); };
+  options.audio = [](const auto&) {
+    return livekit::sdk::Result<void>::failure(
+        livekit::sdk::make_failure(livekit::sdk::ErrorDomain::media,
+                                   livekit::sdk::ErrorCode::callback_failed, "consumer failed"));
+  };
   auto source = std::make_shared<Source>();
   auto output = std::make_shared<ApplicationOutput>(options);
-  std::promise<std::exception_ptr> result;
+  std::promise<livekit::sdk::Failure> result;
   auto ready = result.get_future();
-  output->setFailureHandler([&](auto error) { result.set_value(error); });
+  output->setErrorHandler(
+      [&](auto error) { result.set_value(livekit::sdk::detail::graph_failure(error)); });
   graphflow::engine::GraphEngine graph{1};
   check(graph.loadFromNodes({output, source},
                             {TrackGraphSpec::connect<nodes::AudioFrameEvent>(source, output)}) &&
@@ -340,8 +356,8 @@ void active_output_failure() {
         "Unable to start failing output graph");
   source->raw(rtc_audio_test::tone(1, 0, 48000, 1, false));
   check(ready.wait_for(1s) == std::future_status::ready,
-        "Application worker did not actively report its exception");
-  const auto info = livekit::sdk::describe_failure(ready.get());
+        "Application worker did not actively report its failure");
+  const auto info = ready.get();
   check(
       info->code == livekit::sdk::ErrorCode::callback_failed && info->message == "consumer failed",
       "Output failure lost its type or message");
@@ -358,7 +374,7 @@ void capture_processing_reference() {
   output_options.buffer = 0ms;
   output_options.echo_reference = reference;
   auto output = detail::AudioOutputFactory::create(output_options, std::move(driver));
-  auto track = output->open_track("speaker");
+  auto track = media_result(output->open_track("speaker"));
   auto tone = rtc_audio_test::tone(1, 0, 48000, 1, false);
   track->write(tone);
   std::array<int16_t, 960> played;
@@ -370,14 +386,14 @@ void capture_processing_reference() {
   detail::AudioProcessor processor(AudioProcessingOptions{}, reference);
   for (int i = 0; i < 30; ++i) {
     auto input = rtc_audio_test::tone(i < 15 ? 1 : 2, i * 480, 44100, 1, true);
-    processor.process(input);
+    media_result(processor.process(input));
     check(input.pcm->sample_rate == 48000 && input.pcm->samples.size() == 480,
           "APM lost 10ms format across resampling/epoch reset");
   }
   track->close();
   output.reset();
   auto after_close = rtc_audio_test::tone(3, 0, 48000, 1, false);
-  processor.process(after_close);
+  media_result(processor.process(after_close));
   check(after_close.pcm->samples.size() == 480, "APM retained a destroyed speaker resource");
 }
 
@@ -410,7 +426,7 @@ void echo_convergence() {
     frame.pcm = pcm;
     frame.epoch = 1;
     frame.timestamp = uint64_t(block) * 480;
-    processor.process(frame);
+    media_result(processor.process(frame));
     if (block > 500) {
       for (size_t i = 0; i < 480; ++i) {
         input_energy += double(pcm->samples[i]) * pcm->samples[i];
@@ -424,19 +440,14 @@ void echo_convergence() {
 }  // namespace
 
 int main() {
-  try {
-    synchronous_engine();
-    independent_builder_contract();
-    shared_storage_and_clock();
-    callback_isolation();
-    active_output_failure();
-    active_device_failure();
-    retained_failure_reporter();
-    capture_processing_reference();
-    echo_convergence();
-    std::cout << "architecture contracts passed\n";
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+  synchronous_engine();
+  independent_builder_contract();
+  shared_storage_and_clock();
+  callback_isolation();
+  active_output_failure();
+  active_device_failure();
+  retained_failure_reporter();
+  capture_processing_reference();
+  echo_convergence();
+  std::cout << "architecture contracts passed\n";
 }

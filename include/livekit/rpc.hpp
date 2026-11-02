@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
-#include <stdexcept>
+#include "livekit/result.hpp"
 #include <stop_token>
 #include <string>
 #include <utility>
@@ -23,13 +23,17 @@ enum class RpcErrorCode : uint32_t {
   send_failed = 1505
 };
 
-class RpcError : public std::runtime_error {
+class RpcError {
  public:
   RpcError(uint32_t code, std::string message, std::string data = {})
-      : std::runtime_error(std::move(message)), code_(code), data_(std::move(data)) {}
+      : message_(std::move(message)), code_(code), data_(std::move(data)) {}
 
   RpcError(RpcErrorCode code, std::string message, std::string data = {})
       : RpcError(static_cast<uint32_t>(code), std::move(message), std::move(data)) {}
+
+  const char* what() const noexcept {
+    return message_.c_str();
+  }
 
   uint32_t code() const noexcept {
     return code_;
@@ -40,6 +44,7 @@ class RpcError : public std::runtime_error {
   }
 
  private:
+  std::string message_;
   uint32_t code_;
   std::string data_;
 };

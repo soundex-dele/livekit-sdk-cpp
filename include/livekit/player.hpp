@@ -1,13 +1,12 @@
 #pragma once
 #include "livekit/media_core/frame.hpp"
 #include "livekit/async_result.hpp"
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include <functional>
 #include <chrono>
 #include <future>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 
 namespace livekit::sdk {
@@ -37,14 +36,6 @@ struct PlayerSnapshot {
   size_t pending_commands = 0, audio_demand = 0;
 };
 
-class PlayerError : public SDKError {
- public:
-  explicit PlayerError(std::string message)
-      : SDKError(ErrorDomain::media, ErrorCode::processing_failed, std::move(message)) {}
-
-  explicit PlayerError(std::shared_ptr<const FailureInfo> failure) : SDKError(std::move(failure)) {}
-};
-
 enum class PlayerAudioDelivery { clocked, on_demand };
 
 struct PlayerOutputOptions {
@@ -53,9 +44,9 @@ struct PlayerOutputOptions {
 };
 
 struct PlayerCallbacks {
-  std::function<void(const media::VideoFrame&)> video;
-  std::function<void(const media::AudioFrame&)> audio;
-  std::function<void(const PlayerSnapshot&)> state;
+  std::function<Result<void>(const media::VideoFrame&)> video;
+  std::function<Result<void>(const media::AudioFrame&)> audio;
+  std::function<Result<void>(const PlayerSnapshot&)> state;
 };
 
 // Independent of RTC, FFmpeg and GraphFlow headers. The source worker owns the
@@ -65,13 +56,16 @@ struct PlayerCallbacks {
 // requires callers to stop using the object and fences both workers.
 class Player {
  public:
+  // Invalid options are reported by each asynchronous operation as invalid_argument.
   explicit Player(PlayerOptions options = {});
   ~Player();
   Player(const Player&) = delete;
   Player& operator=(const Player&) = delete;
+  // AsyncResult::get returns Result<T>; failures retain their diagnostic record.
   AsyncResult<PlayerMediaInfo> open(std::string utf8_local_path);
   AsyncResult<void> play();
   AsyncResult<void> pause();
+  // Queued seeks execute in order without cancelling an earlier control command.
   // Paused seek asynchronously delivers one target video frame. The clock stays
   // frozen; audio callbacks resume only after play().
   AsyncResult<void> seek(std::chrono::microseconds position);
@@ -83,9 +77,9 @@ class Player {
   // Missing callbacks discard that stream. Frames own immutable shared storage.
   // Replacing/clearing fences old callbacks; self-removal is supported. Callbacks
   // must return promptly and must not wait for lifecycle results or destroy this
-  // player: lifecycle completion fences delivery. Exceptions fail the player and
+  // player: lifecycle completion fences delivery. Callback failures fail the player and
   // retain the same FailureInfo in its state callback and snapshot.
-  void set_callbacks(PlayerCallbacks, PlayerOutputOptions = {});
+  Result<void> set_callbacks(PlayerCallbacks, PlayerOutputOptions = {});
   // On-demand audio grants bounded credits, one per complete decoded audio frame.
   // Accepted only while playing, for the current generation, with an audio handler.
   // Returns false for a stale generation, disabled output, or exhausted credit

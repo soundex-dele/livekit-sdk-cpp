@@ -1,3 +1,4 @@
+#include "media_result.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "livekit/rtc/stream_pipeline.hpp"
 #include "rtc_video_fixtures.hpp"
@@ -10,8 +11,10 @@ using namespace std::chrono_literals;
 
 namespace {
 void check(bool value, const char* message) {
-  if (!value)
-    throw std::runtime_error(message);
+  if (!value) {
+    std::cerr << message << "\n";
+    std::abort();
+  }
 }
 
 template <class F>
@@ -183,7 +186,7 @@ void encoder_queue() {
       "Encoder did not recover after overload/epoch change");
   codec->quiesce();
   graph.stop();
-  codec->throw_if_failed();
+  media_result(codec->status());
   {
     std::lock_guard lock(out->mutex);
     check(out->encoded.back().epoch == 2 && out->encoded.back().timestamp == 6002 &&
@@ -229,7 +232,7 @@ void decoder_recovery() {
   codec->quiesce();
   graph.stop();
   graph.release();
-  codec->throw_if_failed();
+  media_result(codec->status());
   std::lock_guard lock(out->mutex);
   const auto& frame = out->raw.back();
   check(frame.epoch == 2 && frame.timestamp == 12004 && frame.pixels->width == 64 &&
@@ -261,14 +264,9 @@ void decoded_output_bound() {
 }  // namespace
 
 int main() {
-  try {
-    encoder_queue();
-    decoder_recovery();
-    decoded_output_bound();
-    std::cout << "Video graph codec contracts passed\n";
-    return 0;
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+  encoder_queue();
+  decoder_recovery();
+  decoded_output_bound();
+  std::cout << "Video graph codec contracts passed\n";
+  return 0;
 }

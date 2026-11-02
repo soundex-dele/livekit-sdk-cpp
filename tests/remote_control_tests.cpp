@@ -3,7 +3,7 @@
 #include "scenarios/remote_control/text.hpp"
 #include <fstream>
 #include <iostream>
-#include <stdexcept>
+#include <cstdlib>
 using namespace livekit::sdk;
 using namespace std::chrono_literals;
 
@@ -22,8 +22,34 @@ struct Recorder : ControlInputSink {
 };
 
 void check(bool value, const char* text) {
-  if (!value)
-    throw std::runtime_error(text);
+  if (!value) {
+    std::cerr << text << "\n";
+    std::exit(1);
+  }
+}
+
+void explicit_failure_tests() {
+  RemoteControlSession invalid({}, false);
+  const auto invalid_status = invalid.check();
+  check(!invalid_status && invalid_status.error().code == ErrorCode::invalid_argument,
+        "missing input sink must be an explicit construction failure");
+  const auto now = ControlClock::now();
+  auto sink = std::make_shared<Recorder>();
+  RemoteControlSession session(sink, false);
+  ControlGrant grant{"g", "controller", 1, now + 10s};
+  check(!session.authorize(grant, {1, 0, 0, 0, 100}, now), "invalid layout accepted");
+  check(bool(session.authorize(grant, {1, 0, 0, 100, 100}, now)), "valid setup rejected");
+  const auto malformed = [&](const std::string& raw) {
+    return session.receive({raw.begin(), raw.end()}, {"controller", remote_control_topic, true},
+                           now);
+  };
+  check(!malformed("{") && !malformed("[]"), "malformed control JSON accepted");
+  for (const auto& field : {"v", "grant_id", "epoch", "seq", "type"}) {
+    Json packet{{"v", 1}, {"grant_id", "g"}, {"epoch", 1u}, {"seq", 1u}, {"type", "heartbeat"}};
+    packet[field] = Json::array();
+    check(!malformed(packet.dump()), "mistyped control envelope accepted");
+  }
+  check(session.active() && sink->events.empty(), "bad packet changed authorized state");
 }
 
 void handshake_tests() {
@@ -42,7 +68,7 @@ void handshake_tests() {
     return session.receive({bytes.begin(), bytes.end()}, {"controller", remote_control_topic, true},
                            now);
   };
-  session.authorize(grant, {1, 0, 0, 100, 100}, now);
+  check(bool(session.authorize(grant, {1, 0, 0, 100, 100}, now)), "Control setup failed");
   now += 5s;
   session.tick(now);
   check(session.active(), "transport setup may take more than three seconds");
@@ -57,7 +83,7 @@ void handshake_tests() {
   check(!session.active() && session.reason() == "heartbeat_timeout" && !sink->events.back().down,
         "active connection still releases at three seconds");
   now = began;
-  session.authorize(grant, {1, 0, 0, 100, 100}, now);
+  check(bool(session.authorize(grant, {1, 0, 0, 100, 100}, now)), "Control setup failed");
   seq = 0;
   auto renewal = grant;
   renewal.deadline = began + 120s;
@@ -68,7 +94,7 @@ void handshake_tests() {
   now = began + 10s;
   check(!send({{"type", "heartbeat"}}), "late heartbeat cannot resurrect expired setup");
   grant.deadline = began + 2s;
-  session.authorize(grant, {1, 0, 0, 100, 100}, began);
+  check(bool(session.authorize(grant, {1, 0, 0, 100, 100}, began)), "Control setup failed");
   session.tick(began + 2s);
   check(!session.active() && session.reason() == "lease_expired",
         "business lease bounds setup grace");
@@ -90,7 +116,8 @@ void text_tests() {
   auto sink = std::make_shared<Recorder>();
   RemoteControlSession session(sink, false);
   auto now = ControlClock::now();
-  session.authorize({"g", "controller", 1, now + 10s}, {1, 0, 0, 100, 100}, now);
+  check(bool(session.authorize({"g", "controller", 1, now + 10s}, {1, 0, 0, 100, 100}, now)),
+        "Control setup failed");
   uint64_t sequence = 0;
   DataReceiveParams params{"controller", remote_control_topic, true};
   auto send = [&](Json v) {
@@ -149,17 +176,13 @@ void text_tests() {
   sink->fail = true;
   check(!send(message) && !session.active(), "text failure stops grant");
   check(sink->events.back().type == "text_release", "failed text attempts release");
-  bool rejected = false;
-  try {
-    session.authorize({"g2", "controller", 2, now + 10s}, {1, 0, 0, 100, 100}, now);
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
+  bool rejected = !session.authorize({"g2", "controller", 2, now + 10s}, {1, 0, 0, 100, 100}, now);
   check(rejected, "pending Unicode release prevents new grant");
   sink->fail = false;
   session.tick(now);
   check(sink->events.back().type == "text_release", "retry Unicode release after stop");
-  session.authorize({"g", "controller", 1, now + 1s}, {1, 0, 0, 100, 100}, now);
+  check(bool(session.authorize({"g", "controller", 1, now + 1s}, {1, 0, 0, 100, 100}, now)),
+        "Control setup failed");
   sequence = 0;
   check(send({{"type", "heartbeat"}}), "heartbeat after release");
   check(send({{"type", "layout_ack"}}), "ack after release");
@@ -169,90 +192,87 @@ void text_tests() {
 }
 
 int main(int argc, char** argv) {
-  try {
-    handshake_tests();
-    text_tests();
-    auto sink = std::make_shared<Recorder>();
-    RemoteControlSession session(sink, false);
-    auto now = ControlClock::now();
-    ControlGrant grant{"grant", "controller", 1, now + 10s};
-    session.authorize(grant, {1, -100, 20, 1000, 500}, now);
-    DataReceiveParams params{"controller", remote_control_topic, true};
-    uint64_t seq = 0;
-    auto send = [&](Json v) {
-      v["v"] = 1;
-      v["grant_id"] = "grant";
-      v["epoch"] = 1;
-      v["seq"] = ++seq;
-      v["layout_version"] = 1;
-      auto text = v.dump();
-      return session.receive({text.begin(), text.end()}, params, now);
-    };
-    check(!send({{"type", "layout_ack"}}), "no layout ack before first heartbeat");
-    check(send({{"type", "heartbeat"}}), "initial heartbeat");
-    check(!send({{"type", "key"}, {"code", "KeyA"}, {"down", true}}),
-          "requires layout acknowledgement");
-    check(send({{"type", "layout_ack"}}), "ack");
-    params.sender_identity = "intruder";
-    check(!send({{"type", "key"}, {"code", "KeyA"}, {"down", true}}), "identity");
-    params.sender_identity = "controller";
-    check(send({{"type", "key"}, {"code", "KeyA"}, {"down", true}}), "key down");
-    check(!send({{"type", "key"}, {"code", "FakeKey"}, {"down", true}}), "unknown key");
-    check(send({{"type", "button"}, {"x", 1.0}, {"y", 0.0}, {"button", 0}, {"down", true}}),
-          "button");
-    check(sink->events.back().x == 899 && sink->events.back().y == 20, "coordinate mapping");
-    check(!send({{"type", "move"}, {"x", 1.01}, {"y", 0.0}}), "bounds");
-    check(!send({{"type", "button"},
-                 {"x", 0.5},
-                 {"y", 0.5},
-                 {"button", 4294967296ULL},
-                 {"down", true}}),
-          "button integer overflow");
-    check(!send({{"type", "wheel"}, {"x", 0.5}, {"y", 0.5}, {"delta", 1.5}}), "fractional wheel");
-    session.tick(now + 3s);
-    check(!session.active(), "heartbeat timeout");
-    check(sink->events.size() == 4 && !sink->events[2].down && !sink->events[3].down,
-          "release pressed keys and buttons");
-    check(!session.renew(grant, now + 4s), "cannot resurrect");
-    session.authorize(grant, {1, 0, 0, 100, 100}, now);
-    seq = 0;
-    check(send({{"type", "heartbeat"}}), "heartbeat again");
-    check(send({{"type", "layout_ack"}}), "ack again");
-    auto text =
-        Json{{"v", 1}, {"grant_id", "grant"}, {"epoch", 1}, {"seq", 1}, {"type", "heartbeat"}}
-            .dump();
-    check(!session.receive({text.begin(), text.end()}, params, now), "replay");
-    check(send({{"type", "key"}, {"code", "ShiftLeft"}, {"down", true}}), "shift");
-    session.set_layout({2, 0, 0, 200, 200});
-    check(!sink->events.back().down, "layout releases");
-    check(!send({{"type", "move"}, {"x", 0.5}, {"y", 0.5}}), "stale layout");
-    session.tick(now + 10s);
-    check(session.reason() == "lease_expired", "expiry");
-    session.authorize(grant, {1, 0, 0, 100, 100}, now);
-    seq = 0;
-    check(send({{"type", "heartbeat"}}), "heartbeat");
-    check(send({{"type", "layout_ack"}}), "ack");
-    sink->fail = true;
-    check(!send({{"type", "key"}, {"code", "KeyB"}, {"down", true}}),
-          "injection failure stops control");
-    check(!session.active(), "failed input inactive");
-    sink->fail = false;
-    session.tick(now);
-    check(sink->events.back().code == "KeyB" && !sink->events.back().down,
-          "failed release retried");
-    if (argc > 1) {
-      std::ifstream file(argv[1]);
-      Json fixture;
-      file >> fixture;
-      RemoteControlSession contract(sink, false);
-      contract.authorize({"example", "controller_example", 1, now + 10s}, {1, 0, 0, 1920, 1080},
-                         now);
-      for (auto& message : fixture.at("controller_messages")) {
-        auto raw = message.dump();
-        check(contract.receive({raw.begin(), raw.end()},
-                               {"controller_example", remote_control_topic, true}, now),
-              "shared protocol fixture");
-      }
+  explicit_failure_tests();
+  handshake_tests();
+  text_tests();
+  auto sink = std::make_shared<Recorder>();
+  RemoteControlSession session(sink, false);
+  auto now = ControlClock::now();
+  ControlGrant grant{"grant", "controller", 1, now + 10s};
+  check(bool(session.authorize(grant, {1, -100, 20, 1000, 500}, now)), "Control setup failed");
+  DataReceiveParams params{"controller", remote_control_topic, true};
+  uint64_t seq = 0;
+  auto send = [&](Json v) {
+    v["v"] = 1;
+    v["grant_id"] = "grant";
+    v["epoch"] = 1;
+    v["seq"] = ++seq;
+    v["layout_version"] = 1;
+    auto text = v.dump();
+    return session.receive({text.begin(), text.end()}, params, now);
+  };
+  check(!send({{"type", "layout_ack"}}), "no layout ack before first heartbeat");
+  check(send({{"type", "heartbeat"}}), "initial heartbeat");
+  check(!send({{"type", "key"}, {"code", "KeyA"}, {"down", true}}),
+        "requires layout acknowledgement");
+  check(send({{"type", "layout_ack"}}), "ack");
+  params.sender_identity = "intruder";
+  check(!send({{"type", "key"}, {"code", "KeyA"}, {"down", true}}), "identity");
+  params.sender_identity = "controller";
+  check(send({{"type", "key"}, {"code", "KeyA"}, {"down", true}}), "key down");
+  check(!send({{"type", "key"}, {"code", "FakeKey"}, {"down", true}}), "unknown key");
+  check(send({{"type", "button"}, {"x", 1.0}, {"y", 0.0}, {"button", 0}, {"down", true}}),
+        "button");
+  check(sink->events.back().x == 899 && sink->events.back().y == 20, "coordinate mapping");
+  check(!send({{"type", "move"}, {"x", 1.01}, {"y", 0.0}}), "bounds");
+  check(
+      !send(
+          {{"type", "button"}, {"x", 0.5}, {"y", 0.5}, {"button", 4294967296ULL}, {"down", true}}),
+      "button integer overflow");
+  check(!send({{"type", "wheel"}, {"x", 0.5}, {"y", 0.5}, {"delta", 1.5}}), "fractional wheel");
+  session.tick(now + 3s);
+  check(!session.active(), "heartbeat timeout");
+  check(sink->events.size() == 4 && !sink->events[2].down && !sink->events[3].down,
+        "release pressed keys and buttons");
+  check(!session.renew(grant, now + 4s), "cannot resurrect");
+  check(bool(session.authorize(grant, {1, 0, 0, 100, 100}, now)), "Control setup failed");
+  seq = 0;
+  check(send({{"type", "heartbeat"}}), "heartbeat again");
+  check(send({{"type", "layout_ack"}}), "ack again");
+  auto text =
+      Json{{"v", 1}, {"grant_id", "grant"}, {"epoch", 1}, {"seq", 1}, {"type", "heartbeat"}}.dump();
+  check(!session.receive({text.begin(), text.end()}, params, now), "replay");
+  check(send({{"type", "key"}, {"code", "ShiftLeft"}, {"down", true}}), "shift");
+  check(bool(session.set_layout({2, 0, 0, 200, 200})), "Control setup failed");
+  check(!sink->events.back().down, "layout releases");
+  check(!send({{"type", "move"}, {"x", 0.5}, {"y", 0.5}}), "stale layout");
+  session.tick(now + 10s);
+  check(session.reason() == "lease_expired", "expiry");
+  check(bool(session.authorize(grant, {1, 0, 0, 100, 100}, now)), "Control setup failed");
+  seq = 0;
+  check(send({{"type", "heartbeat"}}), "heartbeat");
+  check(send({{"type", "layout_ack"}}), "ack");
+  sink->fail = true;
+  check(!send({{"type", "key"}, {"code", "KeyB"}, {"down", true}}),
+        "injection failure stops control");
+  check(!session.active(), "failed input inactive");
+  sink->fail = false;
+  session.tick(now);
+  check(sink->events.back().code == "KeyB" && !sink->events.back().down, "failed release retried");
+  if (argc > 1) {
+    std::ifstream file(argv[1]);
+    Json fixture;
+    file >> fixture;
+    RemoteControlSession contract(sink, false);
+    check(bool(contract.authorize({"example", "controller_example", 1, now + 10s},
+                                  {1, 0, 0, 1920, 1080}, now)),
+          "Control setup failed");
+    for (auto& message : fixture.at("controller_messages")) {
+      auto raw = message.dump();
+      check(contract.receive({raw.begin(), raw.end()},
+                             {"controller_example", remote_control_topic, true}, now),
+            "shared protocol fixture");
+    }
     }
 #ifdef _WIN32
     struct FakeApi : detail::WindowsInputApi {
@@ -279,7 +299,9 @@ int main(int argc, char** argv) {
     };
 
     auto api = std::make_shared<FakeApi>();
-    auto native = detail::windows_input_with_api(api);
+    auto native_result = detail::windows_input_with_api(api);
+    check(bool(native_result), "Native input construction failed");
+    auto native = *native_result;
     ControlInput input;
     input.type = "key";
     input.code = "ControlRight";
@@ -359,8 +381,4 @@ int main(int argc, char** argv) {
 #endif
     std::cout << "remote control tests passed\n";
     return 0;
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
-  }
 }

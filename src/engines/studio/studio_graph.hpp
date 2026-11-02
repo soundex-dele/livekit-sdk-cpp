@@ -30,8 +30,8 @@ class StudioGraph {
   ~StudioGraph();
   StudioGraph(const StudioGraph&) = delete;
   StudioGraph& operator=(const StudioGraph&) = delete;
-  void start();
-  void step(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+  Result<void> start();
+  Result<void> step(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
   void stop();
   void release();
 

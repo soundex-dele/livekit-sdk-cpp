@@ -1,16 +1,23 @@
-#include "livekit/error.hpp"
+#include <future>
+#include "media_graph/failure.hpp"
 #include "livekit/rtc/publish_node.hpp"
-#include <stdexcept>
+
 #include "backends/rtc/control_context.hpp"
 
 namespace livekit::sdk::rtc::nodes {
 RtcPublishNode::RtcPublishNode(std::string name, std::shared_ptr<PublishedTrack> track)
     : GraphNode(name, nullptr), track_(std::move(track)) {
-  if (!track_)
-    throw std::invalid_argument("RtcPublishNode requires a publication endpoint");
+  if (!track_) {
+    failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                            "RtcPublishNode requires an endpoint");
+  }
 }
 
 bool RtcPublishNode::doInit() {
+  if (auto valid = status(); !valid) {
+    reportError(livekit::sdk::detail::graph_error(valid.failure_record()));
+    return false;
+  }
   subscribe<EncodedFrameEvent>([this](const EncodedFrameEvent& event) {
     const auto result = active_.load() ? track_->try_write(event.frame) : WriteStatus::not_ready;
     last_write_ = result;
@@ -25,6 +32,9 @@ bool RtcPublishNode::doInit() {
 }
 
 bool RtcPublishNode::doStart() {
+  if (!status()) {
+    return false;
+  }
   const auto state = track_->snapshot().state;
   if (state == TrackState::closed || state == TrackState::failed)
     return false;
@@ -37,66 +47,74 @@ RtcPublishNode::~RtcPublishNode() {
   release();
 }
 
-void RtcPublishNode::activate() {
+Result<void> RtcPublishNode::activate() {
+  if (auto valid = status(); !valid) {
+    return valid;
+  }
   if (!active_) {
-    throw std::logic_error("Activate requires a started RTC sink");
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                                              "Activate requires a started RTC sink"));
   }
   if (worker_.joinable()) {
-    return;
+    return Result<void>::success();
   }
-  std::promise<void> initial;
+  std::promise<Result<void>> initial;
   auto ready = initial.get_future();
   worker_ = std::jthread([this, initial = std::move(initial)](std::stop_token stop) mutable {
     detail::CallbackScope worker_scope;
     bool initialized = false;
-    try {
-      Epoch epoch = 0;
-      uint64_t revision = UINT64_MAX;
-      while (!stop.stop_requested()) {
-        auto feedback = track_->wait_feedback(epoch, revision, stop);
-        if (!feedback) {
-          if (stop.stop_requested()) {
-            break;
-          }
-          const auto state = track_->snapshot();
-          if (state.state == TrackState::failed) {
-            if (state.failure) {
-              throw SDKError(state.failure);
-            }
-            throw std::runtime_error(state.error);
-          }
-          if (!initialized) {
-            throw std::runtime_error("RTC publication closed before initial feedback");
-          }
-          if (terminal_) {
-            terminal_();
-          }
+    Epoch epoch = 0;
+    uint64_t revision = UINT64_MAX;
+    Failure failure;
+    while (!stop.stop_requested()) {
+      auto feedback = track_->wait_feedback(epoch, revision, stop);
+      if (!feedback) {
+        if (stop.stop_requested()) {
           break;
         }
-        epoch = feedback->epoch;
-        revision = feedback->revision;
-        publish(SenderFeedbackEvent(std::move(*feedback)));
-        if (!initialized) {
-          initial.set_value();
-          initialized = true;
+        const auto state = track_->snapshot();
+        if (state.state == TrackState::failed) {
+          failure = state.failure ? state.failure
+                                  : make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                 state.error);
+        } else if (!initialized) {
+          failure = make_failure(ErrorDomain::media, ErrorCode::session_closed,
+                                 "RTC publication closed before initial feedback");
+        } else if (terminal_) {
+          terminal_();
         }
+        break;
       }
-    } catch (...) {
-      const auto failure = normalized_failure(
-          std::current_exception(),
-          {"feedback", track_->descriptor().id, getName(), track_->snapshot().epoch},
-          ErrorDomain::media, ErrorCode::processing_failed);
+      epoch = feedback->epoch;
+      revision = feedback->revision;
+      publish(SenderFeedbackEvent(std::move(*feedback)));
+      if (auto reported = error()) {
+        failure = livekit::sdk::detail::graph_failure(*reported);
+        break;
+      }
+      if (!initialized) {
+        initial.set_value(Result<void>::success());
+        initialized = true;
+      }
+    }
+    if (!initialized && !failure) {
+      failure = make_failure(ErrorDomain::media, ErrorCode::cancelled,
+                             "RTC publication activation cancelled");
+    }
+    if (failure) {
+      failure = with_context(std::move(failure), {"feedback", track_->descriptor().id, getName(),
+                                                  track_->snapshot().epoch});
       {
         std::lock_guard lock(failure_mutex_);
         failure_ = failure;
       }
-      reportFailure(failure);
+      reportError(livekit::sdk::detail::graph_error(failure));
       if (!initialized) {
-        initial.set_exception(failure);
+        initial.set_value(Result<void>::failure(failure));
       }
     }
   });
-  ready.get();
+  return ready.get();
 }
 
 void RtcPublishNode::quiesce() {
@@ -107,11 +125,12 @@ void RtcPublishNode::quiesce() {
   }
 }
 
-void RtcPublishNode::throw_if_failed() const {
+Result<void> RtcPublishNode::status() const {
   std::lock_guard lock(failure_mutex_);
   if (failure_) {
-    std::rethrow_exception(failure_);
+    return Result<void>::failure(failure_);
   }
+  return Result<void>::success();
 }
 
 void RtcPublishNode::doStop() {

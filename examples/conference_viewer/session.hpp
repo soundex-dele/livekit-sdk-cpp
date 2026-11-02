@@ -22,7 +22,7 @@ struct SessionOptions {
   std::vector<sdk::MediaSpec> media;
   bool audio_playout = false;
   std::filesystem::path record;
-  std::function<void(const sdk::Json&)> log_sink;
+  std::function<sdk::Result<void>(const sdk::Json&)> log_sink;
 };
 
 // UI model: advertised publications, independent of the transport's handles.
@@ -67,7 +67,7 @@ class Session {
   // Factory runs on the session worker and returns an exclusively owned engine.
   explicit Session(EngineFactory);
   ~Session();
-  void start(SessionOptions options, bool pause_unused_video = false);
+  sdk::Result<void> start(SessionOptions options, bool pause_unused_video = false);
   void stop();
   // Queue one operation for the supervisor; never wait on the UI thread.
   bool add_video();

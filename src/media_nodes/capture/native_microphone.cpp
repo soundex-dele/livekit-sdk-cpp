@@ -4,7 +4,6 @@
 #include "rtc_base/thread.h"
 #include <algorithm>
 #include <cstring>
-#include <stdexcept>
 
 namespace livekit::sdk::detail {
 namespace {
@@ -66,52 +65,84 @@ class NativeMicrophone final : public MicrophoneDriver {
       thread_->Stop();
   }
 
-  void start(const MicrophoneOptions& options, Callback callback) override {
+  Result<void> start(const MicrophoneOptions& options, Callback callback) override {
     if (!thread_) {
       thread_ = webrtc::Thread::Create();
       if (!thread_->Start()) {
         thread_.reset();
-        throw std::runtime_error("Cannot start microphone control thread");
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                  "Cannot start microphone control thread"));
       }
     }
-    const auto failure = thread_->BlockingCall([&]() -> std::exception_ptr {
-      try {
+    auto result = Result<void>::success();
+    thread_->BlockingCall([&] {
+      result = [&]() -> Result<void> {
         if (adm_)
-          throw std::logic_error("Microphone already started");
+          return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                                                    "Microphone already started"));
         transport_ = create_microphone_transport(std::move(callback));
         queues_ = webrtc::CreateDefaultTaskQueueFactory();
         adm_ = webrtc::AudioDeviceModule::Create(webrtc::AudioDeviceModule::kPlatformDefaultAudio,
                                                  queues_.get());
         if (!adm_)
-          throw std::runtime_error("Cannot create microphone device");
-        require(adm_->Init(), "initialize microphone device");
-        require(adm_->RegisterAudioCallback(transport_.get()), "register microphone callback");
-        if (options.device_index)
-          require(adm_->SetRecordingDevice(*options.device_index), "select microphone");
-        else {
+          return Result<void>::failure(make_failure(
+              ErrorDomain::media, ErrorCode::processing_failed, "Cannot create microphone device"));
+        if (auto checked = require(adm_->Init(), "initialize microphone device"); !checked) {
+          return checked;
+        }
+        if (auto checked = require(adm_->RegisterAudioCallback(transport_.get()),
+                                   "register microphone callback");
+            !checked) {
+          return checked;
+        }
+        if (options.device_index) {
+          if (auto checked =
+                  require(adm_->SetRecordingDevice(*options.device_index), "select microphone");
+              !checked) {
+            return checked;
+          }
+        } else {
 #ifdef _WIN32
-          require(adm_->SetRecordingDevice(webrtc::AudioDeviceModule::kDefaultCommunicationDevice),
+          if (auto checked = require(
+                  adm_->SetRecordingDevice(webrtc::AudioDeviceModule::kDefaultCommunicationDevice),
                   "select default microphone");
+              !checked) {
+            return checked;
+          }
 #else
-          require(adm_->SetRecordingDevice(uint16_t(0)), "select default microphone");
+          if (auto checked =
+                  require(adm_->SetRecordingDevice(uint16_t(0)), "select default microphone");
+              !checked) {
+            return checked;
+          }
 #endif
         }
-        require(adm_->InitMicrophone(), "initialize microphone mixer");
+        if (auto checked = require(adm_->InitMicrophone(), "initialize microphone mixer");
+            !checked) {
+          return checked;
+        }
         bool stereo = false;
         if (options.channels == 2)
           adm_->StereoRecordingIsAvailable(&stereo);
-        require(adm_->SetStereoRecording(stereo), "configure microphone channels");
-        require(adm_->InitRecording(), "initialize microphone capture");
-        require(adm_->StartRecording(), "start microphone capture");
-        return {};
-      } catch (...) {
-        return std::current_exception();
-      }
+        if (auto checked =
+                require(adm_->SetStereoRecording(stereo), "configure microphone channels");
+            !checked) {
+          return checked;
+        }
+        if (auto checked = require(adm_->InitRecording(), "initialize microphone capture");
+            !checked) {
+          return checked;
+        }
+        if (auto checked = require(adm_->StartRecording(), "start microphone capture"); !checked) {
+          return checked;
+        }
+        return Result<void>::success();
+      }();
     });
-    if (failure) {
+    if (!result) {
       stop();
-      std::rethrow_exception(failure);
     }
+    return result;
   }
 
   void stop() noexcept override {
@@ -130,9 +161,12 @@ class NativeMicrophone final : public MicrophoneDriver {
   }
 
  private:
-  static void require(int32_t result, const char* operation) {
-    if (result)
-      throw std::runtime_error(std::string("Cannot ") + operation);
+  static Result<void> require(int32_t result, const char* operation) {
+    if (result) {
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                std::string("Cannot ") + operation, false, result));
+    }
+    return Result<void>::success();
   }
 
   std::unique_ptr<webrtc::Thread> thread_;

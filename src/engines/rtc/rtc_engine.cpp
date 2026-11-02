@@ -103,7 +103,7 @@ Result<void> RtcEngine::clear_tracks() {
   for (auto& [id, entry] : publications_) {
     if (entry.pipeline) {
       auto stopped = detail::control_boundary([&]() -> Result<void> {
-        (void)entry.pipeline->close_locked();
+        (void)entry.pipeline->close();
         return Result<void>::success();
       });
       if (!stopped && result) {
@@ -114,7 +114,7 @@ Result<void> RtcEngine::clear_tracks() {
   for (auto& [id, entry] : subscriptions_) {
     if (entry.pipeline) {
       auto stopped = detail::control_boundary([&]() -> Result<void> {
-        (void)entry.pipeline->close_locked();
+        (void)entry.pipeline->close();
         return Result<void>::success();
       });
       if (!stopped && result) {
@@ -279,8 +279,7 @@ Result<std::shared_ptr<SharedMediaInput>> RtcEngine::create_shared_input(TrackDe
             return detail::failure_result<std::shared_ptr<SharedMediaInput>>(
                 ErrorCode::invalid_state, "Media is not enabled");
           }
-          return Result<std::shared_ptr<SharedMediaInput>>::success(
-              media_->create_shared_input(std::move(descriptor), std::move(input)));
+          return media_->create_shared_input(std::move(descriptor), std::move(input));
         });
       });
 }
@@ -290,7 +289,7 @@ void RtcEngine::unpublish(const TrackId& id, Completion<void> completion) {
     auto it = publications_.find(id);
     if (it != publications_.end() && it->second.pipeline) {
       auto stopped = detail::control_boundary([&]() -> Result<void> {
-        (void)it->second.pipeline->close_locked();
+        (void)it->second.pipeline->close();
         return Result<void>::success();
       });
       if (!stopped) {
@@ -315,7 +314,7 @@ void RtcEngine::unsubscribe(const TrackId& id, Completion<void> completion) {
     auto it = subscriptions_.find(id);
     if (it != subscriptions_.end() && it->second.pipeline) {
       auto stopped = detail::control_boundary([&]() -> Result<void> {
-        (void)it->second.pipeline->close_locked();
+        (void)it->second.pipeline->close();
         return Result<void>::success();
       });
       if (!stopped) {
@@ -403,13 +402,13 @@ void RtcEngine::on_published(TrackId id, Result<std::shared_ptr<PublishedTrack>>
       return;
     }
     auto endpoint = *result;
-    if (closing_ || !publications_.contains(id)) {
+    auto pending = publications_.find(id);
+    if (closing_ || pending == publications_.end()) {
       complete(std::move(completion),
                detail::failure_result<MediaPublication>(ErrorCode::cancelled, "RTC is leaving"));
       return;
     }
-    auto& entry = publications_.at(id);
-    // Adapter boundary: existing graph builders and GraphEngine still use exceptions.
+    auto& entry = pending->second;
     auto built = detail::control_boundary([&]() -> Result<void> {
       auto node = std::make_shared<nodes::RtcPublishNode>("rtc.publish." + id, endpoint);
       TrackGraphSpec spec;
@@ -418,8 +417,11 @@ void RtcEngine::on_published(TrackId id, Result<std::shared_ptr<PublishedTrack>>
           return detail::failure_result<void>(ErrorCode::invalid_state, "Media is not enabled");
         }
         auto prepared = media_->build_publish(std::move(*entry.media), node);
-        spec = std::move(prepared.graph);
-        entry.track = std::move(prepared.track);
+        if (!prepared) {
+          return Result<void>::failure(prepared.failure_record());
+        }
+        spec = std::move(prepared->graph);
+        entry.track = std::move(prepared->track);
         entry.media.reset();
       } else {
         if (!entry.factory) {
@@ -430,7 +432,9 @@ void RtcEngine::on_published(TrackId id, Result<std::shared_ptr<PublishedTrack>>
       }
       entry.pipeline =
           std::shared_ptr<PublishPipeline>(new PublishPipeline(node, std::move(spec), {}));
-      entry.pipeline->start_locked();
+      if (auto started = entry.pipeline->start(); !started) {
+        return started;
+      }
       {
         std::lock_guard lock(ingress_mutex_);
         ingress_[id] = entry.pipeline;
@@ -461,13 +465,13 @@ void RtcEngine::on_subscribed(TrackId id, Result<std::shared_ptr<SubscribedTrack
       return;
     }
     auto endpoint = *result;
-    if (closing_ || !subscriptions_.contains(id)) {
+    auto pending = subscriptions_.find(id);
+    if (closing_ || pending == subscriptions_.end()) {
       complete(std::move(completion),
                detail::failure_result<MediaSubscription>(ErrorCode::cancelled, "RTC is leaving"));
       return;
     }
-    auto& entry = subscriptions_.at(id);
-    // Adapter boundary: existing graph builders and GraphEngine still use exceptions.
+    auto& entry = pending->second;
     auto built = detail::control_boundary([&]() -> Result<void> {
       auto node = std::make_shared<nodes::RtcSubscribeNode>("rtc.subscribe." + id, endpoint);
       TrackGraphSpec spec;
@@ -476,8 +480,11 @@ void RtcEngine::on_subscribed(TrackId id, Result<std::shared_ptr<SubscribedTrack
           return detail::failure_result<void>(ErrorCode::invalid_state, "Media is not enabled");
         }
         auto prepared = media_->build_subscribe(std::move(*entry.media), node);
-        spec = std::move(prepared.graph);
-        entry.track = std::move(prepared.track);
+        if (!prepared) {
+          return Result<void>::failure(prepared.failure_record());
+        }
+        spec = std::move(prepared->graph);
+        entry.track = std::move(prepared->track);
         entry.media.reset();
       } else {
         if (!entry.factory) {
@@ -488,7 +495,9 @@ void RtcEngine::on_subscribed(TrackId id, Result<std::shared_ptr<SubscribedTrack
       }
       entry.pipeline =
           std::shared_ptr<SubscribePipeline>(new SubscribePipeline(node, std::move(spec), {}));
-      entry.pipeline->start_locked();
+      if (auto started = entry.pipeline->start(); !started) {
+        return started;
+      }
 
       return Result<void>::success();
     });
@@ -513,12 +522,12 @@ void RtcEngine::rollback(const TrackId& id, bool publication, Failure failure,
     if (publication) {
       auto it = publications_.find(id);
       if (it != publications_.end() && it->second.pipeline) {
-        (void)it->second.pipeline->close_locked();
+        (void)it->second.pipeline->close();
       }
     } else {
       auto it = subscriptions_.find(id);
       if (it != subscriptions_.end() && it->second.pipeline) {
-        (void)it->second.pipeline->close_locked();
+        (void)it->second.pipeline->close();
       }
     }
   });

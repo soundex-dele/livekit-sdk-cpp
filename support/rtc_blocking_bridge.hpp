@@ -4,7 +4,6 @@
 #include "livekit/rtc/engine_observer.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "rtc_room_fixture.hpp"
-#include "rtc_result.hpp"
 #include <future>
 #include <mutex>
 #include <type_traits>

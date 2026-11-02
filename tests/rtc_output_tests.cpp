@@ -1,3 +1,4 @@
+#include "media_result.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include "media_nodes/playout/audio_output_transport.hpp"
 #include "livekit/rtc/stream_pipeline.hpp"
@@ -14,8 +15,10 @@ using namespace std::chrono_literals;
 
 namespace {
 void check(bool value, const char* message) {
-  if (!value)
-    throw std::runtime_error(message);
+  if (!value) {
+    std::cerr << message << "\n";
+    std::abort();
+  }
 }
 
 class FakeOutput final : public detail::AudioOutputDriver {
@@ -26,13 +29,16 @@ class FakeOutput final : public detail::AudioOutputDriver {
   int starts = 0, stops = 0;
   bool fail_start = false;
 
-  void start(const AudioOutputOptions&, Render next, Failure error) override {
+  livekit::sdk::Result<void> start(const AudioOutputOptions&, Render next, Failure error) override {
     std::lock_guard lock(mutex);
     render = std::move(next);
     failure = std::move(error);
     ++starts;
     if (fail_start)
-      throw std::runtime_error("Injected output startup failure");
+      return livekit::sdk::Result<void>::failure(livekit::sdk::make_failure(
+          livekit::sdk::ErrorDomain::media, livekit::sdk::ErrorCode::processing_failed,
+          "Injected output startup failure"));
+    return livekit::sdk::Result<void>::success();
   }
 
   void stop() noexcept override {
@@ -84,20 +90,11 @@ bool all(const std::array<int16_t, 960>& samples, int16_t value) {
 
 void independent_tracks() {
   Fixture f(0ms, 2);
-  auto a = f.session->open_track("a"), b = f.session->open_track("b");
+  auto a = media_result(f.session->open_track("a")), b = media_result(f.session->open_track("b"));
   check(f.device->starts == 1 && f.session->snapshot().tracks == 2,
         "Tracks opened separate output devices");
-  bool duplicate = false, excess = false;
-  try {
-    f.session->open_track("a");
-  } catch (const std::invalid_argument&) {
-    duplicate = true;
-  }
-  try {
-    f.session->open_track("c");
-  } catch (const std::invalid_argument&) {
-    excess = true;
-  }
+  const bool duplicate = !f.session->open_track("a");
+  const bool excess = !f.session->open_track("c");
   check(duplicate && excess && f.session->snapshot().tracks == 2,
         "Output track admission limit failed");
   a->write(pcm(0, 20000, 960));
@@ -107,11 +104,11 @@ void independent_tracks() {
   check(f.device->stops == 0 && f.session->snapshot().running,
         "Closing one track stopped shared device");
   check(all(f.device->pull(), 20000), "Closing one track cleared the other's pending PCM");
-  auto replacement = f.session->open_track("a");
+  auto replacement = media_result(f.session->open_track("a"));
   check(!a->write(pcm(1000, 9)) && a->snapshot().closed, "Closed output handle admitted media");
   replacement->write(pcm(0, 1000));
   replacement->set_muted(true);
-  b->set_gain(2);
+  media_result(b->set_gain(2));
   b->write(pcm(2194, -20000));
   check(all(f.device->pull(), -32768), "Per-track mute/gain or negative saturation failed");
   auto old = pcm(480, 11000);
@@ -122,7 +119,7 @@ void independent_tracks() {
   b->close();
   replacement->close();
   check(f.device->stops == 1 && !f.session->snapshot().running, "Last track did not stop device");
-  auto again = f.session->open_track("b");
+  auto again = media_result(f.session->open_track("b"));
   again->write(pcm(0, 123));
   check(f.device->starts == 2 && all(f.device->pull(), 123),
         "Output device could not restart independently");
@@ -130,7 +127,7 @@ void independent_tracks() {
 
 void timing() {
   Fixture f(20ms);
-  auto track = f.session->open_track("timed");
+  auto track = media_result(f.session->open_track("timed"));
   check(track->write(pcm(1000, 1000)) && track->write(pcm(1960, 2000)), "Timestamped PCM rejected");
   check(all(f.device->pull(), 0) && all(f.device->pull(), 0), "Prebuffer was not honored");
   check(all(f.device->pull(), 1000) && all(f.device->pull(), 0) && all(f.device->pull(), 2000),
@@ -155,14 +152,14 @@ void timing() {
 
 void queue_and_short_packets() {
   Fixture f;
-  auto track = f.session->open_track("queue");
+  auto track = media_result(f.session->open_track("queue"));
   for (int i = 0; i < 13; ++i)
     check(track->write(pcm(i * 480, int16_t(i + 1))), "Bounded output write failed");
   check(track->snapshot().queued_samples == 480 && track->snapshot().dropped == 12 &&
             all(f.device->pull(), 13),
         "Overflow did not replace stale backlog with recent media");
   track->close();
-  auto short_track = f.session->open_track("short");
+  auto short_track = media_result(f.session->open_track("short"));
   for (int i = 0; i < 4; ++i)
     short_track->write(pcm(i * 120, int16_t(1000 + i), 120));
   const auto rendered = f.device->pull();
@@ -189,16 +186,11 @@ void queue_and_short_packets() {
 void failures_and_barrier() {
   Fixture f;
   f.device->fail_start = true;
-  bool failed = false;
-  try {
-    f.session->open_track("failed");
-  } catch (const std::runtime_error&) {
-    failed = true;
-  }
+  const bool failed = !f.session->open_track("failed");
   check(failed && f.device->stops == 1 && f.session->snapshot().tracks == 0,
         "Output startup rollback failed");
   f.device->fail_start = false;
-  auto track = f.session->open_track("retry");
+  auto track = media_result(f.session->open_track("retry"));
   std::jthread render([&](std::stop_token stop) {
     while (!stop.stop_requested()) {
       f.device->pull();
@@ -212,17 +204,12 @@ void failures_and_barrier() {
   render.join();
   check(all(f.device->pull(), 0) && !track->write(pcm(100000, 1)) && f.device->stops == 2,
         "Callback barrier failed on concurrent close");
-  auto fresh = f.session->open_track("error");
+  auto fresh = media_result(f.session->open_track("error"));
   {
     std::lock_guard lock(f.device->mutex);
     f.device->failure("Injected device failure");
   }
-  bool surfaced = false;
-  try {
-    f.session->throw_if_failed();
-  } catch (const std::runtime_error&) {
-    surfaced = true;
-  }
+  const bool surfaced = !f.session->status();
   check(surfaced && !fresh->write(pcm(0, 123)), "Device failure was hidden from graph polling");
 }
 
@@ -361,8 +348,8 @@ void recording() {
   video->quiesce();
   graph.stop();
   graph.release();
-  audio->throw_if_failed();
-  video->throw_if_failed();
+  media_result(audio->status());
+  media_result(video->status());
   const auto wav = read("audio-0.wav"), next = read("audio-1.wav"), y4m = read("video-0.y4m");
   check(wav.size() == 44 + 1440 * 2 && u32(wav, 4) == wav.size() - 8 && u32(wav, 40) == 1440 * 2 &&
             u32(wav, 24) == 48000,
@@ -394,17 +381,12 @@ void recording() {
 }  // namespace
 
 int main() {
-  try {
-    independent_tracks();
-    timing();
-    queue_and_short_packets();
-    failures_and_barrier();
-    graph_sink();
-    native_callback();
-    recording();
-    std::cout << "RTC shared audio output contracts passed\n";
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
-  }
+  independent_tracks();
+  timing();
+  queue_and_short_packets();
+  failures_and_barrier();
+  graph_sink();
+  native_callback();
+  recording();
+  std::cout << "RTC shared audio output contracts passed\n";
 }

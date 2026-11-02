@@ -6,16 +6,22 @@ class EncodedSourceReader {
  public:
   explicit EncodedSourceReader(std::shared_ptr<EncodedMediaSource> source);
   ~EncodedSourceReader();
-  void start();
+  Result<void> start();
   void stop();
   std::optional<EncodedMediaFrame> read(std::stop_token stop, bool wait = true);
   void feedback(bool keyframe, uint32_t bitrate = 0);
 
   EncodedSourceOptions options() const {
-    return source_->options();
+    return source_ ? source_->options() : EncodedSourceOptions{};
+  }
+
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
   }
 
  private:
+  Failure failure_;
+  bool attached_ = false;
   std::shared_ptr<EncodedMediaSource> source_;
   uint64_t lease_ = 0;
 };
@@ -29,7 +35,13 @@ class EncodedOutput {
   void push(EncodedMediaFrame frame, uint64_t generation);
   void close();
 
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
+
  private:
+  Failure failure_;
+  bool attached_ = false;
   std::shared_ptr<EncodedMediaStream> stream_;
 };
 }  // namespace livekit::sdk::detail

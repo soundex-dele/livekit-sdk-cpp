@@ -1,3 +1,5 @@
+#include "test_failure.hpp"
+#include "server_result.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
@@ -19,7 +21,7 @@ namespace sdk = livekit::sdk;
 
 void check(bool ok, const char* message) {
   if (!ok)
-    throw std::runtime_error(message);
+    livekit::sdk::test::fail(message);
 }
 
 template <class F>
@@ -32,13 +34,13 @@ void until(F predicate, const char* message) {
 }
 
 int main(int argc, char** argv) {
-  try {
+  {
     check(argc == 4, "Usage: rtc_rejoin_integration server-url proxy-url marker-directory");
     const std::filesystem::path markers(argv[3]);
     auto token = [](const char* identity) {
-      return sdk::make_token(
+      return server_result(sdk::make_token(
           "reconnect-test", "reconnect-integration-secret-32-characters", identity,
-          {{"roomJoin", true}, {"room", "rejoin"}, {"canPublish", true}, {"canSubscribe", true}});
+          {{"roomJoin", true}, {"room", "rejoin"}, {"canPublish", true}, {"canSubscribe", true}}));
     };
     auto tx = require_result(livekit::sdk::app_support::create_blocking_room()), rx = require_result(livekit::sdk::app_support::create_blocking_room());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
@@ -84,7 +86,7 @@ int main(int argc, char** argv) {
     auto muted = require_result(tx->publish(audio));
     std::vector<std::shared_ptr<SubscribedTrack>> subscriptions(2);
     auto discover = [&] {
-      while (auto event = rx_events.take_event(0ms)) {
+      while (auto event = require_result(rx_events.take_event(0ms))) {
         if (event->kind != RoomEventKind::remote_track_added)
           continue;
         for (int i = 0; i < 2; ++i)
@@ -182,8 +184,5 @@ int main(int argc, char** argv) {
                            {"terminalLeave", true}}
                      .dump()
               << '\n';
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
   }
 }

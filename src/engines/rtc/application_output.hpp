@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/error.hpp"
+#include "media_graph/failure.hpp"
 #include "livekit/rtc/media_config.hpp"
 #include "livekit/rtc/frame_view.hpp"
 #include "livekit/rtc/video_nodes.hpp"
@@ -23,7 +23,8 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
         inline_(internal_inline) {
     if (!output_.queue.max_frames || !output_.queue.max_bytes ||
         output_.queue.max_age.count() <= 0) {
-      throw std::invalid_argument("Invalid application output queue");
+      failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                              "Invalid application output queue");
     }
   }
 
@@ -46,11 +47,12 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
     }
   }
 
-  void throw_if_failed() const {
+  Result<void> status() const {
     std::lock_guard lock(mutex_);
     if (failure_) {
-      std::rethrow_exception(failure_);
+      return Result<void>::failure(failure_);
     }
+    return Result<void>::success();
   }
 
   std::atomic<uint64_t> frames{0}, bytes{0}, dropped{0};
@@ -64,26 +66,54 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
     SteadyClock::time_point admitted;
   };
 
-  void deliver(const Sample& sample) {
+  Result<void> deliver(const Sample& sample) {
     detail::CallbackScope callback_scope;
     if (auto video = std::get_if<nodes::VideoFrameEvent>(&sample)) {
       if (output_.video) {
-        output_.video({video->pixels, video->timestamp, video->epoch, video->captured,
-                       video->presentation_time});
+        auto result = output_.video({video->pixels, video->timestamp, video->epoch, video->captured,
+                                     video->presentation_time});
+        if (!result) {
+          return result;
+        }
       }
       if (output_.frame) {
-        output_.frame(frame_view(video->pixels, *video));
+        auto result = output_.frame(frame_view(video->pixels, *video));
+        if (!result) {
+          return result;
+        }
       }
     } else {
       const auto& audio = std::get<nodes::AudioFrameEvent>(sample);
       if (output_.audio) {
-        output_.audio({audio.pcm, audio.timestamp, audio.epoch, audio.captured, audio.discontinuity,
-                       audio.presentation_time});
+        auto result = output_.audio({audio.pcm, audio.timestamp, audio.epoch, audio.captured,
+                                     audio.discontinuity, audio.presentation_time});
+        if (!result) {
+          return result;
+        }
       }
       if (output_.frame) {
-        output_.frame(frame_view(audio.pcm, audio));
+        auto result = output_.frame(frame_view(audio.pcm, audio));
+        if (!result) {
+          return result;
+        }
       }
     }
+    return Result<void>::success();
+  }
+
+  void fail(Failure failure) {
+    {
+      std::lock_guard lock(mutex_);
+      if (failure_) {
+        return;
+      }
+      failure_ = failure;
+      active_ = false;
+      queue_.clear();
+      queued_bytes_ = 0;
+    }
+    changed_.notify_all();
+    reportError(livekit::sdk::detail::graph_error(std::move(failure)));
   }
 
   void push(Sample sample, size_t size) {
@@ -93,7 +123,9 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
       return;
     }
     if (inline_) {
-      deliver(sample);
+      if (auto result = deliver(sample); !result) {
+        fail(result.failure_record());
+      }
       return;
     }
     std::lock_guard lock(mutex_);
@@ -113,6 +145,10 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
   }
 
   bool doInit() override {
+    if (auto valid = status(); !valid) {
+      reportError(livekit::sdk::detail::graph_error(valid.failure_record()));
+      return false;
+    }
     subscribe<nodes::VideoFrameEvent>([this](const auto& event) {
       push(event, event.pixels->y.size() + event.pixels->u.size() + event.pixels->v.size());
     });
@@ -127,7 +163,6 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
     active_ = true;
     if (!inline_ && (output_.audio || output_.video || output_.frame)) {
       worker_ = std::jthread([this](std::stop_token stop) {
-        try {
           while (!stop.stop_requested()) {
             std::optional<Pending> pending;
             {
@@ -157,21 +192,12 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
                 continue;
               }
             }
-            deliver(pending->sample);
+            if (auto result = deliver(pending->sample); !result) {
+              fail(result.failure_record());
+              break;
+            }
           }
-        } catch (...) {
-          const auto error =
-              normalized_failure(std::current_exception(), {"output_callback", {}, getName(), 0},
-                                 ErrorDomain::media, ErrorCode::callback_failed);
-          {
-            std::lock_guard lock(mutex_);
-            failure_ = error;
-            dropped += queue_.size();
-            queue_.clear();
-            queued_bytes_ = 0;
-          }
-          reportFailure(error);
-        }
+
       });
     }
     return true;
@@ -188,7 +214,7 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
   std::deque<Pending> queue_;
   size_t queued_bytes_ = 0;
   bool active_ = false;
-  std::exception_ptr failure_;
+  Failure failure_;
   std::jthread worker_;
 };
 }  // namespace livekit::sdk::rtc::engine

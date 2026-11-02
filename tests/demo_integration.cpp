@@ -1,3 +1,4 @@
+#include "server_result.hpp"
 #include "session.hpp"
 #include <livekit/api.hpp>
 #include <chrono>
@@ -10,8 +11,10 @@ namespace sdk = livekit::sdk;
 using namespace std::chrono_literals;
 
 static void check(bool ok, const char* message) {
-  if (!ok)
-    throw std::runtime_error(message);
+  if (!ok) {
+    std::cerr << message << "\n";
+    std::exit(1);
+  }
 }
 
 static std::string env(const char* key) {
@@ -23,8 +26,10 @@ template <class F>
 static void until(F predicate, const char* error, int seconds = 20) {
   const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
   while (!predicate()) {
-    if (std::chrono::steady_clock::now() > end)
-      throw std::runtime_error(error);
+    if (std::chrono::steady_clock::now() > end) {
+      std::cerr << error << "\n";
+      std::exit(1);
+    }
     std::this_thread::sleep_for(20ms);
   }
 }
@@ -33,8 +38,10 @@ static std::vector<demo::rtc::PublicationInfo> tracks(const demo::Session& sessi
                                                       const std::string& identity = {},
                                                       bool video_only = false) {
   const auto s = session.snapshot();
-  if (s.state == demo::State::Error)
-    throw std::runtime_error("Conference session: " + s.error);
+  if (s.state == demo::State::Error) {
+    std::cerr << "Conference session: " + s.error << "\n";
+    std::exit(1);
+  }
   for (const auto& [sid, participant] : s.participants)
     if (identity.empty() ? sid == s.local_sid : participant.identity == identity) {
       auto result = participant.tracks;
@@ -53,7 +60,7 @@ static void stopped(demo::Session& session) {
 }
 
 int main(int argc, char** argv) {
-  try {
+  {
     check(argc == 2, "Expected recording directory");
     const auto url = env("LIVEKIT_URL"), key = env("LIVEKIT_API_KEY"),
                secret = env("LIVEKIT_API_SECRET");
@@ -61,17 +68,14 @@ int main(int argc, char** argv) {
     const std::string name = "imgui-integration";
     std::filesystem::create_directories(std::filesystem::u8path(argv[1]));
     std::ofstream stats_log(std::filesystem::u8path(argv[1]) / "dashboard-stats.jsonl");
-    api.room().create_room(name);
+    server_result(api.room().create_room(name));
 
     struct Cleanup {
       sdk::LiveKitAPI& api;
       std::string name;
 
       ~Cleanup() {
-        try {
-          api.room().delete_room(name);
-        } catch (...) {
-        }
+        (void)api.room().delete_room(name);
       }
     } cleanup{api, name};
 
@@ -80,16 +84,19 @@ int main(int argc, char** argv) {
       o.connection.url = url;
       o.room = name;
       if (identity == "Viewer")
-        o.log_sink = [&](const sdk::Json& event) { stats_log << event.dump() << '\n'; };
-      o.connection.token = api.room()
-                               .create_token()
-                               .set_identity(identity)
-                               .set_name(identity)
-                               .set_video_grant({{"roomJoin", true},
-                                                 {"room", name},
-                                                 {"canPublish", true},
-                                                 {"canSubscribe", true}})
-                               .to_jwt();
+        o.log_sink = [&](const sdk::Json& event) {
+          stats_log << event.dump() << '\n';
+          return sdk::Result<void>::success();
+        };
+      o.connection.token = server_result(api.room()
+                                             .create_token()
+                                             .set_identity(identity)
+                                             .set_name(identity)
+                                             .set_video_grant({{"roomJoin", true},
+                                                               {"room", name},
+                                                               {"canPublish", true},
+                                                               {"canSubscribe", true}})
+                                             .to_jwt());
       return o;
     };
     sdk::MediaSpec video;
@@ -100,23 +107,23 @@ int main(int argc, char** argv) {
     demo::Session first, second, viewer;
     auto one = options("Alice");
     one.media = {video, tone};
-    first.start(one);
+    server_result(first.start(one));
     until([&] { return tracks(first, {}, true).size() == 1; }, "Initial publication");
     const auto first_video = tracks(first, {}, true).front().sid;
     auto view = options("Viewer");
     view.record = std::filesystem::u8path(argv[1]);
-    view.connection.token = api.room()
-                                .create_token()
-                                .set_identity("Viewer")
-                                .set_name("Viewer")
-                                .set_video_grant({{"roomJoin", true},
-                                                  {"room", name},
-                                                  {"canPublish", false},
-                                                  {"canPublishData", false},
-                                                  {"canSubscribe", true}})
-                                .to_jwt();
+    view.connection.token = server_result(api.room()
+                                              .create_token()
+                                              .set_identity("Viewer")
+                                              .set_name("Viewer")
+                                              .set_video_grant({{"roomJoin", true},
+                                                                {"room", name},
+                                                                {"canPublish", false},
+                                                                {"canPublishData", false},
+                                                                {"canSubscribe", true}})
+                                              .to_jwt());
     view.audio_playout = env("LIVEKIT_DEMO_TEST_AUDIO") == "1";
-    viewer.start(view);
+    server_result(viewer.start(view));
     until(
         [&] {
           const auto s = viewer.snapshot();
@@ -127,7 +134,7 @@ int main(int argc, char** argv) {
           "Initial typed participant mapping");
     auto two = options("Bob");
     two.media = {video};
-    second.start(two);
+    server_result(second.start(two));
     until([&] { return tracks(second, {}, true).size() == 1; }, "Second publication");
     const auto second_video = tracks(second, {}, true).front().sid;
     until(
@@ -150,7 +157,7 @@ int main(int argc, char** argv) {
           return true;
         },
         "Dashboard per-track receive/decode FPS or bitrate missing");
-    api.room().mute_published_track(name, "Alice", first_video, true);
+    server_result(api.room().mute_published_track(name, "Alice", first_video, true));
     until(
         [&] {
           for (const auto& tile : demo::tiles(viewer.snapshot()))
@@ -159,7 +166,7 @@ int main(int argc, char** argv) {
           return false;
         },
         "Remote mute missing");
-    api.room().mute_published_track(name, "Alice", first_video, false);
+    server_result(api.room().mute_published_track(name, "Alice", first_video, false));
     until(
         [&] {
           for (const auto& tile : demo::tiles(viewer.snapshot()))
@@ -188,17 +195,13 @@ int main(int argc, char** argv) {
     check(wav && y4m, "Graph recording outputs absent");
     view = options("Viewer");
     view.media = {video, video, tone};
-    viewer.start(view);
-    try {
+    server_result(viewer.start(view));
+    {
       until(
           [&] {
             return tracks(first, "Viewer").size() == 3 && tracks(viewer, {}, true).size() == 2;
           },
           "Multiple publications after reuse missing");
-    } catch (...) {
-      std::cerr << "Remote publications=" << tracks(first, "Viewer").size()
-                << " local videos=" << tracks(viewer, {}, true).size() << '\n';
-      throw;
     }
     until(
         [&] {
@@ -276,35 +279,37 @@ int main(int argc, char** argv) {
               !viewer.remove_video(restarted.sid),
           "Operations survived disconnect");
     for (int i = 0; i < 3; ++i) {
-      viewer.start(view);
+      server_result(viewer.start(view));
       stopped(viewer);
     }
     auto wrong = options("WrongRoom");
     wrong.room = "wrong-room";
-    viewer.start(wrong);
+    server_result(viewer.start(wrong));
     until([&] { return viewer.snapshot().finished; }, "Room mismatch timeout");
     check(viewer.snapshot().state == demo::State::Error, "Room mismatch accepted");
     auto invalid = options("BadToken");
     invalid.connection.token = "invalid-token";
-    viewer.start(invalid);
+    server_result(viewer.start(invalid));
     until([&] { return viewer.snapshot().finished; }, "Bad token timeout");
     check(viewer.snapshot().state == demo::State::Error &&
               viewer.snapshot().error.find("invalid-token") == std::string::npos,
           "Token error/redaction");
-    auto throwing = options("Throwing");
-    throwing.media = {video};
-    throwing.log_sink = [](const auto&) {
-      throw std::runtime_error("Expected diagnostics failure");
+    auto rejected = options("Rejected");
+    rejected.media = {video};
+    rejected.log_sink = [](const auto&) {
+      return sdk::Result<void>::failure(sdk::make_failure(sdk::ErrorDomain::lifecycle,
+                                                          sdk::ErrorCode::callback_failed,
+                                                          "Expected diagnostics failure"));
     };
-    viewer.start(throwing);
-    until([&] { return viewer.snapshot().finished; }, "Observer exception cleanup");
+    server_result(viewer.start(rejected));
+    until([&] { return viewer.snapshot().finished; }, "Observer result cleanup");
     check(viewer.snapshot().state == demo::State::Error &&
               viewer.snapshot().error == "Expected diagnostics failure",
           "Observer failure propagation");
     view.media.clear();
-    viewer.start(view);
+    server_result(viewer.start(view));
     until([&] { return viewer.snapshot().state == demo::State::Connected; }, "Final connect");
-    api.room().remove_participant(name, "Viewer");
+    server_result(api.room().remove_participant(name, "Viewer"));
     until([&] { return viewer.snapshot().finished; }, "Server removal not observed");
     check(viewer.snapshot().state == demo::State::Error && viewer.snapshot().frames.empty(),
           "Server removal state");
@@ -318,8 +323,5 @@ int main(int argc, char** argv) {
                            {"immediateCancellations", 3}}
                      .dump()
               << '\n';
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
   }
 }

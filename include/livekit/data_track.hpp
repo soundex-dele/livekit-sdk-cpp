@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/operation.hpp"
 #include <cstdint>
 #include <future>
@@ -51,8 +52,8 @@ struct DataSubscribeOptions {
 class DataTrackStream {
  public:
   ~DataTrackStream();
-  std::optional<DataFrame> read(std::chrono::milliseconds timeout = std::chrono::seconds(30),
-                                std::stop_token stop = {});
+  Result<std::optional<DataFrame>> read(
+      std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
   void close();
   DataTrackStats stats() const;
 
@@ -66,11 +67,11 @@ class DataTrackStream {
 
 class LocalDataTrack {
  public:
-  DataTrackInfo info() const;
+  Result<DataTrackInfo> info() const;
   // Freshness-oriented, bounded submission. May replace an older unsent frame.
-  void write(DataFrame frame) const;
-  std::future<void> unpublish(OperationOptions operation = {}) const;
-  DataTrackStats stats() const;
+  Result<void> write(DataFrame frame) const;
+  std::future<Result<void>> unpublish(OperationOptions operation = {}) const;
+  Result<DataTrackStats> stats() const;
 
  private:
   LocalDataTrack(std::weak_ptr<detail::DataTrackSession> s, uint64_t generation, uint16_t handle)
@@ -88,8 +89,8 @@ class RemoteDataTrack {
     return info_;
   }
 
-  std::future<std::shared_ptr<DataTrackStream>> subscribe(DataSubscribeOptions options = {},
-                                                          OperationOptions operation = {}) const;
+  std::future<Result<std::shared_ptr<DataTrackStream>>> subscribe(
+      DataSubscribeOptions options = {}, OperationOptions operation = {}) const;
 
  private:
   RemoteDataTrack(std::weak_ptr<detail::DataTrackSession> s, uint64_t generation,

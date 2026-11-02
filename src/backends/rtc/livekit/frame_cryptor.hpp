@@ -13,16 +13,20 @@
 #include <atomic>
 
 namespace livekit::sdk::detail {
-inline EncryptionCodec encryption_codec(std::string codec) {
+inline Result<EncryptionCodec> encryption_codec(std::string codec) {
   std::transform(codec.begin(), codec.end(), codec.begin(),
                  [](unsigned char c) { return char(std::tolower(c)); });
-  if (codec == "opus" || codec == "audio/opus")
-    return EncryptionCodec::opus;
-  if (codec == "h264" || codec == "video/h264")
-    return EncryptionCodec::h264;
-  if (codec == "h265" || codec == "video/h265")
-    return EncryptionCodec::h265;
-  throw std::invalid_argument("E2EE codec must be Opus, H264 or H265");
+  if (codec == "opus" || codec == "audio/opus") {
+    return Result<EncryptionCodec>::success(EncryptionCodec::opus);
+  }
+  if (codec == "h264" || codec == "video/h264") {
+    return Result<EncryptionCodec>::success(EncryptionCodec::h264);
+  }
+  if (codec == "h265" || codec == "video/h265") {
+    return Result<EncryptionCodec>::success(EncryptionCodec::h265);
+  }
+  return Result<EncryptionCodec>::failure(make_failure(ErrorDomain::media, ErrorCode::unsupported,
+                                                       "E2EE codec must be Opus, H264 or H265"));
 }
 
 struct MediaCryptorContext {
@@ -41,8 +45,8 @@ struct MediaCryptorContext {
   void participant(const livekit::ParticipantInfo& p) {
     std::lock_guard lock(mutex);
     std::erase_if(tracks, [&](const auto& t) { return t.second.owner == p.identity(); });
-    if (p.state() != 3)
-      for (auto& t : p.tracks())
+    if (p.state() != 3) {
+      for (auto& t : p.tracks()) {
         tracks[t.sid()] = {
             p.identity(), t.mime_type(), t.encryption() != livekit::Encryption::NONE,
             p.sid() + "|" +
@@ -51,6 +55,8 @@ struct MediaCryptorContext {
                                            ? "screen"
                                            : "camera")
                                     : t.stream())};
+      }
+    }
   }
 };
 
@@ -64,19 +70,16 @@ class NativeFrameEncryptor : public webrtc::FrameEncryptorInterface {
               webrtc::ArrayView<const uint8_t> frame, webrtc::ArrayView<uint8_t> output,
               size_t* written) override {
     *written = 0;
-    try {
-      auto canonical = canonical_media_frame({frame.data(), frame.size()}, codec_);
-      auto bytes = cryptor_.encrypt(canonical);
-      if (bytes.size() > output.size())
-        return 1;
-      std::copy(bytes.begin(), bytes.end(), output.begin());
-      *written = bytes.size();
-      report(true, keys_->current_key_index());
-      return 0;
-    } catch (...) {
+    auto canonical = canonical_media_frame({frame.data(), frame.size()}, codec_);
+    auto bytes = cryptor_.encrypt(canonical);
+    if (!bytes || bytes->size() > output.size()) {
       report(false, -1);
       return 1;
     }
+    std::copy(bytes->begin(), bytes->end(), output.begin());
+    *written = bytes->size();
+    report(true, keys_->current_key_index());
+    return 0;
   }
 
   size_t GetMaxCiphertextByteSize(webrtc::MediaType, size_t size) override {
@@ -86,11 +89,9 @@ class NativeFrameEncryptor : public webrtc::FrameEncryptorInterface {
  private:
   void report(bool ok, int key) noexcept {
     const int state = ok ? key + 1 : -1;
-    if (last_.exchange(state) != state && report_)
-      try {
-        report_(ok, key);
-      } catch (...) {
-      }
+    if (last_.exchange(state) != state && report_) {
+      report_(ok, key);
+    }
   }
 
   std::shared_ptr<KeyProvider> keys_;
@@ -108,7 +109,7 @@ class NativeFrameDecryptor : public webrtc::FrameDecryptorInterface {
   Result Decrypt(webrtc::MediaType, const std::vector<uint32_t>&, webrtc::ArrayView<const uint8_t>,
                  webrtc::ArrayView<const uint8_t> encrypted,
                  webrtc::ArrayView<uint8_t> output) override {
-    try {
+    {
       MediaCryptorContext::Track track;
       {
         std::lock_guard lock(context_->mutex);
@@ -127,18 +128,26 @@ class NativeFrameDecryptor : public webrtc::FrameDecryptorInterface {
         std::copy(encrypted.begin(), encrypted.end(), output.begin());
         return {Status::kOk, encrypted.size()};
       }
-      FrameCryptor cryptor(context_->options.keys, encryption_codec(track.codec));
-      auto frame = cryptor.decrypt({encrypted.data(), encrypted.size()}, context_->sif);
-      if (!frame)
-        return {Status::kRecoverable, 0};
-      if (frame->size() > output.size())
+      auto codec = encryption_codec(track.codec);
+      if (!codec) {
+        report(false, -1);
         return {Status::kFailedToDecrypt, 0};
-      std::copy(frame->begin(), frame->end(), output.begin());
+      }
+      FrameCryptor cryptor(context_->options.keys, *codec);
+      auto frame = cryptor.decrypt({encrypted.data(), encrypted.size()}, context_->sif);
+      if (!frame) {
+        report(false, -1);
+        return {Status::kFailedToDecrypt, 0};
+      }
+      if (!*frame) {
+        return {Status::kRecoverable, 0};
+      }
+      if ((**frame).size() > output.size()) {
+        return {Status::kFailedToDecrypt, 0};
+      }
+      std::copy((**frame).begin(), (**frame).end(), output.begin());
       report(true, encrypted.empty() ? -1 : encrypted[encrypted.size() - 1]);
-      return {Status::kOk, frame->size()};
-    } catch (...) {
-      report(false, -1);
-      return {Status::kFailedToDecrypt, 0};
+      return {Status::kOk, (**frame).size()};
     }
   }
 
@@ -149,11 +158,9 @@ class NativeFrameDecryptor : public webrtc::FrameDecryptorInterface {
  private:
   void report(bool ok, int key) noexcept {
     const int state = ok ? key + 1 : -1;
-    if (last_.exchange(state) != state && context_->report)
-      try {
-        context_->report(track_, ok, key);
-      } catch (...) {
-      }
+    if (last_.exchange(state) != state && context_->report) {
+      context_->report(track_, ok, key);
+    }
   }
 
   std::shared_ptr<MediaCryptorContext> context_;

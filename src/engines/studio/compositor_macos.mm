@@ -39,32 +39,44 @@ struct Compositor::Impl {
   id<MTLCommandQueue> queue;
   id<MTLComputePipelineState> pipeline;
   id<MTLBuffer> output;
+  Failure failure;
 
   Impl(int width, int height, bool soft) : w(width), h(height), software(soft) {
+    auto result = initialize();
+    if (!result)
+      failure = result.failure_record();
+  }
+
+  Result<void> initialize() {
+    if (w <= 0 || h <= 0 || w > 3840 || h > 3840)
+      return failed("Invalid canvas dimensions", ErrorCode::invalid_argument);
     if (software)
-      return;
+      return Result<void>::success();
     @autoreleasepool {
       device = MTLCreateSystemDefaultDevice();
       if (!device) {
         software = true;
-        return;
+        return Result<void>::success();
       }
       NSError* error = nil;
       id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
       if (!library)
-        throw std::runtime_error("Metal shader: " +
-                                 std::string(error.localizedDescription.UTF8String));
+        return failed("Metal shader: " + std::string(error.localizedDescription.UTF8String));
       pipeline =
           [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"composite"]
                                                 error:&error];
       queue = [device newCommandQueue];
       output = [device newBufferWithLength:size_t(w) * h * 4 options:MTLResourceStorageModeShared];
       if (!pipeline || !queue || !output)
-        throw std::runtime_error("无法初始化 Metal 合成器");
+        return failed("无法初始化 Metal 合成器");
     }
+    return Result<void>::success();
   }
 
-  StudioImage render(const Layers& layers) {
+  Result<StudioImage> render(const Layers& layers) {
+    if (failure)
+      return failed(failure);
+    LK_STUDIO_TRY(validate_layers(layers));
     if (software)
       return studio_composite_cpu(w, h, layers);
     @autoreleasepool {
@@ -74,7 +86,7 @@ struct Compositor::Impl {
         pixels[i] = 255;
       id<MTLCommandBuffer> command = [queue commandBuffer];
       if (!command)
-        throw std::runtime_error("Metal command allocation failed");
+        return failed("Metal command allocation failed");
       for (const auto& [s, img] : layers) {
         if (!s.visible || !img || img->width < 1 || img->height < 1 || s.transform.width <= 0 ||
             s.transform.height <= 0)
@@ -83,7 +95,7 @@ struct Compositor::Impl {
                                                    length:img->rgba.size()
                                                   options:MTLResourceStorageModeShared];
         if (!source)
-          throw std::runtime_error("Metal source allocation failed");
+          return failed("Metal source allocation failed");
         const auto& t = s.transform;
         const auto& k = s.chroma;
         float values[]{
@@ -106,8 +118,9 @@ struct Compositor::Impl {
       [command commit];
       [command waitUntilCompleted];
       if (command.status == MTLCommandBufferStatusError)
-        throw std::runtime_error("Metal 合成失败");
-      return {w, h, std::vector<uint8_t>(pixels, pixels + size_t(w) * h * 4)};
+        return failed("Metal 合成失败");
+      return Result<StudioImage>::success(
+          StudioImage{w, h, std::vector<uint8_t>(pixels, pixels + size_t(w) * h * 4)});
     }
   }
 };
@@ -116,7 +129,13 @@ Compositor::Compositor(int w, int h, bool soft) : impl_(std::make_unique<Impl>(w
 
 Compositor::~Compositor() = default;
 
-StudioImage Compositor::render(const Layers& layers) {
+Result<void> Compositor::status() const {
+  if (impl_->failure)
+    return failed(impl_->failure);
+  return Result<void>::success();
+}
+
+Result<StudioImage> Compositor::render(const Layers& layers) {
   return impl_->render(layers);
 }
 }  // namespace livekit::sdk::studio_detail

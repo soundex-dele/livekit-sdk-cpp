@@ -14,21 +14,31 @@ class AudioProcessor final {
   AudioProcessor(AudioProcessingOptions options, std::shared_ptr<AudioRenderReference> reference)
       : options_(options), reference_(std::move(reference)) {
     if (options.device_delay.count() < 0 || options.device_delay > std::chrono::milliseconds(500)) {
-      throw std::invalid_argument("Invalid audio processing device delay");
+      failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                              "Invalid audio processing device delay");
     }
     if (options.enabled && options.echo_cancellation && !reference_) {
-      throw std::invalid_argument("Echo cancellation requires a render reference");
+      failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                              "Echo cancellation requires a render reference");
     }
   }
 
-  void process(nodes::AudioFrameEvent& event) {
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
+
+  Result<void> process(nodes::AudioFrameEvent& event) {
+    if (auto valid = status(); !valid) {
+      return valid;
+    }
     if (!options_.enabled) {
-      return;
+      return Result<void>::success();
     }
     const auto& input = *event.pcm;
     if (input.samples_per_channel() != input.sample_rate / 100 ||
         (input.channels != 1 && input.channels != 2)) {
-      throw std::invalid_argument("Audio processing requires 10 ms mono/stereo PCM");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "Audio processing requires 10 ms mono/stereo PCM"));
     }
     if (!apm_ || epoch_ != event.epoch || input.sample_rate != rate_ ||
         input.channels != channels_ || event.discontinuity) {
@@ -40,7 +50,8 @@ class AudioProcessor final {
       config.gain_controller2.adaptive_digital.enabled = options_.automatic_gain;
       apm_ = webrtc::BuiltinAudioProcessingBuilder(config).Build(webrtc::CreateEnvironment());
       if (!apm_) {
-        throw std::runtime_error("Unable to create audio processor");
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                  "Unable to create audio processor"));
       }
       rate_ = input.sample_rate;
       channels_ = input.channels;
@@ -55,7 +66,8 @@ class AudioProcessor final {
         std::array<int16_t, 960> reverse;
         const webrtc::StreamConfig stereo(48000, 2);
         if (apm_->ProcessReverseStream(block.stereo.data(), stereo, stereo, reverse.data()) != 0) {
-          throw std::runtime_error("Audio reverse processing failed");
+          return Result<void>::failure(make_failure(
+              ErrorDomain::media, ErrorCode::processing_failed, "Audio reverse processing failed"));
         }
       }
     }
@@ -66,7 +78,8 @@ class AudioProcessor final {
       converted.reserve(input.float_samples.size());
       for (auto sample : input.float_samples) {
         if (!std::isfinite(sample)) {
-          throw std::invalid_argument("Non-finite capture sample");
+          return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                    "Non-finite capture sample"));
         }
         converted.push_back(int16_t(
             std::clamp(std::lround(std::clamp(sample, -1.f, 1.f) * 32768.f), -32768l, 32767l)));
@@ -74,17 +87,23 @@ class AudioProcessor final {
       samples = converted;
     }
     const auto normalized = resampler_->process(samples);
+    if (!normalized) {
+      return Result<void>::failure(normalized.failure_record());
+    }
     auto output = std::make_shared<PcmAudioFrame>();
     output->channels = channels_;
     output->samples.resize(480 * channels_);
     const webrtc::StreamConfig stream(48000, channels_);
-    if (apm_->ProcessStream(normalized.data(), stream, stream, output->samples.data()) != 0) {
-      throw std::runtime_error("Audio capture processing failed");
+    if (apm_->ProcessStream(normalized->data(), stream, stream, output->samples.data()) != 0) {
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Audio capture processing failed"));
     }
     event.pcm = std::move(output);
+    return Result<void>::success();
   }
 
  private:
+  Failure failure_;
   AudioProcessingOptions options_;
   std::shared_ptr<AudioRenderReference> reference_;
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm_;

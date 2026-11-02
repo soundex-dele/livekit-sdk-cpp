@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/data_messages.hpp"
 #include "livekit/data_track.hpp"
 #include "livekit/rpc.hpp"
@@ -49,32 +50,32 @@ struct RoomServiceSnapshot {
 // service executors, never on the native transport/signaling thread.
 class RoomServices {
  public:
-  std::future<void> send_data(std::vector<uint8_t>, DataSendOptions = {});
-  std::future<void> send_dtmf(DtmfDigit, DataSendOptions = {});
-  std::future<void> send_transcription(Transcription, DataSendOptions = {});
+  std::future<Result<void>> send_data(std::vector<uint8_t>, DataSendOptions = {});
+  std::future<Result<void>> send_dtmf(DtmfDigit, DataSendOptions = {});
+  std::future<Result<void>> send_transcription(Transcription, DataSendOptions = {});
   // Serial room notification queue, never a transport thread. Register before
   // join. Event references are borrowed for the duration of the call.
   // Replacing/clearing fences old invocations; self-removal is supported. Serialize
   // registration calls and never hold application locks while waiting for them.
-  // A thrown exception disables delivery and fails the room with the same
+  // A failure result disables delivery and fails the room with the same
   // FailureInfo retained in snapshot(). Return promptly; do not destroy the room
   // in a callback. Session close discards queued events; an active call may finish.
-  void set_event_handler(std::function<void(const DataEvent&)>);
+  Result<void> set_event_handler(std::function<Result<void>(const DataEvent&)>);
   RoomServiceSnapshot snapshot() const;
 
-  void register_rpc(std::string method, RpcHandler);
+  Result<void> register_rpc(std::string method, RpcHandler);
   void unregister_rpc(const std::string& method);
-  std::future<std::string> call_rpc(RpcCallOptions);
+  std::future<Result<std::string>> call_rpc(RpcCallOptions);
 
-  void register_stream(bool text, std::string topic, StreamHandler);
+  Result<void> register_stream(bool text, std::string topic, StreamHandler);
   void unregister_stream(bool text, const std::string& topic);
-  std::shared_ptr<StreamWriter> open_stream(bool text, StreamOptions = {});
-  std::future<StreamInfo> send_text(std::string, StreamOptions = {}, OperationOptions = {});
-  std::future<StreamInfo> send_file(std::filesystem::path, StreamOptions = {},
-                                    OperationOptions = {});
+  Result<std::shared_ptr<StreamWriter>> open_stream(bool text, StreamOptions = {});
+  std::future<Result<StreamInfo>> send_text(std::string, StreamOptions = {}, OperationOptions = {});
+  std::future<Result<StreamInfo>> send_file(std::filesystem::path, StreamOptions = {},
+                                            OperationOptions = {});
 
-  std::future<LocalDataTrack> publish_data_track(std::string name, DataTrackOptions = {},
-                                                 OperationOptions = {});
+  std::future<Result<LocalDataTrack>> publish_data_track(std::string name, DataTrackOptions = {},
+                                                         OperationOptions = {});
   std::vector<LocalDataTrack> local_data_tracks() const;
   std::vector<RemoteDataTrack> remote_data_tracks() const;
 

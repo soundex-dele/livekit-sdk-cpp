@@ -1,3 +1,4 @@
+#include "media_result.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "livekit/rtc/stream_pipeline.hpp"
 #include "media_nodes/capture/microphone_driver.hpp"
@@ -20,8 +21,10 @@ using namespace std::chrono_literals;
 
 namespace {
 void check(bool b, const char* message) {
-  if (!b)
-    throw std::runtime_error(message);
+  if (!b) {
+    std::cerr << message << "\n";
+    std::abort();
+  }
 }
 
 template <class F>
@@ -139,12 +142,16 @@ class FakeMicrophone final : public livekit::sdk::detail::MicrophoneDriver {
   std::atomic<int> starts{0}, stops{0};
   bool fail_start = false;
 
-  void start(const livekit::sdk::MicrophoneOptions&, Callback value) override {
+  livekit::sdk::Result<void> start(const livekit::sdk::MicrophoneOptions&,
+                                   Callback value) override {
     std::lock_guard lock(mutex);
     callback = std::move(value);
     ++starts;
     if (fail_start)
-      throw std::runtime_error("Injected microphone startup failure");
+      return livekit::sdk::Result<void>::failure(livekit::sdk::make_failure(
+          livekit::sdk::ErrorDomain::media, livekit::sdk::ErrorCode::processing_failed,
+          "Injected microphone startup failure"));
+    return livekit::sdk::Result<void>::success();
   }
 
   void stop() noexcept override {
@@ -171,14 +178,10 @@ void microphone_input() {
   nodes::MediaInputOptions options;
   options.microphone = microphone;
   Graph first(audio(), options);
-  bool duplicate = false;
-  try {
-    Graph second(audio(), options);
-  } catch (const std::invalid_argument&) {
-    duplicate = true;
-  }
+  nodes::MediaInputNode second("duplicate", audio(), options);
+  const bool duplicate = !second.status();
   check(duplicate, "One microphone admitted two independent source readers");
-  first.input->activate();
+  media_result(first.input->activate());
   std::this_thread::sleep_for(20ms);
   check(driver->starts == 0, "Microphone opened before binding feedback");
   first.feedback->send(1);
@@ -225,7 +228,7 @@ void microphone_input() {
         "Microphone callback survived quiescence");
   Graph replacement(audio(), options);
   replacement.feedback->send(3);
-  replacement.input->activate();
+  media_result(replacement.input->activate());
   eventually([&] { return driver->starts == 2; },
              "Retained microphone could not restart in replacement graph");
   driver->push(std::vector<int16_t>(480, 3000));
@@ -249,18 +252,13 @@ void microphone_queue() {
   options.max_queue_duration = 10ms;
   auto microphone = livekit::sdk::detail::MicrophoneFactory::create(options, std::move(device));
   livekit::sdk::detail::PcmSourceReader reader(microphone->source());
-  reader.start();
+  media_result(reader.start());
   driver->fail_start = true;
-  bool failed = false;
-  try {
-    microphone->start();
-  } catch (const std::runtime_error&) {
-    failed = true;
-  }
+  const bool failed = !microphone->start();
   check(failed && !microphone->snapshot().running && driver->stops == 1,
         "Partial microphone startup did not release callbacks");
   driver->fail_start = false;
-  microphone->start();
+  media_result(microphone->start());
   const auto now = SteadyClock::now();
   std::vector<int16_t> stereo(960);
   for (size_t i = 0; i < 480; ++i) {
@@ -278,13 +276,13 @@ void microphone_queue() {
   microphone->stop();
   reader.stop();
   // A source generation change resets capture cadence; the first block is fresh.
-  reader.start();
-  microphone->start();
+  media_result(reader.start());
+  media_result(microphone->start());
   driver->push(std::vector<int16_t>(480, 8000));
   auto fresh = reader.read({});
   check(fresh && fresh->samples.front() == 8000, "Restart kept stale microphone PCM");
   microphone->stop();
-  microphone->start();
+  media_result(microphone->start());
   driver->push(std::vector<int16_t>(480, 9000));
   auto resumed = reader.read({});
   check(resumed && resumed->samples.front() == 9000 && microphone->snapshot().error.empty(),
@@ -292,14 +290,15 @@ void microphone_queue() {
   microphone->stop();
   reader.stop();
   const auto retired = microphone->source()->stats().generation;
-  reader.start();
+  media_result(reader.start());
   livekit::sdk::PcmInputFrame late;
   late.samples.assign(480, 19000);
   late.capture_time = SteadyClock::now() + 20ms;
-  check(livekit::sdk::detail::PcmSourceWriter::write(*microphone->source(), late, retired) ==
-                livekit::sdk::AudioWriteStatus::backpressure &&
-            microphone->source()->stats().queued_blocks == 0,
-        "In-flight device write crossed source generation despite future timestamp");
+  check(
+      media_result(livekit::sdk::detail::PcmSourceWriter::write(
+          *microphone->source(), late, retired)) == livekit::sdk::AudioWriteStatus::backpressure &&
+          microphone->source()->stats().queued_blocks == 0,
+      "In-flight device write crossed source generation despite future timestamp");
   reader.stop();
 }
 
@@ -340,7 +339,7 @@ void generated_demand() {
   options.generated = true;
   Graph graph(descriptor, options);
   graph.feedback->send(1, 1, 0, false, false);
-  graph.input->activate();
+  media_result(graph.input->activate());
   std::this_thread::sleep_for(100ms);
   check(graph.input->snapshot().emitted == 0, "Generated source ran while initial demand was OFF");
   graph.feedback->send(1, 2, 0, true, true);
@@ -358,15 +357,15 @@ void generated_demand() {
              "Generated source did not restart with same epoch");
   graph.feedback->send(1, 5, 0, false, false);
   graph.input->quiesce();
-  graph.input->throw_if_failed();
+  media_result(graph.input->status());
 }
 
 void generated() {
   nodes::MediaInputOptions options;
   options.generated = true;
   Graph a(audio(), options), v(video(), options);
-  a.input->activate();
-  v.input->activate();
+  media_result(a.input->activate());
+  media_result(v.input->activate());
   std::this_thread::sleep_for(20ms);
   check(a.input->snapshot().emitted == 0 && v.input->snapshot().emitted == 0,
         "Input produced before binding feedback");
@@ -406,8 +405,8 @@ void generated() {
     }
   }
   v.input->quiesce();
-  a.input->throw_if_failed();
-  v.input->throw_if_failed();
+  media_result(a.input->status());
+  media_result(v.input->status());
 }
 
 livekit::sdk::VideoFrame pixels(uint8_t luma) {
@@ -431,12 +430,12 @@ void application_video() {
   options.video_source = source;
   Graph graph(video(), options);
   graph.feedback->send(1);
-  graph.input->activate();
+  media_result(graph.input->activate());
   {
     std::lock_guard lock(graph.output->mutex);
     graph.output->block = true;
   }
-  check(source->write(pixels(10)) == livekit::sdk::VideoWriteStatus::accepted,
+  check(media_result(source->write(pixels(10))) == livekit::sdk::VideoWriteStatus::accepted,
         "Application pixels rejected");
   eventually(
       [&] {
@@ -444,11 +443,12 @@ void application_video() {
         return graph.output->entered;
       },
       "Video worker never entered consumer");
-  source->write(pixels(20), SteadyClock::now() +
-                                50ms);  // Even a future-stamped old generation must be flushed.
+  media_result(source->write(
+      pixels(20),
+      SteadyClock::now() + 50ms));  // Even a future-stamped old generation must be flushed.
   graph.feedback->send(2);
   check(source->stats().queued_frames == 0, "Epoch retained source queue");
-  check(source->write(pixels(30)) == livekit::sdk::VideoWriteStatus::accepted,
+  check(media_result(source->write(pixels(30))) == livekit::sdk::VideoWriteStatus::accepted,
         "New epoch pixels rejected");
   graph.output->unblock();
   eventually(
@@ -470,8 +470,8 @@ void application_video() {
         "Quiescence did not release blocked reader/lease");
   Graph replacement(video(), options);
   replacement.feedback->send(3);
-  replacement.input->activate();
-  check(source->write(pixels(40)) == livekit::sdk::VideoWriteStatus::accepted,
+  media_result(replacement.input->activate());
+  check(media_result(source->write(pixels(40))) == livekit::sdk::VideoWriteStatus::accepted,
         "Quiesced source could not be rebound");
   eventually(
       [&] {
@@ -490,17 +490,17 @@ void application_audio() {
   options.audio_source = source;
   Graph graph(audio(), options);
   graph.feedback->send(1);
-  graph.input->activate();
+  media_result(graph.input->activate());
   livekit::sdk::PcmInputFrame data;
   data.samples.assign(441 * 2 * 4, 1234);
-  check(source->write(data) == livekit::sdk::AudioWriteStatus::accepted,
+  check(media_result(source->write(data)) == livekit::sdk::AudioWriteStatus::accepted,
         "Application PCM rejected");
   // A real-time reader may skip late blocks when the test host is busy. Keep
   // supplying PCM until four actual data blocks arrive; verify silence and
   // clock gaps explicitly instead of assuming four uninterrupted time slots.
   eventually(
       [&] {
-        const auto status = source->write(data);
+        const auto status = media_result(source->write(data));
         check(status == livekit::sdk::AudioWriteStatus::accepted ||
                   status == livekit::sdk::AudioWriteStatus::backpressure,
               "Active PCM source closed");
@@ -537,13 +537,14 @@ void encoded_audio() {
   options.encoded_source = source;
   Graph graph(audio(), options);
   graph.feedback->send(1);
-  graph.input->activate();
+  media_result(graph.input->activate());
   for (uint32_t timestamp : {0xffffff00u, 0x000002c0u}) {
     livekit::sdk::EncodedMediaFrame frame;
     frame.data = {0xf8, 0xff, 0xfe};
     frame.rtp_timestamp = timestamp;
-    check(source->write(std::move(frame)) == livekit::sdk::EncodedWriteStatus::accepted,
-          "Encoded source rejected packet");
+    check(
+        media_result(source->write(std::move(frame))) == livekit::sdk::EncodedWriteStatus::accepted,
+        "Encoded source rejected packet");
   }
   eventually(
       [&] {
@@ -561,14 +562,14 @@ void encoded_audio() {
   future.data = {0xf8, 0xff, 0xfe};
   future.rtp_timestamp = 2000;
   future.captured = SteadyClock::now() + 900ms;
-  source->write(std::move(future));
+  media_result(source->write(std::move(future)));
   std::this_thread::sleep_for(20ms);
   const auto reset = SteadyClock::now();
   graph.feedback->send(2);
   livekit::sdk::EncodedMediaFrame frame;
   frame.data = {0xf8, 0xff, 0xfe};
   frame.rtp_timestamp = 960;
-  source->write(std::move(frame));
+  media_result(source->write(std::move(frame)));
   eventually(
       [&] {
         std::lock_guard lock(graph.output->mutex);
@@ -583,7 +584,7 @@ void encoded_audio() {
   check(SteadyClock::now() - reset < 600ms,
         "New encoded epoch waited for previous future capture time");
   graph.input->quiesce();
-  graph.input->throw_if_failed();
+  media_result(graph.input->status());
 }
 
 void process_inputs(const std::string& executable) {
@@ -592,9 +593,9 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://partial-pcm";
   Graph finite(audio(), options);
   finite.feedback->send(1);
-  finite.input->activate();
+  media_result(finite.input->activate());
   eventually([&] { return finite.input->snapshot().finished; }, "Finite input did not finish");
-  finite.input->throw_if_failed();
+  media_result(finite.input->status());
   {
     std::lock_guard lock(finite.output->mutex);
     check(finite.output->audios.size() == 2, "Final partial PCM block missing");
@@ -605,7 +606,7 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://blocked";
   Graph blocked(audio(), options);
   blocked.feedback->send(1);
-  blocked.input->activate();
+  media_result(blocked.input->activate());
   eventually(
       [&] {
         std::lock_guard lock(blocked.output->mutex);
@@ -618,7 +619,7 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://eof-blocked";
   Graph eof(audio(), options);
   eof.feedback->send(1);
-  eof.input->activate();
+  media_result(eof.input->activate());
   eventually(
       [&] {
         std::lock_guard lock(eof.output->mutex);
@@ -632,7 +633,7 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://truncated-video";
   Graph malformed(video(), options);
   malformed.feedback->send(1);
-  malformed.input->activate();
+  media_result(malformed.input->activate());
   eventually([&] { return malformed.input->snapshot().finished; }, "Malformed input hung");
   check(!malformed.input->snapshot().error.empty(), "Truncated I420 accepted");
 }
@@ -711,7 +712,7 @@ void real_ffmpeg(const std::string& ffmpeg) {
   }
   const auto utf8 = file.u8string();
   const std::string path(utf8.begin(), utf8.end());
-  const auto streams = livekit::sdk::probe_media(path, ffmpeg, false, 64, 48, 30);
+  const auto streams = media_result(livekit::sdk::probe_media(path, ffmpeg, false, 64, 48, 30));
   check(streams.size() == 1 && !streams.front().video,
         "Standalone media probe did not discover WAV audio");
   nodes::MediaInputOptions options;
@@ -719,9 +720,9 @@ void real_ffmpeg(const std::string& ffmpeg) {
   options.input = path;
   Graph graph(audio(), options);
   graph.feedback->send(1);
-  graph.input->activate();
+  media_result(graph.input->activate());
   eventually([&] { return graph.input->snapshot().finished; }, "Real FFmpeg input did not finish");
-  graph.input->throw_if_failed();
+  media_result(graph.input->status());
   std::lock_guard lock(graph.output->mutex);
   check(graph.output->audios.size() == 10, "Real FFmpeg did not resample 100 ms to ten PCM blocks");
   int peak = 0;
@@ -739,26 +740,23 @@ void real_ffmpeg(const std::string& ffmpeg) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc > 1 && std::string(argv[1]) == "-nostdin")
+  if (argc > 1 && std::string(argv[1]) == "-nostdin") {
     return fixture_child(argc, argv);
-  try {
-    if (argc == 3 && std::string(argv[1]) == "--ffmpeg") {
-      real_ffmpeg(argv[2]);
-      std::cout << "RTC real FFmpeg input passed\n";
-      return 0;
-    }
-    microphone_callback();
-    microphone_input();
-    microphone_queue();
-    generated_demand();
-    generated();
-    application_video();
-    application_audio();
-    encoded_audio();
-    process_inputs(std::filesystem::absolute(argv[0]).string());
-    std::cout << "RTC input graph contracts passed\n";
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
   }
+
+  if (argc == 3 && std::string(argv[1]) == "--ffmpeg") {
+    real_ffmpeg(argv[2]);
+    std::cout << "RTC real FFmpeg input passed\n";
+    return 0;
+  }
+  microphone_callback();
+  microphone_input();
+  microphone_queue();
+  generated_demand();
+  generated();
+  application_video();
+  application_audio();
+  encoded_audio();
+  process_inputs(std::filesystem::absolute(argv[0]).string());
+  std::cout << "RTC input graph contracts passed\n";
 }

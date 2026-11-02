@@ -3,14 +3,28 @@
 #include "backends/rtc/livekit/subscribed_quality.hpp"
 #include <iostream>
 #include <limits>
+#include <cstdlib>
 
 using namespace livekit::sdk::rtc;
 using detail::SessionRoster;
 
 namespace {
 void check(bool value, const char* message) {
-  if (!value)
-    throw std::runtime_error(message);
+  if (!value) {
+    std::cerr << message << '\n';
+    std::exit(1);
+  }
+}
+
+bool changed(livekit::sdk::Result<bool> result) {
+  check(bool(result), result ? "" : result.error().message.c_str());
+  return *result;
+}
+
+SessionRoster make_roster(const livekit::JoinResponse& join, uint64_t epoch) {
+  auto result = SessionRoster::create(join, epoch);
+  check(bool(result), "Roster initialization failed");
+  return std::move(*result);
 }
 
 void aggregate_demand() {
@@ -77,35 +91,40 @@ livekit::JoinResponse join() {
 void policy_mapping() {
   SubscriptionPermissions policy{false, {{"viewer", false, {"camera", "screen"}}}};
   auto wire = detail::subscription_permissions_wire(policy, {});
-  check(!wire.all_participants() && !wire.track_permissions(0).all_tracks() &&
-            wire.track_permissions(0).track_sids().empty(),
+  check(bool(wire), "Invalid subscription permission result");
+  check(!wire->all_participants() && !wire->track_permissions(0).all_tracks() &&
+            wire->track_permissions(0).track_sids().empty(),
         "Unpublished IDs expanded access");
   wire = detail::subscription_permissions_wire(policy,
                                                {{"camera", "old-sid"}, {"unlisted", "secret"}});
-  check(wire.track_permissions(0).track_sids_size() == 1 &&
-            wire.track_permissions(0).track_sids(0) == "old-sid",
+  check(bool(wire), "Invalid subscription permission result");
+  check(wire->track_permissions(0).track_sids_size() == 1 &&
+            wire->track_permissions(0).track_sids(0) == "old-sid",
         "Selective policy included unlisted publication");
   wire = detail::subscription_permissions_wire(policy,
                                                {{"camera", "new-sid"}, {"screen", "screen-sid"}});
-  check(wire.track_permissions(0).track_sids_size() == 2 &&
-            wire.track_permissions(0).track_sids(0) == "new-sid",
+  check(bool(wire), "Invalid subscription permission result");
+  check(wire->track_permissions(0).track_sids_size() == 2 &&
+            wire->track_permissions(0).track_sids(0) == "new-sid",
         "Policy retained previous-session SID");
   wire = detail::subscription_permissions_wire(policy, {{"screen", "screen-sid"}});
-  check(wire.track_permissions(0).track_sids_size() == 1 &&
-            wire.track_permissions(0).track_sids(0) == "screen-sid",
+  check(bool(wire), "Invalid subscription permission result");
+  check(wire->track_permissions(0).track_sids_size() == 1 &&
+            wire->track_permissions(0).track_sids(0) == "screen-sid",
         "Removed publication retained access");
   policy.participants[0].track_ids.clear();
   policy.participants[0].all_tracks = true;
   wire = detail::subscription_permissions_wire(policy, {});
-  check(wire.track_permissions(0).all_tracks() &&
-            wire.track_permissions(0).participant_identity() == "viewer",
+  check(bool(wire), "Invalid subscription permission result");
+  check(wire->track_permissions(0).all_tracks() &&
+            wire->track_permissions(0).participant_identity() == "viewer",
         "All-track identity missing");
 }
 
 void roster_contract() {
-  SessionRoster state(join(), 7);
+  auto state = make_roster(join(), 7);
   auto p = participant("remote", 3);
-  check(state.participant(p), "Remote ignored");
+  check(changed(state.participant(p)), "Remote ignored");
   const auto before = state.snapshot();
   check(before->epoch == 7 && before->room.name == "room" &&
             before->local.identity == "identity-local",
@@ -119,14 +138,14 @@ void roster_contract() {
         "Unsupported codec disappeared from roster");
   p.set_version(2);
   p.set_name("stale");
-  check(!state.participant(p), "Stale participant version accepted");
+  check(!changed(state.participant(p)), "Stale participant version accepted");
   p.set_version(4);
   p.set_name("renamed");
   p.set_metadata("updated");
   p.mutable_attributes()->clear();
   p.mutable_tracks(0)->set_muted(true);
   p.mutable_permission()->set_can_publish(false);
-  check(state.participant(p), "New participant version rejected");
+  check(changed(state.participant(p)), "New participant version rejected");
   const auto updated = state.snapshot();
   check(updated->remote.at("remote").name == "renamed" &&
             updated->remote.at("remote").attributes.empty() &&
@@ -137,24 +156,25 @@ void roster_contract() {
             !before->remote.at("remote").publications.at("track-remote").muted,
         "Retained snapshot mutated");
   p.set_state(3);
-  check(state.participant(p), "Same-version disconnect ignored");
+  check(changed(state.participant(p)), "Same-version disconnect ignored");
   p.set_state(2);
   p.set_version(100);
-  check(!state.participant(p) && state.snapshot()->remote.empty(), "Disconnected SID revived");
+  check(!changed(state.participant(p)) && state.snapshot()->remote.empty(),
+        "Disconnected SID revived");
   auto replacement = participant("replacement", 1);
   replacement.set_identity(p.identity());
   replacement.clear_permission();
-  state.participant(replacement);
+  changed(state.participant(replacement));
   check(!state.snapshot()->remote.at("replacement").permissions,
         "Absent permissions became an explicit denial");
-  SessionRoster rejoined(join(), 8);
-  check(rejoined.participant(p), "History leaked into new session");
+  auto rejoined = make_roster(join(), 8);
+  check(changed(rejoined.participant(p)), "History leaked into new session");
 }
 
 void observations() {
-  SessionRoster state(join(), 1);
+  auto state = make_roster(join(), 1);
   auto p = participant("remote", 1);
-  state.participant(p);
+  changed(state.participant(p));
   livekit::SpeakersChanged delta;
   auto* speaker = delta.add_speakers();
   speaker->set_sid("remote");
@@ -172,7 +192,7 @@ void observations() {
   item->set_quality(2);
   check(state.quality(quality), "Quality ignored");
   p.set_version(2);
-  state.participant(p);
+  changed(state.participant(p));
   check(state.snapshot()->remote.at("remote").speaking &&
             state.snapshot()->remote.at("remote").connection_quality == 2,
         "Participant update erased orthogonal observations");
@@ -186,84 +206,126 @@ void observations() {
   auto room = join().room();
   room.set_metadata("new room metadata");
   room.set_active_recording(true);
-  state.room(room);
+  check(bool(state.room(room)), "Room update rejected");
   check(state.snapshot()->room.recording && state.snapshot()->room.metadata == "new room metadata",
         "Room state lost");
   auto track = participant("published", 1).tracks(0);
   state.local_publication(track);
   state.local_muted(track.sid(), true);
   check(state.snapshot()->local.publications.at(track.sid()).muted, "Local mute not observed");
-  check(state.local_unpublished(track.sid()) &&
+  check(changed(state.local_unpublished(track.sid())) &&
             !state.snapshot()->local.publications.contains(track.sid()),
         "Local remove not observed");
 }
 
 void local_publication_ordering() {
-  SessionRoster state(join(), 1);
+  auto state = make_roster(join(), 1);
   const auto first = participant("first", 1).tracks(0), second = participant("second", 1).tracks(0);
   state.local_publication(first);
   state.local_publication(second);
   auto self = participant("local", 2);  // Snapshot predating both AddTrack responses.
-  state.participant(self);
+  changed(state.participant(self));
   check(state.snapshot()->local.publications.contains(first.sid()) &&
             state.snapshot()->local.publications.contains(second.sid()),
         "Delayed self update erased confirmed local publications");
-  state.local_unpublished(first.sid());
+  changed(state.local_unpublished(first.sid()));
   *self.add_tracks() = first;
   self.set_version(3);
-  state.participant(self);
+  changed(state.participant(self));
   check(!state.snapshot()->local.publications.contains(first.sid()) &&
             state.snapshot()->local.publications.contains(second.sid()),
         "Delayed self update revived an unpublished track or removed its sibling");
   check(!state.local_publication(first), "Late AddTrack response revived retired SID");
-  SessionRoster rejoined(join(), 2);
+  auto rejoined = make_roster(join(), 2);
   check(rejoined.local_publication(first), "Retired publication history leaked into new session");
 }
 
 void identity_replacement() {
-  SessionRoster state(join(), 1);
+  auto state = make_roster(join(), 1);
   auto old = participant("old", 8);
   old.set_identity("viewer");
-  state.participant(old);
+  changed(state.participant(old));
   auto next = participant("new", 1);
   next.set_identity("viewer");
-  state.participant(next);
+  changed(state.participant(next));
   check(state.snapshot()->remote.size() == 1 && state.snapshot()->remote.contains("new"),
         "Rapid same-identity rejoin left two roster incarnations");
   old.set_version(9);
   old.set_state(3);
-  check(!state.participant(old) &&
+  check(!changed(state.participant(old)) &&
             state.snapshot()->remote.at("new").publications.contains("track-new"),
         "Retired SID disconnect changed the current identity");
   old.set_state(2);
   old.set_version(10);
-  check(!state.participant(old) && state.snapshot()->remote.size() == 1,
+  check(!changed(state.participant(old)) && state.snapshot()->remote.size() == 1,
         "Retired identity incarnation revived");
   for (int i = 0; i < 4095; ++i)
-    state.participant(participant("filler-" + std::to_string(i), 1));
+    changed(state.participant(participant("filler-" + std::to_string(i), 1)));
   auto replacement = participant("at-capacity", 1);
   replacement.set_identity("viewer");
-  check(state.participant(replacement) && state.snapshot()->remote.size() == 4096 &&
+  check(changed(state.participant(replacement)) && state.snapshot()->remote.size() == 4096 &&
             state.snapshot()->remote.contains("at-capacity"),
         "Full roster rejected same-identity replacement");
   auto absent = participant("late-disconnect", 1);
   absent.set_state(3);
-  check(state.participant(absent) && state.snapshot()->remote.size() == 4096,
+  check(changed(state.participant(absent)) && state.snapshot()->remote.size() == 4096,
         "Full roster rejected a departure notification");
 }
+
+void invalid_updates_are_atomic() {
+  using livekit::sdk::ErrorCode;
+  auto invalid_join = join();
+  invalid_join.mutable_participant()->clear_sid();
+  auto rejected = SessionRoster::create(invalid_join, 1);
+  check(!rejected && rejected.error().code == ErrorCode::malformed_message,
+        "Invalid join must return a protocol failure");
+
+  auto state = make_roster(join(), 1);
+  auto original = participant("original", 1);
+  original.set_identity("viewer");
+  check(changed(state.participant(original)), "Original participant rejected");
+  const auto before = state.snapshot();
+  auto replacement = participant("replacement", 50);
+  replacement.set_identity("viewer");
+  *replacement.add_tracks() = replacement.tracks(0);
+  auto update = state.participant(replacement);
+  check(!update && update.error().code == ErrorCode::malformed_message,
+        "Duplicate publication SID accepted");
+  check(state.snapshot()->revision == before->revision &&
+            state.snapshot()->remote.contains("original") &&
+            !state.snapshot()->remote.contains("replacement"),
+        "Rejected participant update changed the roster");
+  replacement.mutable_tracks()->RemoveLast();
+  replacement.set_version(1);
+  check(changed(state.participant(replacement)), "Rejected update advanced participant history");
+  auto room = join().room();
+  room.set_sid("different-room");
+  const auto revision = state.snapshot()->revision;
+  auto room_update = state.room(room);
+  check(!room_update && room_update.error().code == ErrorCode::malformed_message &&
+            state.snapshot()->revision == revision && state.snapshot()->room.sid == "RM1",
+        "Rejected room update changed session identity");
+
+  SubscriptionPermissions policy{true, {{"viewer", true, {}}}};
+  auto wire = detail::subscription_permissions_wire(policy, {});
+  check(!wire && wire.error().code == ErrorCode::invalid_argument,
+        "Contradictory subscription policy accepted");
+  policy.all_participants = false;
+  policy.participants.push_back(policy.participants.front());
+  wire = detail::subscription_permissions_wire(policy, {});
+  check(!wire && wire.error().code == ErrorCode::invalid_argument,
+        "Duplicate participant permission accepted");
+}
+
 }  // namespace
 
 int main() {
-  try {
-    aggregate_demand();
-    policy_mapping();
-    roster_contract();
-    observations();
-    local_publication_ordering();
-    identity_replacement();
-    std::cout << "RTC session roster contracts passed\n";
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
-  }
+  aggregate_demand();
+  policy_mapping();
+  roster_contract();
+  observations();
+  local_publication_ordering();
+  identity_replacement();
+  invalid_updates_are_atomic();
+  std::cout << "RTC session roster contracts passed\n";
 }

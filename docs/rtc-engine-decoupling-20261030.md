@@ -1,5 +1,7 @@
 # RTC 引擎解耦（2026-10-30）
 
+> 历史重构记录。2026-11-02 核对：当前 RtcEngine 直接持有发布/订阅 map，不再使用下述 TrackGraphRegistry / SessionControl；控制 Completion/Observer、线程和关闭契约见 [当前架构](architecture.md) 与 [媒体 API](rtc-media-engine.md)。本文件验证结果仅对应当时版本。
+
 此次重构保持 `RtcEngine`、`RtcGraphApi` 和 `examples/conference_viewer` 的调用接口，继续使用每轨独立的 GraphEngine。
 
 原有 `RtcMediaEngine → RtcPipelineEngine → RoomEngine` 的调用链拆为 RtcEngine 统一编排三个平级模块：

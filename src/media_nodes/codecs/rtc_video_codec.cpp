@@ -1,4 +1,5 @@
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
+#include "media_graph/failure.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "api/environment/environment_factory.h"
@@ -36,7 +37,7 @@ webrtc::VideoCodecType native_codec(Codec codec) {
     case Codec::h265:
       return webrtc::kVideoCodecH265;
     default:
-      throw std::invalid_argument("Video codec required");
+      return webrtc::kVideoCodecGeneric;
   }
 }
 
@@ -72,6 +73,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     size_t bytes;
   };
 
+  Failure initialization_failure;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
   std::deque<Job> jobs;
@@ -91,8 +93,9 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
 
   Impl(VideoCodecNode& owner, TrackDescriptor d, bool encode, VideoCodecOptions opts)
       : owner(owner), descriptor(std::move(d)), encode(encode), options(opts) {
-    native_codec(descriptor.format.codec);
-    if (descriptor.kind != MediaKind::video || descriptor.format.clock_rate != 90000 ||
+    if ((descriptor.format.codec != Codec::vp8 && descriptor.format.codec != Codec::h264 &&
+         descriptor.format.codec != Codec::h265) ||
+        descriptor.kind != MediaKind::video || descriptor.format.clock_rate != 90000 ||
         descriptor.encodings.size() != 1 || !options.max_frames || options.max_frames > 64 ||
         !options.max_bytes || options.max_bytes > 256 * 1024 * 1024 ||
         options.max_age.count() <= 0 || options.max_age > std::chrono::seconds(5) || !options.fps ||
@@ -100,8 +103,10 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
         options.max_width > 8192 || options.max_height > 8192 ||
         (encode && (!descriptor.format.width || !descriptor.format.height)) ||
         descriptor.format.width > options.max_width ||
-        descriptor.format.height > options.max_height)
-      throw std::invalid_argument("Invalid video codec node configuration");
+        descriptor.format.height > options.max_height) {
+      initialization_failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                            "Invalid video codec node configuration");
+    }
   }
 
   void discard_locked() {
@@ -113,24 +118,23 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     needs_keyframe = true;
   }
 
-  void fail(std::string message) {
-    std::exception_ptr error;
+  void fail(Failure error) {
     {
       std::lock_guard lock(mutex);
       if (!stats.error.empty()) {
         return;
       }
-      stats.error = message;
-      error = normalized_failure(std::current_exception()
-                                     ? std::current_exception()
-                                     : std::make_exception_ptr(std::runtime_error(message)),
-                                 {"codec", descriptor.id, owner.getName(), epoch},
-                                 ErrorDomain::media, ErrorCode::processing_failed);
+      stats.error = error->message;
       active = false;
       discard_locked();
       changed.notify_all();
     }
-    owner.reportFailure(error);
+    owner.reportError(livekit::sdk::detail::graph_error(
+        with_context(std::move(error), {"codec", descriptor.id, owner.getName(), epoch})));
+  }
+
+  void fail(std::string message) {
+    fail(make_failure(ErrorDomain::media, ErrorCode::processing_failed, std::move(message)));
   }
 
   void recover() {
@@ -260,7 +264,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
               frame.keyframe);
   }
 
-  void configure_decoder() {
+  livekit::sdk::Result<void> configure_decoder() {
     webrtc::VideoDecoder::Settings settings;
     settings.set_codec_type(native_codec(descriptor.format.codec));
     settings.set_number_of_cores(1);
@@ -268,10 +272,12 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     settings.set_buffer_pool_size(4);
     if (!decoder->Configure(settings) ||
         decoder->RegisterDecodeCompleteCallback(this) != WEBRTC_VIDEO_CODEC_OK)
-      throw std::runtime_error("Video decoder configuration failed");
+      return livekit::sdk::Result<void>::failure(make_failure(
+          ErrorDomain::media, ErrorCode::processing_failed, "Video decoder configuration failed"));
+    return livekit::sdk::Result<void>::success();
   }
 
-  void create(const webrtc::Environment& env) {
+  livekit::sdk::Result<void> create(const webrtc::Environment& env) {
     if (encode) {
       encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
@@ -279,7 +285,9 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
 #endif
       encoder = encoder_factory->Create(env, native_format(descriptor.format));
       if (!encoder)
-        throw std::runtime_error("Requested video encoder unavailable");
+        return livekit::sdk::Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         "Requested video encoder unavailable"));
       webrtc::VideoCodec codec;
       codec.codecType = native_codec(descriptor.format.codec);
       codec.width = descriptor.format.width;
@@ -300,7 +308,9 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
                                           webrtc::VideoEncoder::Capabilities(false), 1, 1200)) !=
               WEBRTC_VIDEO_CODEC_OK ||
           encoder->RegisterEncodeCompleteCallback(this) != WEBRTC_VIDEO_CODEC_OK)
-        throw std::runtime_error("Video encoder configuration failed");
+        return livekit::sdk::Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         "Video encoder configuration failed"));
     } else {
       decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
@@ -308,19 +318,24 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
 #endif
       decoder = decoder_factory->Create(env, native_format(descriptor.format));
       if (!decoder)
-        throw std::runtime_error("Requested video decoder unavailable");
-      configure_decoder();
+        return livekit::sdk::Result<void>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         "Requested video decoder unavailable"));
+      if (auto result = configure_decoder(); !result) {
+        return result;
+      }
     }
+    return livekit::sdk::Result<void>::success();
   }
 
-  void process(Job job, Epoch& codec_epoch) {
+  livekit::sdk::Result<void> process(Job job, Epoch& codec_epoch) {
     uint32_t bitrate = descriptor.encodings.front().max_bitrate_bps;
     bool keyframe = false;
     bool expired = false;
     {
       std::lock_guard lock(mutex);
       if (!active || job.timing.epoch != epoch || job.timing.generation != generation)
-        return;
+        return livekit::sdk::Result<void>::success();
       if (SteadyClock::now() - job.timing.captured > options.max_age || pending.size() >= 32) {
         discard_locked();
         ++stats.dropped;
@@ -331,7 +346,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
         if (it != feedback.encodings.end()) {
           if (!it->second.active) {
             ++stats.dropped;
-            return;
+            return livekit::sdk::Result<void>::success();
           }
           if (it->second.target_bitrate_bps)
             bitrate = std::min(bitrate, it->second.target_bitrate_bps);
@@ -342,11 +357,13 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     if (expired) {
       if (!encode)
         owner.publish(KeyframeRequestEvent{});
-      return;
+      return livekit::sdk::Result<void>::success();
     }
     if (!encode && codec_epoch != job.timing.epoch) {
       decoder->Release();
-      configure_decoder();
+      if (auto result = configure_decoder(); !result) {
+        return result;
+      }
       codec_epoch = job.timing.epoch;
     }
     {
@@ -386,15 +403,18 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
       std::lock_guard lock(mutex);
       pending.erase(uint32_t(job.timing.timestamp));
     }
+    return livekit::sdk::Result<void>::success();
   }
 
-  void run(std::stop_token stop, std::promise<void> started) {
+  void run(std::stop_token stop, std::promise<livekit::sdk::Result<void>> started) {
     bool ready = false;
     std::optional<webrtc::Environment> env;
-    try {
+    const auto outcome = [&]() -> livekit::sdk::Result<void> {
       env.emplace(webrtc::CreateEnvironment());
-      create(*env);
-      started.set_value();
+      if (auto result = create(*env); !result) {
+        return result;
+      }
+      started.set_value(livekit::sdk::Result<void>::success());
       ready = true;
       Epoch codec_epoch = 0;
       while (!stop.stop_requested()) {
@@ -409,16 +429,16 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
           stats.queued_frames = jobs.size();
           stats.queued_bytes -= job->bytes;
         }
-        process(std::move(*job), codec_epoch);
+        if (auto result = process(std::move(*job), codec_epoch); !result) {
+          return result;
+        }
       }
-    } catch (const std::exception& e) {
+      return livekit::sdk::Result<void>::success();
+    }();
+    if (!outcome) {
       if (!ready)
-        started.set_exception(std::current_exception());
-      fail(e.what());
-    } catch (...) {
-      if (!ready)
-        started.set_exception(std::current_exception());
-      fail("Unknown video codec error");
+        started.set_value(outcome);
+      fail(outcome.failure_record());
     }
     if (encoder) {
       encoder->Release();
@@ -457,7 +477,6 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
 
   Result OnEncodedImage(const webrtc::EncodedImage& image,
                         const webrtc::CodecSpecificInfo*) override {
-    try {
       if (auto timing = completed(image.RtpTimestamp())) {
         EncodedFrame frame;
         frame.buffer =
@@ -470,26 +489,24 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
         frame.duration = std::chrono::microseconds(1000000 / options.fps);
         owner.publish(EncodedFrameEvent(std::move(frame)));
       }
-    } catch (const std::exception& e) {
-      fail(e.what());
-    } catch (...) {
-      fail("Video encode output failed");
-    }
     return Result(Result::OK);
   }
 
   int32_t Decoded(webrtc::VideoFrame& frame) override {
-    try {
       if (auto timing = completed(frame.rtp_timestamp())) {
         auto i420 = frame.video_frame_buffer()->ToI420();
         if (!i420 || i420->width() <= 0 || i420->height() <= 0 ||
             uint32_t(i420->width()) > options.max_width ||
-            uint32_t(i420->height()) > options.max_height)
-          throw std::runtime_error("Decoded dimensions exceed video limits");
+            uint32_t(i420->height()) > options.max_height) {
+          fail("Decoded dimensions exceed video limits");
+          return WEBRTC_VIDEO_CODEC_ERROR;
+        }
         const auto decoded_bytes = size_t(i420->width()) * i420->height() +
                                    2 * size_t((i420->width() + 1) / 2) * ((i420->height() + 1) / 2);
-        if (decoded_bytes > options.max_bytes)
-          throw std::runtime_error("Decoded pixels exceed video byte limit");
+        if (decoded_bytes > options.max_bytes) {
+          fail("Decoded pixels exceed video byte limit");
+          return WEBRTC_VIDEO_CODEC_ERROR;
+        }
         auto pixels = std::make_shared<livekit::sdk::VideoFrame>();
         pixels->track_id = descriptor.id;
         pixels->width = i420->width();
@@ -515,11 +532,6 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
         output.sender_capture_time_us = timing->sender_capture_time_us;
         owner.publish(output);
       }
-    } catch (const std::exception& e) {
-      fail(e.what());
-    } catch (...) {
-      fail("Video decode output failed");
-    }
     return WEBRTC_VIDEO_CODEC_OK;
   }
 };
@@ -535,6 +547,10 @@ VideoCodecNode::~VideoCodecNode() {
 }
 
 bool VideoCodecNode::doInit() {
+  if (impl_->initialization_failure) {
+    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
+    return false;
+  }
   if (impl_->encode) {
     subscribe<VideoFrameEvent>([this](const auto& value) { impl_->raw(value); });
     subscribe<SenderFeedbackEvent>([this](const auto& value) { impl_->update(value.feedback); });
@@ -550,19 +566,18 @@ bool VideoCodecNode::doStart() {
       return false;
     impl_->active = true;
   }
-  std::promise<void> ready;
+  std::promise<livekit::sdk::Result<void>> ready;
   auto result = ready.get_future();
   impl_->worker = std::jthread([this, ready = std::move(ready)](std::stop_token stop) mutable {
     detail::CallbackScope worker_scope;
     impl_->run(stop, std::move(ready));
   });
-  try {
-    result.get();
-    return true;
-  } catch (...) {
+  auto status = result.get();
+  if (!status) {
     quiesce();
-    throw;
+    return false;
   }
+  return true;
 }
 
 void VideoCodecNode::quiesce() {
@@ -587,9 +602,13 @@ VideoCodecSnapshot VideoCodecNode::snapshot() const {
   return impl_->stats;
 }
 
-void VideoCodecNode::throw_if_failed() const {
-  if (auto error = failure()) {
-    std::rethrow_exception(error);
+Result<void> VideoCodecNode::status() const {
+  if (impl_->initialization_failure) {
+    return livekit::sdk::Result<void>::failure(impl_->initialization_failure);
   }
+  if (auto value = error()) {
+    return livekit::sdk::Result<void>::failure(livekit::sdk::detail::graph_failure(*value));
+  }
+  return livekit::sdk::Result<void>::success();
 }
 }  // namespace livekit::sdk::rtc::nodes

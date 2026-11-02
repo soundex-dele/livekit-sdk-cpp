@@ -2,6 +2,7 @@
 #include "livekit/player.hpp"
 #include "media_graph/channel.hpp"
 #include "media_graph/media_flow.hpp"
+#include "media_graph/failure.hpp"
 #include <mutex>
 
 namespace livekit::sdk::detail {
@@ -18,15 +19,18 @@ class PlaybackOutputNode final : public MediaNode {
     return end_;
   }  // playback worker only
 
-  bool push(T& frame) {
+  Result<bool> push(T& frame) {
     std::lock_guard lock(mutex_);
-    if (released_)
-      throw PlayerError("playback/output: node is released");
+    if (released_) {
+      return Result<bool>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                                                "playback/output: node is released"));
+    }
     frame.generation = generation_;
-    if constexpr (std::is_same_v<T, media::VideoFrame>)
+    if constexpr (std::is_same_v<T, media::VideoFrame>) {
       return channel_.push(frame, frame.rgba->size());
-    else
+    } else {
       return channel_.push(frame, frame.pcm->size() * sizeof(float));
+    }
   }
 
   std::optional<T> take_due(int64_t time, uint64_t generation) {
@@ -58,23 +62,33 @@ class PlaybackOutputNode final : public MediaNode {
  protected:
   bool doInit() override {
     using E = std::conditional_t<std::is_same_v<T, media::VideoFrame>, RGBA8, StereoFloat48k>;
-    subscribe_media<E>([this](E& event) {
+    auto subscribed = subscribe_media<E>([this](E& event) -> Result<bool> {
       if (event.eos) {
         finished_ = true;
-        return true;
+        return Result<bool>::success(true);
       }
       const auto end = event.frame.timestamp_us + event.frame.duration_us;
-      if (!push(event.frame))
-        return false;
+      auto pushed = push(event.frame);
+      if (!pushed) {
+        return pushed;
+      }
+      if (!*pushed) {
+        return Result<bool>::success(false);
+      }
       end_ = std::max(end_, end);
-      return true;
+      return Result<bool>::success(true);
     });
+    if (!subscribed) {
+      reportError(graph_error(subscribed.failure_record()));
+      return false;
+    }
     return true;
   }
 
-  void on_reset(int64_t position) override {
+  Result<void> on_reset(int64_t position) override {
     clear();
     end_ = position;
+    return Result<void>::success();
   }
 
   void doRelease() override {

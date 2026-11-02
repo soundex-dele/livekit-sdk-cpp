@@ -1,4 +1,5 @@
 #pragma once
+#include "backends/rtc/livekit/service_result.hpp"
 #include "livekit/rpc.hpp"
 #include "livekit.pb.h"
 #include <future>
@@ -29,9 +30,9 @@ class RpcSession {
   void connect();
   void disconnect();
   void participant_left(const std::string& identity);
-  void register_method(const std::string& method, RpcHandler handler);
+  Result<void> register_method(const std::string& method, RpcHandler handler);
   void unregister_method(const std::string& method);
-  std::future<std::string> call(const RpcCallOptions& options);
+  std::future<Result<std::string>> call(const RpcCallOptions& options);
   void receive(const livekit::DataPacket& packet);
   bool has_outgoing() const;
   RpcSessionSnapshot snapshot() const;

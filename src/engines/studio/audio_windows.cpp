@@ -1,3 +1,8 @@
+// Process loopback declarations require Windows 10 build 20348 or newer.
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#undef NTDDI_VERSION
+#define NTDDI_VERSION 0x0A00000A
 #include "internal.hpp"
 #include <windows.h>
 #include <audioclient.h>
@@ -17,9 +22,11 @@ extern "C" {
 namespace livekit::sdk::studio_detail {
 using namespace Microsoft::WRL;
 
-static void check(HRESULT hr) {
+static Result<void> check(HRESULT hr) {
   if (FAILED(hr))
-    throw std::runtime_error("音频设备错误: " + std::to_string(uint32_t(hr)));
+    return failed("音频设备错误: " + std::to_string(uint32_t(hr)), ErrorCode::processing_failed,
+                  int(hr));
+  return Result<void>::success();
 }
 
 struct Activation : RuntimeClass<RuntimeClassFlags<ClassicCom>,
@@ -58,12 +65,14 @@ struct AudioCapture::Impl {
       SwrContext* swr = nullptr;
       ComPtr<IAudioClient> client;
       WAVEFORMATEX* allocated = nullptr;
-      try {
-        check(initialized);
+      auto run = [&]() -> Result<void> {
+        LK_STUDIO_TRY(check(initialized));
         WAVEFORMATEX format{};
         WAVEFORMATEX* mix = &format;
         if (system) {
-          auto completion = Make<Activation>();
+          auto completion = Microsoft::WRL::Make<Activation>();
+          if (!completion || !completion->event)
+            return failed("Cannot allocate audio activation", ErrorCode::resource_exhausted);
           AUDIOCLIENT_ACTIVATION_PARAMS params{};
           params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
           params.ProcessLoopbackParams.TargetProcessId = GetCurrentProcessId();
@@ -74,11 +83,12 @@ struct AudioCapture::Impl {
           prop.blob.cbSize = sizeof(params);
           prop.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
           ComPtr<IActivateAudioInterfaceAsyncOperation> op;
-          check(ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-                                            __uuidof(IAudioClient), &prop, completion.Get(), &op));
+          LK_STUDIO_TRY(check(ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+                                                          __uuidof(IAudioClient), &prop,
+                                                          completion.Get(), &op)));
           if (WaitForSingleObject(completion->event, 5000) != WAIT_OBJECT_0)
-            throw std::runtime_error("系统音频初始化超时");
-          check(completion->result);
+            return failed("系统音频初始化超时");
+          LK_STUDIO_TRY(check(completion->result));
           client = completion->client;
           format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
           format.nChannels = 2;
@@ -88,16 +98,19 @@ struct AudioCapture::Impl {
           format.nAvgBytesPerSec = 384000;
         } else {
           ComPtr<IMMDeviceEnumerator> enumerator;
-          check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                 IID_PPV_ARGS(&enumerator)));
+          LK_STUDIO_TRY(check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                               IID_PPV_ARGS(&enumerator))));
           ComPtr<IMMDevice> device;
-          check(enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &device));
-          check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client));
-          check(client->GetMixFormat(&allocated));
+          LK_STUDIO_TRY(
+              check(enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &device)));
+          LK_STUDIO_TRY(
+              check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client)));
+          LK_STUDIO_TRY(check(client->GetMixFormat(&allocated)));
           mix = allocated;
         }
         DWORD flags = system ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
-        check(client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, mix, nullptr));
+        LK_STUDIO_TRY(
+            check(client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, mix, nullptr)));
         bool floating = mix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
         if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
           floating = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mix)->SubFormat ==
@@ -106,20 +119,20 @@ struct AudioCapture::Impl {
             floating ? AV_SAMPLE_FMT_FLT
                      : (mix->wBitsPerSample == 16 ? AV_SAMPLE_FMT_S16 : AV_SAMPLE_FMT_S32);
         if (mix->wBitsPerSample != 16 && mix->wBitsPerSample != 32)
-          throw std::runtime_error("不支持的音频设备格式");
+          return failed("不支持的音频设备格式");
         AVChannelLayout in{}, out = AV_CHANNEL_LAYOUT_STEREO;
         av_channel_layout_default(&in, mix->nChannels);
         int e = swr_alloc_set_opts2(&swr, &out, AV_SAMPLE_FMT_FLT, 48000, &in, input,
                                     mix->nSamplesPerSec, 0, nullptr);
         av_channel_layout_uninit(&in);
         if (e < 0 || swr_init(swr) < 0)
-          throw std::runtime_error("音频重采样初始化失败");
+          return failed("音频重采样初始化失败");
         ComPtr<IAudioCaptureClient> capture;
-        check(client->GetService(IID_PPV_ARGS(&capture)));
-        check(client->Start());
+        LK_STUDIO_TRY(check(client->GetService(IID_PPV_ARGS(&capture))));
+        LK_STUDIO_TRY(check(client->Start()));
         while (!stop) {
           UINT32 available = 0;
-          check(capture->GetNextPacketSize(&available));
+          LK_STUDIO_TRY(check(capture->GetNextPacketSize(&available)));
           if (!available) {
             std::this_thread::sleep_for(std::chrono::milliseconds(3));
             continue;
@@ -127,20 +140,24 @@ struct AudioCapture::Impl {
           BYTE* data = nullptr;
           UINT32 frames = 0;
           DWORD status = 0;
-          check(capture->GetBuffer(&data, &frames, &status, nullptr, nullptr));
+          LK_STUDIO_TRY(check(capture->GetBuffer(&data, &frames, &status, nullptr, nullptr)));
           std::vector<uint8_t> silence;
           if (status & AUDCLNT_BUFFERFLAGS_SILENT) {
             silence.resize(size_t(frames) * mix->nBlockAlign);
             data = silence.data();
           }
           int cap = swr_get_out_samples(swr, frames);
+          if (cap < 0) {
+            capture->ReleaseBuffer(frames);
+            return failed("Audio resampler size failed");
+          }
           std::vector<float> samples(size_t(cap) * 2);
           uint8_t* dst = reinterpret_cast<uint8_t*>(samples.data());
           const uint8_t* src = data;
           int count = swr_convert(swr, &dst, cap, &src, frames);
           capture->ReleaseBuffer(frames);
           if (count < 0)
-            throw std::runtime_error("音频转换失败");
+            return failed("音频转换失败");
           samples.resize(size_t(count) * 2);
           {
             std::lock_guard lock(mutex);
@@ -149,9 +166,12 @@ struct AudioCapture::Impl {
               queue.pop_front();
           }
         }
-      } catch (const std::exception& e) {
+        return Result<void>::success();
+      };
+      auto result = run();
+      if (!result) {
         std::lock_guard lock(mutex);
-        error = e.what();
+        error = result.error().message;
       }
       if (client)
         client->Stop();
@@ -203,14 +223,14 @@ struct Monitor::Impl {
     worker = std::jthread([this] {
       HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
       ComPtr<IAudioClient> client;
-      try {
-        check(initialized);
+      auto run = [&]() -> Result<void> {
+        LK_STUDIO_TRY(check(initialized));
         ComPtr<IMMDeviceEnumerator> en;
-        check(
-            CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en)));
+        LK_STUDIO_TRY(check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                             IID_PPV_ARGS(&en))));
         ComPtr<IMMDevice> dev;
-        check(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &dev));
-        check(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client));
+        LK_STUDIO_TRY(check(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &dev)));
+        LK_STUDIO_TRY(check(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client)));
         WAVEFORMATEX f{};
         f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
         f.nChannels = 2;
@@ -218,22 +238,22 @@ struct Monitor::Impl {
         f.wBitsPerSample = 32;
         f.nBlockAlign = 8;
         f.nAvgBytesPerSec = 384000;
-        check(client->Initialize(
+        LK_STUDIO_TRY(check(client->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, 1000000,
-            0, &f, nullptr));
+            0, &f, nullptr)));
         ComPtr<IAudioRenderClient> render;
-        check(client->GetService(IID_PPV_ARGS(&render)));
+        LK_STUDIO_TRY(check(client->GetService(IID_PPV_ARGS(&render))));
         UINT32 capacity;
-        check(client->GetBufferSize(&capacity));
-        check(client->Start());
+        LK_STUDIO_TRY(check(client->GetBufferSize(&capacity)));
+        LK_STUDIO_TRY(check(client->Start()));
         while (!stop) {
           UINT32 used = 0;
-          check(client->GetCurrentPadding(&used));
+          LK_STUDIO_TRY(check(client->GetCurrentPadding(&used)));
           UINT32 count = std::min(UINT32(480), capacity - used);
           if (count) {
             BYTE* data = nullptr;
-            check(render->GetBuffer(count, &data));
+            LK_STUDIO_TRY(check(render->GetBuffer(count, &data)));
             auto* p = reinterpret_cast<float*>(data);
             std::lock_guard lock(mutex);
             for (UINT32 i = 0; i < count * 2; ++i) {
@@ -241,13 +261,16 @@ struct Monitor::Impl {
               if (!queue.empty())
                 queue.pop_front();
             }
-            check(render->ReleaseBuffer(count, 0));
+            LK_STUDIO_TRY(check(render->ReleaseBuffer(count, 0)));
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-      } catch (const std::exception& e) {
+        return Result<void>::success();
+      };
+      auto result = run();
+      if (!result) {
         std::lock_guard lock(mutex);
-        error = e.what();
+        error = result.error().message;
       }
       if (client)
         client->Stop();

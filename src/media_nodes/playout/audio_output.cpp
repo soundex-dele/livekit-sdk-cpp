@@ -1,4 +1,5 @@
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
+#include "media_graph/failure.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include "livekit/rtc/audio_processing.hpp"
 #include <algorithm>
@@ -10,7 +11,6 @@
 #include <map>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -60,21 +60,22 @@ struct AudioOutputSession::Impl {
     if (!this->driver || !options.max_tracks || options.max_tracks > 128 || options.buffer < 0ms ||
         options.buffer > 200ms || options.max_latency < 120ms || options.max_latency > 2s ||
         options.buffer >= options.max_latency) {
-      throw std::invalid_argument("Invalid audio output device options");
+      stats.failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                   "Invalid audio output device options");
+      stats.error = stats.failure->message;
     }
   }
 
   void fail(std::string message) {
-    auto error = normalized_failure(std::make_exception_ptr(std::runtime_error(message)),
-                                    {"playout", {}, "audio.device", 0}, ErrorDomain::media,
-                                    ErrorCode::processing_failed);
+    auto error = make_failure(ErrorDomain::media, ErrorCode::processing_failed, message, false, 0,
+                              {"playout", {}, "audio.device", 0});
     std::vector<AudioOutputSession::FailureHandler> handlers;
     {
       std::lock_guard lock(mutex);
       if (stats.failure) {
         return;
       }
-      stats.failure = describe_failure(error);
+      stats.failure = error;
       stats.error = std::move(message);
       for (const auto& [id, track] : tracks) {
         track->reset();
@@ -84,12 +85,7 @@ struct AudioOutputSession::Impl {
       }
     }
     for (const auto& handler : handlers) {
-      try {
-        handler(error);
-      } catch (...) {
-        // Device callbacks are an exception boundary. The failure remains in
-        // the shared session snapshot even if an external handler throws.
-      }
+      handler(error);
     }
   }
 
@@ -163,12 +159,19 @@ AudioOutputSession::AudioOutputSession(AudioOutputOptions options,
     : impl_(std::make_unique<Impl>(options, std::move(driver))) {}
 
 AudioOutputSession::~AudioOutputSession() {
-  impl_->driver->stop();
+  if (impl_->driver) {
+    impl_->driver->stop();
+  }
 }
 
-std::shared_ptr<AudioOutputTrack> AudioOutputSession::open_track(TrackId id,
-                                                                 FailureHandler failure_handler) {
-  auto self = shared_from_this();
+Result<std::shared_ptr<AudioOutputTrack>> AudioOutputSession::open_track(
+    TrackId id, FailureHandler failure_handler) {
+  auto self = weak_from_this().lock();
+  if (!self) {
+    return livekit::sdk::Result<std::shared_ptr<AudioOutputTrack>>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                     "Audio output session requires shared ownership"));
+  }
   auto& s = *impl_;
   auto state = std::make_shared<AudioOutputTrack::State>();
   state->id = std::move(id);
@@ -180,11 +183,13 @@ std::shared_ptr<AudioOutputTrack> AudioOutputSession::open_track(TrackId id,
   {
     std::lock_guard lock(s.mutex);
     if (s.stats.failure) {
-      throw SDKError(s.stats.failure);
+      return Result<std::shared_ptr<AudioOutputTrack>>::failure(s.stats.failure);
     }
     if (state->id.empty() || s.tracks.contains(state->id) ||
         s.tracks.size() >= s.options.max_tracks) {
-      throw std::invalid_argument("Duplicate, empty or excess audio output track");
+      return livekit::sdk::Result<std::shared_ptr<AudioOutputTrack>>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                       "Duplicate, empty or excess audio output track"));
     }
     first = s.tracks.empty();
     s.tracks.emplace(state->id, state);
@@ -192,25 +197,29 @@ std::shared_ptr<AudioOutputTrack> AudioOutputSession::open_track(TrackId id,
     s.stats.tracks = s.tracks.size();
   }
   if (first) {
-    try {
-      s.driver->start(
-          s.options, [&s](auto output) { s.render(output); },
-          [&s](std::string message) { s.fail(std::move(message)); });
+    auto started = s.driver->start(
+        s.options, [&s](auto output) { s.render(output); },
+        [&s](std::string message) { s.fail(std::move(message)); });
+    Failure failure = started ? Failure{} : started.failure_record();
+    {
       std::lock_guard lock(s.mutex);
-      if (s.stats.failure) {
-        throw SDKError(s.stats.failure);
+      if (!failure) {
+        failure = s.stats.failure;
       }
-      s.stats.running = true;
-    } catch (...) {
+      if (!failure) {
+        s.stats.running = true;
+      }
+    }
+    if (failure) {
       s.driver->stop();
       std::lock_guard lock(s.mutex);
       s.tracks.erase(state->id);
       s.stats.tracks = s.tracks.size();
       state->stats.closed = true;
-      throw;
+      return Result<std::shared_ptr<AudioOutputTrack>>::failure(failure);
     }
   }
-  return track;
+  return Result<std::shared_ptr<AudioOutputTrack>>::success(std::move(track));
 }
 
 AudioOutputSnapshot AudioOutputSession::snapshot() const {
@@ -220,11 +229,12 @@ AudioOutputSnapshot AudioOutputSession::snapshot() const {
   return result;
 }
 
-void AudioOutputSession::throw_if_failed() const {
+Result<void> AudioOutputSession::status() const {
   const auto state = snapshot();
   if (state.failure) {
-    throw SDKError(state.failure);
+    return Result<void>::failure(state.failure);
   }
+  return Result<void>::success();
 }
 
 AudioOutputTrack::AudioOutputTrack(std::shared_ptr<AudioOutputSession> session,
@@ -337,12 +347,14 @@ bool AudioOutputTrack::write(const nodes::AudioFrameEvent& event) {
   return true;
 }
 
-void AudioOutputTrack::set_gain(float gain) {
+Result<void> AudioOutputTrack::set_gain(float gain) {
   if (!std::isfinite(gain) || gain < 0 || gain > 4) {
-    throw std::invalid_argument("Audio output gain must be 0..4");
+    return livekit::sdk::Result<void>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::invalid_argument, "Audio output gain must be 0..4"));
   }
   std::lock_guard lock(session_->impl_->mutex);
   state_->gain = gain;
+  return Result<void>::success();
 }
 
 void AudioOutputTrack::set_muted(bool muted) {
@@ -391,6 +403,7 @@ struct AudioOutputNode::Impl {
   std::shared_ptr<AudioOutputSession> session;
   mutable std::mutex mutex;
   std::shared_ptr<AudioOutputTrack> track;
+  Failure initialization_failure;
   bool closed = false;
   float gain = 1;
   bool muted = false;
@@ -400,7 +413,9 @@ AudioOutputNode::AudioOutputNode(std::string name, TrackId id,
                                  std::shared_ptr<AudioOutputSession> session)
     : GraphNode(name, nullptr), impl_(std::make_unique<Impl>()) {
   if (id.empty() || !session) {
-    throw std::invalid_argument("Audio output needs a track ID and device session");
+    impl_->initialization_failure =
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                     "Audio output needs a track ID and device session");
   }
   impl_->id = std::move(id);
   impl_->session = std::move(session);
@@ -412,6 +427,10 @@ AudioOutputNode::~AudioOutputNode() {
 }
 
 bool AudioOutputNode::doInit() {
+  if (impl_->initialization_failure) {
+    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
+    return false;
+  }
   subscribe<AudioFrameEvent>([this](const auto& frame) {
     std::lock_guard lock(impl_->mutex);
     if (!impl_->closed && impl_->track) {
@@ -426,21 +445,30 @@ bool AudioOutputNode::doStart() {
   if (impl_->closed) {
     return false;
   }
-  impl_->track = impl_->session->open_track(impl_->id, failureReporter());
-  impl_->track->set_gain(impl_->gain);
+  auto opened = impl_->session->open_track(impl_->id, [report = errorReporter()](Failure failure) {
+    report(livekit::sdk::detail::graph_error(std::move(failure)));
+  });
+  if (!opened) {
+    reportError(livekit::sdk::detail::graph_error(opened.failure_record()));
+    return false;
+  }
+  impl_->track = *std::move(opened);
+  (void)impl_->track->set_gain(impl_->gain);
   impl_->track->set_muted(impl_->muted);
   return true;
 }
 
-void AudioOutputNode::set_gain(float gain) {
+Result<void> AudioOutputNode::set_gain(float gain) {
   if (!std::isfinite(gain) || gain < 0 || gain > 4) {
-    throw std::invalid_argument("Audio output gain must be 0..4");
+    return livekit::sdk::Result<void>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::invalid_argument, "Audio output gain must be 0..4"));
   }
   std::lock_guard lock(impl_->mutex);
   impl_->gain = gain;
   if (impl_->track) {
-    impl_->track->set_gain(gain);
+    return impl_->track->set_gain(gain);
   }
+  return Result<void>::success();
 }
 
 void AudioOutputNode::set_muted(bool muted) {
@@ -473,8 +501,11 @@ AudioOutputTrackSnapshot AudioOutputNode::snapshot() const {
   return state;
 }
 
-void AudioOutputNode::throw_if_failed() const {
-  impl_->session->throw_if_failed();
+Result<void> AudioOutputNode::status() const {
+  if (impl_->initialization_failure) {
+    return livekit::sdk::Result<void>::failure(impl_->initialization_failure);
+  }
+  return impl_->session->status();
 }
 }  // namespace nodes
 }  // namespace livekit::sdk::rtc

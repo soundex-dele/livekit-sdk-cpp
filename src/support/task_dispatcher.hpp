@@ -1,5 +1,5 @@
 #pragma once
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include "utoolkit/task_queue/task_queue.h"
 #include <functional>
 #include <memory>
@@ -28,13 +28,14 @@ class TaskDispatcher {
     state_->queue = nullptr;
   }
 
-  void operator()(std::function<void()> task) const {
+  Result<void> operator()(std::function<void()> task) const {
     std::lock_guard lock(state_->mutex);
     if (!state_->queue) {
-      throw SDKError(ErrorDomain::lifecycle, ErrorCode::session_closed,
-                     "Task dispatcher is closed");
+      return Result<void>::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::session_closed,
+                                                "Task dispatcher is closed"));
     }
     state_->queue->postTask(std::move(task));
+    return Result<void>::success();
   }
 };
 }  // namespace livekit::sdk::detail

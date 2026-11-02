@@ -54,10 +54,6 @@ ErrorCode PublishedTrack::close() {
   return ErrorCode::session_closed;
 }
 
-ErrorCode PublishedTrack::close_locked() {
-  return close();
-}
-
 SubscribedTrack::SubscribedTrack(std::shared_ptr<detail::Endpoint> endpoint,
                                  std::weak_ptr<detail::TrackControl> session)
     : endpoint_(std::move(endpoint)), session_(std::move(session)) {}
@@ -100,10 +96,6 @@ ErrorCode SubscribedTrack::close() {
     return ErrorCode::ok;
   }
   return ErrorCode::session_closed;
-}
-
-ErrorCode SubscribedTrack::close_locked() {
-  return close();
 }
 
 void SubscribedTrack::request_keyframe_async() {

@@ -26,7 +26,7 @@
 | `RoomCallback` / `ParticipantCallback` | `RoomCallback` | 参与者、publication、订阅、静音、数据、metadata/属性、room metadata/录制、speakers、连接质量 |
 | Connect options | `RoomOptions` | 自动订阅/指定轨道、relay-only、禁用 TURN、超时；其余媒体选项沿用 CLI |
 
-C++ 不暴露 Pion 或 libwebrtc 类型。`ParticipantInfo` 和 `TrackInfo` 是值对象，`TrackPublication` 是带会话代数的轻量句柄。断开后尚未完成的请求以异常结束，旧代数句柄不能操作新会话。`publish_track` 的输入是 `MediaSpec`（生成图案/音调、FFmpeg 文件/网络源或应用 I420 源）；默认麦克风通过 `RoomOptions.microphone` 启用。
+C++ 不暴露 Pion 或 libwebrtc 类型。`ParticipantInfo` 和 `TrackInfo` 是值对象，`TrackPublication` 是带会话代数的轻量句柄。断开后尚未完成的请求以 `Result<T>` 失败结束，旧代数句柄不能操作新会话。`publish_track` 的输入是 `MediaSpec`（生成图案/音调、FFmpeg 文件/网络源或应用 I420 源）；默认麦克风通过 `RoomOptions.microphone` 启用。
 
 `on_track_subscribed` 暴露轨道状态；音视频由 native sink 自动接收并解码，通过录制/播放消费。尚未提供 Go `TrackRemote.ReadRTP`、`LocalSampleTrack` 对应的原始 RTP/编码样本扩展。工作区同期新增的视频帧回调和会议 Demo 属于独立开发，本轮 Go 适配验收不包含 Demo。
 
@@ -62,7 +62,7 @@ C++ 不暴露 Pion 或 libwebrtc 类型。`ParticipantInfo` 和 `TrackInfo` 是�
 3. 仍无凭证时才读取 `LIVEKIT_API_KEY` 与 `LIVEKIT_API_SECRET`。
 4. 显式 Token 优先于同时给出的 key/secret；显式不完整 key/secret 报错，不与环境混合。
 
-`APIError.status()`、`code()`、`what()`、`metadata()` 保留 Twirp 错误信息。`RequestOptions.stop` 支持预取消和执行中取消；每次请求独立 HTTP client，无自动重试，避免重复执行有副作用的请求。与 Go 当前实现不同，未提供跨服务共享连接池、多 URL 故障转移或 SIP/Ingress 扩展查询 helper 的完整集合。
+服务方法返回 `Result<Json>`；失败记录的 `backend_reason`、`backend_code`、`message`、`backend_metadata` 和 `backend_data` 保留 HTTP 状态与 Twirp 错误信息。`ServiceClient::status()` 报告配置错误，签名与编码辅助函数同样返回 `Result<T>`。`RequestOptions.stop` 支持预取消和执行中取消；每次请求独立 HTTP client，无自动重试，避免重复执行有副作用的请求。与 Go 当前实现不同，未提供跨服务共享连接池、多 URL 故障转移或 SIP/Ingress 扩展查询 helper 的完整集合。
 
 ## 线程与兼容边界
 

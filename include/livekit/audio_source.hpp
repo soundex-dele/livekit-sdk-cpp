@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/audio_frame.hpp"
 
 namespace livekit::sdk {
@@ -42,12 +43,13 @@ class PcmAudioSource {
  public:
   explicit PcmAudioSource(PcmSourceOptions options = {});
   ~PcmAudioSource();
+  Result<void> status() const;
   PcmAudioSource(const PcmAudioSource&) = delete;
   PcmAudioSource& operator=(const PcmAudioSource&) = delete;
   PcmSourceOptions options() const;
   // Atomic admission of the whole write; no waiting for queue space. A caller
   // may retry backpressure. No input or sample position is consumed on rejection.
-  AudioWriteStatus write(const PcmInputFrame& frame);
+  Result<AudioWriteStatus> write(const PcmInputFrame& frame);
   AudioSourceStats stats() const;
   // Permanent EOS discards pending samples. Unpublish separately. An already
   // consumed block may still be in the encoder/transport.
@@ -56,7 +58,7 @@ class PcmAudioSource {
  private:
   friend class detail::PcmSourceReader;
   friend class detail::PcmSourceWriter;
-  AudioWriteStatus write(const PcmInputFrame&, std::optional<uint64_t> expected_generation);
+  Result<AudioWriteStatus> write(const PcmInputFrame&, std::optional<uint64_t> expected_generation);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

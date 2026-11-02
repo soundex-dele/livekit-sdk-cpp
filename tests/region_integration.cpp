@@ -1,4 +1,4 @@
-#include "livekit/error.hpp"
+#include "server_result.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
@@ -18,17 +18,19 @@ using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 
 static void check(bool ok, const char* text) {
-  if (!ok)
-    throw std::runtime_error(text);
+  if (!ok) {
+    std::cerr << text << "\n";
+    std::exit(1);
+  }
 }
 
 int main(int argc, char** argv) {
-  try {
+  {
     check(argc == 4, "Usage: region_integration server-url websocket-fixture-url http-fixture-url");
     const std::string server(argv[1]), fixture(argv[2]), discovery(argv[3]);
-    const auto token = sdk::make_token(
+    const auto token = server_result(sdk::make_token(
         "region-test", "region-integration-secret-32-characters", "region-client",
-        {{"roomJoin", true}, {"room", "regions"}, {"canPublish", true}, {"canSubscribe", true}});
+        {{"roomJoin", true}, {"room", "regions"}, {"canPublish", true}, {"canSubscribe", true}}));
     transport::LiveKitRoomOptions options;
     options.token = token;
     options.regions.trusted_endpoints = {server};
@@ -36,7 +38,11 @@ int main(int argc, char** argv) {
     auto join = [&](livekit::sdk::app_support::BlockingRoom& room, const std::string& url,
                     transport::LiveKitRoomOptions value) {
       value.url = url;
-      return room.join(std::move(value));
+      std::promise<sdk::Result<transport::RoomSnapshot>> completion;
+      auto result = completion.get_future();
+      room.raw().join(std::move(value),
+                      [&](auto ready) { completion.set_value(std::move(ready)); });
+      return result.get();
     };
     transport::TrackDescriptor video;
     video.id = "video";
@@ -66,7 +72,7 @@ int main(int argc, char** argv) {
       int connected = 0, interrupted = 0;
       const auto notification_deadline = Clock::now() + 2s;
       while (Clock::now() < notification_deadline) {
-        auto event = room_events.take_event(connected ? 0ms : 50ms);
+        auto event = require_result(room_events.take_event(connected ? 0ms : 50ms));
         if (!event) {
           if (connected)
             break;
@@ -85,13 +91,7 @@ int main(int argc, char** argv) {
       auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       auto initial = options;
       initial.regions.fallback_endpoints = {server};
-      bool rejected = false;
-      try {
-        require_result(join(*room, fixture + path, initial));
-      } catch (const std::exception&) {
-        rejected = true;
-      }
-      check(rejected, "Initial failover bypassed a terminal error");
+      check(!join(*room, fixture + path, initial), "Initial failover bypassed a terminal error");
     }
     {
       auto room = require_result(livekit::sdk::app_support::create_blocking_room());
@@ -100,13 +100,9 @@ int main(int argc, char** argv) {
       initial.regions.endpoint_timeout = 5s;
       initial.regions.trusted_endpoints.push_back(fixture + "/silent-2");
       initial.regions.fallback_endpoints = {fixture + "/silent-2"};
-      bool timed_out = false;
       const auto start = Clock::now();
-      try {
-        require_result(join(*room, fixture + "/silent", initial));
-      } catch (const sdk::SDKError& error) {
-        timed_out = error.code() == sdk::ErrorCode::timeout;
-      }
+      auto result = join(*room, fixture + "/silent", initial);
+      bool timed_out = !result && result.error().code == sdk::ErrorCode::timeout;
       check(timed_out && Clock::now() - start < 2500ms, "Initial failover total deadline exceeded");
     }
     {
@@ -124,7 +120,8 @@ int main(int argc, char** argv) {
             "Leave did not interrupt initial connection");
       auto result = joining.get();
       require_result(leaving.get());
-      check(result == sdk::ErrorCode::cancelled && Clock::now() - start < 2500ms &&
+      check(!result && result.error().code == sdk::ErrorCode::cancelled &&
+                Clock::now() - start < 2500ms &&
                 room->snapshot().state == transport::ConnectionState::closed,
             "Asynchronous cancellation/leave failed");
     }
@@ -132,14 +129,10 @@ int main(int argc, char** argv) {
       auto room = require_result(livekit::sdk::app_support::create_blocking_room());
       auto untrusted = options;
       untrusted.regions.trusted_endpoints.clear();
-      try {
-        require_result(join(*room, fixture + path, untrusted));
-      } catch (const sdk::SDKError& error) {
-        check(error.code() == expected && (!status || error.backend_reason() == status),
-              "Wrong redirect failure");
-        return;
-      }
-      throw std::runtime_error("Redirect was not rejected");
+      auto result = join(*room, fixture + path, untrusted);
+      check(!result, "Redirect was not rejected");
+      check(result.error().code == expected && (!status || result.error().backend_reason == status),
+            "Wrong redirect failure");
     };
     rejected("/untrusted", sdk::ErrorCode::permission_denied);
     rejected("/cycle", sdk::ErrorCode::recovery_failed);
@@ -147,12 +140,8 @@ int main(int argc, char** argv) {
     auto force_relay = require_result(livekit::sdk::app_support::create_blocking_room());
     auto direct = options;
     direct.media_transport = sdk::MediaTransport::udp_only;
-    bool relay_conflict = false;
-    try {
-      require_result(join(*force_relay, fixture + "/force-relay", direct));
-    } catch (const sdk::SDKError& error) {
-      relay_conflict = error.code() == sdk::ErrorCode::unsupported;
-    }
+    auto relay = join(*force_relay, fixture + "/force-relay", direct);
+    bool relay_conflict = !relay && relay.error().code == sdk::ErrorCode::unsupported;
     check(relay_conflict, "Server relay policy was bypassed by strict direct transport");
     const auto regions =
         lk::fetch_regions(discovery + "/settings-ok", token, {}, Clock::now() + 2s);
@@ -192,8 +181,5 @@ int main(int argc, char** argv) {
                            {"initialFailoverCancellation", true}}
                      .dump()
               << '\n';
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
   }
 }

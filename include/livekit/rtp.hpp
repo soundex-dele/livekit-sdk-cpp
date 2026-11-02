@@ -21,8 +21,9 @@ class PacketStream {
  public:
   explicit PacketStream(size_t capacity = 512);
   ~PacketStream();
-  std::optional<PacketEvent> read(std::chrono::milliseconds timeout = std::chrono::seconds(30),
-                                  std::stop_token stop = {});
+  Result<void> status() const;
+  Result<std::optional<PacketEvent>> read(
+      std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
   void close();
   uint64_t dropped() const;
 
@@ -38,11 +39,16 @@ class PacketStream {
 class RtpClock {
  public:
   explicit RtpClock(uint32_t rate);
+
+  Result<void> status() const {
+    return failure_ ? Result<void>::failure(failure_) : Result<void>::success();
+  }
   void sender_report(uint32_t rtp, uint64_t ntp);
   std::optional<std::chrono::nanoseconds> ntp_time(uint32_t rtp) const;
   void reset();
 
  private:
+  Failure failure_;
   uint32_t rate_, rtp_ = 0;
   std::optional<std::chrono::nanoseconds> ntp_;
 };
@@ -54,8 +60,9 @@ class RtpMediaSource {
  public:
   RtpMediaSource(EncodedSourceOptions options, uint8_t payload_type, uint32_t ssrc);
   ~RtpMediaSource();
+  Result<void> status() const;
   std::shared_ptr<EncodedMediaSource> source() const;
-  EncodedWriteStatus write(std::span<const uint8_t> packet);
+  Result<EncodedWriteStatus> write(std::span<const uint8_t> packet);
   void reset();
 
  private:

@@ -3,9 +3,11 @@
 #include "livekit.pb.h"
 
 namespace livekit::sdk::rtc::detail {
-inline livekit::SubscriptionPermission subscription_permissions_wire(
+inline Result<livekit::SubscriptionPermission> subscription_permissions_wire(
     const SubscriptionPermissions& policy, const std::map<TrackId, std::string>& publication_sids) {
-  validate_subscription_permissions(policy);
+  if (auto valid = validate_subscription_permissions(policy); !valid) {
+    return Result<livekit::SubscriptionPermission>::failure(valid.failure_record());
+  }
   livekit::SubscriptionPermission result;
   result.set_all_participants(policy.all_participants);
   for (const auto& participant : policy.participants) {
@@ -19,6 +21,6 @@ inline livekit::SubscriptionPermission subscription_permissions_wire(
         entry->add_track_sids(found->second);
     }
   }
-  return result;
+  return Result<livekit::SubscriptionPermission>::success(std::move(result));
 }
 }  // namespace livekit::sdk::rtc::detail

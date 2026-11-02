@@ -1,50 +1,72 @@
 #include "livekit/encoding.hpp"
-#include <openssl/evp.h>
-#include <stdexcept>
 
 namespace livekit::sdk {
-std::string base64url(std::string_view v) {
-  std::string out(4 * ((v.size() + 2) / 3), '\0');
-  if (!v.empty())
-    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()),
-                    reinterpret_cast<const unsigned char*>(v.data()), static_cast<int>(v.size()));
-  for (auto& c : out) {
-    if (c == '+')
-      c = '-';
-    if (c == '/')
-      c = '_';
+std::string base64url(std::string_view value) {
+  constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  std::string encoded;
+  unsigned bits = 0, count = 0;
+  for (unsigned char byte : value) {
+    bits = (bits << 8) | byte;
+    count += 8;
+    while (count >= 6) {
+      count -= 6;
+      encoded += alphabet[(bits >> count) & 63];
+    }
   }
-  while (!out.empty() && out.back() == '=')
-    out.pop_back();
-  return out;
+  if (count) {
+    encoded += alphabet[(bits << (6 - count)) & 63];
+  }
+  return encoded;
 }
 
-std::string base64_decode(std::string_view value) {
-  std::string encoded(value);
-  for (auto& c : encoded) {
-    if (c == '-')
-      c = '+';
-    else if (c == '_')
-      c = '/';
+Result<std::string> base64_decode(std::string_view value) {
+  auto invalid = [] {
+    return Result<std::string>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument, "Invalid Base64 data",
+                     false, 0, {"base64_decode"}));
+  };
+  const auto first_padding = value.find('=');
+  const size_t content_size =
+      first_padding == std::string_view::npos ? value.size() : first_padding;
+  const size_t padding = value.size() - content_size;
+  if (content_size % 4 == 1 || padding > 2 ||
+      (padding && (value.size() % 4 || content_size % 4 + padding != 4))) {
+    return invalid();
   }
-  if (encoded.size() % 4 == 1)
-    throw std::invalid_argument("Invalid Base64 length");
-  while (encoded.size() % 4)
-    encoded += '=';
-  if (encoded.empty())
-    return {};
-  std::string decoded(encoded.size() / 4 * 3, '\0');
-  auto length = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
-                                reinterpret_cast<const unsigned char*>(encoded.data()),
-                                static_cast<int>(encoded.size()));
-  if (length < 0)
-    throw std::invalid_argument("Invalid Base64 data");
-  if (encoded.back() == '=')
-    --length;
-  if (encoded.size() > 1 && encoded[encoded.size() - 2] == '=')
-    --length;
-  decoded.resize(length);
-  return decoded;
+  for (size_t i = content_size; i < value.size(); ++i) {
+    if (value[i] != '=') {
+      return invalid();
+    }
+  }
+  std::string decoded;
+  unsigned bits = 0, count = 0;
+  for (size_t i = 0; i < content_size; ++i) {
+    const unsigned char c = value[i];
+    unsigned digit;
+    if (c >= 'A' && c <= 'Z') {
+      digit = c - 'A';
+    } else if (c >= 'a' && c <= 'z') {
+      digit = c - 'a' + 26;
+    } else if (c >= '0' && c <= '9') {
+      digit = c - '0' + 52;
+    } else if (c == '+' || c == '-') {
+      digit = 62;
+    } else if (c == '/' || c == '_') {
+      digit = 63;
+    } else {
+      return invalid();
+    }
+    bits = (bits << 6) | digit;
+    count += 6;
+    if (count >= 8) {
+      count -= 8;
+      decoded += static_cast<char>((bits >> count) & 255);
+    }
+  }
+  if (count && (bits & ((1u << count) - 1))) {
+    return invalid();
+  }
+  return Result<std::string>::success(std::move(decoded));
 }
 
 std::string percent_encode(std::string_view value) {
@@ -63,19 +85,26 @@ std::string percent_encode(std::string_view value) {
   return result;
 }
 
-std::string endpoint(std::string url, bool ws) {
+Result<std::string> endpoint(std::string url, bool ws) {
   auto pos = url.find("://");
   if (pos == std::string::npos)
-    throw std::runtime_error("URL must start with http(s):// or ws(s)://");
+    return Result<std::string>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                     "URL must start with http(s):// or ws(s)://", false, 0, {"endpoint"}));
   auto scheme = url.substr(0, pos);
   if (scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss")
-    throw std::runtime_error("Unsupported URL scheme");
+    return Result<std::string>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument, "Unsupported URL scheme",
+                     false, 0, {"endpoint"}));
   auto rest = url.substr(pos + 3);
   if (rest.empty() || rest.front() == '/' || rest.find_first_of("?#@\r\n") != std::string::npos)
-    throw std::runtime_error("URL must contain a host and no credentials, query, or fragment");
+    return Result<std::string>::failure(make_failure(
+        ErrorDomain::protocol, ErrorCode::invalid_argument,
+        "URL must contain a host and no credentials, query, or fragment", false, 0, {"endpoint"}));
   while (!rest.empty() && rest.back() == '/')
     rest.pop_back();
   bool tls = scheme == "https" || scheme == "wss";
-  return std::string(ws ? (tls ? "wss://" : "ws://") : (tls ? "https://" : "http://")) + rest;
+  return Result<std::string>::success(
+      std::string(ws ? (tls ? "wss://" : "ws://") : (tls ? "https://" : "http://")) + rest);
 }
 }  // namespace livekit::sdk

@@ -1,8 +1,15 @@
 #include "livekit/encoded_file.hpp"
-#include "livekit/error.hpp"
+#include "livekit/result.hpp"
 #include <condition_variable>
 #include <mutex>
+#include <limits>
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/bsf.h>
@@ -11,6 +18,7 @@ extern "C" {
 
 namespace livekit::sdk {
 struct EncodedFileReader::Impl {
+  Failure failure;
   EncodedSourceOptions options;
   std::filesystem::path path;
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
@@ -31,70 +39,115 @@ struct EncodedFileReader::Impl {
 
 EncodedFileReader::EncodedFileReader(const std::filesystem::path& path, bool video)
     : impl_(std::make_unique<Impl>()) {
+  const auto initialized = [&]() -> Result<void> {
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
-  auto& s = *impl_;
-  s.path = path;
-  const auto u8 = path.u8string();
-  const std::string name(u8.begin(), u8.end());
-  if (avformat_open_input(&s.format, name.c_str(), nullptr, nullptr) < 0 ||
-      avformat_find_stream_info(s.format, nullptr) < 0)
-    throw std::runtime_error("Cannot open encoded media file");
-  s.stream = av_find_best_stream(s.format, video ? AVMEDIA_TYPE_VIDEO : AVMEDIA_TYPE_AUDIO, -1, -1,
-                                 nullptr, 0);
-  if (s.stream < 0)
-    throw std::invalid_argument("Requested encoded media stream not found");
-  const auto* codec = s.format->streams[s.stream]->codecpar;
-  const char* filter = nullptr;
-  switch (codec->codec_id) {
-    case AV_CODEC_ID_H264:
-      s.options.codec = "h264";
-      filter = "h264_mp4toannexb";
-      break;
-    case AV_CODEC_ID_HEVC:
-      s.options.codec = "h265";
-      filter = "hevc_mp4toannexb";
-      break;
-    case AV_CODEC_ID_VP8:
-      s.options.codec = "vp8";
-      break;
-    case AV_CODEC_ID_OPUS:
-      s.options.codec = "opus";
-      break;
-    default:
-      throw std::invalid_argument("File codec must be VP8, H264, H265 or Opus");
-  }
-  if (video) {
-    s.options.width = codec->width;
-    s.options.height = codec->height;
-  }
-  if (filter) {
-    const auto* f = av_bsf_get_by_name(filter);
-    if (!f || av_bsf_alloc(f, &s.filter) < 0)
-      throw std::runtime_error("Annex-B filter unavailable");
-    if (avcodec_parameters_copy(s.filter->par_in, codec) < 0)
-      throw std::runtime_error("Cannot configure Annex-B filter");
-    s.filter->time_base_in = s.format->streams[s.stream]->time_base;
-    if (av_bsf_init(s.filter) < 0)
-      throw std::runtime_error("Cannot initialize Annex-B filter");
-  }
+    auto& s = *impl_;
+    s.path = path;
+    const auto& native = path.native();
+    if (native.empty() ||
+        native.find(std::filesystem::path::value_type{}) !=
+            std::filesystem::path::string_type::npos ||
+        native.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "Invalid encoded media path"));
+    }
+#ifdef _WIN32
+    const int length =
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, native.data(),
+                            static_cast<int>(native.size()), nullptr, 0, nullptr, nullptr);
+    if (!length) {
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "Invalid encoded media path encoding"));
+    }
+    std::string name(length, '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, native.data(),
+                            static_cast<int>(native.size()), name.data(), length, nullptr,
+                            nullptr) != length) {
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "Cannot encode media path"));
+    }
 #else
-  throw SDKError(ErrorDomain::media, ErrorCode::unsupported,
-                 "Encoded files require LIVEKIT_RTC_FFMPEG_CODECS");
+    const auto& name = native;
 #endif
+    if (avformat_open_input(&s.format, name.c_str(), nullptr, nullptr) < 0 ||
+        avformat_find_stream_info(s.format, nullptr) < 0)
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Cannot open encoded media file"));
+    s.stream = av_find_best_stream(s.format, video ? AVMEDIA_TYPE_VIDEO : AVMEDIA_TYPE_AUDIO, -1,
+                                   -1, nullptr, 0);
+    if (s.stream < 0)
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "Requested encoded media stream not found"));
+    const auto* codec = s.format->streams[s.stream]->codecpar;
+    const char* filter = nullptr;
+    switch (codec->codec_id) {
+      case AV_CODEC_ID_H264:
+        s.options.codec = "h264";
+        filter = "h264_mp4toannexb";
+        break;
+      case AV_CODEC_ID_HEVC:
+        s.options.codec = "h265";
+        filter = "hevc_mp4toannexb";
+        break;
+      case AV_CODEC_ID_VP8:
+        s.options.codec = "vp8";
+        break;
+      case AV_CODEC_ID_OPUS:
+        s.options.codec = "opus";
+        break;
+      default:
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                  "File codec must be VP8, H264, H265 or Opus"));
+    }
+    if (video) {
+      s.options.width = codec->width;
+      s.options.height = codec->height;
+    }
+    if (filter) {
+      const auto* f = av_bsf_get_by_name(filter);
+      if (!f || av_bsf_alloc(f, &s.filter) < 0)
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                  "Annex-B filter unavailable"));
+      if (avcodec_parameters_copy(s.filter->par_in, codec) < 0)
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                  "Cannot configure Annex-B filter"));
+      s.filter->time_base_in = s.format->streams[s.stream]->time_base;
+      if (av_bsf_init(s.filter) < 0)
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                  "Cannot initialize Annex-B filter"));
+    }
+#else
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::unsupported,
+                                              "Encoded files require LIVEKIT_RTC_FFMPEG_CODECS"));
+#endif
+    return Result<void>::success();
+  }();
+  if (!initialized) {
+    impl_->failure = initialized.failure_record();
+  }
 }
 
 EncodedFileReader::~EncodedFileReader() = default;
+
+Result<void> EncodedFileReader::status() const {
+  return impl_->failure ? Result<void>::failure(impl_->failure) : Result<void>::success();
+}
 
 EncodedSourceOptions EncodedFileReader::source_options() const {
   return impl_->options;
 }
 
-std::optional<EncodedMediaFrame> EncodedFileReader::read() {
+Result<std::optional<EncodedMediaFrame>> EncodedFileReader::read() {
+  using ReadResult = Result<std::optional<EncodedMediaFrame>>;
+  if (impl_->failure) {
+    return ReadResult::failure(impl_->failure);
+  }
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
   auto& s = *impl_;
   auto* raw = av_packet_alloc();
   if (!raw)
-    throw std::bad_alloc();
+    return ReadResult::failure(make_failure(ErrorDomain::media, ErrorCode::resource_exhausted,
+                                            "Cannot allocate encoded file packet"));
   const std::unique_ptr<AVPacket, void (*)(AVPacket*)> packet(
       raw, [](AVPacket* p) { av_packet_free(&p); });
   for (;;) {
@@ -103,12 +156,13 @@ std::optional<EncodedMediaFrame> EncodedFileReader::read() {
       if (result == 0)
         break;
       if (result == AVERROR_EOF)
-        return {};
+        return ReadResult::success({});
       if (result != AVERROR(EAGAIN))
-        throw std::runtime_error("Annex-B conversion failed");
+        return ReadResult::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Annex-B conversion failed"));
     }
     if (s.eof)
-      return {};
+      return ReadResult::success({});
     int result = av_read_frame(s.format, raw);
     if (result == AVERROR_EOF) {
       s.eof = true;
@@ -116,10 +170,11 @@ std::optional<EncodedMediaFrame> EncodedFileReader::read() {
         av_bsf_send_packet(s.filter, nullptr);
         continue;
       }
-      return {};
+      return ReadResult::success({});
     }
     if (result < 0)
-      throw std::runtime_error("Encoded file read failed");
+      return ReadResult::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                              "Encoded file read failed"));
     if (raw->stream_index != s.stream) {
       av_packet_unref(raw);
       continue;
@@ -127,7 +182,8 @@ std::optional<EncodedMediaFrame> EncodedFileReader::read() {
     if (!s.filter)
       break;
     if (av_bsf_send_packet(s.filter, raw) < 0)
-      throw std::runtime_error("Annex-B input failed");
+      return ReadResult::failure(
+          make_failure(ErrorDomain::media, ErrorCode::processing_failed, "Annex-B input failed"));
   }
   const auto timebase = s.filter ? s.filter->time_base_out : s.format->streams[s.stream]->time_base;
   auto pts = raw->pts == AV_NOPTS_VALUE ? raw->dts : raw->pts;
@@ -140,7 +196,9 @@ std::optional<EncodedMediaFrame> EncodedFileReader::read() {
                   : s.options.codec == "opus" ? 20000
                                               : 33333;
   if (us < 0 || (s.last_us && us <= *s.last_us) || duration < 1 || duration > 1000000)
-    throw std::invalid_argument("Non-monotonic encoded access units; B-frames are not supported");
+    return ReadResult::failure(
+        make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                     "Non-monotonic encoded access units; B-frames are not supported"));
   s.last_us = us;
   s.next_us = us + duration;
   EncodedMediaFrame frame;
@@ -151,19 +209,22 @@ std::optional<EncodedMediaFrame> EncodedFileReader::read() {
   frame.keyframe = raw->flags & AV_PKT_FLAG_KEY;
   frame.duration = std::chrono::microseconds(duration);
   frame.captured = s.epoch + std::chrono::microseconds(us);
-  return frame;
+  return ReadResult::success(std::move(frame));
 #else
-  return {};
+  return ReadResult::success({});
 #endif
 }
 
-void EncodedFileReader::rewind() {
+Result<void> EncodedFileReader::rewind() {
+  if (impl_->failure) {
+    return Result<void>::failure(impl_->failure);
+  }
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
   auto& s = *impl_;
   if (av_seek_frame(s.format, s.stream, 0, AVSEEK_FLAG_BACKWARD) < 0) {
     EncodedFileReader reopened(s.path, s.options.codec != "opus");
     impl_ = std::move(reopened.impl_);
-    return;
+    return status();
   }
   if (s.filter)
     av_bsf_flush(s.filter);
@@ -173,48 +234,87 @@ void EncodedFileReader::rewind() {
   s.eof = false;
   s.epoch = std::chrono::steady_clock::now();
 #endif
+  return Result<void>::success();
 }
 
-void EncodedFileReader::pump(const std::shared_ptr<EncodedMediaSource>& source,
-                             std::stop_token stop) {
+Result<void> EncodedFileReader::pump(const std::shared_ptr<EncodedMediaSource>& source,
+                                     std::stop_token stop) {
+  if (impl_->failure) {
+    return Result<void>::failure(impl_->failure);
+  }
+  if (source) {
+    if (auto result = source->status(); !result) {
+      return result;
+    }
+  }
   if (!source || source->options().codec != impl_->options.codec)
-    throw std::invalid_argument("Encoded file source mismatch");
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                              "Encoded file source mismatch"));
   std::mutex mutex;
   std::condition_variable_any ready;
   std::unique_lock lock(mutex);
-  auto wait = [&](std::chrono::steady_clock::time_point time) {
+  auto wait = [&](std::chrono::steady_clock::time_point time) -> Result<void> {
     ready.wait_until(lock, stop, time, [] { return false; });
     if (stop.stop_requested())
-      throw SDKError(ErrorDomain::media, ErrorCode::cancelled, "Encoded file pump cancelled");
+      return Result<void>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::cancelled, "Encoded file pump cancelled"));
+    return Result<void>::success();
   };
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (!source->stats().accepting) {
     if (source->stats().closed || std::chrono::steady_clock::now() > deadline)
-      throw std::runtime_error("Encoded source is not active");
-    wait(std::chrono::steady_clock::now() + std::chrono::milliseconds(5));
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Encoded source is not active"));
+    if (auto result = wait(std::chrono::steady_clock::now() + std::chrono::milliseconds(5));
+        !result) {
+      return result;
+    }
   }
   const auto generation = source->stats().generation;
-  rewind();
-  while (auto frame = read()) {
-    wait(frame->captured);
+  if (auto result = rewind(); !result) {
+    return result;
+  }
+  while (true) {
+    auto next = read();
+    if (!next) {
+      return Result<void>::failure(next.failure_record());
+    }
+    if (!*next) {
+      break;
+    }
+    auto frame = std::move(*next);
+    if (auto result = wait(frame->captured); !result) {
+      return result;
+    }
     for (;;) {
       auto stats = source->stats();
       if (!stats.accepting || stats.generation != generation)
-        throw SDKError(ErrorDomain::media, ErrorCode::session_closed,
-                       "Encoded source generation changed");
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::session_closed,
+                                                  "Encoded source generation changed"));
       if (stats.keyframe_required && !frame->keyframe && frame->codec != "opus")
         break;
       const auto status = source->write(*frame);
-      if (status == EncodedWriteStatus::accepted || status == EncodedWriteStatus::keyframe_required)
+      if (!status) {
+        return Result<void>::failure(status.failure_record());
+      }
+      if (*status == EncodedWriteStatus::accepted ||
+          *status == EncodedWriteStatus::keyframe_required) {
         break;
-      if (status == EncodedWriteStatus::closed)
-        throw std::runtime_error("Encoded source closed");
+      }
+      if (*status == EncodedWriteStatus::closed) {
+        return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                  "Encoded source closed"));
+      }
       if (std::chrono::steady_clock::now() - frame->captured > source->options().max_age) {
         source->request_keyframe();
         break;
       }
-      wait(std::chrono::steady_clock::now() + std::chrono::milliseconds(2));
+      if (auto result = wait(std::chrono::steady_clock::now() + std::chrono::milliseconds(2));
+          !result) {
+        return result;
+      }
     }
   }
+  return Result<void>::success();
 }
 }  // namespace livekit::sdk

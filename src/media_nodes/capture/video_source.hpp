@@ -16,11 +16,14 @@ class I420SourceReader {
   ~I420SourceReader();
   I420SourceReader(const I420SourceReader&) = delete;
   I420SourceReader& operator=(const I420SourceReader&) = delete;
-  void start();
+  Result<void> status() const;
+  Result<void> start();
   void stop();
   std::shared_ptr<const I420SourceFrame> read(std::stop_token stop);
 
  private:
   std::shared_ptr<I420VideoSource> source_;
+  Failure failure_;
+  bool attached_ = false;
 };
 }  // namespace livekit::sdk::detail

@@ -1,6 +1,7 @@
 #include "engines/player/playback_graph.hpp"
 #include "backends/ffmpeg/ffmpeg_playback.hpp"
 #include "engine/graph_engine.h"
+#include "media_graph/failure.hpp"
 #include <algorithm>
 
 namespace livekit::sdk::detail {
@@ -30,8 +31,11 @@ class PlaybackGraph::Impl {
         {"video.rgba", "video.output", "RGBA8", ""},
         {"audio.resampler", "audio.output", "StereoFloat48k", ""},
     };
-    if (!engine.loadFromNodes(lifecycle_nodes, connections))
-      throw PlayerError("playback/build: graph load failed");
+    if (!engine.loadFromNodes(lifecycle_nodes, connections)) {
+      build_failure = make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                   "playback/build: graph load failed");
+      return;
+    }
     for (const auto& node : nodes) {
       const auto& outgoing = node->getPubEdges();
       edges.insert(edges.end(), outgoing.begin(), outgoing.end());
@@ -39,16 +43,17 @@ class PlaybackGraph::Impl {
     executor = std::make_unique<MediaExecutor>(nodes);
     nodes = executor->nodes();
     engine.eventBus()->subscribe<Control>("player.control", [this](Control& event) {
-      try {
-        if (event.kind == Control::start) {
-          if (!engine.start())
-            throw PlayerError("playback/start: graph is not prepared");
-        } else if (event.kind == Control::pause)
-          engine.stop();
-        else
-          flush_seek(event.position);
-      } catch (...) {
-        event.error = std::current_exception();
+      if (event.kind == Control::start) {
+        if (!engine.start()) {
+          event.error = node_failure("playback/start: graph is not prepared");
+        }
+      } else if (event.kind == Control::pause) {
+        engine.stop();
+      } else {
+        auto result = flush_seek(event.position);
+        if (!result) {
+          event.error = result.failure_record();
+        }
       }
     });
   }
@@ -61,58 +66,98 @@ class PlaybackGraph::Impl {
     enum Kind { start, pause, seek } kind;
 
     int64_t position = 0;
-    std::exception_ptr error;
+    Failure error;
 
     Control(Kind kind, int64_t position = 0) : kind(kind), position(position) {}
   };
 
-  void dispatch(Control event) {
-    engine.eventBus()->publish("player.control", event);
-    if (event.error)
-      std::rethrow_exception(event.error);
+  Failure node_failure(const std::string& fallback) const {
+    for (const auto& node : nodes) {
+      if (auto error = node->error()) {
+        return graph_failure(*error);
+      }
+    }
+    return make_failure(ErrorDomain::media, ErrorCode::processing_failed, fallback);
   }
 
-  PlayerMediaInfo open(const std::string& filename) {
-    if (engine.state() != graphflow::core::LifecycleState::Created)
-      throw std::logic_error("playback/open: graph already used");
+  Result<void> dispatch(Control event) {
+    if (build_failure) {
+      return Result<void>::failure(build_failure);
+    }
+    engine.eventBus()->publish("player.control", event);
+    return event.error ? Result<void>::failure(event.error) : Result<void>::success();
+  }
+
+  Result<PlayerMediaInfo> open(const std::string& filename) {
+    if (build_failure) {
+      return Result<PlayerMediaInfo>::failure(build_failure);
+    }
+    auto valid = executor->status();
+    if (!valid) {
+      return Result<PlayerMediaInfo>::failure(valid.failure_record());
+    }
+    if (engine.state() != graphflow::core::LifecycleState::Created) {
+      return Result<PlayerMediaInfo>::failure(make_failure(
+          ErrorDomain::media, ErrorCode::invalid_state, "playback/open: graph already used"));
+    }
     source->configure(filename);
-    try {
-      if (!engine.init())
-        throw PlayerError("playback/prepare: graph init failed");
-      // Media preparation may publish stream formats after every subscription
-      // exists. GraphEngine alone drives init/start/stop/release.
-      for (const auto& node : nodes)
-        node->prepare();
-    } catch (...) {
+    Failure failure;
+    if (!engine.init()) {
+      failure = node_failure("playback/prepare: graph init failed");
+    } else {
+      for (const auto& node : nodes) {
+        auto prepared = node->prepare();
+        if (!prepared) {
+          failure = prepared.failure_record();
+          break;
+        }
+      }
+    }
+    if (failure) {
       engine.release();
       edges.clear();
-      throw;
+      return Result<PlayerMediaInfo>::failure(failure);
     }
-    return demux->info();
+    return Result<PlayerMediaInfo>::success(demux->info());
   }
 
-  void flush_seek(int64_t position) {
-    if (position < 0)
-      throw std::invalid_argument("playback/seek: negative position");
-    executor->reset(position);
+  Result<void> flush_seek(int64_t position) {
+    if (position < 0) {
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                                "playback/seek: negative position"));
+    }
+    return executor->reset(position);
   }
 
-  Step step() {
-    if (engine.state() != graphflow::core::LifecycleState::Running)
-      throw std::logic_error("playback/step: graph is not running");
-    if (cancelled.load())
-      throw PlayerError("playback: cancelled");
-    switch (executor->step()) {
+  Result<Step> step() {
+    if (build_failure) {
+      return Result<Step>::failure(build_failure);
+    }
+    if (engine.state() != graphflow::core::LifecycleState::Running) {
+      return Result<Step>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                                                "playback/step: graph is not running"));
+    }
+    if (cancelled.load()) {
+      return Result<Step>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::cancelled, "playback: cancelled"));
+    }
+    auto stepped = executor->step();
+    if (!stepped) {
+      return Result<Step>::failure(stepped.failure_record());
+    }
+    switch (*stepped) {
       case MediaExecutor::Step::progress:
-        return Step::progress;
+        return Result<Step>::success(Step::progress);
       case MediaExecutor::Step::backpressured:
-        return Step::backpressured;
+        return Result<Step>::success(Step::backpressured);
       case MediaExecutor::Step::end:
-        return Step::end;
+        return Result<Step>::success(Step::end);
     }
-    throw std::logic_error("playback: invalid executor result");
+    return Result<Step>::failure(make_failure(ErrorDomain::media, ErrorCode::internal_error,
+                                              "playback: invalid executor result"));
   }
 
+  Failure build_failure;
   graphflow::engine::GraphEngine engine{1};
   std::atomic<bool>& cancelled;
   std::shared_ptr<FileSourceNode> source;
@@ -132,11 +177,11 @@ PlaybackGraph::PlaybackGraph(std::atomic<bool>& cancel, const PlayerOptions& opt
 
 PlaybackGraph::~PlaybackGraph() = default;
 
-PlayerMediaInfo PlaybackGraph::open(const std::string& path) {
+Result<PlayerMediaInfo> PlaybackGraph::open(const std::string& path) {
   return impl_->open(path);
 }
 
-PlaybackGraph::Step PlaybackGraph::step() {
+Result<PlaybackGraph::Step> PlaybackGraph::step() {
   return impl_->step();
 }
 
@@ -150,8 +195,9 @@ std::shared_ptr<PlaybackOutputs> PlaybackGraph::outputs() const {
 
 std::vector<PlaybackGraph::NodeInfo> PlaybackGraph::nodes() const {
   std::vector<NodeInfo> result;
-  for (const auto& node : impl_->nodes)
+  for (const auto& node : impl_->nodes) {
     result.push_back({node->getName(), node->state(), node->received(), node->published()});
+  }
   return result;
 }
 
@@ -159,15 +205,15 @@ std::vector<graphflow::core::GraphEdge> PlaybackGraph::edges() const {
   return impl_->edges;
 }
 
-void PlaybackGraph::seek(int64_t position) {
-  impl_->dispatch(Impl::Control(Impl::Control::seek, position));
+Result<void> PlaybackGraph::seek(int64_t position) {
+  return impl_->dispatch(Impl::Control(Impl::Control::seek, position));
 }
 
-void PlaybackGraph::start() {
-  impl_->dispatch(Impl::Control(Impl::Control::start));
+Result<void> PlaybackGraph::start() {
+  return impl_->dispatch(Impl::Control(Impl::Control::start));
 }
 
-void PlaybackGraph::pause() {
-  impl_->dispatch(Impl::Control(Impl::Control::pause));
+Result<void> PlaybackGraph::pause() {
+  return impl_->dispatch(Impl::Control(Impl::Control::pause));
 }
 }  // namespace livekit::sdk::detail

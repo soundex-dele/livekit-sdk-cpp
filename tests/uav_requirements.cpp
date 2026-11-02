@@ -1,3 +1,7 @@
+#include "test_failure.hpp"
+#include "rtc_result.hpp"
+#include "server_result.hpp"
+#include "media_result.hpp"
 #include "livekit/error.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
@@ -27,7 +31,7 @@ static MediaTransport test_transport = MediaTransport::automatic;
 
 static void require(bool ok, const std::string& message) {
   if (!ok)
-    throw std::runtime_error(message);
+    livekit::sdk::test::fail(message);
 }
 
 template <class F>
@@ -46,14 +50,14 @@ auto done(Future f) {
 }
 
 static std::string token(const std::string& identity) {
-  return AccessToken("uav-test", "uav-local-test-secret-at-least-32-characters")
-      .set_identity(identity)
-      .set_video_grant({{"roomJoin", true},
-                        {"room", "uav-requirements"},
-                        {"canPublish", true},
-                        {"canSubscribe", true},
-                        {"canPublishData", true}})
-      .to_jwt();
+  return server_result(AccessToken("uav-test", "uav-local-test-secret-at-least-32-characters")
+                           .set_identity(identity)
+                           .set_video_grant({{"roomJoin", true},
+                                             {"room", "uav-requirements"},
+                                             {"canPublish", true},
+                                             {"canSubscribe", true},
+                                             {"canPublishData", true}})
+                           .to_jwt());
 }
 
 struct VideoObservation {
@@ -80,7 +84,7 @@ struct VideoInput {
           f.u.assign(160 * 90, 100);
           f.v.assign(160 * 90, 160);
           while (!stop.stop_requested()) {
-            source->write(f);
+            media_result(source->write(f));
             std::this_thread::sleep_for(33ms);
           }
         }) {}
@@ -123,7 +127,7 @@ struct AudioInput {
             for (size_t i = 0; i < f.samples.size(); ++i)
               f.samples[i] = static_cast<int16_t>(
                   6000 * std::sin(2 * std::numbers::pi * hz * (offset + i) / 48000));
-            if (source->write(f) == AudioWriteStatus::accepted)
+            if (media_result(source->write(f)) == AudioWriteStatus::accepted)
               offset += f.samples.size();
             std::this_thread::sleep_for(2ms);
           }
@@ -429,28 +433,23 @@ static void transport_reject_case(const std::string& url, Json& report) {
   require(test_transport != MediaTransport::automatic, "negative test requires strict transport");
   bool joined = false, connected = false;
   const auto start = Clock::now();
-  auto joining =
-      std::async(std::launch::async, [&] { return require_result(room->join(options)); });
+  auto joining = std::async(std::launch::async, [&] { return room->join(options); });
   while (joining.wait_for(0ms) != std::future_status::ready) {
-    if (auto event = room_events.take_event(10ms)) {
+    if (auto event = require_result(room_events.take_event(10ms))) {
       joined |= event->kind == transport::RoomEventKind::session_changed;
       connected |= event->kind == transport::RoomEventKind::connected;
     }
   }
-  try {
-    joining.get();
-  } catch (const SDKError& error) {
-    require(joined && !connected &&
-                (error.code() == ErrorCode::timeout || error.code() == ErrorCode::connection_lost),
-            "failure was not an expected media transport rejection");
-    passed(report, "opposite_protocol_rejected",
-           {{"signaling_joined", joined},
-            {"error", error.what()},
-            {"elapsed_ms",
-             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count()}});
-    return;
-  }
-  throw std::runtime_error("opposite protocol unexpectedly connected");
+  const auto result = joining.get();
+  require(result != ErrorCode::ok, "opposite protocol unexpectedly connected");
+  require(joined && !connected &&
+              (result == ErrorCode::timeout || result == ErrorCode::connection_lost),
+          "failure was not an expected media transport rejection");
+  passed(report, "opposite_protocol_rejected",
+         {{"signaling_joined", joined},
+          {"error_code", static_cast<int>(result)},
+          {"elapsed_ms",
+           std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count()}});
 }
 
 int main(int argc, char** argv) {
@@ -464,13 +463,15 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::filesystem::path out(argv[4]);
-  std::filesystem::create_directories(out);
+  std::error_code filesystem_error;
+  std::filesystem::create_directories(out, filesystem_error);
+  require(!filesystem_error, filesystem_error.message());
   Json report{{"ok", false},
               {"checks", Json::array()},
               {"scenario", argv[2]},
               {"codec", argv[3]},
               {"device_acceptance", false}};
-  try {
+  {
     const std::string transport = argc == 6 ? argv[5] : "auto";
     if (transport == "udp")
       test_transport = MediaTransport::udp_only;
@@ -490,11 +491,8 @@ int main(int argc, char** argv) {
     else if (std::string(argv[2]) == "transport-reject")
       transport_reject_case(argv[1], report);
     else
-      throw std::runtime_error("unknown scenario");
+      livekit::sdk::test::fail("unknown scenario");
     report["ok"] = true;
-  } catch (const std::exception& e) {
-    report["error"] = e.what();
-    std::cerr << e.what() << '\n';
   }
   std::ofstream(out / "client-result.json") << report.dump(2);
   return report["ok"].get<bool>() ? 0 : 1;

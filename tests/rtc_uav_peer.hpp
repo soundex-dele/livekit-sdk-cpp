@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
@@ -36,8 +37,7 @@ struct Peer {
     auto ready = started.get_future();
     worker_ = std::jthread(
         [this, url, identity, started = std::move(started)](std::stop_token stop) mutable {
-          bool announced = false;
-          try {
+          {
             engine_ = require_result(livekit::sdk::app_support::create_blocking_engine());
             engine_events_.attach(*engine_);
             transport::LiveKitRoomOptions options;
@@ -49,7 +49,6 @@ struct Peer {
             await(engine_->join(options));
             connected = true;
             started.set_value();
-            announced = true;
             while (!stop.stop_requested()) {
               std::function<void()> command;
               {
@@ -64,22 +63,10 @@ struct Peer {
               tick();
               std::this_thread::sleep_for(2ms);
             }
-          } catch (...) {
-            {
-              std::lock_guard lock(mutex_);
-              failure_ = std::current_exception();
-            }
-            if (!announced)
-              started.set_exception(std::current_exception());
           }
-          if (engine_)
-            try {
-              require_result(engine_->close());
-            } catch (...) {
-              std::lock_guard lock(mutex_);
-              if (!failure_)
-                failure_ = std::current_exception();
-            }
+          if (engine_) {
+            require_result(engine_->close());
+          }
           connected = false;
           {
             std::lock_guard lock(mutex_);
@@ -99,13 +86,13 @@ struct Peer {
 
   VideoObservation observation(const std::string& sid) {
     std::lock_guard lock(mutex_);
-    rethrow();
+
     return video_[sid];
   }
 
   bool has_demand(const std::string& sid, bool enabled) {
     std::lock_guard lock(mutex_);
-    rethrow();
+
     const auto found = demand_.find(sid);
     return found != demand_.end() && found->second == enabled;
   }
@@ -115,7 +102,7 @@ struct Peer {
     until(
         [&] {
           std::lock_guard lock(mutex_);
-          rethrow();
+
           for (const auto& [id, descriptor] : known_)
             if (descriptor.source_id == who && descriptor.remote_sid == sid) {
               result = {id, sid, mime(descriptor)};
@@ -129,14 +116,14 @@ struct Peer {
 
   bool subscribed(const std::string& id) {
     std::lock_guard lock(mutex_);
-    rethrow();
+
     return active_.contains(id);
   }
 
   DecodedAudio read_audio(std::chrono::milliseconds timeout) {
     std::unique_lock lock(mutex_);
     audio_ready_.wait_for(lock, timeout, [&] { return !audio_.empty() || finished_; });
-    rethrow();
+
     if (audio_.empty())
       return {};
     auto frame = std::move(audio_.front());
@@ -176,7 +163,7 @@ struct Peer {
               TrackGraph::connect<transport::nodes::EncodedFrameEvent>(codec, sink),
               TrackGraph::connect<transport::nodes::SenderFeedbackEvent>(sink, codec),
               TrackGraph::connect<transport::nodes::SenderFeedbackEvent>(sink, source)};
-          graph.activate = [source] { source->activate(); };
+          graph.activate = [source] { return source->activate(); };
           graph.quiesce = [source, codec] {
             source->quiesce();
             codec->quiesce();
@@ -282,25 +269,18 @@ struct Peer {
     auto promise = std::make_shared<std::promise<T>>();
     auto result = promise->get_future();
     std::lock_guard lock(mutex_);
-    rethrow();
+
     require(!finished_, "Peer finished");
     commands_.push_back([promise, operation = std::move(operation)] {
-      try {
+      {
         if constexpr (std::is_void_v<T>) {
           operation();
           promise->set_value();
         } else
           promise->set_value(operation());
-      } catch (...) {
-        promise->set_exception(std::current_exception());
       }
     });
     return result;
-  }
-
-  void rethrow() const {
-    if (failure_)
-      std::rethrow_exception(failure_);
   }
 
   void subscribe(const transport::TrackDescriptor& d) {
@@ -332,12 +312,12 @@ struct Peer {
   }
 
   void tick() {
-    if (auto failure = engine_events_.take_failure())
-      throw std::runtime_error(failure->message);
-    while (auto event = engine_events_.take_event(0ms)) {
+    if (auto failure = require_result(engine_events_.take_failure()))
+      livekit::sdk::test::fail(failure->message);
+    while (auto event = require_result(engine_events_.take_event(0ms))) {
       if (event->kind == transport::RoomEventKind::closed ||
           event->kind == transport::RoomEventKind::failed)
-        throw std::runtime_error(event->message);
+        livekit::sdk::test::fail(event->message);
       if (event->kind == transport::RoomEventKind::remote_track_added && event->descriptor) {
         {
           std::lock_guard lock(mutex_);
@@ -354,7 +334,8 @@ struct Peer {
       }
       if (event->kind == transport::RoomEventKind::statistics && event->statistics) {
         const auto& report = *event->statistics;
-        auto rows = Json::parse(report.json);
+        auto rows = Json::parse(report.json, nullptr, false);
+        require(!rows.is_discarded(), "Invalid RTC stats JSON");
         events_ << Json{{"event", "rtc-stats"}, {"target", report.target}, {"stats", rows}}.dump()
                 << '\n';
         if (report.target == 0) {
@@ -396,7 +377,6 @@ struct Peer {
   std::map<std::string, TestTrack> outgoing_;
   std::unique_ptr<livekit::sdk::app_support::BlockingRtc> engine_;
   livekit::sdk::app_support::RtcEventMailbox engine_events_;
-  std::exception_ptr failure_;
   bool finished_ = false;
   uint64_t sequence_ = 0;
   std::atomic<bool> stopping_{false};

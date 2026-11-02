@@ -17,6 +17,6 @@ class WindowsInputApi {
   virtual unsigned send(std::span<const INPUT>) noexcept = 0;
 };
 
-std::shared_ptr<ControlInputSink> windows_input_with_api(std::shared_ptr<WindowsInputApi>);
+Result<std::shared_ptr<ControlInputSink>> windows_input_with_api(std::shared_ptr<WindowsInputApi>);
 }  // namespace livekit::sdk::detail
 #endif

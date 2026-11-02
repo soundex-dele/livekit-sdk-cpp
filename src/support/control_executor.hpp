@@ -4,7 +4,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
-#include <exception>
+#include "livekit/result.hpp"
 
 namespace livekit::sdk::detail {
 // One bounded, ordered control callback lane. Media/RPC workers stay independent.
@@ -27,27 +27,43 @@ class ControlExecutor {
     return thread_.get_id() == std::this_thread::get_id();
   }
 
-  void post(std::function<void()> fn) {
+  Result<void> post(std::function<Result<void>()> fn) {
     std::lock_guard lock(mutex_);
-    if (error_)
-      std::rethrow_exception(error_);
-    if (stopping_ || queue_.size() >= capacity_)
-      throw std::runtime_error("Control callback queue exhausted");
+    if (error_) {
+      return Result<void>::failure(error_);
+    }
+    if (stopping_ || queue_.size() >= capacity_) {
+      return Result<void>::failure(
+          make_failure(ErrorDomain::lifecycle,
+                       stopping_ ? ErrorCode::session_closed : ErrorCode::resource_exhausted,
+                       "Control callback queue is closed or exhausted"));
+    }
+    if (!fn) {
+      return Result<void>::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_argument,
+                                                "Empty control callback"));
+    }
     queue_.push_back(std::move(fn));
     ready_.notify_one();
+    return Result<void>::success();
   }
 
-  void drain() {
+  Result<void> drain() {
     std::unique_lock lock(mutex_);
+    if (current()) {
+      return Result<void>::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_thread,
+                                                "Cannot drain the control callback thread"));
+    }
     ready_.wait(lock, [&] { return queue_.empty() && !active_; });
-    if (error_)
-      std::rethrow_exception(error_);
+    if (error_) {
+      return Result<void>::failure(error_);
+    }
+    return Result<void>::success();
   }
 
  private:
   void run() {
     for (;;) {
-      std::function<void()> fn;
+      std::function<Result<void>()> fn;
       {
         std::unique_lock lock(mutex_);
         ready_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
@@ -57,16 +73,17 @@ class ControlExecutor {
         queue_.pop_front();
         active_ = true;
       }
-      try {
-        fn();
-      } catch (...) {
+      if (auto result = fn(); !result) {
+        std::deque<std::function<Result<void>()>> abandoned;
         {
           std::lock_guard lock(mutex_);
           if (!error_)
-            error_ = std::current_exception();
-          queue_.clear();
+            error_ = result.failure_record();
+          abandoned.swap(queue_);
         }
-        failed_();
+        if (failed_) {
+          failed_();
+        }
       }
       {
         std::lock_guard lock(mutex_);
@@ -80,8 +97,8 @@ class ControlExecutor {
   std::function<void()> failed_;
   std::mutex mutex_;
   std::condition_variable ready_;
-  std::deque<std::function<void()>> queue_;
-  std::exception_ptr error_;
+  std::deque<std::function<Result<void>()>> queue_;
+  Failure error_;
   bool active_ = false, stopping_ = false;
   std::thread thread_;
 };

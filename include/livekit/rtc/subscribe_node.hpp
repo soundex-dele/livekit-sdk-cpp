@@ -15,14 +15,15 @@ class RtcSubscribeNode final : public graphflow::core::GraphNode {
  public:
   RtcSubscribeNode(std::string name, std::shared_ptr<SubscribedTrack> track);
   ~RtcSubscribeNode() override;
-  void activate();  // After all graph nodes and downstream producers are ready.
+  Result<void> activate();  // After all graph nodes and downstream producers are ready.
   void quiesce();
 
   // Install before activate; invoked on the source worker, never during quiesce.
   void set_terminal_handler(std::function<void()> handler) {
     terminal_ = std::move(handler);
   }
-  void throw_if_failed() const;
+
+  Result<void> status() const;
 
   std::shared_ptr<SubscribedTrack> track() const {
     return track_;
@@ -42,7 +43,7 @@ class RtcSubscribeNode final : public graphflow::core::GraphNode {
   std::atomic<bool> active_{false};
   std::atomic<uint64_t> delivered_{0};
   mutable std::mutex failure_mutex_;
-  std::exception_ptr failure_;
+  Failure failure_;
   std::jthread worker_;
   std::function<void()> terminal_;
 };

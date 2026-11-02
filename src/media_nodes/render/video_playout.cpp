@@ -8,15 +8,18 @@
 #include <mutex>
 #include <optional>
 #include <set>
-#include <stdexcept>
 
 namespace lk {
+using namespace livekit::sdk;
 namespace {
 std::atomic_flag active_playout = ATOMIC_FLAG_INIT;
 
-void check_sdl(int result, const char* action) {
-  if (result < 0)
-    throw std::runtime_error(std::string(action) + ": " + SDL_GetError());
+Result<void> check_sdl(int result, const char* action) {
+  if (result < 0) {
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                              std::string(action) + ": " + SDL_GetError()));
+  }
+  return Result<void>::success();
 }
 
 struct Window {
@@ -39,6 +42,8 @@ struct Window {
 }  // namespace
 
 struct VideoPlayout::Impl {
+  Failure failure;
+  bool acquired = false, initialized = false;
   EventEmitter event;
   std::mutex mutex;
   std::map<std::string, std::optional<webrtc::VideoFrame>> latest;
@@ -52,16 +57,23 @@ struct VideoPlayout::Impl {
 
 VideoPlayout::VideoPlayout(EventEmitter events) : impl_(std::make_unique<Impl>()) {
   impl_->event = std::move(events);
-  if (active_playout.test_and_set())
-    throw std::runtime_error("Only one video playout session may run in a process");
-  try {
-    SDL_SetMainReady();
-    check_sdl(SDL_InitSubSystem(SDL_INIT_VIDEO), "Cannot initialize video display");
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
-  } catch (...) {
-    active_playout.clear();
-    throw;
+  if (active_playout.test_and_set()) {
+    impl_->failure = make_failure(ErrorDomain::media, ErrorCode::busy,
+                                  "Only one video playout session may run in a process");
+    return;
   }
+  impl_->acquired = true;
+  SDL_SetMainReady();
+  if (auto initialized =
+          check_sdl(SDL_InitSubSystem(SDL_INIT_VIDEO), "Cannot initialize video display");
+      !initialized) {
+    impl_->failure = initialized.failure_record();
+    active_playout.clear();
+    impl_->acquired = false;
+    return;
+  }
+  impl_->initialized = true;
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
 }
 
 VideoPlayout::~VideoPlayout() {
@@ -69,8 +81,12 @@ VideoPlayout::~VideoPlayout() {
     if (view)
       impl_->summarize(id, *view);
   impl_->windows.clear();
-  SDL_QuitSubSystem(SDL_INIT_VIDEO);
-  active_playout.clear();
+  if (impl_->initialized) {
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+  }
+  if (impl_->acquired) {
+    active_playout.clear();
+  }
 }
 
 void VideoPlayout::add_track(const std::string& id) {
@@ -90,14 +106,21 @@ void VideoPlayout::submit(const std::string& id, const webrtc::VideoFrame& frame
     found->second = frame;
 }
 
-bool VideoPlayout::poll() {
+Result<void> VideoPlayout::status() const {
+  return impl_->failure ? Result<void>::failure(impl_->failure) : Result<void>::success();
+}
+
+Result<bool> VideoPlayout::poll() {
+  if (auto valid = status(); !valid) {
+    return Result<bool>::failure(valid.failure_record());
+  }
   SDL_Event input;
   while (SDL_PollEvent(&input)) {
     if (input.type == SDL_QUIT ||
         (input.type == SDL_WINDOWEVENT && input.window.event == SDL_WINDOWEVENT_CLOSE) ||
         (input.type == SDL_KEYDOWN && input.key.keysym.sym == SDLK_ESCAPE)) {
       impl_->event("video-playout-closed");
-      return false;
+      return Result<bool>::success(false);
     }
     if (input.type == SDL_WINDOWEVENT && (input.window.event == SDL_WINDOWEVENT_EXPOSED ||
                                           input.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)) {
@@ -128,7 +151,8 @@ bool VideoPlayout::poll() {
   for (const auto& [id, frame] : frames) {
     auto buffer = frame.video_frame_buffer()->ToI420();
     if (!buffer)
-      throw std::runtime_error("Display frame cannot convert to I420");
+      return Result<bool>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Display frame cannot convert to I420"));
     if (frame.rotation() != webrtc::kVideoRotation_0)
       buffer = webrtc::I420Buffer::Rotate(*buffer, frame.rotation());
     const int width = buffer->width(), height = buffer->height();
@@ -142,14 +166,18 @@ bool VideoPlayout::poll() {
                            std::max(1, static_cast<int>(height * scale)),
                            SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
       if (!created->window)
-        throw std::runtime_error(std::string("Cannot create video window: ") + SDL_GetError());
+        return Result<bool>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         std::string("Cannot create video window: ") + SDL_GetError()));
       // No vsync wait on the signaling/main loop. Software rendering is a
       // fallback for remote desktop sessions and systems without a GPU driver.
       created->renderer = SDL_CreateRenderer(created->window, -1, SDL_RENDERER_ACCELERATED);
       if (!created->renderer)
         created->renderer = SDL_CreateRenderer(created->window, -1, SDL_RENDERER_SOFTWARE);
       if (!created->renderer)
-        throw std::runtime_error(std::string("Cannot create video renderer: ") + SDL_GetError());
+        return Result<bool>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         std::string("Cannot create video renderer: ") + SDL_GetError()));
       SDL_RendererInfo info{};
       SDL_GetRendererInfo(created->renderer, &info);
       impl_->event("video-window", {{"track", id},
@@ -161,20 +189,29 @@ bool VideoPlayout::poll() {
       auto texture = SDL_CreateTexture(view->renderer, SDL_PIXELFORMAT_IYUV,
                                        SDL_TEXTUREACCESS_STREAMING, width, height);
       if (!texture)
-        throw std::runtime_error(std::string("Cannot create YUV texture: ") + SDL_GetError());
+        return Result<bool>::failure(
+            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                         std::string("Cannot create YUV texture: ") + SDL_GetError()));
       if (view->texture)
         SDL_DestroyTexture(view->texture);
       view->texture = texture;
       view->width = width;
       view->height = height;
-      check_sdl(SDL_RenderSetLogicalSize(view->renderer, width, height),
-                "Cannot set video aspect ratio");
+      if (auto checked = check_sdl(SDL_RenderSetLogicalSize(view->renderer, width, height),
+                                   "Cannot set video aspect ratio");
+          !checked) {
+        return Result<bool>::failure(checked.failure_record());
+      }
       impl_->event("video-format", {{"track", id}, {"width", width}, {"height", height}});
     }
-    check_sdl(SDL_UpdateYUVTexture(view->texture, nullptr, buffer->DataY(), buffer->StrideY(),
-                                   buffer->DataU(), buffer->StrideU(), buffer->DataV(),
-                                   buffer->StrideV()),
-              "Cannot upload video frame");
+    if (auto checked =
+            check_sdl(SDL_UpdateYUVTexture(view->texture, nullptr, buffer->DataY(),
+                                           buffer->StrideY(), buffer->DataU(), buffer->StrideU(),
+                                           buffer->DataV(), buffer->StrideV()),
+                      "Cannot upload video frame");
+        !checked) {
+      return Result<bool>::failure(checked.failure_record());
+    }
     ++view->presented;
     view->dirty = true;
   }
@@ -183,13 +220,23 @@ bool VideoPlayout::poll() {
   for (const auto& [id, view] : impl_->windows) {
     if (!view->dirty)
       continue;
-    check_sdl(SDL_SetRenderDrawColor(view->renderer, 0, 0, 0, 255), "Cannot set background");
-    check_sdl(SDL_RenderClear(view->renderer), "Cannot clear video window");
-    check_sdl(SDL_RenderCopy(view->renderer, view->texture, nullptr, nullptr),
-              "Cannot render video frame");
+    if (auto checked = check_sdl(SDL_SetRenderDrawColor(view->renderer, 0, 0, 0, 255),
+                                 "Cannot set background");
+        !checked) {
+      return Result<bool>::failure(checked.failure_record());
+    }
+    if (auto checked = check_sdl(SDL_RenderClear(view->renderer), "Cannot clear video window");
+        !checked) {
+      return Result<bool>::failure(checked.failure_record());
+    }
+    if (auto checked = check_sdl(SDL_RenderCopy(view->renderer, view->texture, nullptr, nullptr),
+                                 "Cannot render video frame");
+        !checked) {
+      return Result<bool>::failure(checked.failure_record());
+    }
     SDL_RenderPresent(view->renderer);
     view->dirty = false;
   }
-  return true;
+  return Result<bool>::success(true);
 }
 }  // namespace lk

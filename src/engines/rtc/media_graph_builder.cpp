@@ -8,14 +8,16 @@
 #include <algorithm>
 #include "livekit/rtc/input_node.hpp"
 #include "livekit/rtc/recording_node.hpp"
-#include <stdexcept>
+#include "media_graph/failure.hpp"
 
 namespace livekit::sdk::rtc::engine {
 namespace {
-void validate_output(MediaKind kind, const MediaOutput& output) {
+Result<void> validate_output(MediaKind kind, const MediaOutput& output) {
   if ((kind == MediaKind::video && (output.audio || output.playout)) ||
       (kind == MediaKind::audio && output.video))
-    throw std::invalid_argument("Media output does not match track kind");
+    return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                              "Media output does not match track kind"));
+  return Result<void>::success();
 }
 
 nodes::MediaInputOptions input_options(const MediaInput& source) {
@@ -45,7 +47,7 @@ nodes::MediaInputOptions input_options(const MediaInput& source) {
 struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::Impl> {
   struct Target {
     std::shared_ptr<detail::RawFrameQueue> frames;
-    graphflow::core::GraphNode::FailureHandler report;
+    graphflow::core::GraphNode::ErrorHandler report;
     bool active = false;  // lifecycle mutex
   };
 
@@ -64,7 +66,7 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
   MediaInput options;
   mutable std::mutex lifecycle, targets_mutex;
   std::vector<std::weak_ptr<Target>> targets;
-  std::exception_ptr failure;  // targets_mutex
+  Failure failure;  // targets_mutex
   size_t consumers = 0;
   uint64_t emitted = 0;
   std::unique_ptr<graphflow::engine::GraphEngine> graph;
@@ -79,9 +81,8 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
     return result;
   }
 
-  void report_failure(std::exception_ptr error) {
-    error = normalized_failure(error, {"shared_capture", {}, "shared.capture", 0},
-                               ErrorDomain::media, ErrorCode::processing_failed);
+  void report_failure(Failure error) {
+    error = with_context(error, {"shared_capture", {}, "shared.capture", 0});
     {
       std::lock_guard lock(targets_mutex);
       if (failure) {
@@ -91,7 +92,7 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
     }
     for (const auto& target : receivers()) {
       if (target->report) {
-        target->report(error);
+        target->report(livekit::sdk::detail::graph_error(error));
       }
     }
   }
@@ -109,23 +110,24 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
     graph.reset();
   }
 
-  void start(const std::shared_ptr<Target>& target) {
+  Result<void> start(const std::shared_ptr<Target>& target) {
     std::lock_guard lock(lifecycle);
     if (target->active)
-      return;
+      return Result<void>::success();
     if (consumers >= 128)
-      throw std::runtime_error("Shared capture consumer limit reached");
+      return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                                                "Shared capture consumer limit reached"));
     {
       std::lock_guard lock(targets_mutex);
       if (!consumers) {
         failure = {};
       }
       if (failure) {
-        std::rethrow_exception(failure);
+        return Result<void>::failure(failure);
       }
       targets.push_back(target);
     }
-    try {
+    auto started = [&]() -> Result<void> {
       if (!consumers) {
         input = std::make_shared<nodes::MediaInputNode>("shared.capture", format,
                                                         input_options(options));
@@ -137,6 +139,7 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
               receiver->frames->write(
                   {sample.pixels, sample.captured,
                    sample.pixels->y.size() + sample.pixels->u.size() + sample.pixels->v.size()});
+            return Result<void>::success();
           };
         else
           delivery.audio = [this](const auto& sample) {
@@ -145,6 +148,7 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
                                        sample.pcm->samples.size() * sizeof(int16_t) +
                                            sample.pcm->float_samples.size() * sizeof(float),
                                        0, sample.timestamp});
+            return Result<void>::success();
           };
         auto output = std::make_shared<ApplicationOutput>(std::move(delivery), true);
         std::vector<graphflow::engine::NodeConnection> edges = {
@@ -155,30 +159,36 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
           edges.push_back(TrackGraphSpec::connect<nodes::AudioFrameEvent>(input, output));
         auto report = [weak = weak_from_this()](auto error) {
           if (auto state = weak.lock()) {
-            state->report_failure(error);
+            state->report_failure(livekit::sdk::detail::graph_failure(error));
           }
         };
-        input->setFailureHandler(report);
-        output->setFailureHandler(report);
-        feedback->setFailureHandler(report);
+        input->setErrorHandler(report);
+        output->setErrorHandler(report);
+        feedback->setErrorHandler(report);
         graph = std::make_unique<graphflow::engine::GraphEngine>(1);
         if (!graph->loadFromNodes({output, input, feedback}, edges) || !graph->init() ||
             !graph->start())
-          throw std::runtime_error("Unable to start shared capture graph");
+          return Result<void>::failure(make_failure(ErrorDomain::media,
+                                                    ErrorCode::processing_failed,
+                                                    "Unable to start shared capture graph"));
         feedback->start_input();
-        input->activate();
+        if (auto activated = input->activate(); !activated) {
+          return activated;
+        }
       }
       target->active = true;
       ++consumers;
-    } catch (...) {
+      return Result<void>::success();
+    }();
+    if (!started) {
       {
         std::lock_guard lock(targets_mutex);
         std::erase_if(targets, [&](auto& weak) { return weak.lock() == target; });
       }
       if (!consumers)
         stop_capture();
-      throw;
     }
+    return started;
   }
 
   void stop(const std::shared_ptr<Target>& target) {
@@ -211,7 +221,7 @@ struct MediaTrack::State {
   mutable std::mutex mutex;
   TrackDescriptor descriptor;
   bool publication = false;
-  std::exception_ptr failure;
+  Failure failure;
   std::shared_ptr<PublishedTrack> published;
   std::shared_ptr<SubscribedTrack> subscribed;
   std::shared_ptr<nodes::MediaInputNode> input;
@@ -223,16 +233,15 @@ struct MediaTrack::State {
   std::shared_ptr<nodes::AudioOutputNode> speaker;
   std::shared_ptr<nodes::RecordingNode> recording;
   std::vector<MediaEdgeSnapshot> edges;
-  std::function<void()> start_source, stop_source;
+  std::function<Result<void>()> start_source;
+  std::function<void()> stop_source;
 
-  void check() const {
+  ErrorCode check() const {
     std::lock_guard lock(mutex);
-    if (failure) {
-      std::rethrow_exception(failure);
-    }
+    return failure ? failure->code : ErrorCode::ok;
   }
 
-  void failed(std::exception_ptr value) {
+  void failed(Failure value) {
     std::lock_guard lock(mutex);
     if (!failure) {
       failure = value;
@@ -306,14 +315,8 @@ MediaTrackSnapshot MediaTrack::snapshot() const {
     result.transport.id = s.descriptor.id;
   if (s.failure) {
     result.transport.state = TrackState::failed;
-    result.transport.failure = describe_failure(s.failure);
-    try {
-      std::rethrow_exception(s.failure);
-    } catch (const std::exception& error) {
-      result.transport.error = error.what();
-    } catch (...) {
-      result.transport.error = "Media operation failed";
-    }
+    result.transport.failure = s.failure;
+    result.transport.error = s.failure->message;
   }
   const auto row = [&](const auto& node, const char* kind, uint64_t in, uint64_t out,
                        uint64_t dropped = 0, uint64_t errors = 0) {
@@ -366,21 +369,24 @@ MediaTrackSnapshot MediaTrack::snapshot() const {
 }
 
 ErrorCode MediaTrack::check() const {
-  return detail::control_boundary([&] { state_->check(); });
+  return state_->check();
 }
 
-PreparedMediaGraph RtcMediaGraphBuilder::build_publish(
+Result<PreparedMediaGraph> RtcMediaGraphBuilder::build_publish(
     MediaPublishSpec spec, std::shared_ptr<nodes::RtcPublishNode> sink) {
-  validate_output(spec.track.kind, spec.preview);
+  if (auto valid = validate_output(spec.track.kind, spec.preview); !valid) {
+    return Result<PreparedMediaGraph>::failure(valid.failure_record());
+  }
   if (!spec.input.echo_reference) {
     spec.input.echo_reference = resources_.echo_reference;
   }
   if (spec.input.encoded_source &&
       (spec.preview.video || spec.preview.audio || spec.preview.frame || spec.preview.playout ||
        !spec.preview.recording.empty())) {
-    throw std::invalid_argument(
+    return Result<PreparedMediaGraph>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::invalid_argument,
         "Encoded publication has no raw preview; subscribe with a decoder to consume pixels or "
-        "PCM");
+        "PCM"));
   }
   auto state = std::make_shared<MediaTrack::State>();
   state->descriptor = spec.track;
@@ -391,14 +397,18 @@ PreparedMediaGraph RtcMediaGraphBuilder::build_publish(
     if (spec.input.generated || !spec.input.input.empty() ||
         spec.input.capture != CaptureKind::input || spec.input.video_source ||
         spec.input.audio_source || spec.input.encoded_source || spec.input.microphone)
-      throw std::invalid_argument("Choose a shared input or an individual input");
+      return Result<PreparedMediaGraph>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                       "Choose a shared input or an individual input"));
     auto shared = spec.shared_input->impl_;
     const auto& format = shared->format;
     if (format.kind != spec.track.kind ||
         (format.kind == MediaKind::video && (format.format.width != spec.track.format.width ||
                                              format.format.height != spec.track.format.height)) ||
         (format.kind == MediaKind::audio && format.format.channels != spec.track.format.channels))
-      throw std::invalid_argument("Shared input raw format must match publication");
+      return Result<PreparedMediaGraph>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                       "Shared input raw format must match publication"));
     auto target = shared_target = std::make_shared<SharedMediaInput::Impl::Target>();
     spec.input.fps = shared->options.fps;
     QueueLimits limits;
@@ -408,7 +418,10 @@ PreparedMediaGraph RtcMediaGraphBuilder::build_publish(
         format.kind == MediaKind::video ? spec.video.max_bytes : spec.audio.max_bytes;
     limits.max_age = format.kind == MediaKind::video ? spec.video.max_age : spec.audio.max_age;
     shared_frames = target->frames = std::make_shared<detail::RawFrameQueue>(limits);
-    state->start_source = [shared, target] { shared->start(target); };
+    if (auto valid = shared_frames->status(); !valid) {
+      return Result<PreparedMediaGraph>::failure(valid.failure_record());
+    }
+    state->start_source = [shared, target] { return shared->start(target); };
     state->stop_source = [shared, target] { shared->stop(target); };
   }
   auto source_options = input_options(spec.input);
@@ -416,9 +429,9 @@ PreparedMediaGraph RtcMediaGraphBuilder::build_publish(
   state->input =
       std::make_shared<nodes::MediaInputNode>("input", spec.track, std::move(source_options));
   if (shared_target) {
-    shared_target->report = state->input->failureReporter();
+    shared_target->report = state->input->errorReporter();
   }
-  try {
+  {
     std::lock_guard lock(state->mutex);
     state->sink = sink;
     state->published = sink->track();
@@ -449,26 +462,31 @@ PreparedMediaGraph RtcMediaGraphBuilder::build_publish(
     }
     state->connect<nodes::SenderFeedbackEvent>(graph, sink, state->input);
     state->topology(graph);
-    graph.activate = [state] {
-      state->input->activate();
-      if (state->start_source)
-        state->start_source();
+    graph.activate = [state]() -> Result<void> {
+      if (auto activated = state->input->activate(); !activated) {
+        return activated;
+      }
+      if (state->start_source) {
+        return state->start_source();
+      }
+      return Result<void>::success();
     };
     graph.quiesce = [state] { state->quiesce(); };
     graph.on_failure = [state](auto error) { state->failed(error); };
-    return {std::move(graph), std::shared_ptr<MediaTrack>(new MediaTrack(state))};
-  } catch (...) {
-    state->quiesce();
-    throw;
+    return Result<PreparedMediaGraph>::success(
+        {std::move(graph), std::shared_ptr<MediaTrack>(new MediaTrack(state))});
   }
 }
 
-PreparedMediaGraph RtcMediaGraphBuilder::build_subscribe(
+Result<PreparedMediaGraph> RtcMediaGraphBuilder::build_subscribe(
     MediaSubscribeSpec spec, std::shared_ptr<nodes::RtcSubscribeNode> source) {
-  validate_output(spec.track.kind, spec.output);
+  if (auto valid = validate_output(spec.track.kind, spec.output); !valid) {
+    return Result<PreparedMediaGraph>::failure(valid.failure_record());
+  }
   if (spec.presentation_delay.count() < 0 ||
       spec.presentation_delay > std::chrono::milliseconds(500)) {
-    throw std::invalid_argument("Invalid presentation delay");
+    return Result<PreparedMediaGraph>::failure(make_failure(
+        ErrorDomain::media, ErrorCode::invalid_argument, "Invalid presentation delay"));
   }
   std::shared_ptr<detail::MediaSyncClock> clock;
   if (spec.synchronize && !spec.track.source_id.empty()) {
@@ -482,7 +500,7 @@ PreparedMediaGraph RtcMediaGraphBuilder::build_subscribe(
   }
   auto state = std::make_shared<MediaTrack::State>();
   state->descriptor = spec.track;
-  try {
+  {
     std::lock_guard lock(state->mutex);
     state->source = source;
     state->subscribed = source->track();
@@ -515,17 +533,17 @@ PreparedMediaGraph RtcMediaGraphBuilder::build_subscribe(
     state->topology(graph);
     graph.quiesce = [state] { state->quiesce(); };
     graph.on_failure = [state](auto error) { state->failed(error); };
-    return {std::move(graph), std::shared_ptr<MediaTrack>(new MediaTrack(state))};
-  } catch (...) {
-    state->quiesce();
-    throw;
+    return Result<PreparedMediaGraph>::success(
+        {std::move(graph), std::shared_ptr<MediaTrack>(new MediaTrack(state))});
   }
 }
 
-std::shared_ptr<SharedMediaInput> RtcMediaGraphBuilder::create_shared_input(TrackDescriptor format,
-                                                                            MediaInput options) {
+Result<std::shared_ptr<SharedMediaInput>> RtcMediaGraphBuilder::create_shared_input(
+    TrackDescriptor format, MediaInput options) {
   if (options.encoded_source || !options.input.empty())
-    throw std::invalid_argument("Shared capture requires a live raw source");
+    return Result<std::shared_ptr<SharedMediaInput>>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                     "Shared capture requires a live raw source"));
   format.follow_subscriber_demand = false;
   if (!options.echo_reference) {
     options.echo_reference = resources_.echo_reference;
@@ -533,10 +551,14 @@ std::shared_ptr<SharedMediaInput> RtcMediaGraphBuilder::create_shared_input(Trac
   // Validate before a publication exists; constructing a source opens no device.
   {
     nodes::MediaInputNode validate("shared.validate", format, input_options(options));
+    if (auto valid = validate.status(); !valid) {
+      return Result<std::shared_ptr<SharedMediaInput>>::failure(valid.failure_record());
+    }
   }
   auto state = std::make_shared<SharedMediaInput::Impl>();
   state->format = std::move(format);
   state->options = std::move(options);
-  return std::shared_ptr<SharedMediaInput>(new SharedMediaInput(std::move(state)));
+  return Result<std::shared_ptr<SharedMediaInput>>::success(
+      std::shared_ptr<SharedMediaInput>(new SharedMediaInput(std::move(state))));
 }
 }  // namespace livekit::sdk::rtc::engine

@@ -1,4 +1,5 @@
 #pragma once
+#include "backends/rtc/livekit/service_result.hpp"
 #include "livekit/streams.hpp"
 #include "livekit.pb.h"
 #include "support/task_executor.hpp"
@@ -23,9 +24,9 @@ struct StreamReaderState {
   Utf8State utf8;
   std::unique_ptr<InflateRaw> inflater;
   bool closed = false;
-  std::exception_ptr error;
+  Failure error;
   std::chrono::steady_clock::time_point touched = std::chrono::steady_clock::now();
-  void finish(std::exception_ptr failure = {});
+  void finish(Failure failure = {});
 };
 
 class StreamSession : public std::enable_shared_from_this<StreamSession> {
@@ -35,26 +36,26 @@ class StreamSession : public std::enable_shared_from_this<StreamSession> {
   void connect();
   void disconnect();
   void participant_left(const std::string& identity);
-  void register_handler(bool text, const std::string& topic, StreamHandler handler);
+  Result<void> register_handler(bool text, const std::string& topic, StreamHandler handler);
   void unregister_handler(bool text, const std::string& topic);
-  std::shared_ptr<StreamWriter> open(bool text, StreamOptions options);
-  std::future<StreamInfo> send_text(std::string text, StreamOptions options,
-                                    OperationOptions operation);
-  std::future<StreamInfo> send_file(std::filesystem::path path, StreamOptions options,
-                                    OperationOptions operation);
-  std::future<void> enqueue(uint64_t generation, const std::string& id,
-                            std::span<const uint8_t> bytes, std::optional<std::string> reason,
-                            OperationOptions operation);
+  Result<std::shared_ptr<StreamWriter>> open(bool text, StreamOptions options);
+  std::future<Result<StreamInfo>> send_text(std::string text, StreamOptions options,
+                                            OperationOptions operation);
+  std::future<Result<StreamInfo>> send_file(std::filesystem::path path, StreamOptions options,
+                                            OperationOptions operation);
+  std::future<Result<void>> enqueue(uint64_t generation, const std::string& id,
+                                    std::span<const uint8_t> bytes,
+                                    std::optional<std::string> reason, OperationOptions operation);
   void receive(const livekit::DataPacket& packet);
   bool has_outgoing();
   // Called only on the session runner; send is invoked without mutex_.
-  void pump(const std::function<bool(const livekit::DataPacket&)>& send, size_t max_packets = 4,
-            const std::function<bool()>& ready = {});
+  void pump(const std::function<Result<bool>(const livekit::DataPacket&)>& send,
+            size_t max_packets = 4, const std::function<bool()>& ready = {});
 
  private:
   struct Batch {
     std::deque<livekit::DataPacket> packets;
-    std::shared_ptr<std::promise<void>> promise;
+    std::shared_ptr<livekit::sdk::detail::ServicePromise<void>> promise;
     OperationOptions options;
     std::chrono::steady_clock::time_point deadline;
     bool sent = false;
@@ -72,7 +73,7 @@ class StreamSession : public std::enable_shared_from_this<StreamSession> {
   };
 
   void expire();
-  void fail_outgoing(const std::string& id, std::exception_ptr failure);
+  void fail_outgoing(const std::string& id, Failure failure);
   std::mutex mutex_;
   uint64_t generation_ = 0;
   bool connected_ = false;

@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
 using livekit::sdk::app_support::require_result;
@@ -15,7 +16,7 @@ using namespace std::chrono_literals;
 namespace {
 void check(bool ok, const char* message) {
   if (!ok)
-    throw std::runtime_error(message);
+    livekit::sdk::test::fail(message);
 }
 
 template <class Future>
@@ -49,7 +50,7 @@ class Consumer : public graphflow::core::GraphNode {
         if (closing && (silence || (expected_.size() > 3 && std::ranges::equal(bytes, blank)))) {
           return;
         }
-        throw std::runtime_error("Engine routed incorrect encoded payload");
+        livekit::sdk::test::fail("Engine routed incorrect encoded payload");
       }
       ++frames;
     });
@@ -62,7 +63,7 @@ class Consumer : public graphflow::core::GraphNode {
 }  // namespace
 
 int main() {
-  try {
+  {
     auto tx = require_result(livekit::sdk::app_support::create_blocking_engine()),
          rx = require_result(livekit::sdk::app_support::create_blocking_engine());
     livekit::sdk::app_support::RtcEventMailbox rx_events(*rx);
@@ -95,7 +96,7 @@ int main() {
     const auto discovered_by = SteadyClock::now() + 10s;
     while (subscribed < 4) {
       check(SteadyClock::now() < discovered_by, "Engine remote discovery timed out");
-      auto event = rx_events.take_event(100ms);
+      auto event = require_result(rx_events.take_event(100ms));
       if (!event || event->kind != RoomEventKind::remote_track_added)
         continue;
       for (int i = 0; i < 4; ++i)
@@ -128,10 +129,10 @@ int main() {
         }
         // Graph setup has completed. Media and feedback must progress while
         // both control threads deliberately stop polling.
-        if (auto failure = tx_events.take_failure())
-          throw std::runtime_error(failure->message);
-        if (auto failure = rx_events.take_failure())
-          throw std::runtime_error(failure->message);
+        if (auto failure = require_result(tx_events.take_failure()))
+          livekit::sdk::test::fail(failure->message);
+        if (auto failure = require_result(rx_events.take_failure()))
+          livekit::sdk::test::fail(failure->message);
         if (std::all_of(active.begin(), active.end(), [&](int i) { return sinks[i]->frames >= 3; }))
           return;
         std::this_thread::sleep_for(20ms);
@@ -158,20 +159,17 @@ int main() {
     check(tx->room().snapshot().epoch > previous_epoch, "Native rejoin reused its epoch");
     check(old_services != require_result(tx->room().services()),
           "Native rejoin reused closed room services");
-    bool old_service_closed = false;
-    try {
-      old_services->send_data({1}).get();
-    } catch (const std::exception&) {
-      old_service_closed = true;
-    }
+    const auto old_send = old_services->send_data({1}).get();
+    const bool old_service_closed =
+        !old_send && old_send.error().code == livekit::sdk::ErrorCode::session_closed;
     check(old_service_closed, "Old room services affected the new join");
-    require_result(tx->room().services())->send_data({2}).get();
+    require_result(require_result(tx->room().services())->send_data({2}).get());
     await(*tx, tx->publish(descriptors[3]));
     const auto rejoined_by = SteadyClock::now() + 10s;
     bool subscribed_again = false;
     while (!subscribed_again) {
       check(SteadyClock::now() < rejoined_by, "Rejoined remote discovery timed out");
-      auto event = rx_events.take_event(100ms);
+      auto event = require_result(rx_events.take_event(100ms));
       if (!event || event->kind != RoomEventKind::remote_track_added ||
           event->descriptor->name != descriptors[3].name) {
         continue;
@@ -190,8 +188,5 @@ int main() {
     std::cout << "{\"engineMultiGraph\":true,\"encodedMedia\":true,\"independentClose\":true,"
                  "\"leaveRejoin\":true,\"serviceIsolation\":true,\"noMediaPoll\":true}\n";
     return 0;
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
   }
 }

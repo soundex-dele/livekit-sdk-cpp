@@ -24,12 +24,7 @@ class DeadlineIndex {
     erase(key);
     if (time) {
       const auto position = by_time_.emplace(*time, key);
-      try {
-        by_key_.emplace(key, position);
-      } catch (...) {
-        by_time_.erase(position);
-        throw;
-      }
+      by_key_.emplace(key, position);
     }
   }
 

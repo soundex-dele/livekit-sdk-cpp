@@ -41,10 +41,10 @@ class MediaInputNode final : public graphflow::core::GraphNode {
  public:
   MediaInputNode(std::string name, TrackDescriptor, MediaInputOptions);
   ~MediaInputNode() override;
-  void activate();  // TrackGraphSpec::activate, after downstream graph start.
+  Result<void> activate();  // TrackGraphSpec::activate, after downstream graph start.
   void quiesce();   // TrackGraphSpec::quiesce, before downstream graph stop.
   MediaInputSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> status() const;
 
  protected:
   bool doInit() override;

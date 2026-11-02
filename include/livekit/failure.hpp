@@ -47,6 +47,9 @@ struct FailureInfo {
   bool retryable = false;
   int backend_reason = 0;
   FailureContext context;
+  std::string backend_code;
+  std::string backend_metadata;
+  std::string backend_data;
 };
 
 inline uint64_t next_failure_id() {

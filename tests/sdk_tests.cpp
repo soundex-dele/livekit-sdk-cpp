@@ -1,4 +1,5 @@
-#include "livekit/error.hpp"
+#include "livekit/failure.hpp"
+#include <cstdlib>
 #include <livekit/livekit.hpp>
 #include "api_contract.hpp"
 #include "backends/rtc/events.hpp"
@@ -18,23 +19,14 @@
 namespace sdk = livekit::sdk;
 
 static void check(bool condition, const char* message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
-
-template <class F>
-void rejects(F action) {
-  bool rejected = false;
-  try {
-    action();
-  } catch (const std::exception&) {
-    rejected = true;
+  if (!condition) {
+    std::cerr << message << "\n";
+    std::exit(1);
   }
-  check(rejected, "Expected an exception");
 }
 
 int main(int argc, char** argv) {
-  try {
+  {
     if (argc == 2)
       return api_contract(argv[1]);
     token_provider_contract();
@@ -45,12 +37,12 @@ int main(int argc, char** argv) {
     rpc_contract();
     subscribed_quality_contract();
     livekit::ClientConfiguration client_config;
-    check(!sdk::detail::relay_required(false, false, client_config), "Default relay policy");
+    check(!*sdk::detail::relay_required(false, false, client_config), "Default relay policy");
     client_config.set_force_relay(livekit::ENABLED);
-    check(sdk::detail::relay_required(false, false, client_config), "Server must force relay");
-    rejects([&] { sdk::detail::relay_required(false, true, client_config); });
+    check(*sdk::detail::relay_required(false, false, client_config), "Server must force relay");
+    check(!sdk::detail::relay_required(false, true, client_config), "Conflicting relay policy");
     client_config.set_force_relay(livekit::DISABLED);
-    check(sdk::detail::relay_required(true, false, client_config),
+    check(*sdk::detail::relay_required(true, false, client_config),
           "Server cannot undo user relay policy");
     // No global event sink: two sessions route to different handlers, on the caller thread.
     int first = 0, second = 0;
@@ -89,9 +81,9 @@ int main(int argc, char** argv) {
     check(sdk::detail::reconnect_delay(reconnect, 1000, 1).count() == 5000, "Reconnect delay cap");
     reconnect.max_attempts = 0;
     check(!sdk::detail::validate_reconnect(reconnect), "Invalid reconnect budget accepted");
-    sdk::SDKError typed(sdk::ErrorDomain::signaling, sdk::ErrorCode::permission_denied, "denied",
-                        false, 403);
-    check(!typed.retryable() && typed.backend_reason() == 403, "Typed failure semantics");
+    auto typed = sdk::make_failure(sdk::ErrorDomain::signaling, sdk::ErrorCode::permission_denied,
+                                   "denied", false, 403);
+    check(!typed->retryable && typed->backend_reason == 403, "Typed failure semantics");
     sdk::ReconnectOptions budget_options;
     budget_options.max_attempts = 2;
     sdk::detail::RecoveryBudget budget(budget_options);
@@ -108,12 +100,10 @@ int main(int argc, char** argv) {
     check(sdk::detail::terminal_leave(2) && sdk::detail::terminal_leave(4) &&
               sdk::detail::terminal_leave(5) && !sdk::detail::terminal_leave(6),
           "Lifecycle removal must override reconnect requests");
-    rejects([] { sdk::RoomServiceClient("http://localhost:7880", {}); });
-    rejects([] { sdk::make_token("key", "secret", "id", {}, 0); });
+    check(!sdk::RoomServiceClient("http://localhost:7880", {}).status(),
+          "Invalid service credentials");
+    check(!sdk::make_token("key", "secret", "id", {}, 0), "Invalid token TTL");
     std::cout << "SDK tests passed\n";
     return 0;
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
-    return 1;
   }
 }

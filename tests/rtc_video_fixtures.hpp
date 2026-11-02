@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #pragma once
 #include "livekit/rtc/types.hpp"
 #include <vector>
@@ -51,5 +52,5 @@ inline std::vector<uint8_t> fixture_video(livekit::sdk::rtc::Codec codec, bool b
             0x00, 0x01, 0x28, 0x01, 0xaf, 0x08, 0x60, 0xf2, 0xe3, 0x5d, 0xff, 0xe8, 0xf6, 0x1f,
             0xa3, 0xf2, 0x1a, 0xb9, 0xf9, 0x18, 0xf9, 0x3b, 0x22};
   }
-  throw std::invalid_argument("No encoded video fixture for codec");
+  livekit::sdk::test::fail("No encoded video fixture for codec");
 }

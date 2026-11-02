@@ -25,7 +25,7 @@ class VideoCodecNode final : public graphflow::core::GraphNode {
   VideoCodecNode(std::string name, TrackDescriptor, bool encode, VideoCodecOptions = {});
   ~VideoCodecNode() override;
   VideoCodecSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> status() const;
   // Close admission and join worker before graph lifecycle stops downstream.
   // Idempotent; required as the owning TrackGraphSpec's quiesce hook.
   void quiesce();

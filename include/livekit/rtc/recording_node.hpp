@@ -20,7 +20,7 @@ class RecordingNode final : public graphflow::core::GraphNode {
   ~RecordingNode() override;
   void quiesce();  // Close admission, drain queued writes and finalize WAV headers.
   RecordingSnapshot snapshot() const;
-  void throw_if_failed() const;
+  Result<void> status() const;
 
  protected:
   bool doInit() override;

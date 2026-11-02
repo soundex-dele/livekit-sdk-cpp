@@ -1,3 +1,4 @@
+#include "test_failure.hpp"
 #pragma once
 #include "backends/webrtc/pcm_resampler.hpp"
 #include <algorithm>
@@ -7,7 +8,7 @@
 inline void pcm_resampler_contract() {
   auto require = [](bool ok) {
     if (!ok)
-      throw std::runtime_error("PCM resampler contract failed");
+      livekit::sdk::test::fail("PCM resampler contract failed");
   };
   for (const int rate : {8000, 16000, 24000, 32000, 44100, 48000, 96000}) {
     livekit::sdk::detail::PcmResampler resampler(rate, 2);

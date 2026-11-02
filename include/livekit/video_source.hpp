@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/result.hpp"
 #include "livekit/media.hpp"
 #include <chrono>
 #include <memory>
@@ -40,20 +41,22 @@ class I420VideoSource {
  public:
   explicit I420VideoSource(I420SourceOptions options = {});
   ~I420VideoSource();
+  Result<void> status() const;
   I420VideoSource(const I420VideoSource&) = delete;
   I420VideoSource& operator=(const I420VideoSource&) = delete;
   I420SourceOptions options() const;
   // Never waits for queue space. A full queue or inactive publisher returns
-  // backpressure; invalid dimensions/planes throw invalid_argument.
-  VideoWriteStatus write(const VideoFrame& frame);
+  // backpressure; invalid dimensions/planes return invalid_argument.
+  Result<VideoWriteStatus> write(const VideoFrame& frame);
   // Explicit steady_clock capture time, strictly increasing per activation.
   // Outside now-5s..now+100ms is invalid; older than max_age is backpressure.
-  VideoWriteStatus write(const VideoFrame& frame,
-                         std::optional<std::chrono::steady_clock::time_point> captured);
+  Result<VideoWriteStatus> write(const VideoFrame& frame,
+                                 std::optional<std::chrono::steady_clock::time_point> captured);
   // Convert RGBA to BT.601 limited-range I420, then rotate clockwise. Resulting
   // dimensions must match options(). Conversion and copy occur on the caller.
-  VideoWriteStatus write_rgba(const RgbaInputFrame& frame,
-                              std::optional<std::chrono::steady_clock::time_point> captured = {});
+  Result<VideoWriteStatus> write_rgba(
+      const RgbaInputFrame& frame,
+      std::optional<std::chrono::steady_clock::time_point> captured = {});
   VideoSourceStats stats() const;
   // Permanent EOS: discard pending frames and wake the consumer. Publication
   // remains until explicitly unpublished (or Room exits).

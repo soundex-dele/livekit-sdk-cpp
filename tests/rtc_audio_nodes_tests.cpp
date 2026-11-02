@@ -1,3 +1,4 @@
+#include "media_result.hpp"
 #include "rtc_audio_fixtures.hpp"
 #include "livekit/rtc/stream_pipeline.hpp"
 #include <condition_variable>
@@ -9,8 +10,10 @@ using namespace std::chrono_literals;
 
 namespace {
 void check(bool value, const char* message) {
-  if (!value)
-    throw std::runtime_error(message);
+  if (!value) {
+    std::cerr << message << "\n";
+    std::abort();
+  }
 }
 
 template <class F>
@@ -111,8 +114,8 @@ void roundtrip(uint16_t channels, uint32_t rate, bool floating) {
   decoder->quiesce();
   graph.stop();
   graph.release();
-  encoder->throw_if_failed();
-  decoder->throw_if_failed();
+  media_result(encoder->status());
+  media_result(decoder->status());
   std::lock_guard lock(output->mutex);
   check(output->packets.size() == 12, "Opus packet aggregation lost data");
   for (size_t i = 0; i < 12; ++i) {
@@ -210,7 +213,7 @@ void jitter_loss_and_reordering() {
   decoder->quiesce();
   graph.stop();
   graph.release();
-  decoder->throw_if_failed();
+  media_result(decoder->status());
 }
 
 void overload_and_epoch() {
@@ -285,7 +288,7 @@ void overload_and_epoch() {
       "New epoch did not recover Opus");
   encoder->quiesce();
   graph.stop();
-  encoder->throw_if_failed();
+  media_result(encoder->status());
   std::lock_guard lock(out->mutex);
   check(out->packets.back().epoch == 2 && out->packets.back().timestamp == 0,
         "Old partial packet crossed epoch");
@@ -340,7 +343,7 @@ void decode_gaps() {
   decoder->quiesce();
   graph.stop();
   graph.release();
-  decoder->throw_if_failed();
+  media_result(decoder->status());
   std::lock_guard lock(out->mutex);
   check(!out->frames[1].discontinuity && out->frames[2].discontinuity &&
             out->frames[2].timestamp == 3840 && out->frames[3].discontinuity &&
@@ -350,16 +353,11 @@ void decode_gaps() {
 }  // namespace
 
 int main() {
-  try {
-    roundtrip(1, 44100, true);
-    roundtrip(2, 48000, false);
-    overload_and_epoch();
-    jitter_loss_and_reordering();
-    decode_gaps();
-    std::cout << "Audio graph codec contracts passed\n";
-    return 0;
-  } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
-  }
+  roundtrip(1, 44100, true);
+  roundtrip(2, 48000, false);
+  overload_and_epoch();
+  jitter_loss_and_reordering();
+  decode_gaps();
+  std::cout << "Audio graph codec contracts passed\n";
+  return 0;
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "livekit/video_source.hpp"
+#include "livekit/result.hpp"
 #include "livekit/audio_source.hpp"
 #include <array>
 #include <filesystem>
@@ -57,6 +58,7 @@ struct StudioSnapshot {
   float microphone_peak = 0, system_peak = 0, output_peak = 0;
   bool recording = false;
   std::string error, recording_path;
+  Failure failure;
   std::map<std::string, std::string> source_errors;
   std::shared_ptr<const StudioImage> preview;
 };
@@ -70,13 +72,14 @@ class Studio {
   ~Studio();
   Studio(const Studio&) = delete;
   Studio& operator=(const Studio&) = delete;
-  void set_scene(StudioScene scene);
-  void set_audio(StudioAudioSettings settings);
-  void submit_remote_video(std::string id, const VideoFrame& frame);
-  void submit_remote_audio(std::string id, const AudioFrame& frame);
+  Result<void> status() const;
+  Result<void> set_scene(StudioScene scene);
+  Result<void> set_audio(StudioAudioSettings settings);
+  Result<void> submit_remote_video(std::string id, const VideoFrame& frame);
+  Result<void> submit_remote_audio(std::string id, const AudioFrame& frame);
   void clear_remote();
   void remove_remote(const std::string& track_id);
-  void start_recording(std::filesystem::path mp4_path);
+  Result<void> start_recording(std::filesystem::path mp4_path);
   void stop_recording();
   StudioSnapshot snapshot() const;
   StudioOptions options() const;
@@ -85,10 +88,11 @@ class Studio {
   std::shared_ptr<I420VideoSource> local_video_output() const;
   std::shared_ptr<PcmAudioSource> local_audio_output() const;
   // Versioned project JSON; replace via same-directory atomic rename.
-  static void save_project(const std::filesystem::path&, const std::vector<StudioScene>&,
-                           size_t selected, StudioOptions, StudioAudioSettings);
-  static std::vector<StudioScene> load_project(const std::filesystem::path&, size_t& selected,
-                                               StudioOptions&, StudioAudioSettings&);
+  static Result<void> save_project(const std::filesystem::path&, const std::vector<StudioScene>&,
+                                   size_t selected, StudioOptions, StudioAudioSettings);
+  static Result<std::vector<StudioScene>> load_project(const std::filesystem::path&,
+                                                       size_t& selected, StudioOptions&,
+                                                       StudioAudioSettings&);
 
  private:
   struct Impl;
@@ -99,12 +103,12 @@ struct StudioDevice {
   std::string id, name;
 };
 
-std::vector<StudioDevice> studio_windows();
-std::vector<StudioDevice> studio_screens();
-std::vector<StudioDevice> studio_cameras();
+Result<std::vector<StudioDevice>> studio_windows();
+Result<std::vector<StudioDevice>> studio_screens();
+Result<std::vector<StudioDevice>> studio_cameras();
 // Public pure operations for offline verification and media consumers.
-StudioImage studio_composite_cpu(
+Result<StudioImage> studio_composite_cpu(
     int width, int height,
     const std::vector<std::pair<StudioSource, std::shared_ptr<const StudioImage>>>& layers);
-void studio_mix(std::vector<float>& target, const std::vector<float>& source, float gain);
+Result<void> studio_mix(std::vector<float>& target, const std::vector<float>& source, float gain);
 }  // namespace livekit::sdk

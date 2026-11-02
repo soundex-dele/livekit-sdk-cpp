@@ -19,10 +19,11 @@ struct PreparedMediaGraph {
 class MediaGraphBuilder {
  public:
   virtual ~MediaGraphBuilder() = default;
-  virtual PreparedMediaGraph build_publish(MediaPublishSpec,
-                                           std::shared_ptr<nodes::RtcPublishNode>) = 0;
-  virtual PreparedMediaGraph build_subscribe(MediaSubscribeSpec,
-                                             std::shared_ptr<nodes::RtcSubscribeNode>) = 0;
-  virtual std::shared_ptr<SharedMediaInput> create_shared_input(TrackDescriptor, MediaInput) = 0;
+  virtual Result<PreparedMediaGraph> build_publish(MediaPublishSpec,
+                                                   std::shared_ptr<nodes::RtcPublishNode>) = 0;
+  virtual Result<PreparedMediaGraph> build_subscribe(MediaSubscribeSpec,
+                                                     std::shared_ptr<nodes::RtcSubscribeNode>) = 0;
+  virtual Result<std::shared_ptr<SharedMediaInput>> create_shared_input(TrackDescriptor,
+                                                                        MediaInput) = 0;
 };
 }  // namespace livekit::sdk::rtc::engine

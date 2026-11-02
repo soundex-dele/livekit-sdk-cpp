@@ -1,6 +1,6 @@
 # RTC 完成回调与持续 Observer
 
-当前契约（2026-10-31）：控制方法保持 `void`，每次调用可传入 `Completion<T>`
+当前契约（2026-11-02 按源码核对）：控制方法保持 `void`，每次调用可传入 `Completion<T>`
 （`std::function<void(Result<T>)>`）；持续状态通过 `RoomObserver` / `RtcObserver` 接收。
 空 completion 表示调用方主动忽略本次结果，不再通过全局成功事件找回结果。
 
@@ -10,7 +10,7 @@
   只产生持续事件，不重复交付 join 结果。初始会话信息在 join 成功时可读。
 - RoomEngine 的 publish/subscribe 返回对应端点；RtcEngine 返回 MediaPublication /
   MediaSubscription，表示端点 ready 且图已启动，不表示远端首帧已显示。
-- unpublish/unsubscribe 在原生端点解绑完成时结算；RtcEngine 还先停止并释放对应图。
+- unpublish/unsubscribe 在原生端点解绑完成时结算；RtcEngine 先停止图，成功解绑后移除轨道条目。解绑失败不表示资源已全部释放。
 - set_muted、接收需求和权限成功表示后端本地应用/信令提交；参与者更新等待协议响应。
 - 本地校验、后端失败及媒体构图失败都通过 Result 交付；不以异常向控制调用者报错。
   重复结果不再次调用 completion；退会会以 cancelled 结算仍在等待的操作。
@@ -21,14 +21,16 @@
 
 ## 线程与关闭
 
-继续复用 control、lifecycle、notification 三个 TaskQueue：
+RtcEngine 与其 RoomEngine 共使用三个 TaskQueue；独立 RoomEngine 仅有 control 和 notification：
 
 - control：RoomEngine 状态、Transport 请求/事件、端点收发、操作结果匹配。
 - lifecycle：RtcEngine 轨道目录、GraphEngine 构图、启停和媒体资源释放。
-- notification：所有公开 completion 与持续 Observer。内部 RoomEngine 的结果续接直接
-  转发到所属工作线程，不经过用户通知队列，慢用户回调不阻塞内部媒体编排。
+- notification：RtcEngine / RoomEngine 的公开 Completion 与持续 Observer。RoomEngine 向
+  RtcEngine 的内部结果和事件续接也经过该队列，再投递到 lifecycle；慢用户回调可能延迟
+  构图或清理，不能假设内部续接完全隔离于应用通知。RoomServices 使用独立服务契约。
 
-本地发起仍在所属线程同步执行，因此方法可能等待队列中的先前工作；不会等待网络 ACK。
+join、发布订阅及轨道/成员控制通过 post 入队，不等待网络 ACK。快照、媒体装配、共享输入
+创建、Observer 替换及 leave 等同步接口可能等待对应队列；不能把它们一概当作非阻塞请求。
 completion 不在提交调用栈内联执行，但另一线程可能在提交方法返回前执行它。
 回调可以提交下一次请求，不得等待其它回调、同步退会、替换 Observer 或销毁引擎。
 媒体输出回调仍使用原有输出线程。
@@ -45,10 +47,10 @@ write 对未知轨道返回 not_ready，publication 的未知轨道快照包含 
 带音频配置的 create_livekit_engine 返回 Result<unique_ptr<RtcEngine>>；也可以
 先使用无参数工厂，再检查 enable_media 返回的错误码。
 
-本轮不改 GraphEngine、编解码和原生传输的实现，不增加任务调度器、超时线程或恢复机制。
-旧后端、校验器和构图器仍有异常实现；现有 control_boundary 仅作为迁移适配边界，将其
-转换为显式错误。当前 SDK 尚未通过全目标 -fno-exceptions 编译，不能将 API 错误通道迁移
-等同于全仓异常清理。超时和重连支持范围仍以现有后端为准。
+媒体图、设备和部分旧实现仍使用异常，由 legacy_control_boundary 转换为显式错误。
+部分后端目标已单独禁用异常，见 [原生回调迁移记录](rtc-native-completion-20261031.md)；
+这不代表整个 SDK 已通过禁异常构建。当前引擎没有额外的截止时间调度器或图恢复状态机，
+超时和重连范围取决于后端。RtcEngine / RoomEngine 控制方法没有逐次 ControlOptions 参数。
 
 ## 调用示例
 
@@ -73,7 +75,7 @@ engine.join(options, [&engine, spec](Result<RoomSnapshot> joined) {
 RtcGraphApi 同样接收逐次 completion；非安装的 BlockingEngine 直接等待该回调，
 不再用 Observer/TrackId 建立成功结果映射。
 
-本次验证见 [回调重构记录](rtc-callback-observer-20261031.md)。以下为旧版历史记录。
+本次为文档源码核对，未新增运行验证；2026-10-31 的历史验证见 [回调重构记录](rtc-callback-observer-20261031.md)。以下为旧版历史记录。
 
 ## 历史验证：三线程拆分前的主动回调版本
 

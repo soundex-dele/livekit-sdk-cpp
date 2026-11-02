@@ -2,15 +2,18 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <chrono>
-#include <stdexcept>
+#include "server_sdk/json_validation.hpp"
+#include <limits>
 
 namespace livekit::sdk {
-static std::string sign_claims(const std::string& key, const std::string& secret, Json claims,
-                               int ttl) {
+static Result<std::string> sign_claims(const std::string& key, const std::string& secret,
+                                       Json claims, int ttl) {
   if (key.empty() || secret.empty())
-    throw std::invalid_argument("API key and secret are required");
+    return Result<std::string>::failure(make_failure(
+        ErrorDomain::protocol, ErrorCode::invalid_argument, "API key and secret are required"));
   if (ttl <= 0)
-    throw std::invalid_argument("Token TTL must be positive");
+    return Result<std::string>::failure(make_failure(
+        ErrorDomain::protocol, ErrorCode::invalid_argument, "Token TTL must be positive"));
   auto now = std::chrono::duration_cast<std::chrono::seconds>(
                  std::chrono::system_clock::now().time_since_epoch())
                  .count();
@@ -18,18 +21,36 @@ static std::string sign_claims(const std::string& key, const std::string& secret
   claims["iat"] = now;
   claims["nbf"] = now;
   claims["exp"] = now + ttl;
-  auto payload = base64url(R"({"alg":"HS256","typ":"JWT"})") + "." + base64url(claims.dump());
+  if (secret.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return Result<std::string>::failure(make_failure(
+        ErrorDomain::protocol, ErrorCode::invalid_argument, "API secret is too large"));
+  }
+  for (const char* grant : {"video", "sip", "agent"}) {
+    auto found = claims.find(grant);
+    if (found != claims.end() && !found->is_object()) {
+      return Result<std::string>::failure(
+          make_failure(ErrorDomain::protocol, ErrorCode::invalid_argument,
+                       std::string(grant) + " grant must be an object"));
+    }
+  }
+  auto serialized = detail::serialize_json(claims);
+  if (!serialized) {
+    return Result<std::string>::failure(serialized.failure_record());
+  }
+  auto payload = base64url(R"({"alg":"HS256","typ":"JWT"})") + "." + base64url(*serialized);
   unsigned char digest[EVP_MAX_MD_SIZE];
   unsigned int size = 0;
   if (!HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()),
             reinterpret_cast<const unsigned char*>(payload.data()), payload.size(), digest, &size))
-    throw std::runtime_error("HMAC-SHA256 failed");
-  return payload + "." + base64url({reinterpret_cast<char*>(digest), size});
+    return Result<std::string>::failure(
+        make_failure(ErrorDomain::protocol, ErrorCode::processing_failed, "HMAC-SHA256 failed"));
+  return Result<std::string>::success(payload + "." +
+                                      base64url({reinterpret_cast<char*>(digest), size}));
 }
 
-std::string make_token(const std::string& key, const std::string& secret,
-                       const std::string& identity, const Json& grants, int ttl,
-                       const std::string& name) {
+Result<std::string> make_token(const std::string& key, const std::string& secret,
+                               const std::string& identity, const Json& grants, int ttl,
+                               const std::string& name) {
   return AccessToken(key, secret)
       .set_identity(identity)
       .set_video_grant(grants)
@@ -67,8 +88,6 @@ AccessToken& AccessToken::set_kind(std::string v) {
 }
 
 AccessToken& AccessToken::set_valid_for(int v) {
-  if (v <= 0)
-    throw std::invalid_argument("Token TTL must be positive");
   ttl_ = v;
   return *this;
 }
@@ -88,7 +107,7 @@ AccessToken& AccessToken::set_agent_grant(Json v) {
   return *this;
 }
 
-std::string AccessToken::to_jwt() const {
+Result<std::string> AccessToken::to_jwt() const {
   return sign_claims(key_, secret_, claims_, ttl_);
 }
 }  // namespace livekit::sdk

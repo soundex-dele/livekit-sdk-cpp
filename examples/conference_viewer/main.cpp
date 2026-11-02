@@ -35,22 +35,26 @@ int main() {
   SDL_Window* window = nullptr;
   SDL_Renderer* renderer = nullptr;
   bool platform = false, backend = false;
-  int result = 0;
-  try {
+  using namespace livekit::sdk;
+  auto failed = [](std::string message) {
+    return Result<void>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::processing_failed, std::move(message)));
+  };
+  auto run = [&]() -> Result<void> {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0)
-      throw std::runtime_error(SDL_GetError());
+      return failed(SDL_GetError());
     float scale = ui_scale(0);
     window = SDL_CreateWindow("LiveKit Conference", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               static_cast<int>(1100 * scale), static_cast<int>(720 * scale),
                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!window)
-      throw std::runtime_error(SDL_GetError());
+      return failed(SDL_GetError());
     SDL_SetWindowMinimumSize(window, 640, 480);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer)
       renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     if (!renderer)
-      throw std::runtime_error(SDL_GetError());
+      return failed(SDL_GetError());
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
@@ -60,7 +64,7 @@ int main() {
     platform = ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     backend = ImGui_ImplSDLRenderer2_Init(renderer);
     if (!platform || !backend)
-      throw std::runtime_error("Cannot initialize ImGui SDL backends");
+      return failed("Cannot initialize ImGui SDL backends");
     {
       demo::Session session;
       demo::View view;
@@ -99,25 +103,31 @@ int main() {
         if (action == demo::Action::RemoveVideo && !closing)
           session.remove_video(view.remove_video_sid);
         if (action == demo::Action::Join && !closing) {
-          try {
-            session.start(view.options(), view.pause_unused_video);
-          } catch (const std::exception& e) {
-            view.error = e.what();
+          auto options = view.options();
+          if (!options) {
+            view.error = options.error().message;
+          } else if (auto started = session.start(std::move(*options), view.pause_unused_video);
+                     !started) {
+            view.error = started.error().message;
           }
         }
         ImGui::Render();
         SDL_SetRenderDrawColor(renderer, 14, 17, 23, 255);
         SDL_RenderClear(renderer);
-        demo::render_draw_data(renderer);
+        if (auto rendered = demo::render_draw_data(renderer); !rendered) {
+          return rendered;
+        }
         SDL_RenderPresent(renderer);
         const auto elapsed = SDL_GetTicks64() - started;
         if (elapsed < 16)
           SDL_Delay(static_cast<Uint32>(16 - elapsed));
       }
     }
-  } catch (const std::exception& error) {
-    std::cerr << "Conference: " << error.what() << '\n';
-    result = 1;
+    return Result<void>::success();
+  };
+  auto completed = run();
+  if (!completed) {
+    std::cerr << "Conference: " << completed.error().message << '\n';
   }
   if (backend)
     ImGui_ImplSDLRenderer2_Shutdown();
@@ -130,5 +140,5 @@ int main() {
   if (window)
     SDL_DestroyWindow(window);
   SDL_Quit();
-  return result;
+  return completed ? 0 : 1;
 }
