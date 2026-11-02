@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "service_test_result.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
@@ -37,7 +39,7 @@ auto await(std::future<T> future) {
   return service_value(future.get());
 }
 
-std::vector<uint8_t> normalized(std::span<const uint8_t> bytes) {
+std::vector<uint8_t> normalized(livekit::compat::span<const uint8_t> bytes) {
   std::vector<uint8_t> result;
   for (size_t i = 0; i < bytes.size();) {
     if (i + 4 <= bytes.size() && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 0 &&
@@ -151,7 +153,7 @@ int main(int argc, char** argv) {
     options.encryption.media = mode == "media-e2ee";
   }
   await(room->join(options));
-  std::jthread media_pump;
+  livekit::compat::jthread media_pump;
   if (media_mode) {
     TrackDescriptor d;
     d.id = d.name = "cpp-encoded";
@@ -159,7 +161,7 @@ int main(int argc, char** argv) {
     d.format.width = 64;
     d.format.height = 48;
     auto track = await(room->publish(d));
-    media_pump = std::jthread([track](std::stop_token stop) {
+    media_pump = livekit::compat::jthread([track](livekit::compat::stop_token stop) {
       uint64_t timestamp = 0;
       while (!stop.stop_requested()) {
         EncodedFrame frame;

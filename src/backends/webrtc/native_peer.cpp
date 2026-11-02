@@ -1,3 +1,5 @@
+#include "livekit/compat/span.hpp"
+#include "livekit/compat/algorithm.hpp"
 #include "backends/webrtc/native_peer.hpp"
 #include "api/make_ref_counted.h"
 #include "api/stats/rtc_stats_collector_callback.h"
@@ -273,7 +275,8 @@ void NativePeer::create_local(bool offer, bool ice_restart,
       if (codecs.empty()) {
         codecs = runtime_.factory->GetRtpReceiverCapabilities(webrtc::MediaType::VIDEO).codecs;
       }
-      std::erase_if(codecs, [](const auto& codec) { return codec.name == "flexfec-03"; });
+      livekit::compat::erase_if(codecs,
+                                [](const auto& codec) { return codec.name == "flexfec-03"; });
       const auto error = transceiver->SetCodecPreferences(codecs);
       if (!error.ok()) {
         completion->reject(failure(error));
@@ -404,8 +407,8 @@ void NativePeer::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> 
     for (const auto& stream : receiver->streams()) {
       const auto id = stream->id();
       const auto separator = id.find('|');
-      if (id.starts_with("PA_") && separator != std::string::npos &&
-          id.substr(separator + 1).starts_with("TR_"))
+      if (livekit::compat::starts_with(id, "PA_") && separator != std::string::npos &&
+          livekit::compat::starts_with(id.substr(separator + 1), "TR_"))
         sid = id.substr(separator + 1);
     }
     {
@@ -490,7 +493,7 @@ bool NativePeer::data_ready(const std::string& label, size_t bytes) {
   });
 }
 
-bool NativePeer::send_data(const std::string& label, std::span<const uint8_t> bytes) {
+bool NativePeer::send_data(const std::string& label, livekit::compat::span<const uint8_t> bytes) {
   if (!pc || bytes.size() > 16384)
     return false;
   return runtime_.signaling->BlockingCall([&] {

@@ -2,7 +2,9 @@
 
 当前 RTC 接口见 [完成回调与持续 Observer](docs/rtc-simple-observer.md)。RtcEngine 和 RoomEngine 的控制接口返回 `void`，每次调用通过 `Completion<T>` 接收 `Result<T>`；持续状态交给 Observer。RtcEngine 在对应 GraphEngine 启动后交付发布/订阅结果。RtcEngine 与其 RoomEngine 共使用 control、lifecycle、notification 三线程（独立 RoomEngine 仅有 control 与 notification），应用无需调用 `poll()`；leave/close 保持同步。
 
-C++20 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
+C++17 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
+
+数据视图和线程取消类型使用 `livekit::compat` 命名空间，见 [C++17 迁移说明](../docs/development/cxx17-migration.md)。从旧版本升级时需重新编译 SDK 与使用方。
 
 普通媒体会话通过 RtcEngine 装配可选的 RtcMediaGraphBuilder 与 RtcMediaResources：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
 

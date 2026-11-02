@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
@@ -168,7 +169,7 @@ int main() {
   service_value(b.write({{8, 9}, 789}));
   bf = service_value(br->read(5s));
   check(bf && bf->payload == std::vector<uint8_t>({8, 9}), "Removing DataTrack stopped sibling");
-  std::stop_source stop;
+  livekit::compat::stop_source stop;
   stop.request_stop();
   DataSendOptions cancelled;
   cancelled.operation.stop = stop.get_token();

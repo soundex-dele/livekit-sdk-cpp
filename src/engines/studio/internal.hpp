@@ -1,9 +1,9 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "livekit/studio.hpp"
 #include "studio_result.hpp"
 #include <deque>
 #include <mutex>
-#include <span>
 
 namespace livekit::sdk::studio_detail {
 using Layers = std::vector<std::pair<StudioSource, std::shared_ptr<const StudioImage>>>;
@@ -51,7 +51,7 @@ class Monitor {
  public:
   Monitor();
   ~Monitor();
-  void write(std::span<const float>);
+  void write(livekit::compat::span<const float>);
   void clear();
   std::string error();
 
@@ -66,7 +66,7 @@ class Recorder {
   ~Recorder();
   Result<void> status() const;
   Result<void> video(const StudioImage&, std::chrono::steady_clock::time_point);
-  Result<void> audio(std::span<const float>, std::chrono::steady_clock::time_point);
+  Result<void> audio(livekit::compat::span<const float>, std::chrono::steady_clock::time_point);
   Result<void> finish();
 
  private:

@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "ui.hpp"
 #include "connection.hpp"
 #include "imgui.h"
@@ -128,14 +129,14 @@ void View::draw_quality(const Snapshot& snapshot) {
                 track.name.empty() ? kind : track.name.c_str());
             ImGui::TextWrapped("%s %s | %s%s", local ? "Send" : "Receive", kind, track.sid.c_str(),
                                track.muted ? " | Muted"
-                                           : (!local && !snapshot.subscriptions.contains(track.sid)
+                                           : (!local && !snapshot.subscriptions.count(track.sid)
                                                   ? " | Unsubscribed"
                                                   : ""));
             for (const auto rate :
                  {QualitySnapshot::Bitrate::rtp, QualitySnapshot::Bitrate::retransmit,
                   QualitySnapshot::Bitrate::fec}) {
               ImGui::TableNextColumn();
-              const auto value = local || snapshot.subscriptions.contains(track.sid)
+              const auto value = local || snapshot.subscriptions.count(track.sid)
                                      ? snapshot.quality.bitrate(rate, track.sid, local)
                                      : std::nullopt;
               if (value)
@@ -184,7 +185,7 @@ void View::draw_quality(const Snapshot& snapshot) {
                 track.name.empty() ? "Video" : track.name.c_str());
             ImGui::TextWrapped("%s | %s%s", local ? "Local" : "Remote", track.sid.c_str(),
                                track.muted ? " | Muted"
-                                           : (!local && !snapshot.subscriptions.contains(track.sid)
+                                           : (!local && !snapshot.subscriptions.count(track.sid)
                                                   ? " | Unsubscribed"
                                                   : ""));
             for (auto stage :
@@ -192,7 +193,7 @@ void View::draw_quality(const Snapshot& snapshot) {
               ImGui::TableNextColumn();
               const bool applicable =
                   local ? stage <= Stage::send
-                        : snapshot.subscriptions.contains(track.sid) && stage >= Stage::receive;
+                        : snapshot.subscriptions.count(track.sid) && stage >= Stage::receive;
               const auto value = applicable ? snapshot.quality.fps(stage, track.sid) : std::nullopt;
               if (value)
                 ImGui::Text("%.1f", *value);
@@ -479,7 +480,8 @@ Action View::draw(SDL_Renderer* renderer, const Snapshot& snapshot) {
       ImGui::EndChild();
       ImGui::PopID();
     }
-    std::erase_if(textures_, [&](const auto& item) { return !active.contains(item.first); });
+    livekit::compat::erase_if(textures_,
+                              [&](const auto& item) { return !active.count(item.first); });
     ImGui::EndChild();
   }
   ImGui::End();

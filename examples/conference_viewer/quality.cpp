@@ -102,7 +102,7 @@ void QualitySnapshot::update(const Json& event) {
   const double seconds = (*timestamp - previous.timestamp_us) / 1e6;
   for (const auto& row : *rows) {
     const auto type = text(row, "type"), id = text(row, "id");
-    if (type == "candidate-pair" && selected_pairs.contains(id)) {
+    if (type == "candidate-pair" && selected_pairs.count(id)) {
       if (auto rtt = number(row, "currentRoundTripTime"); rtt && *rtt >= 0)
         next.rtt_ms = *rtt * 1000;
     }
@@ -179,7 +179,7 @@ void QualitySnapshot::update_graph(const Json& event) {
       stage = Stage::decode;
     else if (kind == "RtcSubscribeNode")
       stage = Stage::receive;
-    else if (kind == "MediaInputNode" && raw_sources.contains(name))
+    else if (kind == "MediaInputNode" && raw_sources.count(name))
       stage = Stage::capture;
     else
       continue;

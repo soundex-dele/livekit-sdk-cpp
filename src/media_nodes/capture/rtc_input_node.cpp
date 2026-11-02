@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/algorithm.hpp"
 #include "media_graph/failure.hpp"
 #include "backends/rtc/control_context.hpp"
 #include "livekit/rtc/input_node.hpp"
@@ -14,7 +16,6 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
-#include <numbers>
 #include <thread>
 
 namespace livekit::sdk::rtc::nodes {
@@ -39,7 +40,7 @@ Result<std::string> codec_name(Codec c) {
 std::vector<std::string> input_args(const std::string& input) {
   for (const auto& codec : {"h264", "h265", "vp8", "opus"}) {
     const auto prefix = std::string(codec) + "://";
-    if (!input.starts_with(prefix))
+    if (!livekit::compat::starts_with(input, prefix))
       continue;
     const auto address = input.substr(prefix.size());
     return {"-probesize",
@@ -52,7 +53,7 @@ std::vector<std::string> input_args(const std::string& input) {
             : std::string(codec) == "opus" ? "ogg"
                                            : "h264",
             "-i",
-            address.starts_with('/') ? "unix:" + address : "tcp://" + address};
+            livekit::compat::starts_with(address, '/') ? "unix:" + address : "tcp://" + address};
   }
   return {"-i", input};
 }
@@ -64,7 +65,7 @@ struct MediaInputNode::Impl {
   MediaInputOptions options;
   Failure initialization_failure;
   mutable std::mutex mutex;
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   MediaInputSnapshot stats;
   SenderFeedback feedback;
   SteadyClock::time_point boundary{}, origin = SteadyClock::now();
@@ -72,7 +73,7 @@ struct MediaInputNode::Impl {
   bool started = false, closed = false, microphone_reporter = false;
   std::atomic<bool> stop{false};
   std::atomic<bool> capture_stop{false};
-  std::jthread worker;
+  livekit::compat::jthread worker;
   std::shared_ptr<lk::Process> process;
   std::unique_ptr<livekit::sdk::detail::I420SourceReader> video;
   std::unique_ptr<livekit::sdk::detail::PcmSourceReader> audio;
@@ -293,13 +294,13 @@ struct MediaInputNode::Impl {
            uint64_t(us % 1000000) * descriptor.format.clock_rate / 1000000;
   }
 
-  bool pace(std::stop_token cancel, SteadyClock::time_point when) {
+  bool pace(livekit::compat::stop_token cancel, SteadyClock::time_point when) {
     std::unique_lock lock(mutex);
     changed.wait_until(lock, cancel, when, [&] { return stop.load(); });
     return !stop && !cancel.stop_requested();
   }
 
-  bool wait_enabled(std::stop_token cancel) {
+  bool wait_enabled(livekit::compat::stop_token cancel) {
     std::unique_lock lock(mutex);
     changed.wait(lock, cancel, [&] { return stop || enabled(feedback); });
     return !stop && !cancel.stop_requested();
@@ -362,7 +363,7 @@ struct MediaInputNode::Impl {
     return Result<void>::success();
   }
 
-  Result<void> shared(std::stop_token cancel) {
+  Result<void> shared(livekit::compat::stop_token cancel) {
     while (!stop && !cancel.stop_requested()) {
       if (!wait_enabled(cancel)) {
         break;
@@ -388,7 +389,7 @@ struct MediaInputNode::Impl {
     return Result<void>::success();
   }
 
-  Result<void> application(std::stop_token cancel) {
+  Result<void> application(livekit::compat::stop_token cancel) {
     auto next = SteadyClock::now();
     std::optional<SteadyClock::time_point> audio_origin;
     uint64_t audio_base = 0, audio_generation = 0, rtp_unwrapped = 0, rtp_generation = 0;
@@ -488,7 +489,7 @@ struct MediaInputNode::Impl {
     return Result<void>::success();
   }
 
-  Result<void> generated_or_file(std::stop_token cancel) {
+  Result<void> generated_or_file(livekit::compat::stop_token cancel) {
     const bool is_video = descriptor.kind == MediaKind::video;
     std::shared_ptr<lk::Process> child;
     if (!options.generated) {
@@ -594,7 +595,7 @@ struct MediaInputNode::Impl {
           for (int i = 0; i < 480; ++i)
             for (uint16_t ch = 0; ch < pcm->channels; ++ch)
               pcm->samples[i * pcm->channels + ch] =
-                  int16_t(6000 * std::sin(2 * std::numbers::pi * (440 + ch * 220) *
+                  int16_t(6000 * std::sin(2 * livekit::compat::pi * (440 + ch * 220) *
                                           (sequence * 480 + i) / 48000.0));
         if (admit(binding, captured)) {
           AudioFrameEvent event;
@@ -633,7 +634,7 @@ struct MediaInputNode::Impl {
     return Result<void>::success();
   }
 
-  void run(std::stop_token cancel) {
+  void run(livekit::compat::stop_token cancel) {
     auto completed = [&]() -> Result<void> {
       // No media is read or generated before the first binding feedback.
       {
@@ -766,7 +767,7 @@ Result<void> MediaInputNode::activate() {
     impl_->microphone_reporter = true;
   }
   impl_->stats.active = true;
-  impl_->worker = std::jthread([this](std::stop_token cancel) {
+  impl_->worker = livekit::compat::jthread([this](livekit::compat::stop_token cancel) {
     detail::CallbackScope worker_scope;
     impl_->run(cancel);
   });

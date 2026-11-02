@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "engines/rtc/media_graph_builder.hpp"
 #include "engine/graph_engine.h"
 #include "engines/rtc/application_output.hpp"
@@ -183,7 +184,7 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
     if (!started) {
       {
         std::lock_guard lock(targets_mutex);
-        std::erase_if(targets, [&](auto& weak) { return weak.lock() == target; });
+        livekit::compat::erase_if(targets, [&](auto& weak) { return weak.lock() == target; });
       }
       if (!consumers)
         stop_capture();
@@ -197,7 +198,8 @@ struct SharedMediaInput::Impl : std::enable_shared_from_this<SharedMediaInput::I
       return;
     {
       std::lock_guard lock(targets_mutex);
-      std::erase_if(targets, [&](auto& weak) { return weak.expired() || weak.lock() == target; });
+      livekit::compat::erase_if(
+          targets, [&](auto& weak) { return weak.expired() || weak.lock() == target; });
     }
     target->active = false;
     if (--consumers == 0)
@@ -268,8 +270,8 @@ struct MediaTrack::State {
       stop_source();
   }
 
-  template <class Event>
-  void connect(TrackGraphSpec& graph, const auto& from, const auto& to) {
+  template <class Event, class From, class To>
+  void connect(TrackGraphSpec& graph, const From& from, const To& to) {
     graph.connections.push_back(TrackGraphSpec::connect<Event>(from, to));
   }
 
@@ -490,7 +492,8 @@ Result<PreparedMediaGraph> RtcMediaGraphBuilder::build_subscribe(
   }
   std::shared_ptr<detail::MediaSyncClock> clock;
   if (spec.synchronize && !spec.track.source_id.empty()) {
-    std::erase_if(resources_.clocks, [](const auto& entry) { return entry.second.expired(); });
+    livekit::compat::erase_if(resources_.clocks,
+                              [](const auto& entry) { return entry.second.expired(); });
     const auto key = std::pair{spec.track.source_id, spec.track.stream_group};
     clock = resources_.clocks[key].lock();
     if (!clock) {

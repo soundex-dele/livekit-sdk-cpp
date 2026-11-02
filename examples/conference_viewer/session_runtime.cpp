@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "session.hpp"
 #include <livekit/rtc/engine.hpp>
 #include <algorithm>
@@ -82,7 +83,7 @@ class SessionInbox final : public engine::RtcObserver {
     push(event);
   }
 
-  Batch take(std::stop_token stop) {
+  Batch take(livekit::compat::stop_token stop) {
     std::unique_lock lock(mutex_);
     changed_.wait_for(lock, stop, 5ms, [&] { return overflow_ || !messages_.empty(); });
     Batch batch;
@@ -93,7 +94,7 @@ class SessionInbox final : public engine::RtcObserver {
 
  private:
   std::mutex mutex_;
-  std::condition_variable_any changed_;
+  livekit::compat::condition_variable_any changed_;
   std::deque<Message> messages_;
   bool overflow_ = false;
 };
@@ -140,8 +141,8 @@ sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video
     data_.pause_unused_video = pause_unused_video;
   }
   {
-    worker_ = std::jthread([this, options = std::move(options),
-                            pause_unused_video](std::stop_token stop) mutable {
+    worker_ = livekit::compat::jthread([this, options = std::move(options), pause_unused_video](
+                                           livekit::compat::stop_token stop) mutable {
       std::string error;
       const auto redact = [&](std::string message) {
         const auto& token = options.connection.token;
@@ -246,7 +247,7 @@ sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video
             });
           };
           const auto subscribe = [&](TrackDescriptor descriptor) {
-            if (tracks.contains(descriptor.id))
+            if (tracks.count(descriptor.id))
               return;
             auto track = std::make_shared<Track>();
             track->descriptor = descriptor;

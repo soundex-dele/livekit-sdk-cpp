@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include <future>
 #include "media_graph/failure.hpp"
 #include "livekit/rtc/publish_node.hpp"
@@ -60,7 +61,8 @@ Result<void> RtcPublishNode::activate() {
   }
   std::promise<Result<void>> initial;
   auto ready = initial.get_future();
-  worker_ = std::jthread([this, initial = std::move(initial)](std::stop_token stop) mutable {
+  worker_ = livekit::compat::jthread([this, initial = std::move(initial)](
+                                         livekit::compat::stop_token stop) mutable {
     detail::CallbackScope worker_scope;
     bool initialized = false;
     Epoch epoch = 0;

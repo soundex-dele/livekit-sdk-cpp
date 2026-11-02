@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "backends/rtc/livekit/service_result.hpp"
 #include "backends/rtc/livekit/room_service_state.hpp"
 #include "backends/rtc/livekit/data_message_wire.hpp"
@@ -236,7 +238,7 @@ std::future<Result<void>> RoomServiceState::enqueue(livekit::DataPacket packet,
         return Result<void>::failure(watched.failure_record());
       }
       const auto wake = *watched;
-      auto cancellation = std::make_shared<std::stop_callback<std::function<void()>>>(
+      auto cancellation = std::make_shared<livekit::compat::stop_callback<std::function<void()>>>(
           options.operation.stop, [wake] { wake->signal(); });
       send_deadlines.set(id, deadline);
       outgoing.emplace(id, Pending{std::move(packet), bytes, promise, deadline,
@@ -394,7 +396,8 @@ void RoomServiceState::deliver_events() {
   }
 }
 
-Result<void> RoomServiceState::receive(const std::string& label, std::span<const uint8_t> bytes) {
+Result<void> RoomServiceState::receive(const std::string& label,
+                                       livekit::compat::span<const uint8_t> bytes) {
   const auto reject_packet = [&](Failure failure, std::string sender = {}) {
     return emit(
         {std::move(sender), label == "_reliable",

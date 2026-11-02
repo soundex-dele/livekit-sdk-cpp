@@ -1,5 +1,6 @@
 #pragma once
 
+#include "livekit/compat/thread.hpp"
 #include "backends/rtc/room_transport.hpp"
 #include "backends/rtc/queue_budget.hpp"
 #include "livekit/result.hpp"
@@ -30,7 +31,7 @@ struct Endpoint {
   std::optional<SteadyClock::time_point> next_expiration();
   TrackSnapshot snapshot() const;
   SenderFeedback feedback() const;
-  std::optional<SenderFeedback> wait_feedback(Epoch, uint64_t, std::stop_token);
+  std::optional<SenderFeedback> wait_feedback(Epoch, uint64_t, livekit::compat::stop_token);
 
   std::shared_ptr<QueueBudget> queue_budget() const {
     return budget_;
@@ -42,8 +43,8 @@ struct Endpoint {
   void ready(std::string server_sid);
   void finish(TrackState, std::string error = {}, std::shared_ptr<const FailureInfo> = {});
   WriteStatus write(EncodedFrame);
-  ReadResult read(std::chrono::milliseconds, std::stop_token);
-  ReadResult wait_frame(std::stop_token);
+  ReadResult read(std::chrono::milliseconds, livekit::compat::stop_token);
+  ReadResult wait_frame(livekit::compat::stop_token);
   std::optional<Item> front();
   void consumed(uint64_t serial, bool dropped = false);
   void update_feedback(const SenderFeedback&);
@@ -52,12 +53,12 @@ struct Endpoint {
   void require_keyframe();
 
  private:
-  ReadResult read_locked(std::stop_token);
+  ReadResult read_locked(livekit::compat::stop_token);
   void clear_locked();
   void require_keyframe_locked();
   void expire_locked();
   mutable std::mutex mutex_;
-  std::condition_variable_any changed_;
+  livekit::compat::condition_variable_any changed_;
   std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup_;
   void notify_locked();
   BindingToken binding_;

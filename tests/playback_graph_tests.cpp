@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
                                            "video.output", "audio.output"},
             "node identities mismatch");
     for (const auto& edge : graph.edges()) {
-      require(names.contains(edge.from()) && names.contains(edge.to()), "dangling graph edge");
+      require(names.count(edge.from()) && names.count(edge.to()), "dangling graph edge");
       require(!edge.dataType().empty() && edge.eventBus(),
               "media edge must carry typed pub/sub events");
       if (edge.from() == "file.demuxer") {

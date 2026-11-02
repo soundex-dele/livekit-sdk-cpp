@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "media_result.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "livekit/rtc/stream_pipeline.hpp"
@@ -11,7 +12,6 @@
 #include <thread>
 #include <condition_variable>
 #include <cmath>
-#include <numbers>
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -707,7 +707,7 @@ void real_ffmpeg(const std::string& ffmpeg) {
     out.write("data", 4);
     u32(4410 * 2);
     for (int i = 0; i < 4410; ++i)
-      u16(uint16_t(int16_t(6000 * std::sin(2 * std::numbers::pi * 440 * i / 44100.0))));
+      u16(uint16_t(int16_t(6000 * std::sin(2 * livekit::compat::pi * 440 * i / 44100.0))));
     check(bool(out), "Cannot write file-input fixture");
   }
   const auto utf8 = file.u8string();

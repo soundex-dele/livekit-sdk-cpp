@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "test_failure.hpp"
 #include "server_result.hpp"
 #include "rtc_room_test_bridge.hpp"
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
                   auto read = subscriptions[i]->read(0ms);
                   if (read.status != ReadStatus::frame)
                     break;
-                  check(std::ranges::equal(read.frame->buffer.bytes(), payload),
+                  check(livekit::compat::equal(read.frame->buffer.bytes(), payload),
                         "Rejoin crossed media routes");
                   ++received[i];
                   ++frames;

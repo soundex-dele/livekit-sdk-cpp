@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "test_failure.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
@@ -35,45 +36,45 @@ struct Peer {
       : codec_(codec), events_(directory / (identity + ".jsonl")) {
     std::promise<void> started;
     auto ready = started.get_future();
-    worker_ = std::jthread(
-        [this, url, identity, started = std::move(started)](std::stop_token stop) mutable {
-          {
-            engine_ = require_result(livekit::sdk::app_support::create_blocking_engine());
-            engine_events_.attach(*engine_);
-            transport::LiveKitRoomOptions options;
-            options.url = url;
-            options.token = token(identity);
-            options.media_transport = test_transport;
-            options.stats_interval = 1s;
-            options.reconnect.enabled = false;
-            await(engine_->join(options));
-            connected = true;
-            started.set_value();
-            while (!stop.stop_requested()) {
-              std::function<void()> command;
-              {
-                std::lock_guard lock(mutex_);
-                if (!commands_.empty()) {
-                  command = std::move(commands_.front());
-                  commands_.pop_front();
-                }
-              }
-              if (command)
-                command();
-              tick();
-              std::this_thread::sleep_for(2ms);
-            }
-          }
-          if (engine_) {
-            require_result(engine_->close());
-          }
-          connected = false;
+    worker_ = livekit::compat::jthread([this, url, identity, started = std::move(started)](
+                                           livekit::compat::stop_token stop) mutable {
+      {
+        engine_ = require_result(livekit::sdk::app_support::create_blocking_engine());
+        engine_events_.attach(*engine_);
+        transport::LiveKitRoomOptions options;
+        options.url = url;
+        options.token = token(identity);
+        options.media_transport = test_transport;
+        options.stats_interval = 1s;
+        options.reconnect.enabled = false;
+        await(engine_->join(options));
+        connected = true;
+        started.set_value();
+        while (!stop.stop_requested()) {
+          std::function<void()> command;
           {
             std::lock_guard lock(mutex_);
-            finished_ = true;
+            if (!commands_.empty()) {
+              command = std::move(commands_.front());
+              commands_.pop_front();
+            }
           }
-          audio_ready_.notify_all();
-        });
+          if (command)
+            command();
+          tick();
+          std::this_thread::sleep_for(2ms);
+        }
+      }
+      if (engine_) {
+        require_result(engine_->close());
+      }
+      connected = false;
+      {
+        std::lock_guard lock(mutex_);
+        finished_ = true;
+      }
+      audio_ready_.notify_all();
+    });
     ready.get();
   }
 
@@ -117,7 +118,7 @@ struct Peer {
   bool subscribed(const std::string& id) {
     std::lock_guard lock(mutex_);
 
-    return active_.contains(id);
+    return active_.count(id);
   }
 
   DecodedAudio read_audio(std::chrono::milliseconds timeout) {
@@ -155,7 +156,11 @@ struct Peer {
       input.fps = spec.fps;
       await(engine_->graph().publish_graph(d, [d, input](auto sink) {
         auto source = std::make_shared<transport::nodes::MediaInputNode>("input", d, input);
-        const auto build = [&]<class Codec, class Event>(std::shared_ptr<Codec> codec) {
+        const auto build = [&](auto codec) {
+          using Codec = typename decltype(codec)::element_type;
+          using Event = std::conditional_t<std::is_same_v<Codec, transport::nodes::VideoCodecNode>,
+                                           transport::nodes::VideoFrameEvent,
+                                           transport::nodes::AudioFrameEvent>;
           TrackGraph graph;
           graph.nodes = {source, codec};
           graph.connections = {
@@ -171,12 +176,8 @@ struct Peer {
           return graph;
         };
         if (d.kind == transport::MediaKind::video)
-          return build.template
-          operator()<transport::nodes::VideoCodecNode, transport::nodes::VideoFrameEvent>(
-              std::make_shared<transport::nodes::VideoCodecNode>("encoder", d, true));
-        return build.template
-        operator()<transport::nodes::AudioCodecNode, transport::nodes::AudioFrameEvent>(
-            std::make_shared<transport::nodes::AudioCodecNode>("encoder", d, true));
+          return build(std::make_shared<transport::nodes::VideoCodecNode>("encoder", d, true));
+        return build(std::make_shared<transport::nodes::AudioCodecNode>("encoder", d, true));
       }));
       TestTrack track{d.id, engine_->publication(d.id).server_sid, mime(d)};
       outgoing_[d.id] = track;
@@ -286,7 +287,11 @@ struct Peer {
   void subscribe(const transport::TrackDescriptor& d) {
     require_result(engine_->graph().subscribe_graph(d, [this, d](auto source) {
       auto output = std::make_shared<Observe>(*this, d.remote_sid);
-      const auto build = [&]<class Codec, class Event>(std::shared_ptr<Codec> codec) {
+      const auto build = [&](auto codec) {
+        using Codec = typename decltype(codec)::element_type;
+        using Event = std::conditional_t<std::is_same_v<Codec, transport::nodes::VideoCodecNode>,
+                                         transport::nodes::VideoFrameEvent,
+                                         transport::nodes::AudioFrameEvent>;
         TrackGraph graph;
         graph.nodes = {codec, output};
         graph.connections = {
@@ -299,12 +304,8 @@ struct Peer {
         return graph;
       };
       if (d.kind == transport::MediaKind::video)
-        return build.template
-        operator()<transport::nodes::VideoCodecNode, transport::nodes::VideoFrameEvent>(
-            std::make_shared<transport::nodes::VideoCodecNode>("decoder", d, false));
-      return build
-          .template operator()<transport::nodes::AudioCodecNode, transport::nodes::AudioFrameEvent>(
-              std::make_shared<transport::nodes::AudioCodecNode>("decoder", d, false));
+        return build(std::make_shared<transport::nodes::VideoCodecNode>("decoder", d, false));
+      return build(std::make_shared<transport::nodes::AudioCodecNode>("decoder", d, false));
     }));
 
     std::lock_guard lock(mutex_);
@@ -380,5 +381,5 @@ struct Peer {
   bool finished_ = false;
   uint64_t sequence_ = 0;
   std::atomic<bool> stopping_{false};
-  std::jthread worker_;
+  livekit::compat::jthread worker_;
 };

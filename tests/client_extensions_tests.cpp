@@ -1,3 +1,4 @@
+#include "livekit/compat/span.hpp"
 #include "media_result.hpp"
 #include <livekit/livekit.hpp>
 #include "rtc_services_contract.hpp"
@@ -23,7 +24,7 @@ static void require(bool ok, const char* message) {
   }
 }
 
-static std::span<const uint8_t> bytes(const std::string& s) {
+static livekit::compat::span<const uint8_t> bytes(const std::string& s) {
   return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
 }
 

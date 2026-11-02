@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "livekit/rtc/audio_processing.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
 #include "backends/webrtc/pcm_resampler.hpp"
@@ -73,7 +74,7 @@ class AudioProcessor final {
     }
     apm_->set_stream_delay_ms(int(options_.device_delay.count()));
     std::vector<int16_t> converted;
-    std::span<const int16_t> samples = input.samples;
+    livekit::compat::span<const int16_t> samples = input.samples;
     if (input.format == PcmFormat::f32) {
       converted.reserve(input.float_samples.size());
       for (auto sample : input.float_samples) {

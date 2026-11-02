@@ -142,7 +142,7 @@ Result<bool> VideoPlayout::poll() {
     }
   }
   for (auto it = impl_->windows.begin(); it != impl_->windows.end();) {
-    if (!active.contains(it->first)) {
+    if (!active.count(it->first)) {
       impl_->summarize(it->first, *it->second);
       it = impl_->windows.erase(it);
     } else

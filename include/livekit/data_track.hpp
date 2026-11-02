@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/result.hpp"
 #include "livekit/operation.hpp"
 #include <cstdint>
@@ -53,7 +54,8 @@ class DataTrackStream {
  public:
   ~DataTrackStream();
   Result<std::optional<DataFrame>> read(
-      std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
+      std::chrono::milliseconds timeout = std::chrono::seconds(30),
+      livekit::compat::stop_token stop = {});
   void close();
   DataTrackStats stats() const;
 

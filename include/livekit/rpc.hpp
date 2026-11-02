@@ -1,10 +1,10 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include "livekit/result.hpp"
-#include <stop_token>
 #include <string>
 #include <utility>
 
@@ -52,14 +52,14 @@ class RpcError {
 struct RpcCallOptions {
   std::string destination_identity, method, payload;
   std::chrono::milliseconds response_timeout{15000};
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
   bool compress = false;  // Opt-in only for peers supporting compressed RPC payloads.
 };
 
 struct RpcInvocation {
   std::string request_id, caller_identity, payload;
   std::chrono::steady_clock::time_point deadline;
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 
 struct RpcResult {

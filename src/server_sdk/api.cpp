@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "livekit/api.hpp"
 #include "server_sdk/api_transport.hpp"
 #include "server_sdk/json_validation.hpp"
@@ -147,7 +148,7 @@ class APITransport {
     args->extraHeaders = {{"Authorization", "Bearer " + token},
                           {"Content-Type", "application/json"},
                           {"X-Livekit-Request-Id", request_id}};
-    std::stop_callback cancel(options.stop, [&] { args->cancel = true; });
+    livekit::compat::stop_callback cancel(options.stop, [&] { args->cancel = true; });
     auto response =
         client.post(url + "/twirp/livekit." + service + "/" + method, *serialized, args);
     if (options.stop.stop_requested())

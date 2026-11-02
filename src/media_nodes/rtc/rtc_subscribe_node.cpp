@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "media_graph/failure.hpp"
 #include "livekit/rtc/subscribe_node.hpp"
 
@@ -51,7 +52,7 @@ Result<void> RtcSubscribeNode::activate() {
   if (worker_.joinable()) {
     return Result<void>::success();
   }
-  worker_ = std::jthread([this](std::stop_token stop) {
+  worker_ = livekit::compat::jthread([this](livekit::compat::stop_token stop) {
     detail::CallbackScope worker_scope;
     Failure failure;
     while (!stop.stop_requested()) {

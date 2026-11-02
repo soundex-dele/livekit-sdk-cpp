@@ -11,7 +11,7 @@ CLI 已使用新的 `rtc::RoomEngine` 和 `rtc::engine::RtcEngine`，不再包�
 
 原生 W3C 指标描述传输 PeerConnection；实际编解码位于上层，使用 `media-graph-stats` 的节点计数查看其准入、完成、丢弃和错误。该事件的 `edges` 来自运行中 GraphEngine 节点的真实连接。带宽估计、探测参数和 RTP/RTCP 算法由 libwebrtc 决定，设备不放进传输 PeerConnection。
 
-原生 C++20 LiveKit CLI，当前迁移范围是**房间管理、音视频流发布与订阅**。
+原生 C++17 LiveKit CLI，当前迁移范围是**房间管理、音视频流发布与订阅**。
 直接编译链接同级目录的 WebRTC（本机为 `D:\workspace\webrtc`），不调用 Go CLI，也不通过 Rust FFI 转接媒体。
 
 ## 构建

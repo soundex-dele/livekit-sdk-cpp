@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "session.hpp"
 #include <set>
 #include <chrono>
@@ -34,15 +35,16 @@ void Snapshot::update(Participant local, const std::vector<Participant>& remote)
   }
   // Unknown/removed tracks cannot accumulate pixels indefinitely. A frame that
   // precedes metadata is replaced by the next decoded frame once subscribed.
-  std::erase_if(frames, [&](const auto& item) { return !current.contains(item.first); });
-  std::erase_if(subscriptions, [&](const auto& sid) { return !current.contains(sid); });
-  std::erase_if(quality.participants,
-                [&](const auto& item) { return !participants.contains(item.first); });
+  livekit::compat::erase_if(frames, [&](const auto& item) { return !current.count(item.first); });
+  livekit::compat::erase_if(subscriptions, [&](const auto& sid) { return !current.count(sid); });
+  livekit::compat::erase_if(quality.participants,
+                            [&](const auto& item) { return !participants.count(item.first); });
   std::set<std::string> local_tracks;
   if (auto it = participants.find(local_sid); it != participants.end())
     for (const auto& track : it->second.tracks)
       local_tracks.insert(track.sid);
-  std::erase_if(video_demand, [&](const auto& item) { return !local_tracks.contains(item.first); });
+  livekit::compat::erase_if(video_demand,
+                            [&](const auto& item) { return !local_tracks.count(item.first); });
 }
 
 std::vector<Tile> tiles(const Snapshot& s) {

@@ -1,3 +1,4 @@
+#include "livekit/compat/span.hpp"
 #include "backends/webrtc/encoded_receiver.hpp"
 #include "backends/rtc/queue_budget.hpp"
 #include <utility>
@@ -64,7 +65,7 @@ void EncodedReceiver::receive(std::unique_ptr<webrtc::TransformableFrameInterfac
   auto* video = dynamic_cast<webrtc::TransformableVideoFrameInterface*>(frame.get());
   auto* audio = dynamic_cast<webrtc::TransformableAudioFrameInterface*>(frame.get());
   const auto encrypted = frame->GetData();
-  std::span<const uint8_t> data(encrypted.data(), encrypted.size());
+  livekit::compat::span<const uint8_t> data(encrypted.data(), encrypted.size());
   std::optional<std::vector<uint8_t>> plaintext;
   if ((kind_ == MediaKind::video && !video) || (kind_ == MediaKind::audio && !audio) ||
       data.empty()) {

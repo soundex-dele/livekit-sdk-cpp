@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "livekit/result.hpp"
 #include "media_graph/failure.hpp"
 #include "backends/rtc/control_context.hpp"
@@ -39,10 +41,10 @@ struct AudioCodecNode::Impl {
 
   Failure initialization_failure;
   mutable std::mutex mutex;
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   std::deque<Job> jobs;
   AudioCodecSnapshot stats;
-  std::jthread worker;
+  livekit::compat::jthread worker;
   bool active = false, closed = false;
   Epoch epoch = 0;
   uint64_t generation = 0;
@@ -216,7 +218,7 @@ struct AudioCodecNode::Impl {
     ++stats.dropped;
   }
 
-  Result<void> decode_realtime(std::stop_token stop,
+  Result<void> decode_realtime(livekit::compat::stop_token stop,
                                std::promise<livekit::sdk::Result<void>>& started, bool& ready) {
     using namespace std::chrono_literals;
     const auto env = webrtc::CreateEnvironment();
@@ -398,7 +400,7 @@ struct AudioCodecNode::Impl {
     return livekit::sdk::Result<void>::success();
   }
 
-  void run(std::stop_token stop, std::promise<livekit::sdk::Result<void>> started) {
+  void run(livekit::compat::stop_token stop, std::promise<livekit::sdk::Result<void>> started) {
     bool ready = false;
     const auto outcome = [&]() -> Result<void> {
       if (!encode && options.jitter_buffer) {
@@ -497,7 +499,7 @@ struct AudioCodecNode::Impl {
           }
           encoder->SetTargetBitrate(int(bitrate));
           std::vector<int16_t> converted;
-          std::span<const int16_t> input_samples = pcm.samples;
+          livekit::compat::span<const int16_t> input_samples = pcm.samples;
           if (pcm.format == PcmFormat::f32) {
             converted.reserve(pcm.float_samples.size());
             for (const auto sample : pcm.float_samples)
@@ -628,10 +630,11 @@ bool AudioCodecNode::doStart() {
   }
   std::promise<livekit::sdk::Result<void>> started;
   auto result = started.get_future();
-  impl_->worker = std::jthread([this, started = std::move(started)](std::stop_token stop) mutable {
-    detail::CallbackScope worker_scope;
-    impl_->run(stop, std::move(started));
-  });
+  impl_->worker = livekit::compat::jthread(
+      [this, started = std::move(started)](livekit::compat::stop_token stop) mutable {
+        detail::CallbackScope worker_scope;
+        impl_->run(stop, std::move(started));
+      });
   auto status = result.get();
   if (!status) {
     quiesce();

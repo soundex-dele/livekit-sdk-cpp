@@ -1,10 +1,10 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/reconnect.hpp"
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
-#include <stop_token>
 #include "livekit/result.hpp"
 
 namespace livekit::sdk::detail {
@@ -87,9 +87,10 @@ class RecoveryBudget {
   Clock::time_point deadline_ = Clock::time_point::max();
 };
 
-inline bool wait_reconnect(std::stop_token stop, RecoveryBudget::Clock::time_point until) {
+inline bool wait_reconnect(livekit::compat::stop_token stop,
+                           RecoveryBudget::Clock::time_point until) {
   std::mutex mutex;
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   std::unique_lock lock(mutex);
   changed.wait_until(lock, stop, until, [] { return false; });
   return !stop.stop_requested();

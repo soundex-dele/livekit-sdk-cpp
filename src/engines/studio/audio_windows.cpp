@@ -3,6 +3,8 @@
 #define _WIN32_WINNT 0x0A00
 #undef NTDDI_VERSION
 #define NTDDI_VERSION 0x0A00000A
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "internal.hpp"
 #include <windows.h>
 #include <audioclient.h>
@@ -57,10 +59,10 @@ struct AudioCapture::Impl {
   std::deque<float> queue;
   std::string error;
   std::atomic<bool> stop{false};
-  std::jthread worker;
+  livekit::compat::jthread worker;
 
   explicit Impl(bool system) {
-    worker = std::jthread([this, system] {
+    worker = livekit::compat::jthread([this, system] {
       HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
       SwrContext* swr = nullptr;
       ComPtr<IAudioClient> client;
@@ -217,10 +219,10 @@ struct Monitor::Impl {
   std::deque<float> queue;
   std::string error;
   std::atomic<bool> stop{false};
-  std::jthread worker;
+  livekit::compat::jthread worker;
 
   Impl() {
-    worker = std::jthread([this] {
+    worker = livekit::compat::jthread([this] {
       HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
       ComPtr<IAudioClient> client;
       auto run = [&]() -> Result<void> {
@@ -290,7 +292,7 @@ Monitor::Monitor() : impl_(std::make_unique<Impl>()) {}
 
 Monitor::~Monitor() = default;
 
-void Monitor::write(std::span<const float> s) {
+void Monitor::write(livekit::compat::span<const float> s) {
   std::lock_guard lock(impl_->mutex);
   impl_->queue.insert(impl_->queue.end(), s.begin(), s.end());
   while (impl_->queue.size() > 9600)

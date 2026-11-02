@@ -1,7 +1,7 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/auth.hpp"
 #include <memory>
-#include <stop_token>
 
 namespace livekit::sdk {
 struct Credentials {
@@ -11,7 +11,7 @@ struct Credentials {
 struct RequestOptions {
   int connect_timeout = 10;
   int timeout = 30;
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 
 namespace detail {

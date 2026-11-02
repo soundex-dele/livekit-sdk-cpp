@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "support/process.hpp"
 #include "support/ready_set.hpp"
 #include "support/deadline_index.hpp"
@@ -85,7 +86,7 @@ void task_shutdown_reentry() {
       });
   check(tasks.post([source] { source->set_value(1); }), "Queued completion rejected");
   source.reset();
-  std::jthread stopping([&] { tasks.stop(); });
+  livekit::compat::jthread stopping([&] { tasks.stop(); });
   check(cancelled.wait_for(5s) == std::future_status::ready,
         "Cancellation reentered executor while its queue lock was held");
   auto result = cancelled.get();

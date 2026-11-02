@@ -178,7 +178,7 @@ void RtcEngine::subscribe(TrackDescriptor descriptor, Completion<MediaSubscripti
 
 void RtcEngine::subscribe(const TrackId& id, Completion<MediaSubscription> completion) {
   post_request(std::move(completion), [this, id](auto completion) mutable {
-    if (subscriptions_.contains(id)) {
+    if (subscriptions_.count(id)) {
       complete(std::move(completion), detail::failure_result<MediaSubscription>(
                                           ErrorCode::busy, "Subscription already exists"));
       return;
@@ -195,7 +195,7 @@ void RtcEngine::publish_graph(TrackDescriptor descriptor, PublishGraphFactory fa
   post_request(std::move(completion), [this, descriptor = std::move(descriptor),
                                        factory = std::move(factory)](auto completion) mutable {
     const auto id = descriptor.id;
-    if (publications_.contains(id)) {
+    if (publications_.count(id)) {
       complete(std::move(completion),
                detail::failure_result<MediaPublication>(ErrorCode::busy, "Track already exists"));
       return;
@@ -212,7 +212,7 @@ void RtcEngine::publish_media(MediaPublishSpec spec, Completion<MediaPublication
   post_request(std::move(completion), [this, spec = std::move(spec)](auto completion) mutable {
     auto descriptor = spec.track;
     const auto id = descriptor.id;
-    if (publications_.contains(id)) {
+    if (publications_.count(id)) {
       complete(std::move(completion),
                detail::failure_result<MediaPublication>(ErrorCode::busy, "Track already exists"));
       return;
@@ -230,7 +230,7 @@ void RtcEngine::subscribe_graph(TrackDescriptor descriptor, SubscribeGraphFactor
   post_request(std::move(completion), [this, descriptor = std::move(descriptor),
                                        factory = std::move(factory)](auto completion) mutable {
     const auto id = descriptor.id;
-    if (subscriptions_.contains(id)) {
+    if (subscriptions_.count(id)) {
       complete(std::move(completion),
                detail::failure_result<MediaSubscription>(ErrorCode::busy, "Track already exists"));
       return;
@@ -247,7 +247,7 @@ void RtcEngine::subscribe_media(MediaSubscribeSpec spec, Completion<MediaSubscri
   post_request(std::move(completion), [this, spec = std::move(spec)](auto completion) mutable {
     auto descriptor = spec.track;
     const auto id = descriptor.id;
-    if (subscriptions_.contains(id)) {
+    if (subscriptions_.count(id)) {
       complete(std::move(completion),
                detail::failure_result<MediaSubscription>(ErrorCode::busy, "Track already exists"));
       return;

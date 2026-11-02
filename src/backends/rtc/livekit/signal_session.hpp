@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "backends/rtc/livekit/signal_socket.hpp"
 #include "backends/rtc/events.hpp"
 #include "livekit.pb.h"
@@ -16,8 +17,8 @@ class SignalSession {
   using SyncBuilder = std::function<void(livekit::SyncState&)>;
   using ReconnectHandler = std::function<void(const livekit::ReconnectResponse&)>;
   using MovedHandler = std::function<void(const livekit::RoomMovedResponse&)>;
-  SignalSession(const SignalingOptions& options, std::stop_token stop, EventEmitter events,
-                livekit::sdk::detail::SignalRecoveryState* recovery = nullptr,
+  SignalSession(const SignalingOptions& options, livekit::compat::stop_token stop,
+                EventEmitter events, livekit::sdk::detail::SignalRecoveryState* recovery = nullptr,
                 std::shared_ptr<livekit::sdk::detail::WakeEvent> wakeup = {});
   Result<void> connect();
 
@@ -41,7 +42,7 @@ class SignalSession {
     return attempt_deadline_;
   }
 
-  std::stop_token stop_token() const noexcept {
+  livekit::compat::stop_token stop_token() const noexcept {
     return stop_;
   }
 
@@ -85,7 +86,7 @@ class SignalSession {
   livekit::SessionDescription initial_offer_;
   std::vector<livekit::AddTrackRequest> initial_tracks_;
   SignalingOptions options_;
-  std::stop_token stop_;
+  livekit::compat::stop_token stop_;
   EventEmitter events_;
   SignalSocket socket_;
   livekit::sdk::detail::SignalRecoveryState local_recovery_;

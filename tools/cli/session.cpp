@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "data_event_mailbox.hpp"
 #include "rtc_event_mailbox.hpp"
@@ -163,7 +164,7 @@ Result<void> doctor(std::function<void(const Json&)> report) {
 }
 
 Result<void> run_session(const SessionOptions& options, std::function<void(const Json&)> report,
-                         std::stop_token stop) {
+                         livekit::compat::stop_token stop) {
   if (options.stats_interval_ms &&
       (options.stats_interval_ms < 200 || options.stats_interval_ms > 60000))
     return Result<void>::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_argument,
@@ -266,7 +267,7 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
   std::optional<SteadyClock::time_point> eof;
   bool announced = false;
   const auto subscribe = [&](TrackDescriptor d) -> Result<void> {
-    if (!options.subscribe || tracks.contains(d.id))
+    if (!options.subscribe || tracks.count(d.id))
       return Result<void>::success();
     if (!options.subscribe_tracks.empty() &&
         std::find(options.subscribe_tracks.begin(), options.subscribe_tracks.end(), d.remote_sid) ==

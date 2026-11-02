@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "backends/rtc/livekit/service_result.hpp"
 #include "backends/rtc/livekit/stream_session.hpp"
 #include "livekit/result.hpp"
@@ -23,7 +25,7 @@ Failure error(ErrorCode code, const char* text) {
   return make_failure(ErrorDomain::data, code, text);
 }
 
-std::span<const uint8_t> bytes_of(const std::string& s) {
+livekit::compat::span<const uint8_t> bytes_of(const std::string& s) {
   return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
 }
 
@@ -62,7 +64,7 @@ Result<void> valid_string(const std::string& s, size_t max) {
 }
 }  // namespace
 
-bool Utf8State::append(std::span<const uint8_t> bytes) {
+bool Utf8State::append(livekit::compat::span<const uint8_t> bytes) {
   for (auto c : bytes) {
     if (!remaining) {
       if (c < 0x80) {
@@ -302,7 +304,7 @@ Result<std::shared_ptr<StreamWriter>> StreamSession::open(bool text, StreamOptio
     return Return::failure(
         make_failure(ErrorDomain::data, ErrorCode::resource_exhausted, "Outgoing stream limit"));
   }
-  if (writers_.contains(info.id)) {
+  if (writers_.count(info.id)) {
     return Return::failure(
         make_failure(ErrorDomain::data, ErrorCode::invalid_argument, "Duplicate stream ID"));
   }
@@ -321,7 +323,7 @@ Result<std::shared_ptr<StreamWriter>> StreamSession::open(bool text, StreamOptio
 }
 
 std::future<Result<void>> StreamSession::enqueue(uint64_t generation, const std::string& id,
-                                                 std::span<const uint8_t> data,
+                                                 livekit::compat::span<const uint8_t> data,
                                                  std::optional<std::string> reason,
                                                  OperationOptions operation) {
   auto promise = std::make_shared<livekit::sdk::detail::ServicePromise<void>>();
@@ -557,7 +559,7 @@ void StreamSession::receive(const livekit::DataPacket& packet) {
     if (packet.has_stream_header()) {
       const auto& h = packet.stream_header();
       const auto key = std::make_pair(sender, h.stream_id());
-      if (h.stream_id().empty() || h.stream_id().size() > 256 || readers_.contains(key) ||
+      if (h.stream_id().empty() || h.stream_id().size() > 256 || readers_.count(key) ||
           readers_.size() >= 32 || h.compression() < livekit::DataStream::NONE ||
           h.compression() > livekit::DataStream::DEFLATE_RAW) {
         return;
@@ -876,7 +878,7 @@ StreamInfo StreamReader::info() const {
 }
 
 Result<std::optional<std::vector<uint8_t>>> StreamReader::read(std::chrono::milliseconds timeout,
-                                                               std::stop_token stop) {
+                                                               livekit::compat::stop_token stop) {
   using Return = Result<std::optional<std::vector<uint8_t>>>;
   if (timeout.count() < 0) {
     return Return::failure(
@@ -905,7 +907,7 @@ Result<std::optional<std::vector<uint8_t>>> StreamReader::read(std::chrono::mill
   return Return::success(result);
 }
 
-Result<std::vector<uint8_t>> StreamReader::read_all(size_t max, std::stop_token stop) {
+Result<std::vector<uint8_t>> StreamReader::read_all(size_t max, livekit::compat::stop_token stop) {
   std::vector<uint8_t> result;
   for (;;) {
     auto chunk = read(std::chrono::seconds(30), stop);
@@ -926,7 +928,7 @@ Result<std::vector<uint8_t>> StreamReader::read_all(size_t max, std::stop_token 
   return Result<std::vector<uint8_t>>::success(std::move(result));
 }
 
-Result<std::string> StreamReader::read_all_text(size_t max, std::stop_token stop) {
+Result<std::string> StreamReader::read_all_text(size_t max, livekit::compat::stop_token stop) {
   if (!info().text) {
     return Result<std::string>::failure(
         make_failure(ErrorDomain::data, ErrorCode::invalid_state, "Not a text stream"));
@@ -942,7 +944,7 @@ void StreamReader::close() {
   state_->finish(make_failure(ErrorDomain::data, ErrorCode::cancelled, "Stream reader closed"));
 }
 
-std::future<Result<void>> StreamWriter::write(std::span<const uint8_t> bytes,
+std::future<Result<void>> StreamWriter::write(livekit::compat::span<const uint8_t> bytes,
                                               const OperationOptions& operation) {
   auto session = session_.lock();
   if (!session) {

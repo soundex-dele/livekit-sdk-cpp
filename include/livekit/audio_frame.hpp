@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <vector>
 

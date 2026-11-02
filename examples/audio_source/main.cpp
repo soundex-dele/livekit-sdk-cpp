@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "../media_result.hpp"
 using livekit::sdk::examples::report_result;
@@ -6,7 +7,6 @@ using livekit::sdk::examples::report_result;
 #include <livekit/rtc/engine.hpp>
 #include <cmath>
 #include <iostream>
-#include <numbers>
 #include <thread>
 
 using namespace livekit::sdk::rtc;
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
       pcm.float_samples.resize(441);
       for (size_t i = 0; i < 441; ++i) {
         pcm.float_samples[i] =
-            float(.2 * std::sin(2 * std::numbers::pi * 440 * (block * 441 + i) / 44100));
+            float(.2 * std::sin(2 * livekit::compat::pi * 440 * (block * 441 + i) / 44100));
       }
       if (!report_result(input.audio_source->write(pcm))) {
         return 1;  // Bounded queue; a busy input may drop this block.

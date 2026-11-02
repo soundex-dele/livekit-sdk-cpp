@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "media_result.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include "media_nodes/playout/audio_output_transport.hpp"
@@ -191,7 +192,7 @@ void failures_and_barrier() {
         "Output startup rollback failed");
   f.device->fail_start = false;
   auto track = media_result(f.session->open_track("retry"));
-  std::jthread render([&](std::stop_token stop) {
+  livekit::compat::jthread render([&](livekit::compat::stop_token stop) {
     while (!stop.stop_requested()) {
       f.device->pull();
       std::this_thread::yield();

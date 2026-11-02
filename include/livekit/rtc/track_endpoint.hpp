@@ -1,9 +1,9 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/failure.hpp"
 #include "livekit/rtc/types.hpp"
 #include <memory>
 #include <optional>
-#include <stop_token>
 
 namespace livekit::sdk::rtc {
 namespace nodes {
@@ -22,7 +22,7 @@ struct TrackControl;
 
 struct ControlOptions {
   std::chrono::milliseconds timeout{0};  // Zero uses RoomOptions::operation_timeout.
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 
 // Controls submit directly to the room; ErrorCode::ok denotes local submission.
@@ -34,7 +34,7 @@ class PublishedTrack {
   // Wait for a new epoch/revision without polling. Null on stop or terminal
   // endpoint state. Multiple observers may independently retain their cursors.
   std::optional<SenderFeedback> wait_feedback(Epoch previous_epoch, uint64_t previous_revision,
-                                              std::stop_token stop = {}) const;
+                                              livekit::compat::stop_token stop = {}) const;
   WriteStatus try_write(EncodedFrame frame);
   // Local gate plus signaling submission, not a server ACK. Already transmitted
   // packets cannot be retracted. Muting does not unpublish the track.
@@ -55,10 +55,10 @@ class SubscribedTrack {
  public:
   const TrackDescriptor& descriptor() const;
   TrackSnapshot snapshot() const;
-  ReadResult read(std::chrono::milliseconds timeout, std::stop_token stop = {});
+  ReadResult read(std::chrono::milliseconds timeout, livekit::compat::stop_token stop = {});
   // Single-reader blocking receive. Remains asleep across suspension/rebind;
   // returns on media, cancellation, failure or close. No timeout polling.
-  ReadResult wait_frame(std::stop_token stop = {});
+  ReadResult wait_frame(livekit::compat::stop_token stop = {});
   // Sends a rate-limited PLI independently of incoming media arrival.
   [[nodiscard]] ErrorCode request_keyframe();
   // SFU forwarding demand, not a local decoder/device gate. Success means

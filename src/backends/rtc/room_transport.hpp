@@ -1,11 +1,11 @@
 #pragma once
 
+#include <tuple>
+#include "livekit/compat/thread.hpp"
 #include "livekit/rtc/types.hpp"
 #include "livekit/result.hpp"
 #include "support/wake_event.hpp"
-#include <stop_token>
 #include <functional>
-#include <compare>
 
 namespace livekit::sdk::rtc {
 class RoomServices;
@@ -20,8 +20,20 @@ struct BindingToken {
   Epoch epoch = 0;
   uint64_t incarnation = 0;
   bool publication = true;
-  bool operator==(const BindingToken&) const = default;
-  auto operator<=>(const BindingToken&) const = default;
+
+  bool operator==(const BindingToken& other) const {
+    return std::tie(id, epoch, incarnation, publication) ==
+           std::tie(other.id, other.epoch, other.incarnation, other.publication);
+  }
+
+  bool operator!=(const BindingToken& other) const {
+    return !(*this == other);
+  }
+
+  bool operator<(const BindingToken& other) const {
+    return std::tie(id, epoch, incarnation, publication) <
+           std::tie(other.id, other.epoch, other.incarnation, other.publication);
+  }
 };
 
 enum class TransportEventKind {
@@ -69,7 +81,7 @@ struct ParticipantUpdateRequest {
   Epoch epoch = 0;
   ParticipantUpdate update;
   SteadyClock::time_point deadline;
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 
 struct MuteRequest {
@@ -77,7 +89,7 @@ struct MuteRequest {
   BindingToken binding;
   bool muted = false;
   SteadyClock::time_point deadline;
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 
 struct ReceiveDemandRequest {
@@ -85,7 +97,7 @@ struct ReceiveDemandRequest {
   BindingToken binding;
   ReceiveDemand demand;
   SteadyClock::time_point deadline;
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 
 struct SubscriptionPermissionsRequest {
@@ -93,7 +105,7 @@ struct SubscriptionPermissionsRequest {
   Epoch epoch = 0;
   SubscriptionPermissions permissions;
   SteadyClock::time_point deadline;
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 enum class SendResult { sent, would_block, dropped };
 

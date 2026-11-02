@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "internal.hpp"
 #include <algorithm>
 #include <chrono>
@@ -239,7 +241,7 @@ struct Encoder {
     return encode(video, vs, vf);
   }
 
-  Result<void> writeAudio(std::span<const float> samples,
+  Result<void> writeAudio(livekit::compat::span<const float> samples,
                           std::chrono::steady_clock::time_point captured) {
     if (samples.size() % 2 || samples.size() > 96000)
       return failed("Invalid recorder audio frame", ErrorCode::invalid_argument);
@@ -383,7 +385,7 @@ struct Recorder::Impl {
   mutable std::mutex mutex;
   std::condition_variable wake;
   std::deque<Packet> queue;
-  std::jthread worker;
+  livekit::compat::jthread worker;
   bool closing = false;
   size_t videos = 0;
   Failure error;
@@ -394,7 +396,7 @@ struct Recorder::Impl {
       closing = true;
       return;
     }
-    worker = std::jthread([this] {
+    worker = livekit::compat::jthread([this] {
       auto run = [&]() -> Result<void> {
         for (;;) {
           Packet packet;
@@ -479,7 +481,7 @@ Result<void> Recorder::video(const StudioImage& i, std::chrono::steady_clock::ti
   return impl_->push({std::make_shared<StudioImage>(i), {}, captured});
 }
 
-Result<void> Recorder::audio(std::span<const float> s,
+Result<void> Recorder::audio(livekit::compat::span<const float> s,
                              std::chrono::steady_clock::time_point captured) {
   return impl_->push({{}, std::vector<float>(s.begin(), s.end()), captured});
 }

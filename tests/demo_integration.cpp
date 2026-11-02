@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "server_result.hpp"
 #include "session.hpp"
 #include <livekit/api.hpp>
@@ -46,7 +47,7 @@ static std::vector<demo::rtc::PublicationInfo> tracks(const demo::Session& sessi
     if (identity.empty() ? sid == s.local_sid : participant.identity == identity) {
       auto result = participant.tracks;
       if (video_only)
-        std::erase_if(result, [](const auto& track) {
+        livekit::compat::erase_if(result, [](const auto& track) {
           return track.kind != demo::rtc::PublicationKind::video;
         });
       return result;
@@ -127,7 +128,7 @@ int main(int argc, char** argv) {
     until(
         [&] {
           const auto s = viewer.snapshot();
-          return s.state == demo::State::Connected && s.frames.contains(first_video);
+          return s.state == demo::State::Connected && s.frames.count(first_video);
         },
         "Initial participant/frame absent");
     check(demo::tiles(viewer.snapshot()).front().label == "Alice / Test video 1",
@@ -140,8 +141,8 @@ int main(int argc, char** argv) {
     until(
         [&] {
           const auto s = viewer.snapshot();
-          return s.participants.size() == 3 && s.frames.contains(first_video) &&
-                 s.frames.contains(second_video) && s.received_frames > 120;
+          return s.participants.size() == 3 && s.frames.count(first_video) &&
+                 s.frames.count(second_video) && s.received_frames > 120;
         },
         "Two simultaneous video tracks missing");
     using Stage = demo::QualitySnapshot::Stage;
@@ -176,7 +177,7 @@ int main(int argc, char** argv) {
         },
         "Remote unmute missing");
     check(second.remove_video(second_video), "Remove second video rejected");
-    until([&] { return !viewer.snapshot().frames.contains(second_video); },
+    until([&] { return !viewer.snapshot().frames.count(second_video); },
           "Unpublished frame retained");
     stopped(second);
     until([&] { return viewer.snapshot().participants.size() == 2; },
@@ -230,7 +231,7 @@ int main(int argc, char** argv) {
         [&] {
           const auto s = first.snapshot();
           for (const auto& track : three)
-            if (!s.frames.contains(track.sid))
+            if (!s.frames.count(track.sid))
               return false;
           return true;
         },
@@ -240,7 +241,7 @@ int main(int argc, char** argv) {
         [&] {
           return !viewer.snapshot().changing_video && tracks(viewer, {}, true).size() == 2 &&
                  tracks(first, "Viewer").size() == 3 &&
-                 !first.snapshot().frames.contains(initial[0].sid);
+                 !first.snapshot().frames.count(initial[0].sid);
         },
         "Removed stream retained");
     const auto remaining = tracks(viewer, {}, true);
@@ -249,7 +250,7 @@ int main(int argc, char** argv) {
         [&] {
           const auto after = first.snapshot();
           for (const auto& track : remaining)
-            if (!after.frames.contains(track.sid) ||
+            if (!after.frames.count(track.sid) ||
                 after.frames.at(track.sid) == before.frames.at(track.sid))
               return false;
           return true;
@@ -271,8 +272,7 @@ int main(int argc, char** argv) {
           "Restart video timeout");
     const auto restarted = tracks(viewer, {}, true).front();
     check(restarted.name == "Test video 4", "Reused video name");
-    until([&] { return first.snapshot().frames.contains(restarted.sid); },
-          "Restarted video missing");
+    until([&] { return first.snapshot().frames.count(restarted.sid); }, "Restarted video missing");
     check(viewer.add_video(), "Add before stop rejected");
     stopped(viewer);
     check(!viewer.snapshot().changing_video && !viewer.add_video() &&

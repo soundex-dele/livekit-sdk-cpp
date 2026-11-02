@@ -1,3 +1,4 @@
+#include "livekit/compat/span.hpp"
 #include "livekit/result.hpp"
 #include "media_graph/failure.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
@@ -89,7 +90,7 @@ struct AudioOutputSession::Impl {
     }
   }
 
-  void render(std::span<int16_t> output) noexcept {
+  void render(livekit::compat::span<int16_t> output) noexcept {
     std::fill(output.begin(), output.end(), 0);
     if (output.size() != 960) {
       return;
@@ -97,7 +98,7 @@ struct AudioOutputSession::Impl {
 
     struct ReferenceWrite {
       AudioRenderReference* reference;
-      std::span<int16_t> output;
+      livekit::compat::span<int16_t> output;
 
       ~ReferenceWrite() {
         if (reference) {
@@ -185,8 +186,7 @@ Result<std::shared_ptr<AudioOutputTrack>> AudioOutputSession::open_track(
     if (s.stats.failure) {
       return Result<std::shared_ptr<AudioOutputTrack>>::failure(s.stats.failure);
     }
-    if (state->id.empty() || s.tracks.contains(state->id) ||
-        s.tracks.size() >= s.options.max_tracks) {
+    if (state->id.empty() || s.tracks.count(state->id) || s.tracks.size() >= s.options.max_tracks) {
       return livekit::sdk::Result<std::shared_ptr<AudioOutputTrack>>::failure(
           make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
                        "Duplicate, empty or excess audio output track"));

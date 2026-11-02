@@ -1,10 +1,10 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/result.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -66,7 +66,8 @@ class EncodedMediaStream {
   explicit EncodedMediaStream(size_t max_frames = 64, size_t max_bytes = 16 * 1024 * 1024);
   ~EncodedMediaStream();
   Result<std::shared_ptr<const EncodedMediaFrame>> read(
-      std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
+      std::chrono::milliseconds timeout = std::chrono::seconds(30),
+      livekit::compat::stop_token stop = {});
   void close();
   EncodedMediaStats stats() const;
   Result<void> status() const;

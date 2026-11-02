@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "backends/rtc/livekit/signal_session.hpp"
 #include "backends/rtc/livekit/reconnect_policy.hpp"
 #include "backends/rtc/livekit/token_request.hpp"
@@ -8,7 +9,7 @@ namespace lk {
 using namespace livekit::sdk;
 using Clock = std::chrono::steady_clock;
 
-SignalSession::SignalSession(const SignalingOptions& options, std::stop_token stop,
+SignalSession::SignalSession(const SignalingOptions& options, livekit::compat::stop_token stop,
                              EventEmitter events, detail::SignalRecoveryState* recovery,
                              std::shared_ptr<detail::WakeEvent> wakeup)
     : options_(options),
@@ -93,10 +94,9 @@ Result<void> SignalSession::open_initial_socket() {
   for (;;) {
     const bool has_alternative =
         initial_failover_ &&
-        std::any_of(recovery_.regions.candidates.begin(), recovery_.regions.candidates.end(),
-                    [&](const auto& candidate) {
-                      return !recovery_.regions.attempted.contains(candidate);
-                    });
+        std::any_of(
+            recovery_.regions.candidates.begin(), recovery_.regions.candidates.end(),
+            [&](const auto& candidate) { return !recovery_.regions.attempted.count(candidate); });
     attempt_deadline_ = has_alternative ? std::min(connect_deadline_,
                                                    Clock::now() + options_.regions.endpoint_timeout)
                                         : connect_deadline_;

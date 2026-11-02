@@ -1,8 +1,8 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "livekit/rtc/audio_output.hpp"
 #include <functional>
 #include <memory>
-#include <span>
 #include <string>
 #include <utility>
 
@@ -10,7 +10,7 @@ namespace livekit::sdk::rtc::detail {
 class AudioOutputDriver {
  public:
   // Serialized 10 ms pulls, 48 kHz stereo. No callbacks may survive stop().
-  using Render = std::function<void(std::span<int16_t>)>;
+  using Render = std::function<void(livekit::compat::span<int16_t>)>;
   using Failure = std::function<void(std::string)>;
   virtual ~AudioOutputDriver() = default;
   virtual Result<void> start(const AudioOutputOptions&, Render, Failure) = 0;

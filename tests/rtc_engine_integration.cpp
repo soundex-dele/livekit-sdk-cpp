@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "test_failure.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "rtc_result.hpp"
@@ -36,7 +37,7 @@ class Consumer : public graphflow::core::GraphNode {
   bool doInit() override {
     subscribe<nodes::EncodedFrameEvent>([this](const auto& event) {
       const auto bytes = event.frame.buffer.bytes();
-      if (!std::ranges::equal(bytes, expected_)) {
+      if (!livekit::compat::equal(bytes, expected_)) {
         // LiveKit downtrack shutdown sends these exact Opus/VP8 flush frames.
         // Permit them only after teardown starts; never count them as delivery.
         static const std::vector<uint8_t> blank = {0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x08, 0x00,
@@ -47,7 +48,8 @@ class Consumer : public graphflow::core::GraphNode {
             expected_.size() == 3 && bytes.size() == 80 && bytes[0] == 0xf8 && bytes[1] == 0xff &&
             bytes[2] == 0xfe &&
             std::all_of(bytes.begin() + 3, bytes.end(), [](auto byte) { return byte == 0; });
-        if (closing && (silence || (expected_.size() > 3 && std::ranges::equal(bytes, blank)))) {
+        if (closing &&
+            (silence || (expected_.size() > 3 && livekit::compat::equal(bytes, blank)))) {
           return;
         }
         livekit::sdk::test::fail("Engine routed incorrect encoded payload");

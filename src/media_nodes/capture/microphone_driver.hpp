@@ -1,11 +1,11 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "livekit/microphone.hpp"
 #include <functional>
-#include <span>
 
 namespace livekit::sdk::detail {
 struct MicrophoneBlock {
-  std::span<const int16_t> samples;
+  livekit::compat::span<const int16_t> samples;
   int sample_rate = 48000;
   size_t channels = 1;
   std::chrono::steady_clock::time_point captured;

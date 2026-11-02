@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include <livekit/remote_control.hpp>
 #include "scenarios/remote_control/text.hpp"
 #include <algorithm>
@@ -131,7 +132,7 @@ struct RemoteControlSession::Impl {
   std::string stopped = "idle";
   std::set<std::string> keys;
   std::set<int> buttons;
-  std::jthread watchdog;
+  livekit::compat::jthread watchdog;
 
   bool release() noexcept {
     bool ok = true;
@@ -198,7 +199,7 @@ RemoteControlSession::RemoteControlSession(std::shared_ptr<ControlInputSink> sin
   }
   impl_->sink = std::move(sink);
   if (watchdog)
-    impl_->watchdog = std::jthread([this](std::stop_token stop) {
+    impl_->watchdog = livekit::compat::jthread([this](livekit::compat::stop_token stop) {
       while (!stop.stop_requested()) {
         tick();
         std::this_thread::sleep_for(std::chrono::milliseconds(20));

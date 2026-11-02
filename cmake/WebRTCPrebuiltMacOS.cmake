@@ -43,7 +43,7 @@ foreach(_framework Foundation AVFoundation AudioToolbox CoreAudio CoreFoundation
 endforeach()
 add_library(livekit_webrtc_prebuilt INTERFACE)
 add_library(WebRTC::webrtc ALIAS livekit_webrtc_prebuilt)
-target_compile_features(livekit_webrtc_prebuilt INTERFACE cxx_std_20)
+target_compile_features(livekit_webrtc_prebuilt INTERFACE cxx_std_17)
 target_include_directories(livekit_webrtc_prebuilt INTERFACE
   "${WEBRTC_SOURCE_DIR}" "${WEBRTC_SOURCE_DIR}/third_party/abseil-cpp"
   "${WEBRTC_SOURCE_DIR}/third_party/libyuv/include" "${_webrtc_vpx_include}")

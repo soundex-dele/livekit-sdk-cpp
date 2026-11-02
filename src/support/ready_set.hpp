@@ -30,7 +30,7 @@ class ReadySet : public std::enable_shared_from_this<ReadySet<Key>> {
       }
     });
     std::lock_guard lock(mutex_);
-    if (registered_.contains(key)) {
+    if (registered_.count(key)) {
       return Watch::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_state,
                                          "Duplicate ready-set registration"));
     }
@@ -46,7 +46,7 @@ class ReadySet : public std::enable_shared_from_this<ReadySet<Key>> {
     bool changed = false;
     {
       std::lock_guard lock(mutex_);
-      if (registered_.contains(key)) {
+      if (registered_.count(key)) {
         changed = ready_.insert(key).second;
       }
     }

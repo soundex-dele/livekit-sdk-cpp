@@ -1,3 +1,5 @@
+#include "livekit/compat/algorithm.hpp"
+#include "livekit/compat/span.hpp"
 #include "test_failure.hpp"
 #include "native_completion_wait.hpp"
 #include "backends/webrtc/encoded_audio_sender.hpp"
@@ -361,7 +363,7 @@ void audio_loopback() {
         inputs[i]->configure(*parameters.encodings[0].ssrc, uint8_t(codec->payload_type)));
   }
   auto outputs = subscriber.outputs();
-  check(outputs.size() == 2 && outputs.contains("microphone") && outputs.contains("music"),
+  check(outputs.size() == 2 && outputs.count("microphone") && outputs.count("music"),
         "Audio tracks not independently routed");
   std::map<std::string, std::vector<native::ReceivedAccessUnit>> received;
   for (size_t i = 0; i < inputs.size(); ++i) {
@@ -414,7 +416,7 @@ void audio_loopback() {
   });
   publisher.remote(webrtc::SdpType::kAnswer, subscriber.local(false));
   auto remapped_outputs = subscriber.outputs();
-  check(remapped_outputs.size() == 1 && remapped_outputs.contains("TR_music"),
+  check(remapped_outputs.size() == 1 && remapped_outputs.count("TR_music"),
         "Receiver rebind retained an old SID or resurrected a removed track");
   const auto changes = subscriber.take_track_events();
   check(std::any_of(changes.begin(), changes.end(),
@@ -446,7 +448,8 @@ void pending_native_close() {
   require_native(peer.status());
   const auto report =
       complete_native<TransportStatistics>([&](auto done) { peer.statistics(std::move(done)); });
-  check(report.timestamp_us > 0 && report.json.starts_with('[') && report.json.ends_with(']') &&
+  check(report.timestamp_us > 0 && livekit::compat::starts_with(report.json, '[') &&
+            livekit::compat::ends_with(report.json, ']') &&
             report.json.find("local-candidate") == std::string::npos &&
             report.json.find("remote-candidate") == std::string::npos &&
             report.json.find("certificate") == std::string::npos,
@@ -486,7 +489,7 @@ void pending_native_close() {
         "Closed native peer accepted remote description");
 }
 
-std::vector<uint8_t> canonical_annex_b(std::span<const uint8_t> input) {
+std::vector<uint8_t> canonical_annex_b(livekit::compat::span<const uint8_t> input) {
   std::vector<uint8_t> result;
   for (size_t i = 0; i < input.size();) {
     if (i + 4 <= input.size() && input[i] == 0 && input[i + 1] == 0 && input[i + 2] == 0 &&
@@ -541,13 +544,12 @@ void video_loopback(Codec codec) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   check(publisher.connected && subscriber.connected, "Video loopback ICE/DTLS failed");
   auto outputs = subscriber.outputs();
-  check(outputs.contains("camera") && outputs.contains("screen"),
-        "Missing independent video receivers");
+  check(outputs.count("camera") && outputs.count("screen"), "Missing independent video receivers");
   std::map<std::string, native::ReceivedAccessUnit> received;
   for (int attempt = 0; attempt < 40 && received.size() < 2; ++attempt) {
     for (size_t i = 0; i < inputs.size(); ++i) {
       const auto id = i == 0 ? "camera" : "screen";
-      if (received.contains(id))
+      if (received.count(id))
         continue;
       auto frame = sample(100001 + i * 90000 + attempt * 3000);
       frame.buffer = EncodedBuffer(fixture_video(codec, i == 1));

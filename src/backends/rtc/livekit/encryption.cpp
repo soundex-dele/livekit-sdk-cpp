@@ -1,3 +1,4 @@
+#include "livekit/compat/span.hpp"
 #include "backends/rtc/livekit/packet_encryption.hpp"
 #include "livekit/result.hpp"
 #include <openssl/crypto.h>
@@ -24,7 +25,7 @@ ExternalKeyProvider::ExternalKeyProvider() : impl_(std::make_unique<Impl>()) {}
 
 ExternalKeyProvider::~ExternalKeyProvider() = default;
 
-Result<void> ExternalKeyProvider::set_key(uint8_t index, std::span<const uint8_t> key) {
+Result<void> ExternalKeyProvider::set_key(uint8_t index, livekit::compat::span<const uint8_t> key) {
   using Return = Result<void>;
   if (key.size() != 16) {
     return Return::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
@@ -93,7 +94,7 @@ struct Secret {
 
 using Context = std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>;
 
-Result<size_t> header_bytes(std::span<const uint8_t> data, EncryptionCodec codec) {
+Result<size_t> header_bytes(livekit::compat::span<const uint8_t> data, EncryptionCodec codec) {
   using Return = Result<size_t>;
   if (codec == EncryptionCodec::opus) {
     if (data.empty()) {
@@ -122,7 +123,7 @@ Result<size_t> header_bytes(std::span<const uint8_t> data, EncryptionCodec codec
   return Return::success(data.size());
 }
 
-std::vector<uint8_t> rbsp(std::span<const uint8_t> data, bool escape) {
+std::vector<uint8_t> rbsp(livekit::compat::span<const uint8_t> data, bool escape) {
   std::vector<uint8_t> result;
   result.reserve(data.size() + data.size() / 32);
   if (escape) {
@@ -151,7 +152,8 @@ std::vector<uint8_t> rbsp(std::span<const uint8_t> data, bool escape) {
 }  // namespace
 
 namespace detail {
-std::vector<uint8_t> canonical_media_frame(std::span<const uint8_t> frame, EncryptionCodec codec) {
+std::vector<uint8_t> canonical_media_frame(livekit::compat::span<const uint8_t> frame,
+                                           EncryptionCodec codec) {
   if (codec == EncryptionCodec::opus) {
     return {frame.begin(), frame.end()};
   }
@@ -175,8 +177,9 @@ std::vector<uint8_t> canonical_media_frame(std::span<const uint8_t> frame, Encry
   return result;
 }
 
-Result<SealedPayload> encrypt_payload(const KeyProvider& keys, std::span<const uint8_t> plaintext,
-                                      std::span<const uint8_t> aad) {
+Result<SealedPayload> encrypt_payload(const KeyProvider& keys,
+                                      livekit::compat::span<const uint8_t> plaintext,
+                                      livekit::compat::span<const uint8_t> aad) {
   using Return = Result<SealedPayload>;
   if (plaintext.size() > 16 * 1024 * 1024 || aad.size() > 16 * 1024 * 1024) {
     return Return::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
@@ -235,9 +238,9 @@ Result<SealedPayload> encrypt_payload(const KeyProvider& keys, std::span<const u
 }
 
 Result<std::vector<uint8_t>> decrypt_payload(const KeyProvider& keys, uint8_t index,
-                                             std::span<const uint8_t> iv,
-                                             std::span<const uint8_t> ciphertext,
-                                             std::span<const uint8_t> aad) {
+                                             livekit::compat::span<const uint8_t> iv,
+                                             livekit::compat::span<const uint8_t> ciphertext,
+                                             livekit::compat::span<const uint8_t> aad) {
   using Return = Result<std::vector<uint8_t>>;
   if (iv.size() != 12 || ciphertext.size() < 16 || ciphertext.size() > 16 * 1024 * 1024 ||
       aad.size() > 16 * 1024 * 1024) {
@@ -393,7 +396,8 @@ Result<livekit::DataPacket> decrypt_packet(const livekit::DataPacket& p,
 FrameCryptor::FrameCryptor(std::shared_ptr<KeyProvider> keys, EncryptionCodec codec)
     : keys_(std::move(keys)), codec_(codec) {}
 
-Result<std::vector<uint8_t>> FrameCryptor::encrypt(std::span<const uint8_t> frame) const {
+Result<std::vector<uint8_t>> FrameCryptor::encrypt(
+    livekit::compat::span<const uint8_t> frame) const {
   using Return = Result<std::vector<uint8_t>>;
   if (frame.size() > 8 * 1024 * 1024) {
     return Return::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
@@ -429,7 +433,7 @@ Result<std::vector<uint8_t>> FrameCryptor::encrypt(std::span<const uint8_t> fram
 }
 
 Result<std::optional<std::vector<uint8_t>>> FrameCryptor::decrypt(
-    std::span<const uint8_t> frame, std::span<const uint8_t> sif) const {
+    livekit::compat::span<const uint8_t> frame, livekit::compat::span<const uint8_t> sif) const {
   using Return = Result<std::optional<std::vector<uint8_t>>>;
   if (!sif.empty() && frame.size() >= sif.size() &&
       std::equal(sif.begin(), sif.end(), frame.end() - sif.size())) {
@@ -459,9 +463,9 @@ Result<std::optional<std::vector<uint8_t>>> FrameCryptor::decrypt(
                                         "Invalid encrypted media frame"));
   }
   const auto size = body.size() - 14;
-  auto plain =
-      detail::decrypt_payload(*keys_, body.back(), std::span<const uint8_t>(body).subspan(size, 12),
-                              std::span<const uint8_t>(body).first(size), frame.first(n));
+  auto plain = detail::decrypt_payload(
+      *keys_, body.back(), livekit::compat::span<const uint8_t>(body).subspan(size, 12),
+      livekit::compat::span<const uint8_t>(body).first(size), frame.first(n));
   std::vector<uint8_t> result(frame.begin(), frame.begin() + n);
   if (!plain) {
     return Return::failure(plain.failure_record());

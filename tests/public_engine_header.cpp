@@ -15,7 +15,11 @@ static_assert(
     std::is_same_v<decltype(engine::create_livekit_engine()), std::unique_ptr<RtcEngine>>);
 
 // Results arrive through callbacks; neither facade exposes a polling API.
+template <class T, class = void>
+struct HasPoll : std::false_type {};
+
 template <class T>
-concept HasPoll = requires(T& engine) { engine.poll(); };
-static_assert(!HasPoll<RtcEngine>);
-static_assert(!HasPoll<RoomEngine>);
+struct HasPoll<T, std::void_t<decltype(std::declval<T&>().poll())>> : std::true_type {};
+
+static_assert(!HasPoll<RtcEngine>::value);
+static_assert(!HasPoll<RoomEngine>::value);

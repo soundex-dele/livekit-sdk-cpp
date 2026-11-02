@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "internal.hpp"
 #include "media_nodes/capture/capture.hpp"
 #include <windows.h>
@@ -66,10 +67,10 @@ struct Capture::Impl {
 
   std::shared_ptr<State> state = std::make_shared<State>();
   std::atomic<bool> stop{false};
-  std::jthread worker;
+  livekit::compat::jthread worker;
 
   explicit Impl(StudioSource s) {
-    worker = std::jthread([this, s] {
+    worker = livekit::compat::jthread([this, s] {
       bool apartment = false;
       auto run = [&]() -> Result<void> {
         init_apartment(apartment_type::multi_threaded);

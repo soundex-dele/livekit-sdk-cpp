@@ -1,3 +1,5 @@
+#include "livekit/compat/span.hpp"
+#include "livekit/compat/algorithm.hpp"
 #include "test_failure.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
@@ -11,7 +13,7 @@ using livekit::sdk::app_support::require_result;
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
-#include <source_location>
+#include "test_source_location.hpp"
 #include <thread>
 
 using namespace livekit::sdk::rtc;
@@ -75,7 +77,7 @@ Codec video_codec() {
   return media_encrypted() ? Codec::h264 : Codec::vp8;
 }
 
-std::vector<uint8_t> normalized(std::span<const uint8_t> bytes) {
+std::vector<uint8_t> normalized(livekit::compat::span<const uint8_t> bytes) {
   std::vector<uint8_t> result;
   for (size_t i = 0; i < bytes.size();) {
     if (i + 4 <= bytes.size() && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 0 &&
@@ -113,10 +115,11 @@ std::vector<uint8_t> payload(int index) {
                    : fixture_video(video_codec(), index == 3);
 }
 
-void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
-              const std::vector<std::shared_ptr<SubscribedTrack>>& rx,
-              const std::vector<int>& indices, uint64_t& sequence, bool resubscribed = false,
-              std::source_location caller = std::source_location::current()) {
+void transmit(
+    const std::vector<std::shared_ptr<PublishedTrack>>& tx,
+    const std::vector<std::shared_ptr<SubscribedTrack>>& rx, const std::vector<int>& indices,
+    uint64_t& sequence, bool resubscribed = false,
+    livekit::sdk::test::SourceLocation caller = livekit::sdk::test::SourceLocation::current()) {
   std::vector<int> received(indices.size());
   const auto deadline = SteadyClock::now() + 10s;
   while (SteadyClock::now() < deadline) {
@@ -143,7 +146,7 @@ void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
                                                    0x08, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
                                                    0x85, 0x84, 0x88, 0x02, 0x02, 0x00, 0x0c, 0x0d,
                                                    0x60, 0x00, 0xfe, 0xff, 0xab, 0x50, 0x80};
-        if (resubscribed && i == 2 && std::ranges::equal(read.frame->buffer.bytes(), blank))
+        if (resubscribed && i == 2 && livekit::compat::equal(read.frame->buffer.bytes(), blank))
           continue;
         // Go downtrack.go injects this exact H264KeyFrame2x2 on publisher mute.
         // Accept only this known filler after the transition, never arbitrary
@@ -172,7 +175,7 @@ void transmit(const std::vector<std::shared_ptr<PublishedTrack>>& tx,
         }
         if (!(i >= 2 && video_codec() != Codec::vp8
                   ? normalized(read.frame->buffer.bytes()) == normalized(expected)
-                  : std::ranges::equal(read.frame->buffer.bytes(), expected))) {
+                  : livekit::compat::equal(read.frame->buffer.bytes(), expected))) {
           std::cerr << "payload mismatch track=" << i << " size=" << read.frame->buffer.size()
                     << " expected=" << expected.size() << " bytes=";
           for (auto byte : read.frame->buffer.bytes())
@@ -269,7 +272,7 @@ int main() {
     eventually(
         [&] {
           const auto state = subscriber->snapshot().session;
-          return state && state->remote.contains(publisher_sid) &&
+          return state && state->remote.count(publisher_sid) &&
                  state->remote.at(publisher_sid).identity == "publisher";
         },
         "Subscriber roster missed publisher");
@@ -281,9 +284,8 @@ int main() {
           const auto self = publisher->snapshot().session;
           const auto& remote = state->remote.at(publisher_sid);
           return remote.name == "renamed publisher" && remote.metadata == "updated metadata" &&
-                 remote.attributes.contains("role") &&
-                 remote.attributes.at("role") == "presenter" && self->local.name == remote.name &&
-                 self->local.metadata == remote.metadata;
+                 remote.attributes.count("role") && remote.attributes.at("role") == "presenter" &&
+                 self->local.name == remote.name && self->local.metadata == remote.metadata;
         },
         "Acknowledged participant update did not reach local/remote state");
     await(publisher->update_local_participant({{}, {}, {{"role", ""}}}));
@@ -291,7 +293,7 @@ int main() {
         [&] {
           const auto state = subscriber->snapshot().session;
           const auto& remote = state->remote.at(publisher_sid);
-          return !remote.attributes.contains("role") && remote.name == "renamed publisher" &&
+          return !remote.attributes.count("role") && remote.name == "renamed publisher" &&
                  remote.metadata == "updated metadata";
         },
         "Attribute deletion or unchanged scalar semantics failed");
@@ -482,7 +484,7 @@ int main() {
     eventually(
         [&] {
           const auto state = subscriber->snapshot().session;
-          return state && !state->remote.contains(publisher_sid);
+          return state && !state->remote.count(publisher_sid);
         },
         "Departed participant remained in roster");
     await(subscriber->leave());

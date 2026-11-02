@@ -1,6 +1,6 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/audio_source.hpp"
-#include <stop_token>
 
 namespace livekit::sdk::detail {
 class PcmSourceWriter {
@@ -30,7 +30,7 @@ class PcmSourceReader {
   void stop();
   // Waits only for the very first input. Thereafter produces one 10ms slot,
   // including explicit silence for gaps/underflow. Native caller paces reads.
-  std::optional<PcmSourceBlock> read(std::stop_token stop = {});
+  std::optional<PcmSourceBlock> read(livekit::compat::stop_token stop = {});
   void skip(size_t blocks);  // scheduler stall: advance instead of bursting
  private:
   std::shared_ptr<PcmAudioSource> source_;

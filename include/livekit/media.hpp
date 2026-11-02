@@ -1,4 +1,5 @@
 #pragma once
+#include <tuple>
 #include "livekit/result.hpp"
 #include <string>
 #include <vector>
@@ -53,7 +54,16 @@ struct ScreenCaptureDevice {
   int x = 0, y = 0, width = 0, height = 0;
   bool primary = false;
   int rotation = 0, refresh_rate = 0;
-  bool operator==(const ScreenCaptureDevice&) const = default;
+
+  bool operator==(const ScreenCaptureDevice& other) const {
+    return std::tie(id, name, x, y, width, height, primary, rotation, refresh_rate) ==
+           std::tie(other.id, other.name, other.x, other.y, other.width, other.height,
+                    other.primary, other.rotation, other.refresh_rate);
+  }
+
+  bool operator!=(const ScreenCaptureDevice& other) const {
+    return !(*this == other);
+  }
 };
 
 struct CaptureSize {

@@ -1,3 +1,4 @@
+#include "livekit/compat/span.hpp"
 #include <livekit/remote_control.hpp>
 #include "backends/platform/windows/control_input_win.hpp"
 #include "scenarios/remote_control/text.hpp"
@@ -45,7 +46,7 @@ class SystemInputApi final : public detail::WindowsInputApi {
     return result;
   }
 
-  unsigned send(std::span<const INPUT> inputs) noexcept override {
+  unsigned send(livekit::compat::span<const INPUT> inputs) noexcept override {
     return SendInput(static_cast<UINT>(inputs.size()), const_cast<INPUT*>(inputs.data()),
                      sizeof(INPUT));
   }
@@ -75,7 +76,7 @@ class WindowsInput final : public ControlInputSink {
       up.type = INPUT_KEYBOARD;
       up.ki.wScan = *pending_unicode_up_;
       up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-      if (api_->send(std::span<const INPUT>(&up, 1)) != 1)
+      if (api_->send(livekit::compat::span<const INPUT>(&up, 1)) != 1)
         return false;
       pending_unicode_up_.reset();
       return true;
@@ -105,7 +106,7 @@ class WindowsInput final : public ControlInputSink {
           up = down;
           up.ki.dwFlags |= KEYEVENTF_KEYUP;
         }
-        const auto sent = api_->send(std::span<const INPUT>(text_inputs.data(), used));
+        const auto sent = api_->send(livekit::compat::span<const INPUT>(text_inputs.data(), used));
         if (sent < used && (sent % 2))
           pending_unicode_up_ = text_inputs[sent - 1].ki.wScan;
         return sent == used;
@@ -150,7 +151,7 @@ class WindowsInput final : public ControlInputSink {
       } else if (event.type != "move")
         return false;
     }
-    return api_->send(std::span<const INPUT>(inputs, count)) == count;
+    return api_->send(livekit::compat::span<const INPUT>(inputs, count)) == count;
   }
 };
 }  // namespace

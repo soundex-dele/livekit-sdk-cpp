@@ -1,7 +1,7 @@
 #pragma once
+#include "livekit/compat/algorithm.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
 #include <cmath>
-#include <numbers>
 
 namespace rtc_audio_test {
 using namespace livekit::sdk::rtc;
@@ -26,7 +26,7 @@ inline nodes::AudioFrameEvent tone(Epoch epoch, uint64_t timestamp, uint32_t rat
   pcm->format = floating ? PcmFormat::f32 : PcmFormat::s16;
   for (size_t i = 0; i < rate / 100; ++i)
     for (size_t ch = 0; ch < channels; ++ch) {
-      const double value = .3 * std::sin(2 * std::numbers::pi * frequency * (1 + .5 * ch) *
+      const double value = .3 * std::sin(2 * livekit::compat::pi * frequency * (1 + .5 * ch) *
                                          (double(timestamp) / 48000 + double(i) / rate));
       if (floating)
         pcm->float_samples.push_back(float(value));
@@ -44,7 +44,7 @@ inline double tone_power(const PcmAudioFrame& pcm, size_t channel, double freque
   double real = 0, imaginary = 0;
   const auto count = pcm.samples_per_channel();
   for (size_t i = 0; i < count; ++i) {
-    const double angle = 2 * std::numbers::pi * frequency * i / pcm.sample_rate;
+    const double angle = 2 * livekit::compat::pi * frequency * i / pcm.sample_rate;
     const double sample = pcm.samples[i * pcm.channels + channel];
     real += sample * std::cos(angle);
     imaginary += sample * std::sin(angle);

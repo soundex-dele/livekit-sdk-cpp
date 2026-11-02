@@ -1,9 +1,9 @@
+#include "livekit/compat/algorithm.hpp"
 #include "test_failure.hpp"
 #pragma once
 #include "backends/webrtc/pcm_resampler.hpp"
 #include <algorithm>
 #include <cmath>
-#include <numbers>
 
 inline void pcm_resampler_contract() {
   auto require = [](bool ok) {
@@ -17,7 +17,7 @@ inline void pcm_resampler_contract() {
     for (int block = 0; block < 102; ++block) {
       for (int i = 0; i < rate / 100; ++i) {
         input[i * 2] = static_cast<int16_t>(
-            6000 * std::sin(2 * std::numbers::pi * 1000 * (block * (rate / 100) + i) / rate));
+            6000 * std::sin(2 * livekit::compat::pi * 1000 * (block * (rate / 100) + i) / rate));
         input[i * 2 + 1] = 0;
       }
       auto out = resampler.process(input);

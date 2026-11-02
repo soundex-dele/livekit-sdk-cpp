@@ -1,4 +1,5 @@
 #pragma once
+#include <tuple>
 #include <livekit/data_messages.hpp>
 #include <livekit/json.hpp>
 #include <livekit/result.hpp>
@@ -13,7 +14,15 @@ using ControlClock = std::chrono::steady_clock;
 struct ControlLayout {
   uint64_t version = 1;
   int x = 0, y = 0, width = 0, height = 0;
-  bool operator==(const ControlLayout&) const = default;
+
+  bool operator==(const ControlLayout& other) const {
+    return std::tie(version, x, y, width, height) ==
+           std::tie(other.version, other.x, other.y, other.width, other.height);
+  }
+
+  bool operator!=(const ControlLayout& other) const {
+    return !(*this == other);
+  }
 };
 
 struct ControlGrant {

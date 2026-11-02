@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "internal.hpp"
 #include "studio_graph.hpp"
 #include "support/utf8.hpp"
@@ -116,7 +117,7 @@ void append(std::deque<float>& q, const std::vector<float>& p) {
 
 struct Studio::Impl : StudioGraphState {
   std::atomic<bool> stop{false};
-  std::jthread worker;
+  livekit::compat::jthread worker;
 
   explicit Impl(StudioOptions options) : StudioGraphState(options), worker([this] { run(); }) {}
 
@@ -206,7 +207,7 @@ Result<void> Studio::submit_remote_video(std::string id, const VideoFrame& f) {
     return failed("无效远端视频", ErrorCode::invalid_argument);
   LK_STUDIO_ASSIGN(image, from_i420(f));
   std::lock_guard lock(impl_->mutex);
-  if (impl_->remoteVideo.size() < 4 || impl_->remoteVideo.contains(id)) {
+  if (impl_->remoteVideo.size() < 4 || impl_->remoteVideo.count(id)) {
     impl_->remoteVideo[id] = std::move(image);
     impl_->remoteSeen[id] = std::chrono::steady_clock::now();
   }
@@ -234,7 +235,7 @@ Result<void> Studio::submit_remote_audio(std::string id, const AudioFrame& f) {
           f.format == AudioSampleFormat::pcm16 ? f.samples[p] / 32768.f : f.float_samples[p];
     }
   std::lock_guard lock(impl_->mutex);
-  if (impl_->remoteAudio.size() < 4 || impl_->remoteAudio.contains(id)) {
+  if (impl_->remoteAudio.size() < 4 || impl_->remoteAudio.count(id)) {
     append(impl_->remoteAudio[id], samples);
     impl_->remoteSeen[id] = std::chrono::steady_clock::now();
   }

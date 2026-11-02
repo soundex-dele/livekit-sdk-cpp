@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "backends/webrtc/encoded_receiver.hpp"
 #include "backends/webrtc/transport_runtime.hpp"
 #include "api/rtp_transceiver_interface.h"
@@ -72,7 +73,7 @@ class NativePeer : public webrtc::PeerConnectionObserver {
   void set_receiver_transform(ReceiverTransformFactory);
   Result<void> create_data_channel(const std::string& label, bool reliable);
   bool data_ready(const std::string& label, size_t bytes = 16384);
-  bool send_data(const std::string& label, std::span<const uint8_t> bytes);
+  bool send_data(const std::string& label, livekit::compat::span<const uint8_t> bytes);
   std::vector<NativeDataMessage> take_data(size_t max_messages = 64);
   void close();
 

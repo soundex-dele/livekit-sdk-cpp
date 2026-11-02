@@ -1,6 +1,6 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/video_source.hpp"
-#include <stop_token>
 
 namespace livekit::sdk::detail {
 struct I420SourceFrame {
@@ -19,7 +19,7 @@ class I420SourceReader {
   Result<void> status() const;
   Result<void> start();
   void stop();
-  std::shared_ptr<const I420SourceFrame> read(std::stop_token stop);
+  std::shared_ptr<const I420SourceFrame> read(livekit::compat::stop_token stop);
 
  private:
   std::shared_ptr<I420VideoSource> source_;

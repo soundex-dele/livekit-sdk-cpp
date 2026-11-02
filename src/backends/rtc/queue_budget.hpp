@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "livekit/rtc/types.hpp"
 #include <atomic>
 #include <limits>
@@ -79,7 +80,7 @@ struct QueueBudget : std::enable_shared_from_this<QueueBudget> {
     return true;
   }
 
-  std::optional<EncodedBuffer> copy(std::span<const uint8_t> bytes) {
+  std::optional<EncodedBuffer> copy(livekit::compat::span<const uint8_t> bytes) {
     auto reservation = claim(bytes.size());
     if (!reservation)
       return {};

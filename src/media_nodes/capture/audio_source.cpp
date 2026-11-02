@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "media_nodes/capture/audio_source.hpp"
 #include <algorithm>
 #include <cmath>
@@ -14,7 +15,7 @@ struct PcmAudioSource::Impl {
   const PcmSourceOptions options;
   Failure failure;
   mutable std::mutex mutex;
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   AudioSourceStats stats;
   std::list<detail::PcmSourceBlock> queue;
   std::vector<int16_t> remainder;
@@ -286,7 +287,7 @@ void PcmSourceReader::stop() {
   s.changed.notify_all();
 }
 
-std::optional<PcmSourceBlock> PcmSourceReader::read(std::stop_token stop) {
+std::optional<PcmSourceBlock> PcmSourceReader::read(livekit::compat::stop_token stop) {
   if (!attached_) {
     return {};
   }

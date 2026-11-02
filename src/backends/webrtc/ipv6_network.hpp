@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/algorithm.hpp"
 #include "rtc_base/network.h"
 #include "api/environment/environment_factory.h"
 #include <algorithm>
@@ -23,7 +24,7 @@ class IPv6NetworkManager final : public webrtc::BasicNetworkManager {
 
  private:
   static std::vector<const webrtc::Network*> filter(std::vector<const webrtc::Network*> networks) {
-    std::erase_if(networks, [](auto* n) { return n->family() != AF_INET6; });
+    livekit::compat::erase_if(networks, [](auto* n) { return n->family() != AF_INET6; });
     return networks;
   }
 };

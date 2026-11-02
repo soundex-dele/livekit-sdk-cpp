@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/algorithm.hpp"
 #include "livekit/encryption.hpp"
 #include "backends/rtc/livekit/packet_encryption.hpp"
 #include "livekit.pb.h"
@@ -44,7 +45,8 @@ struct MediaCryptorContext {
 
   void participant(const livekit::ParticipantInfo& p) {
     std::lock_guard lock(mutex);
-    std::erase_if(tracks, [&](const auto& t) { return t.second.owner == p.identity(); });
+    livekit::compat::erase_if(tracks,
+                              [&](const auto& t) { return t.second.owner == p.identity(); });
     if (p.state() != 3) {
       for (auto& t : p.tracks()) {
         tracks[t.sid()] = {

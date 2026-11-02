@@ -326,7 +326,7 @@ void RoomEngine::publish(TrackDescriptor descriptor,
       return;
     }
     const auto key = std::make_pair(descriptor.id, true);
-    if (tracks_.contains(key)) {
+    if (tracks_.count(key)) {
       complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
       return;
     }
@@ -365,7 +365,7 @@ void RoomEngine::subscribe_on_control(TrackDescriptor descriptor,
     return;
   }
   const auto key = std::make_pair(descriptor.id, false);
-  if (tracks_.contains(key)) {
+  if (tracks_.count(key)) {
     complete(completion, detail::failure_result<Value>(ErrorCode::busy, "Track already exists"));
     return;
   }

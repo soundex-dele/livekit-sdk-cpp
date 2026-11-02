@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "server_result.hpp"
 #include "rtc_room_test_bridge.hpp"
 #include "rtc_blocking_bridge.hpp"
@@ -156,8 +157,8 @@ int main(int argc, char** argv) {
     check(!timeout_result && timeout_result.error().code == sdk::ErrorCode::timeout &&
               Clock::now() - start < 1500ms,
           "Region discovery deadline not bounded");
-    std::stop_source stop;
-    std::jthread cancel([&] {
+    livekit::compat::stop_source stop;
+    livekit::compat::jthread cancel([&] {
       std::this_thread::sleep_for(100ms);
       stop.request_stop();
     });

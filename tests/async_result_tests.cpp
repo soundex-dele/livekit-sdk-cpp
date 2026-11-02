@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "livekit/async_result.hpp"
 #include <chrono>
 #include <cstdlib>
@@ -107,7 +108,7 @@ void concurrent_completion() {
   CompletionSource<int> source;
   auto result = source.get_result();
   check(result.wait_for(0ms) == std::future_status::timeout);
-  std::jthread worker([&] { source.set_value(42); });
+  livekit::compat::jthread worker([&] { source.set_value(42); });
   check(result.wait_until(std::chrono::steady_clock::now() + 5s) == std::future_status::ready);
   auto future = std::move(result).as_future();
   auto value = future.get();

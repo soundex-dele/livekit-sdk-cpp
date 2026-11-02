@@ -1,4 +1,6 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "backends/rtc/livekit/service_result.hpp"
 #include "livekit/rtc/room_services.hpp"
 #include "backends/rtc/livekit/rpc_session.hpp"
@@ -24,8 +26,8 @@ struct RoomServiceState : std::enable_shared_from_this<RoomServiceState> {
   void close();
   void participant(const livekit::ParticipantInfo&);
   Result<void> receive_signal(const livekit::SignalResponse&);
-  Result<void> receive(const std::string& label, std::span<const uint8_t>);
-  using Send = std::function<bool(const std::string&, std::span<const uint8_t>)>;
+  Result<void> receive(const std::string& label, livekit::compat::span<const uint8_t>);
+  using Send = std::function<bool(const std::string&, livekit::compat::span<const uint8_t>)>;
   Result<void> pump(const Send&, const std::function<Result<void>(const livekit::SignalRequest&)>&,
                     const std::function<bool()>& reliable_ready = {});
   std::future<Result<void>> enqueue(livekit::DataPacket, DataSendOptions);
@@ -46,8 +48,8 @@ struct RoomServiceState : std::enable_shared_from_this<RoomServiceState> {
     size_t bytes;
     std::shared_ptr<livekit::sdk::detail::ServicePromise<void>> promise;
     std::chrono::steady_clock::time_point deadline;
-    std::stop_token stop;
-    std::shared_ptr<std::stop_callback<std::function<void()>>> cancellation;
+    livekit::compat::stop_token stop;
+    std::shared_ptr<livekit::compat::stop_callback<std::function<void()>>> cancellation;
   };
 
   struct Handler {
@@ -65,7 +67,7 @@ struct RoomServiceState : std::enable_shared_from_this<RoomServiceState> {
   std::shared_ptr<const FailureInfo> callback_failure;
   Result<void> schedule_events_locked();
   void deliver_events();
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   bool active = false, closed = false;
   EncryptionOptions encryption;
   std::chrono::milliseconds timeout{10000};

@@ -1,7 +1,7 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include <zlib.h>
 #include <array>
-#include <span>
 #include "livekit/result.hpp"
 #include <string>
 
@@ -18,7 +18,8 @@ class InflateRaw {
 
   InflateRaw(const InflateRaw&) = delete;
 
-  Result<std::string> append(std::span<const uint8_t> input, size_t limit, bool final = false) {
+  Result<std::string> append(livekit::compat::span<const uint8_t> input, size_t limit,
+                             bool final = false) {
     if (!initialized_) {
       return Result<std::string>::failure(make_failure(
           ErrorDomain::data, ErrorCode::processing_failed, "Cannot initialize DEFLATE"));

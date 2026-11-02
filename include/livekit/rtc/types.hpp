@@ -1,4 +1,6 @@
 #pragma once
+#include <tuple>
+#include "livekit/compat/span.hpp"
 #include "livekit/failure.hpp"
 #include "livekit/rtc/backend_options.hpp"
 #include "livekit/rtc/session_info.hpp"
@@ -11,7 +13,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <vector>
 
@@ -39,8 +40,9 @@ class EncodedBuffer {
   explicit EncodedBuffer(std::vector<uint8_t> bytes)
       : bytes_(std::make_shared<const std::vector<uint8_t>>(std::move(bytes))) {}
 
-  std::span<const uint8_t> bytes() const {
-    return bytes_ ? std::span<const uint8_t>(*bytes_) : std::span<const uint8_t>{};
+  livekit::compat::span<const uint8_t> bytes() const {
+    return bytes_ ? livekit::compat::span<const uint8_t>(*bytes_)
+                  : livekit::compat::span<const uint8_t>{};
   }
 
   size_t size() const {
@@ -83,7 +85,16 @@ struct ReceiveDemand {
   ReceiveQuality quality = ReceiveQuality::high;  // Used when dimensions are zero.
   uint32_t width = 0, height = 0, fps = 0;  // Dimensions are either both zero or both positive.
   uint32_t priority = 0;                    // Zero: server default; 1 is highest priority.
-  bool operator==(const ReceiveDemand&) const = default;
+
+  bool operator==(const ReceiveDemand& other) const {
+    return std::tie(disabled, quality, width, height, fps, priority) ==
+           std::tie(other.disabled, other.quality, other.width, other.height, other.fps,
+                    other.priority);
+  }
+
+  bool operator!=(const ReceiveDemand& other) const {
+    return !(*this == other);
+  }
 };
 
 struct TrackDescriptor {

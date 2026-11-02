@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "livekit/rtc/track_endpoint.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include "backends/rtc/track_control.hpp"
@@ -23,8 +24,8 @@ SenderFeedback PublishedTrack::feedback() const {
   return endpoint_->feedback();
 }
 
-std::optional<SenderFeedback> PublishedTrack::wait_feedback(Epoch epoch, uint64_t revision,
-                                                            std::stop_token stop) const {
+std::optional<SenderFeedback> PublishedTrack::wait_feedback(
+    Epoch epoch, uint64_t revision, livekit::compat::stop_token stop) const {
   return endpoint_->wait_feedback(epoch, revision, stop);
 }
 
@@ -66,11 +67,12 @@ TrackSnapshot SubscribedTrack::snapshot() const {
   return endpoint_->snapshot();
 }
 
-ReadResult SubscribedTrack::read(std::chrono::milliseconds timeout, std::stop_token stop) {
+ReadResult SubscribedTrack::read(std::chrono::milliseconds timeout,
+                                 livekit::compat::stop_token stop) {
   return endpoint_->read(timeout, stop);
 }
 
-ReadResult SubscribedTrack::wait_frame(std::stop_token stop) {
+ReadResult SubscribedTrack::wait_frame(livekit::compat::stop_token stop) {
   return endpoint_->wait_frame(stop);
 }
 

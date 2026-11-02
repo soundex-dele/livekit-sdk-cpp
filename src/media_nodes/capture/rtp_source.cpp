@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "livekit/rtp.hpp"
 #include "livekit/result.hpp"
 #include <condition_variable>
@@ -10,7 +12,7 @@ struct PacketStream::Impl {
   explicit Impl(size_t n) : capacity(n) {}
 
   mutable std::mutex mutex;
-  std::condition_variable_any ready;
+  livekit::compat::condition_variable_any ready;
   size_t capacity;
   std::deque<PacketEvent> queue;
   uint64_t dropped = 0;
@@ -60,7 +62,7 @@ uint64_t PacketStream::dropped() const {
 }
 
 Result<std::optional<PacketEvent>> PacketStream::read(std::chrono::milliseconds timeout,
-                                                      std::stop_token stop) {
+                                                      livekit::compat::stop_token stop) {
   using ReadResult = Result<std::optional<PacketEvent>>;
   if (impl_->failure) {
     return ReadResult::failure(impl_->failure);
@@ -108,11 +110,11 @@ void RtpClock::reset() {
 }
 
 namespace {
-uint16_t read16(std::span<const uint8_t> p, size_t n) {
+uint16_t read16(livekit::compat::span<const uint8_t> p, size_t n) {
   return uint16_t(p[n]) << 8 | p[n + 1];
 }
 
-uint32_t read32(std::span<const uint8_t> p, size_t n) {
+uint32_t read32(livekit::compat::span<const uint8_t> p, size_t n) {
   return uint32_t(read16(p, n)) << 16 | read16(p, n + 2);
 }
 }  // namespace
@@ -171,7 +173,7 @@ void RtpMediaSource::reset() {
   impl_->base.reset();
 }
 
-Result<EncodedWriteStatus> RtpMediaSource::write(std::span<const uint8_t> p) {
+Result<EncodedWriteStatus> RtpMediaSource::write(livekit::compat::span<const uint8_t> p) {
   auto& s = *impl_;
   if (s.failure) {
     return Result<EncodedWriteStatus>::failure(s.failure);
@@ -265,7 +267,7 @@ Result<EncodedWriteStatus> RtpMediaSource::write(std::span<const uint8_t> p) {
     if (hevc && data.size() < 2)
       return invalid();
     const int aggregation = hevc ? 48 : 24, fu = hevc ? 49 : 28;
-    auto nal = [&](std::span<const uint8_t> bytes) {
+    auto nal = [&](livekit::compat::span<const uint8_t> bytes) {
       annex();
       s.unit.insert(s.unit.end(), bytes.begin(), bytes.end());
       auto t = hevc ? (bytes[0] >> 1) & 63 : bytes[0] & 31;

@@ -1,16 +1,17 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "media_result.hpp"
 #include "media_nodes/capture/video_source.hpp"
 #include <future>
 #include <thread>
-#include <source_location>
+#include "test_source_location.hpp"
 #include <iostream>
 
 inline void video_source_contract() {
   using namespace livekit::sdk;
   using namespace std::chrono_literals;
-  auto require = [](bool ok,
-                    const std::source_location location = std::source_location::current()) {
+  auto require = [](bool ok, const livekit::sdk::test::SourceLocation location =
+                                 livekit::sdk::test::SourceLocation::current()) {
     if (!ok) {
       std::cerr << "I420 source contract failed at line " + std::to_string(location.line()) << "\n";
       std::abort();
@@ -46,7 +47,7 @@ inline void video_source_contract() {
     std::this_thread::sleep_for(30ms);
     require(media_result(source->write(padded)) == VideoWriteStatus::accepted &&
             source->stats().dropped == 2);
-    std::stop_source cancel;
+    livekit::compat::stop_source cancel;
     cancel.request_stop();
     require(!reader.read(cancel.get_token()) && source->stats().queued_frames == 1);
     reader.stop();
@@ -58,7 +59,7 @@ inline void video_source_contract() {
     require(waiting.wait_for(1s) == std::future_status::ready && !waiting.get());
     media_result(reader.start());
     auto cancelled = std::async(std::launch::async, [&] {
-      std::stop_source local;
+      livekit::compat::stop_source local;
       local.request_stop();
       return reader.read(local.get_token());
     });

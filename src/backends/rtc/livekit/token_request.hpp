@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/token_provider.hpp"
 #include "livekit/result.hpp"
 #include <condition_variable>
@@ -10,12 +11,12 @@ namespace livekit::sdk::detail {
 inline Result<std::string> request_token(const TokenProvider& provider, std::string url,
                                          TokenRequestReason reason,
                                          std::chrono::steady_clock::time_point deadline,
-                                         std::stop_token stop) {
+                                         livekit::compat::stop_token stop) {
   using Clock = std::chrono::steady_clock;
 
   struct Pending {
     std::mutex mutex;
-    std::condition_variable_any changed;
+    livekit::compat::condition_variable_any changed;
     std::optional<TokenResult> result;
     bool closed = false;
   };
@@ -32,8 +33,8 @@ inline Result<std::string> request_token(const TokenProvider& provider, std::str
     return Result<std::string>::failure(std::move(failure));
   }
   auto pending = std::make_shared<Pending>();
-  std::stop_source cancellation;
-  std::stop_callback propagate(stop, [&] { cancellation.request_stop(); });
+  livekit::compat::stop_source cancellation;
+  livekit::compat::stop_callback propagate(stop, [&] { cancellation.request_stop(); });
   TokenCompletion complete = [weak = std::weak_ptr(pending)](TokenResult result) {
     if (auto state = weak.lock()) {
       std::lock_guard lock(state->mutex);

@@ -1,3 +1,5 @@
+#include "livekit/compat/algorithm.hpp"
+#include "livekit/compat/span.hpp"
 #include "test_failure.hpp"
 #include "native_completion_wait.hpp"
 #include "backends/webrtc/encoded_video_sender.hpp"
@@ -57,14 +59,14 @@ struct LossState {
       ++fec_packets;
       return discard_fec;
     }
-    if ((pt != media_pt && !media_pts.contains(pt)) || (packet[0] & 0x20)) {
+    if ((pt != media_pt && !media_pts.count(pt)) || (packet[0] & 0x20)) {
       return false;
     }
     ++media_packets;
     const auto sequence = uint16_t((uint16_t(packet[2]) << 8) | packet[3]);
     const auto timestamp = (uint32_t(packet[4]) << 24) | (uint32_t(packet[5]) << 16) |
                            (uint32_t(packet[6]) << 8) | packet[7];
-    if (dropped.contains(sequence)) {
+    if (dropped.count(sequence)) {
       ++duplicate_drops;
       return true;  // Same-SSRC NACK retransmission must not rescue the test.
     }
@@ -77,7 +79,7 @@ struct LossState {
 
   size_t recovered() const {
     return std::count_if(dropped.begin(), dropped.end(), [&](const auto& entry) {
-      return delivered_timestamps.contains(entry.second);
+      return delivered_timestamps.count(entry.second);
     });
   }
 };
@@ -277,7 +279,7 @@ std::string local(native::NativePeer& peer, native::TransportRuntime& runtime, b
   });
 }
 
-std::vector<uint8_t> canonical(std::span<const uint8_t> input) {
+std::vector<uint8_t> canonical(livekit::compat::span<const uint8_t> input) {
   std::vector<uint8_t> output;
   for (size_t i = 0; i < input.size(); ++i) {
     if (i + 4 <= input.size() && input[i] == 0 && input[i + 1] == 0 && input[i + 2] == 0 &&
@@ -526,7 +528,7 @@ void sfu_case(Codec codec, bool discard_fec, bool downstream, bool receiver_fec)
             std::istringstream lines(answer);
             std::string codec_line;
             while (std::getline(lines, codec_line)) {
-              if (codec_line.starts_with("a=rtpmap:") &&
+              if (livekit::compat::starts_with(codec_line, "a=rtpmap:") &&
                   codec_line.find(" " + name + "/90000") != std::string::npos) {
                 state->media_pts.insert(std::stoi(codec_line.substr(9)));
               }

@@ -1,17 +1,19 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "backends/rtc/livekit/rpc_session.hpp"
 #include "service_test_result.hpp"
 #include "support/compression.hpp"
 #include "support/wake_event.hpp"
 #include <atomic>
-#include <source_location>
+#include "test_source_location.hpp"
 #include <thread>
 
 namespace rpc_contract_test {
 using namespace livekit::sdk;
 using namespace std::chrono_literals;
 
-inline void check(bool ok, const std::source_location at = std::source_location::current()) {
+inline void check(bool ok, const livekit::sdk::test::SourceLocation at =
+                               livekit::sdk::test::SourceLocation::current()) {
   if (!ok) {
     std::cerr << "RPC contract failed at line " << at.line() << '\n';
     std::abort();
@@ -81,7 +83,7 @@ inline void indexed_deadlines() {
   session.attach_wakeup(wake);
   RpcCallOptions call{"peer", "echo", "indexed"};
   call.response_timeout = 5min;
-  std::vector<std::stop_source> stops(128);
+  std::vector<livekit::compat::stop_source> stops(128);
   std::vector<std::future<Result<std::string>>> pending;
   const auto observed = wake->revision();
   for (auto& stop : stops) {
@@ -191,19 +193,19 @@ inline void run() {
         rejected.error().backend_data == "reason" &&
         rejected.error().message == reply.rpc_response().error().message());
   // Cancelled work must never be taken, and responses cannot win after stop was requested.
-  std::stop_source before;
+  livekit::compat::stop_source before;
   call.stop = before.get_token();
   before.request_stop();
   result = session.call(call);
   sdk_error(result, ErrorCode::cancelled);
   check(session.take_packets().empty());
-  std::stop_source queued;
+  livekit::compat::stop_source queued;
   call.stop = queued.get_token();
   result = session.call(call);
   queued.request_stop();
   check(session.take_packets().empty());
   sdk_error(result, ErrorCode::cancelled);
-  std::stop_source sent;
+  livekit::compat::stop_source sent;
   call.stop = sent.get_token();
   result = session.call(call);
   packets = session.take_packets();
@@ -331,7 +333,7 @@ inline void run() {
   // Full inbound cache rejects explicitly after ACK; cancellation callbacks may reenter.
   std::promise<void> cancel_observed;
   auto cancellation = cancel_observed.get_future();
-  using Callback = std::stop_callback<std::function<void()>>;
+  using Callback = livekit::compat::stop_callback<std::function<void()>>;
   std::vector<std::unique_ptr<Callback>> cancellation_callbacks;
   service_value(session.register_method("capacity", [&](RpcInvocation invocation, RpcCompletion) {
     if (cancellation_callbacks.empty()) {

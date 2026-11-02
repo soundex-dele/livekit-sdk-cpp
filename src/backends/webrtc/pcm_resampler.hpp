@@ -1,8 +1,8 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "common_audio/resampler/include/push_resampler.h"
 #include <cstdint>
 #include <memory>
-#include <span>
 #include "livekit/result.hpp"
 #include <vector>
 
@@ -32,22 +32,23 @@ class PcmResampler {
     resampler_ = std::make_unique<webrtc::PushResampler<int16_t>>(input_samples_, 480, channels_);
   }
 
-  Result<std::span<const int16_t>> process(std::span<const int16_t> input) {
+  Result<livekit::compat::span<const int16_t>> process(livekit::compat::span<const int16_t> input) {
     if (failure_) {
-      return Result<std::span<const int16_t>>::failure(failure_);
+      return Result<livekit::compat::span<const int16_t>>::failure(failure_);
     }
     if (input.size() != input_samples_ * channels_) {
-      return Result<std::span<const int16_t>>::failure(make_failure(
+      return Result<livekit::compat::span<const int16_t>>::failure(make_failure(
           ErrorDomain::media, ErrorCode::invalid_argument, "PCM resampler requires a 10ms block"));
     }
     const auto count = resampler_->Resample(
         webrtc::InterleavedView<const int16_t>(input.data(), input_samples_, channels_),
         webrtc::InterleavedView<int16_t>(output_.data(), 480, channels_));
     if (count != static_cast<int>(output_.size())) {
-      return Result<std::span<const int16_t>>::failure(make_failure(
-          ErrorDomain::media, ErrorCode::processing_failed, "PCM resampling produced an invalid block"));
+      return Result<livekit::compat::span<const int16_t>>::failure(
+          make_failure(ErrorDomain::media, ErrorCode::processing_failed,
+                       "PCM resampling produced an invalid block"));
     }
-    return Result<std::span<const int16_t>>::success(output_);
+    return Result<livekit::compat::span<const int16_t>>::success(output_);
   }
 
  private:

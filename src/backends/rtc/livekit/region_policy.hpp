@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/algorithm.hpp"
 #include "livekit/reconnect.hpp"
 #include "livekit/result.hpp"
 #include <algorithm>
@@ -76,8 +77,8 @@ inline Result<SignalEndpoint> signal_endpoint(const std::string& input) {
   }
   const auto origin = std::string(secure ? "wss://" : "ws://") + host +
                       (port == (secure ? 443 : 80) ? "" : ":" + std::to_string(port));
-  const bool cloud =
-      secure && port == 443 && path.empty() && host.size() > 14 && host.ends_with(".livekit.cloud");
+  const bool cloud = secure && port == 443 && path.empty() && host.size() > 14 &&
+                     livekit::compat::ends_with(host, ".livekit.cloud");
   return Result<SignalEndpoint>::success({origin + path, host, origin, secure, cloud});
 }
 
@@ -135,7 +136,7 @@ struct RegionState {
     const bool secure = !active || active->secure;
     for (const auto& candidate : candidates) {
       const auto parsed = signal_endpoint(candidate);
-      if (parsed && !attempted.contains(candidate) && (!secure || parsed->secure)) {
+      if (parsed && !attempted.count(candidate) && (!secure || parsed->secure)) {
         active_url = candidate;
         break;
       }

@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "service_test_result.hpp"
 #include "livekit/async_result.hpp"
 #include "support/control_executor.hpp"
@@ -99,7 +100,7 @@ void indexed_send_deadlines() {
     return false;
   };
   auto head = service->send_data({1});
-  std::stop_source stop;
+  livekit::compat::stop_source stop;
   DataSendOptions cancel_options;
   cancel_options.operation.stop = stop.get_token();
   auto cancelled = service->send_data({2}, cancel_options);

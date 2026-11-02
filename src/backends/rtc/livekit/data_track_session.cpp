@@ -1,3 +1,6 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
+#include "livekit/compat/algorithm.hpp"
 #include "backends/rtc/livekit/service_result.hpp"
 #include "backends/rtc/livekit/data_track_session.hpp"
 #include "backends/rtc/livekit/stream_session.hpp"
@@ -121,11 +124,11 @@ Result<std::chrono::steady_clock::time_point> due(const OperationOptions& o) {
                          (o.timeout.count() ? o.timeout : std::chrono::seconds(10)));
 }
 
-uint16_t u16(std::span<const uint8_t> p, size_t at) {
+uint16_t u16(livekit::compat::span<const uint8_t> p, size_t at) {
   return (uint16_t(p[at]) << 8) | p[at + 1];
 }
 
-uint32_t u32(std::span<const uint8_t> p, size_t at) {
+uint32_t u32(livekit::compat::span<const uint8_t> p, size_t at) {
   return (uint32_t(u16(p, at)) << 16) | u16(p, at + 2);
 }
 
@@ -402,7 +405,7 @@ std::future<Result<void>> DataTrackSession::unpublish(uint64_t generation, uint1
 Result<DataTrackInfo> DataTrackSession::info(uint64_t generation, uint16_t handle) {
   using Return = Result<DataTrackInfo>;
   std::lock_guard lock(mutex_);
-  if (generation != generation_ || !local_.contains(handle)) {
+  if (generation != generation_ || !local_.count(handle)) {
     return Return::failure(failure(ErrorCode::stale_handle, "DataTrack is stale"));
   }
   return Return::success(local_.find(handle)->second.info);
@@ -411,7 +414,7 @@ Result<DataTrackInfo> DataTrackSession::info(uint64_t generation, uint16_t handl
 Result<DataTrackStats> DataTrackSession::stats(uint64_t generation, uint16_t handle) {
   using Return = Result<DataTrackStats>;
   std::lock_guard lock(mutex_);
-  if (generation != generation_ || !local_.contains(handle)) {
+  if (generation != generation_ || !local_.count(handle)) {
     return Return::failure(failure(ErrorCode::stale_handle, "DataTrack is stale"));
   }
   return Return::success(local_.find(handle)->second.stats);
@@ -740,7 +743,7 @@ Result<void> DataTrackSession::tick() {
         l.unpublish->set_failure(error);
       }
       const auto handle = it->first;
-      std::erase_if(signals_, [&](const auto& r) {
+      livekit::compat::erase_if(signals_, [&](const auto& r) {
         return (r.has_publish_data_track_request() &&
                 r.publish_data_track_request().pub_handle() == handle) ||
                (r.has_unpublish_data_track_request() &&
@@ -771,7 +774,7 @@ Result<void> DataTrackSession::tick() {
     if (had_waiters && r.waiters.empty() && r.readers.empty() && !r.subscribed) {
       subscription_signal(sid, false);
     }
-    std::erase_if(r.readers, [](auto& weak) {
+    livekit::compat::erase_if(r.readers, [](auto& weak) {
       auto q = weak.lock();
       if (!q) {
         return true;
@@ -822,7 +825,7 @@ Result<std::vector<livekit::SignalRequest>> DataTrackSession::take_signals() {
                  : request.has_unpublish_data_track_request()
                      ? request.unpublish_data_track_request().pub_handle()
                      : 0;
-    if (h && h <= 65535 && local_.contains(uint16_t(h))) {
+    if (h && h <= 65535 && local_.count(uint16_t(h))) {
       local_.find(uint16_t(h))->second.pending.sent = true;
     }
     result.push_back(std::move(request));
@@ -859,7 +862,7 @@ Result<std::optional<std::vector<uint8_t>>> DataTrackSession::take_packet() {
   return Return::success({});
 }
 
-void DataTrackSession::packet_sent(std::span<const uint8_t> p, bool success) {
+void DataTrackSession::packet_sent(livekit::compat::span<const uint8_t> p, bool success) {
   if (p.size() < 12) {
     return;
   }
@@ -885,7 +888,7 @@ void DataTrackSession::sync(livekit::SyncState& state) {
   }
 }
 
-Result<void> DataTrackSession::receive_packet(std::span<const uint8_t> p) {
+Result<void> DataTrackSession::receive_packet(livekit::compat::span<const uint8_t> p) {
   using Return = Result<void>;
   if (p.size() < 12 || p.size() > 16384 || (p[0] >> 5) != 0) {
     return Return::success();
@@ -971,9 +974,8 @@ Result<void> DataTrackSession::receive_packet(std::span<const uint8_t> p) {
   auto& partial = it->second;
   if (crypt != partial.encryption || timestamp != partial.timestamp ||
       user != partial.user_timestamp ||
-      (!partial.chunks.contains(sequence) && partial.chunks.size() >= 128) ||
-      (!partial.chunks.contains(sequence) &&
-       partial.bytes + p.size() - offset > 1024 * 1024 + 16)) {
+      (!partial.chunks.count(sequence) && partial.chunks.size() >= 128) ||
+      (!partial.chunks.count(sequence) && partial.bytes + p.size() - offset > 1024 * 1024 + 16)) {
     r.partials.erase(it);
     ++r.stats.malformed;
     return Return::success();
@@ -995,7 +997,7 @@ Result<void> DataTrackSession::receive_packet(std::span<const uint8_t> p) {
     }
     partial.end = sequence;
   }
-  if (!partial.chunks.contains(sequence)) {
+  if (!partial.chunks.count(sequence)) {
     partial.bytes += p.size() - offset;
     partial.chunks.emplace(sequence, std::vector<uint8_t>(p.begin() + offset, p.end()));
   }
@@ -1030,9 +1032,9 @@ Result<void> DataTrackSession::receive_packet(std::span<const uint8_t> p) {
         return Return::failure(make_failure(ErrorDomain::data, ErrorCode::permission_denied,
                                             "No DataTrack decryptor"));
       }
-      auto decrypted =
-          decrypt_payload(*encryption_.keys, encryption.front(),
-                          std::span<const uint8_t>(encryption).subspan(1), output.payload);
+      auto decrypted = decrypt_payload(*encryption_.keys, encryption.front(),
+                                       livekit::compat::span<const uint8_t>(encryption).subspan(1),
+                                       output.payload);
       if (!decrypted) {
         ++r.stats.malformed;
         return Return::failure(decrypted.failure_record());
@@ -1088,7 +1090,7 @@ DataTrackStats DataTrackStream::stats() const {
 }
 
 Result<std::optional<DataFrame>> DataTrackStream::read(std::chrono::milliseconds timeout,
-                                                       std::stop_token stop) {
+                                                       livekit::compat::stop_token stop) {
   using Return = Result<std::optional<DataFrame>>;
   if (timeout.count() < 0) {
     return Return::failure(

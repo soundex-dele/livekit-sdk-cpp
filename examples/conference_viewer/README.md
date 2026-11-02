@@ -42,7 +42,7 @@ open "out/$preset/package/livekit_conference_demo.app"
 
 构建目录中的 `Release/livekit_conference_demo.app` 依赖本机库路径；安装步骤会把非系统动态库复制到应用中、改写加载路径并进行本地 ad-hoc 签名。`package/livekit_conference_demo.app` 是可复制的本地运行产物；公开分发仍需发行者的 Developer ID 签名及公证。预设最低系统版本为 macOS 14，但所用第三方库可能要求更高版本，应以依赖库和最终产物为准。每个构建目录只包含一种架构，不可混用 Intel 与 ARM 依赖。
 
-SDK 公共 API 使用 C++20 `std::jthread` / `std::stop_token`；Xcode 16 自带 libc++ 尚未开放这些类型。macOS 预设因此统一使用 Homebrew LLVM 的编译器与 libc++（安装打包时一并收集）。可用 `-DLIVEKIT_LLVM_ROOT=/path/to/llvm` 指定其他安装前缀；更换编译器需使用新的构建目录或清理 CMake 缓存。
+SDK 公共 API 使用 C++17 `livekit::compat::span` 和 `livekit::compat::stop_token`。macOS 预设继续使用 Homebrew LLVM 及匹配的 libc++，保持 WebRTC 和 SDK 的工具链一致；可用 `-DLIVEKIT_LLVM_ROOT=/path/to/llvm` 指定其他安装前缀。更换编译器需使用新的构建目录。
 
 如果同级 WebRTC 已有匹配源码、架构及 libc++ ABI 的 CMake Release 产物，可在配置命令中追加 `-DWEBRTC_PREBUILT_DIR="$PWD/../webrtc/out/$preset"`，复用原生库以减少重复编译。此路径还需匹配的 libjpeg（Homebrew 可用 `brew install jpeg-turbo`）；配置会检查每个静态库是否含目标架构。切回源码构建时显式传入 `-DWEBRTC_PREBUILT_DIR=`。不要混用其他 WebRTC 版本或架构的库。
 

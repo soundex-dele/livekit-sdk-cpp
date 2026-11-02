@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "backends/rtc/livekit/transport_factory.hpp"
 #include "livekit/rtc/livekit.hpp"
 #include "backends/rtc/room_transport.hpp"
@@ -85,7 +87,7 @@ Result<std::string> codec_name(Codec codec) {
       make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "Unknown encoded codec"));
 }
 
-std::chrono::microseconds opus_duration(std::span<const uint8_t> bytes) {
+std::chrono::microseconds opus_duration(livekit::compat::span<const uint8_t> bytes) {
   if (bytes.empty())
     return {};
   const uint8_t toc = bytes[0];
@@ -246,7 +248,7 @@ class LiveKitTransport final : public RoomTransport {
       }
       permissions_ = options.subscription_permissions;
       worker_done_ = false;
-      worker_ = std::jthread([this](std::stop_token stop) {
+      worker_ = livekit::compat::jthread([this](livekit::compat::stop_token stop) {
         run(stop);
         services_->close();
         std::lock_guard lock(mutex_);
@@ -519,9 +521,9 @@ class LiveKitTransport final : public RoomTransport {
   std::shared_ptr<livekit::sdk::detail::ReadySet<BindingToken>> media_ready_;
   std::shared_ptr<livekit::sdk::detail::WakeEvent> session_wakeup_ =
       std::make_shared<livekit::sdk::detail::WakeEvent>();
-  std::jthread worker_;
+  livekit::compat::jthread worker_;
   std::mutex mutex_;
-  std::condition_variable_any changed_;
+  livekit::compat::condition_variable_any changed_;
   bool worker_done_ = true;
   std::deque<Command> commands_;
   std::deque<TransportEvent> events_;
@@ -580,7 +582,7 @@ class LiveKitTransport final : public RoomTransport {
     session_wakeup_->signal();
   }
 
-  void run(std::stop_token stop) noexcept {
+  void run(livekit::compat::stop_token stop) noexcept {
     const auto terminal = [this](Failure failure) {
       auto value = event(TransportEventKind::terminal_error, {}, failure->message);
       value.failure = std::move(failure);
@@ -636,11 +638,12 @@ class LiveKitTransport final : public RoomTransport {
     }
   }
 
-  Result<void> session(std::stop_token stop, SignalRecoveryState& recovery, bool& recovering);
+  Result<void> session(livekit::compat::stop_token stop, SignalRecoveryState& recovery,
+                       bool& recovering);
 };
 
-Result<void> LiveKitTransport::session(std::stop_token stop, SignalRecoveryState& recovery,
-                                       bool& recovering) {
+Result<void> LiveKitTransport::session(livekit::compat::stop_token stop,
+                                       SignalRecoveryState& recovery, bool& recovering) {
   return [&]() -> Result<void> {
     bool connected = false;
     std::deque<TransportEvent> initial_events;
@@ -760,8 +763,8 @@ Result<void> LiveKitTransport::session(std::stop_token stop, SignalRecoveryState
       subscriber.set_receiver_transform([cryptor](const std::string& sid, MediaKind kind) {
         auto decryptor =
             webrtc::make_ref_counted<livekit::sdk::detail::NativeFrameDecryptor>(cryptor, sid);
-        return [decryptor,
-                kind](std::span<const uint8_t> bytes) -> std::optional<std::vector<uint8_t>> {
+        return [decryptor, kind](livekit::compat::span<const uint8_t> bytes)
+                   -> std::optional<std::vector<uint8_t>> {
           std::vector<uint8_t> output(bytes.size());
           auto result = decryptor->Decrypt(
               kind == MediaKind::audio ? webrtc::MediaType::AUDIO : webrtc::MediaType::VIDEO, {},
@@ -900,7 +903,7 @@ Result<void> LiveKitTransport::session(std::stop_token stop, SignalRecoveryState
       }
       const auto current_roster = session_roster.snapshot();
       for (const auto& [sid, old] : previous->remote)
-        if (!current_roster->remote.contains(sid)) {
+        if (!current_roster->remote.count(sid)) {
           if (sid != participant.sid()) {
             livekit::ParticipantInfo departed;
             departed.set_sid(sid);
@@ -928,7 +931,7 @@ Result<void> LiveKitTransport::session(std::stop_token stop, SignalRecoveryState
           if (track.type() != livekit::AUDIO && track.type() != livekit::VIDEO)
             continue;
           current.insert(track.sid());
-          if (remote_tracks.contains(track.sid()))
+          if (remote_tracks.count(track.sid()))
             continue;
           TrackDescriptor descriptor;
           descriptor.id = "remote/" + track.sid();
@@ -965,7 +968,7 @@ Result<void> LiveKitTransport::session(std::stop_token stop, SignalRecoveryState
           emit(std::move(value));
         }
       for (const auto& sid : participants[participant.sid()])
-        if (!current.contains(sid))
+        if (!current.count(sid))
           remove_remote(sid);
       if (participant.state() != 3)
         participants[participant.sid()] = std::move(current);
@@ -1272,7 +1275,7 @@ Result<void> LiveKitTransport::session(std::stop_token stop, SignalRecoveryState
                   }
                 }
               } else if (command.kind == Command::subscribe) {
-                if (!remote_tracks.contains(command.descriptor.remote_sid))
+                if (!remote_tracks.count(command.descriptor.remote_sid))
                   return Result<void>::failure(make_failure(ErrorDomain::media,
                                                             ErrorCode::invalid_argument,
                                                             "Remote publication no longer exists"));
@@ -1594,7 +1597,7 @@ Result<void> LiveKitTransport::session(std::stop_token stop, SignalRecoveryState
             }
           }
           auto pumped = services_->pump(
-              [&](const std::string& label, std::span<const uint8_t> bytes) {
+              [&](const std::string& label, livekit::compat::span<const uint8_t> bytes) {
                 return publisher.send_data(label, bytes);
               },
               [&](const livekit::SignalRequest& request) { return signal.send(request); },

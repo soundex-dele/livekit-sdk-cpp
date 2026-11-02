@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "backends/rtc/endpoint.hpp"
 #include <algorithm>
 #include <set>
@@ -165,7 +166,7 @@ SenderFeedback Endpoint::feedback() const {
 }
 
 std::optional<SenderFeedback> Endpoint::wait_feedback(Epoch epoch, uint64_t revision,
-                                                      std::stop_token stop) {
+                                                      livekit::compat::stop_token stop) {
   std::unique_lock lock(mutex_);
   changed_.wait(lock, stop, [&] {
     return stats_.state == TrackState::closed || stats_.state == TrackState::failed ||
@@ -318,7 +319,7 @@ WriteStatus Endpoint::write(EncodedFrame frame) {
   return WriteStatus::accepted;
 }
 
-ReadResult Endpoint::read(std::chrono::milliseconds timeout, std::stop_token stop) {
+ReadResult Endpoint::read(std::chrono::milliseconds timeout, livekit::compat::stop_token stop) {
   if (timeout < std::chrono::milliseconds::zero()) {
     return {ReadStatus::failed,
             {},
@@ -331,7 +332,7 @@ ReadResult Endpoint::read(std::chrono::milliseconds timeout, std::stop_token sto
   return read_locked(stop);
 }
 
-ReadResult Endpoint::wait_frame(std::stop_token stop) {
+ReadResult Endpoint::wait_frame(livekit::compat::stop_token stop) {
   std::unique_lock lock(mutex_);
   for (;;) {
     changed_.wait(lock, stop, [&] {
@@ -347,7 +348,7 @@ ReadResult Endpoint::wait_frame(std::stop_token stop) {
   }
 }
 
-ReadResult Endpoint::read_locked(std::stop_token stop) {
+ReadResult Endpoint::read_locked(livekit::compat::stop_token stop) {
   if (stop.stop_requested())
     return {ReadStatus::cancelled, {}};
   if (stats_.state == TrackState::closed)

@@ -1,6 +1,6 @@
-# The SDK's public API uses C++20 stop_token/jthread. Xcode 16's libc++ does
-# not expose them; use Homebrew LLVM and its matching libc++ consistently.
-set(LIVEKIT_LLVM_ROOT "$ENV{LIVEKIT_LLVM_ROOT}" CACHE PATH "LLVM prefix with C++20 libc++")
+# Use one LLVM/libc++ toolchain for the SDK, WebRTC and desktop applications.
+# The public SDK API itself only requires C++17.
+set(LIVEKIT_LLVM_ROOT "$ENV{LIVEKIT_LLVM_ROOT}" CACHE PATH "LLVM prefix with matching libc++")
 if(NOT LIVEKIT_LLVM_ROOT)
   find_program(_livekit_clang NAMES clang++
     PATHS /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin NO_DEFAULT_PATH REQUIRED)

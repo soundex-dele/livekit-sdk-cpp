@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/algorithm.hpp"
 #include "backends/rtc/livekit/service_result.hpp"
 #include "backends/rtc/livekit/rpc_session.hpp"
 #include "backends/rtc/livekit/data_message_wire.hpp"
@@ -100,22 +102,22 @@ struct RpcSession::State {
     std::string destination;
     livekit::sdk::detail::ServicePromise<std::string> promise;
     Clock::time_point deadline, ack_deadline;
-    std::stop_token stop;
-    std::unique_ptr<std::stop_callback<std::function<void()>>> cancellation;
+    livekit::compat::stop_token stop;
+    std::unique_ptr<livekit::compat::stop_callback<std::function<void()>>> cancellation;
     bool acknowledged = false, sent = false;
   };
 
   struct Incoming {
     std::string method, payload;
     Clock::time_point deadline, expires;
-    std::stop_source stop;
+    livekit::compat::stop_source stop;
     uint64_t epoch = 0, incarnation = 0;
     bool completed = false;
     livekit::DataPacket response;
   };
 
   mutable std::mutex mutex;
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   std::shared_ptr<WakeEvent> timer_wakeup = std::make_shared<WakeEvent>();
   std::shared_ptr<ReadySet<std::string>> cancellations =
       std::make_shared<ReadySet<std::string>>(timer_wakeup, max_pending);
@@ -206,16 +208,16 @@ struct RpcSession::State {
 };
 
 struct RpcSession::Threads {
-  std::jthread timer, dispatcher;
+  livekit::compat::jthread timer, dispatcher;
 };
 
 RpcSession::RpcSession()
     : state_(std::make_shared<State>()), threads_(std::make_unique<Threads>()) {
   auto state = state_;
-  threads_->timer = std::jthread([state](std::stop_token stop) {
+  threads_->timer = livekit::compat::jthread([state](livekit::compat::stop_token stop) {
     while (!stop.stop_requested()) {
       const auto observed = state->timer_wakeup->revision();
-      std::vector<std::stop_source> cancelled;
+      std::vector<livekit::compat::stop_source> cancelled;
       std::optional<Clock::time_point> next;
       {
         std::lock_guard lock(state->mutex);
@@ -276,7 +278,7 @@ RpcSession::RpcSession()
       state->timer_wakeup->wait(observed, stop, next);
     }
   });
-  threads_->dispatcher = std::jthread([state](std::stop_token stop) {
+  threads_->dispatcher = livekit::compat::jthread([state](livekit::compat::stop_token stop) {
     while (!stop.stop_requested()) {
       std::function<void()> handler;
       {
@@ -327,7 +329,7 @@ void RpcSession::connect() {
 }
 
 void RpcSession::disconnect() {
-  std::vector<std::stop_source> stops;
+  std::vector<livekit::compat::stop_source> stops;
   {
     std::lock_guard lock(state_->mutex);
     state_->active = false;
@@ -354,7 +356,7 @@ void RpcSession::disconnect() {
 }
 
 void RpcSession::participant_left(const std::string& identity) {
-  std::vector<std::stop_source> stops;
+  std::vector<livekit::compat::stop_source> stops;
   {
     std::lock_guard lock(state_->mutex);
     for (auto it = state_->outgoing.begin(); it != state_->outgoing.end();) {
@@ -373,7 +375,7 @@ void RpcSession::participant_left(const std::string& identity) {
         ++it;
       }
     }
-    std::erase_if(state_->packets, [&](const auto& packet) {
+    livekit::compat::erase_if(state_->packets, [&](const auto& packet) {
       return packet.destination_identities_size() == 1 &&
              packet.destination_identities(0) == identity;
     });
@@ -389,7 +391,7 @@ Result<void> RpcSession::register_method(const std::string& method, RpcHandler h
                                               "RPC method and handler required"));
   }
   std::lock_guard lock(state_->mutex);
-  if (state_->methods.contains(method)) {
+  if (state_->methods.count(method)) {
     return Result<void>::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
                                               "RPC method already registered"));
   }
@@ -475,8 +477,9 @@ std::future<Result<std::string>> RpcSession::call(const RpcCallOptions& options)
       const auto wake = *watched;
       // This callback takes no session lock, including when registration invokes
       // it synchronously or its destructor fences a concurrent request_stop().
-      request->cancellation = std::make_unique<std::stop_callback<std::function<void()>>>(
-          request->stop, [wake] { wake->signal(); });
+      request->cancellation =
+          std::make_unique<livekit::compat::stop_callback<std::function<void()>>>(
+              request->stop, [wake] { wake->signal(); });
       state_->schedule(id, *request);
       state_->packets.push_back(std::move(packet));
       state_->wake_transport();

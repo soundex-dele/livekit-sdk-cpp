@@ -1,6 +1,7 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "livekit/encoded_media.hpp"
-#include <span>
 
 namespace livekit::sdk {
 namespace detail {
@@ -23,7 +24,8 @@ class PacketStream {
   ~PacketStream();
   Result<void> status() const;
   Result<std::optional<PacketEvent>> read(
-      std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
+      std::chrono::milliseconds timeout = std::chrono::seconds(30),
+      livekit::compat::stop_token stop = {});
   void close();
   uint64_t dropped() const;
 
@@ -62,7 +64,7 @@ class RtpMediaSource {
   ~RtpMediaSource();
   Result<void> status() const;
   std::shared_ptr<EncodedMediaSource> source() const;
-  Result<EncodedWriteStatus> write(std::span<const uint8_t> packet);
+  Result<EncodedWriteStatus> write(livekit::compat::span<const uint8_t> packet);
   void reset();
 
  private:

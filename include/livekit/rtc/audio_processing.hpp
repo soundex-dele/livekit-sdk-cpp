@@ -1,11 +1,11 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
-#include <span>
 #include <vector>
 
 namespace livekit::sdk::rtc {
@@ -29,7 +29,7 @@ class AudioRenderReference final {
     uint64_t sequence = 0;
   };
 
-  void write(std::span<const int16_t> stereo) noexcept {
+  void write(livekit::compat::span<const int16_t> stereo) noexcept {
     if (stereo.size() != 960) {
       return;
     }

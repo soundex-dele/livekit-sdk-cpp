@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "control_input.hpp"
 #include "scenarios/remote_control/text.hpp"
 #include <map>
@@ -120,13 +121,13 @@ class MacInput final : public ControlInputSink {
   uint64_t flags() const {
     uint64_t f = 0;
     for (const auto& k : held_) {
-      if (k.starts_with("Shift"))
+      if (livekit::compat::starts_with(k, "Shift"))
         f |= 1ULL << 17;
-      else if (k.starts_with("Control"))
+      else if (livekit::compat::starts_with(k, "Control"))
         f |= 1ULL << 18;
-      else if (k.starts_with("Alt"))
+      else if (livekit::compat::starts_with(k, "Alt"))
         f |= 1ULL << 19;
-      else if (k.starts_with("Meta"))
+      else if (livekit::compat::starts_with(k, "Meta"))
         f |= 1ULL << 20;
     }
     return f;

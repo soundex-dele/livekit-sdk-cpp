@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "backends/rtc/livekit/signal_socket.hpp"
 #include "livekit/version.hpp"
 #include <ixwebsocket/IXHttpClient.h>
@@ -18,7 +19,7 @@ static bool initialize_network() {
 }
 
 Result<std::vector<std::string>> fetch_regions(const std::string& url, const std::string& token,
-                                               std::stop_token stop,
+                                               livekit::compat::stop_token stop,
                                                std::chrono::steady_clock::time_point deadline) {
   using Clock = std::chrono::steady_clock;
   if (!initialize_network()) {
@@ -53,10 +54,10 @@ Result<std::vector<std::string>> fetch_regions(const std::string& url, const std
     } else
       body += chunk;
   };
-  std::stop_callback cancel(stop, [&] { args->cancel = true; });
-  std::jthread timer([args, deadline](std::stop_token timer_stop) {
+  livekit::compat::stop_callback cancel(stop, [&] { args->cancel = true; });
+  livekit::compat::jthread timer([args, deadline](livekit::compat::stop_token timer_stop) {
     std::mutex mutex;
-    std::condition_variable_any changed;
+    livekit::compat::condition_variable_any changed;
     std::unique_lock lock(mutex);
     changed.wait_until(lock, timer_stop, deadline, [] { return false; });
     if (!timer_stop.stop_requested())
@@ -137,7 +138,7 @@ SignalSocket::~SignalSocket() {
 }
 
 Result<void> SignalSocket::connect(const std::string& url, const std::string& token, bool subscribe,
-                                   std::stop_token stop, int timeout_seconds,
+                                   livekit::compat::stop_token stop, int timeout_seconds,
                                    const std::string& resume_sid,
                                    std::chrono::steady_clock::time_point deadline_limit,
                                    int protocol, const std::string& join_request) {
@@ -216,7 +217,7 @@ Result<std::optional<std::string>> SignalSocket::take_message() {
 }
 
 Result<std::optional<std::string>> SignalSocket::receive_until(
-    std::chrono::steady_clock::time_point deadline, std::stop_token stop) {
+    std::chrono::steady_clock::time_point deadline, livekit::compat::stop_token stop) {
   std::unique_lock lock(mutex_);
   cv_.wait_until(lock, stop, deadline,
                  [&] { return !messages_.empty() || !error_.empty() || closing_; });

@@ -1,4 +1,6 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "backends/rtc/livekit/service_result.hpp"
 #include "livekit/data_track.hpp"
 #include "livekit/encryption.hpp"
@@ -8,12 +10,11 @@
 #include <functional>
 #include <map>
 #include <mutex>
-#include <span>
 
 namespace livekit::sdk::detail {
 struct DataFrameQueue {
   mutable std::mutex mutex;
-  std::condition_variable_any ready;
+  livekit::compat::condition_variable_any ready;
   std::deque<DataFrame> frames;
   size_t bytes = 0, capacity = 8;
   bool closed = false;
@@ -30,7 +31,7 @@ class DataTrackSession : public std::enable_shared_from_this<DataTrackSession> {
   void resume();
   void rejoin();
   std::vector<LocalDataTrack> local_tracks();
-  void packet_sent(std::span<const uint8_t> packet, bool success);
+  void packet_sent(livekit::compat::span<const uint8_t> packet, bool success);
   std::future<Result<LocalDataTrack>> publish(std::string name, DataTrackOptions options,
                                               OperationOptions operation);
   std::future<Result<void>> unpublish(uint64_t generation, uint16_t handle,
@@ -45,7 +46,7 @@ class DataTrackSession : public std::enable_shared_from_this<DataTrackSession> {
                                                                   OperationOptions operation);
   void participant(const livekit::ParticipantInfo& participant);
   Result<void> receive_signal(const livekit::SignalResponse& response);
-  Result<void> receive_packet(std::span<const uint8_t> packet);
+  Result<void> receive_packet(livekit::compat::span<const uint8_t> packet);
   Result<bool> needs_publisher();
   Result<std::vector<livekit::SignalRequest>> take_signals();
   Result<std::optional<std::vector<uint8_t>>> take_packet();

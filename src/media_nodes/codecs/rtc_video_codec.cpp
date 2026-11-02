@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "livekit/result.hpp"
 #include "media_graph/failure.hpp"
 #include "backends/rtc/control_context.hpp"
@@ -75,11 +76,11 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
 
   Failure initialization_failure;
   mutable std::mutex mutex;
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   std::deque<Job> jobs;
   std::map<uint32_t, Timing> pending;
   VideoCodecSnapshot stats;
-  std::jthread worker;
+  livekit::compat::jthread worker;
   bool active = false, closed = false, needs_keyframe = true;
   Epoch epoch = 0;
   uint64_t generation = 0;
@@ -406,7 +407,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     return livekit::sdk::Result<void>::success();
   }
 
-  void run(std::stop_token stop, std::promise<livekit::sdk::Result<void>> started) {
+  void run(livekit::compat::stop_token stop, std::promise<livekit::sdk::Result<void>> started) {
     bool ready = false;
     std::optional<webrtc::Environment> env;
     const auto outcome = [&]() -> livekit::sdk::Result<void> {
@@ -568,10 +569,11 @@ bool VideoCodecNode::doStart() {
   }
   std::promise<livekit::sdk::Result<void>> ready;
   auto result = ready.get_future();
-  impl_->worker = std::jthread([this, ready = std::move(ready)](std::stop_token stop) mutable {
-    detail::CallbackScope worker_scope;
-    impl_->run(stop, std::move(ready));
-  });
+  impl_->worker = livekit::compat::jthread(
+      [this, ready = std::move(ready)](livekit::compat::stop_token stop) mutable {
+        detail::CallbackScope worker_scope;
+        impl_->run(stop, std::move(ready));
+      });
   auto status = result.get();
   if (!status) {
     quiesce();

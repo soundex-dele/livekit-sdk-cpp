@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
       const auto snapshot = viewer.snapshot();
       return snapshot.received_frames >= published.size() * 10 &&
              std::all_of(published.begin(), published.end(),
-                         [&](const auto& sid) { return snapshot.frames.contains(sid); });
+                         [&](const auto& sid) { return snapshot.frames.count(sid); });
     };
     server_result(a.start(ao));
     until([&] { return decoded(a); }, "First viewer did not decode both sources");

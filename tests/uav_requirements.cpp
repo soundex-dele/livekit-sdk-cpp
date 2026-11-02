@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/algorithm.hpp"
 #include "test_failure.hpp"
 #include "rtc_result.hpp"
 #include "server_result.hpp"
@@ -21,7 +23,6 @@
 #include <iostream>
 #include <map>
 #include <mutex>
-#include <numbers>
 #include <thread>
 
 using namespace livekit::sdk;
@@ -71,10 +72,10 @@ struct VideoObservation {
 struct VideoInput {
   std::shared_ptr<I420VideoSource> source =
       std::make_shared<I420VideoSource>(I420SourceOptions{320, 180});
-  std::jthread writer;
+  livekit::compat::jthread writer;
 
   explicit VideoInput(int luma)
-      : writer([this, luma](std::stop_token stop) {
+      : writer([this, luma](livekit::compat::stop_token stop) {
           VideoFrame f;
           f.width = 320;
           f.height = 180;
@@ -114,10 +115,10 @@ struct VideoInput {
 
 struct AudioInput {
   std::shared_ptr<PcmAudioSource> source = std::make_shared<PcmAudioSource>();
-  std::jthread writer;
+  livekit::compat::jthread writer;
 
   explicit AudioInput(int hz)
-      : writer([this, hz](std::stop_token stop) {
+      : writer([this, hz](livekit::compat::stop_token stop) {
           uint64_t offset = 0;
           while (!stop.stop_requested()) {
             // Two 10 ms blocks per write: Windows may round sleep_for(2ms) to
@@ -126,7 +127,7 @@ struct AudioInput {
             f.samples.resize(960);
             for (size_t i = 0; i < f.samples.size(); ++i)
               f.samples[i] = static_cast<int16_t>(
-                  6000 * std::sin(2 * std::numbers::pi * hz * (offset + i) / 48000));
+                  6000 * std::sin(2 * livekit::compat::pi * hz * (offset + i) / 48000));
             if (media_result(source->write(f)) == AudioWriteStatus::accepted)
               offset += f.samples.size();
             std::this_thread::sleep_for(2ms);

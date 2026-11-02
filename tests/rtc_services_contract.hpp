@@ -1,4 +1,6 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "service_test_result.hpp"
 #include "backends/rtc/livekit/stream_session.hpp"
 #include "backends/rtc/livekit/data_track_session.hpp"
@@ -23,7 +25,7 @@ static void rejects(F fn) {
   require(!fn(), "Expected rejection");
 }
 
-static std::span<const uint8_t> bytes(const std::string& s) {
+static livekit::compat::span<const uint8_t> bytes(const std::string& s) {
   return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
 }
 
@@ -72,7 +74,7 @@ static void streams() {
   rejects([&] { return pending.get(); });
   a->connect();
   rejects([&] { return stale->write("old").get(); });
-  std::stop_source stop;
+  livekit::compat::stop_source stop;
   stop.request_stop();
   OperationOptions cancel;
   cancel.stop = stop.get_token();

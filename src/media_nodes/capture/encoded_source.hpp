@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/encoded_media.hpp"
 
 namespace livekit::sdk::detail {
@@ -8,7 +9,7 @@ class EncodedSourceReader {
   ~EncodedSourceReader();
   Result<void> start();
   void stop();
-  std::optional<EncodedMediaFrame> read(std::stop_token stop, bool wait = true);
+  std::optional<EncodedMediaFrame> read(livekit::compat::stop_token stop, bool wait = true);
   void feedback(bool keyframe, uint32_t bitrate = 0);
 
   EncodedSourceOptions options() const {

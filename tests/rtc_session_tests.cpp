@@ -214,7 +214,7 @@ void observations() {
   state.local_muted(track.sid(), true);
   check(state.snapshot()->local.publications.at(track.sid()).muted, "Local mute not observed");
   check(changed(state.local_unpublished(track.sid())) &&
-            !state.snapshot()->local.publications.contains(track.sid()),
+            !state.snapshot()->local.publications.count(track.sid()),
         "Local remove not observed");
 }
 
@@ -225,15 +225,15 @@ void local_publication_ordering() {
   state.local_publication(second);
   auto self = participant("local", 2);  // Snapshot predating both AddTrack responses.
   changed(state.participant(self));
-  check(state.snapshot()->local.publications.contains(first.sid()) &&
-            state.snapshot()->local.publications.contains(second.sid()),
+  check(state.snapshot()->local.publications.count(first.sid()) &&
+            state.snapshot()->local.publications.count(second.sid()),
         "Delayed self update erased confirmed local publications");
   changed(state.local_unpublished(first.sid()));
   *self.add_tracks() = first;
   self.set_version(3);
   changed(state.participant(self));
-  check(!state.snapshot()->local.publications.contains(first.sid()) &&
-            state.snapshot()->local.publications.contains(second.sid()),
+  check(!state.snapshot()->local.publications.count(first.sid()) &&
+            state.snapshot()->local.publications.count(second.sid()),
         "Delayed self update revived an unpublished track or removed its sibling");
   check(!state.local_publication(first), "Late AddTrack response revived retired SID");
   auto rejoined = make_roster(join(), 2);
@@ -248,12 +248,12 @@ void identity_replacement() {
   auto next = participant("new", 1);
   next.set_identity("viewer");
   changed(state.participant(next));
-  check(state.snapshot()->remote.size() == 1 && state.snapshot()->remote.contains("new"),
+  check(state.snapshot()->remote.size() == 1 && state.snapshot()->remote.count("new"),
         "Rapid same-identity rejoin left two roster incarnations");
   old.set_version(9);
   old.set_state(3);
   check(!changed(state.participant(old)) &&
-            state.snapshot()->remote.at("new").publications.contains("track-new"),
+            state.snapshot()->remote.at("new").publications.count("track-new"),
         "Retired SID disconnect changed the current identity");
   old.set_state(2);
   old.set_version(10);
@@ -264,7 +264,7 @@ void identity_replacement() {
   auto replacement = participant("at-capacity", 1);
   replacement.set_identity("viewer");
   check(changed(state.participant(replacement)) && state.snapshot()->remote.size() == 4096 &&
-            state.snapshot()->remote.contains("at-capacity"),
+            state.snapshot()->remote.count("at-capacity"),
         "Full roster rejected same-identity replacement");
   auto absent = participant("late-disconnect", 1);
   absent.set_state(3);
@@ -292,8 +292,8 @@ void invalid_updates_are_atomic() {
   check(!update && update.error().code == ErrorCode::malformed_message,
         "Duplicate publication SID accepted");
   check(state.snapshot()->revision == before->revision &&
-            state.snapshot()->remote.contains("original") &&
-            !state.snapshot()->remote.contains("replacement"),
+            state.snapshot()->remote.count("original") &&
+            !state.snapshot()->remote.count("replacement"),
         "Rejected participant update changed the roster");
   replacement.mutable_tracks()->RemoveLast();
   replacement.set_version(1);

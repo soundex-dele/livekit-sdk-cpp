@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "media_graph/failure.hpp"
 #include "livekit/rtc/media_config.hpp"
 #include "livekit/rtc/frame_view.hpp"
@@ -162,42 +163,41 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
   bool doStart() override {
     active_ = true;
     if (!inline_ && (output_.audio || output_.video || output_.frame)) {
-      worker_ = std::jthread([this](std::stop_token stop) {
-          while (!stop.stop_requested()) {
-            std::optional<Pending> pending;
-            {
-              std::unique_lock lock(mutex_);
-              changed_.wait(lock, stop, [&] { return !active_ || !queue_.empty(); });
-              if (!active_ || stop.stop_requested()) {
-                break;
-              }
-              pending = std::move(queue_.front());
-              queue_.pop_front();
-              queued_bytes_ -= pending->bytes;
+      worker_ = livekit::compat::jthread([this](livekit::compat::stop_token stop) {
+        while (!stop.stop_requested()) {
+          std::optional<Pending> pending;
+          {
+            std::unique_lock lock(mutex_);
+            changed_.wait(lock, stop, [&] { return !active_ || !queue_.empty(); });
+            if (!active_ || stop.stop_requested()) {
+              break;
             }
-            if (SteadyClock::now() - pending->admitted > output_.queue.max_age) {
+            pending = std::move(queue_.front());
+            queue_.pop_front();
+            queued_bytes_ -= pending->bytes;
+          }
+          if (SteadyClock::now() - pending->admitted > output_.queue.max_age) {
+            ++dropped;
+            continue;
+          }
+          const auto presentation = std::visit(
+              [](const auto& sample) { return sample.presentation_time; }, pending->sample);
+          if (presentation) {
+            std::unique_lock lock(mutex_);
+            changed_.wait_until(lock, stop, *presentation, [&] { return !active_; });
+            if (!active_ || stop.stop_requested()) {
+              break;
+            }
+            if (SteadyClock::now() - *presentation > output_.queue.max_age) {
               ++dropped;
               continue;
             }
-            const auto presentation = std::visit(
-                [](const auto& sample) { return sample.presentation_time; }, pending->sample);
-            if (presentation) {
-              std::unique_lock lock(mutex_);
-              changed_.wait_until(lock, stop, *presentation, [&] { return !active_; });
-              if (!active_ || stop.stop_requested()) {
-                break;
-              }
-              if (SteadyClock::now() - *presentation > output_.queue.max_age) {
-                ++dropped;
-                continue;
-              }
-            }
-            if (auto result = deliver(pending->sample); !result) {
-              fail(result.failure_record());
-              break;
-            }
           }
-
+          if (auto result = deliver(pending->sample); !result) {
+            fail(result.failure_record());
+            break;
+          }
+        }
       });
     }
     return true;
@@ -210,11 +210,11 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
   MediaOutput output_;
   const bool inline_;
   mutable std::mutex mutex_;
-  std::condition_variable_any changed_;
+  livekit::compat::condition_variable_any changed_;
   std::deque<Pending> queue_;
   size_t queued_bytes_ = 0;
   bool active_ = false;
   Failure failure_;
-  std::jthread worker_;
+  livekit::compat::jthread worker_;
 };
 }  // namespace livekit::sdk::rtc::engine

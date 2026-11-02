@@ -80,7 +80,7 @@ struct Wire {
   BindingToken binding(const TrackId& id, bool pub = true) {
     eventually([&] {
       std::lock_guard lock(mutex);
-      return bindings.contains({id, pub});
+      return bindings.count({id, pub});
     });
     std::lock_guard lock(mutex);
     return bindings.at({id, pub});

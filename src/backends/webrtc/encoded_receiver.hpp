@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include "livekit/result.hpp"
 #include "livekit/rtc/types.hpp"
 #include "support/wake_event.hpp"
@@ -25,7 +26,7 @@ struct ReceivedAccessUnit {
 class EncodedReceiver : public webrtc::FrameTransformerInterface {
  public:
   using PayloadTransform =
-      std::function<std::optional<std::vector<uint8_t>>(std::span<const uint8_t>)>;
+      std::function<std::optional<std::vector<uint8_t>>(livekit::compat::span<const uint8_t>)>;
   EncodedReceiver(MediaKind kind, QueueLimits limits, std::shared_ptr<QueueBudget> budget = {},
                   PayloadTransform transform = {});
   void Transform(std::unique_ptr<webrtc::TransformableFrameInterface> frame) override;

@@ -1,10 +1,10 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <optional>
-#include <stop_token>
 #include <functional>
 #include <utility>
 
@@ -34,7 +34,7 @@ class WakeEvent {
     }
   }
 
-  void wait(uint64_t observed, std::stop_token stop,
+  void wait(uint64_t observed, livekit::compat::stop_token stop,
             std::optional<std::chrono::steady_clock::time_point> deadline = {}) {
     std::unique_lock lock(mutex_);
     const auto changed = [&] { return revision_ != observed; };
@@ -47,7 +47,7 @@ class WakeEvent {
 
  private:
   mutable std::mutex mutex_;
-  std::condition_variable_any changed_;
+  livekit::compat::condition_variable_any changed_;
   uint64_t revision_ = 0;
   const std::function<void()> relay_;
 };

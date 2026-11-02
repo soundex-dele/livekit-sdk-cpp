@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "media_result.hpp"
 #include "media_nodes/capture/audio_source.hpp"
 #include <future>
@@ -59,7 +60,7 @@ inline void audio_source_contract() {
             source->stats().skipped_samples == 320);
     reader.stop();
     media_result(reader.start());
-    std::stop_source cancel;
+    livekit::compat::stop_source cancel;
     auto waiting = std::async(std::launch::async, [&] { return reader.read(cancel.get_token()); });
     require(waiting.wait_for(20ms) == std::future_status::timeout);
     cancel.request_stop();

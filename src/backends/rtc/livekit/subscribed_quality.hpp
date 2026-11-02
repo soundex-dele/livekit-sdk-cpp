@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/algorithm.hpp"
 #include "livekit.pb.h"
 #include <algorithm>
 #include <cctype>
@@ -28,7 +29,7 @@ inline std::optional<bool> subscribed_video_enabled(const livekit::SubscribedQua
     auto name = codec.codec();
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (name.starts_with("video/"))
+    if (livekit::compat::starts_with(name, "video/"))
       name.erase(0, 6);
     if (name != current_codec)
       continue;

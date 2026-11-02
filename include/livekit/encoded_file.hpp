@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/encoded_media.hpp"
 #include <filesystem>
 
@@ -15,7 +16,8 @@ class EncodedFileReader {
   Result<void> rewind();
   // Blocking, stop-aware paced submission. Run on an application worker.
   // Does not close/unpublish the source, and never replays across generations.
-  Result<void> pump(const std::shared_ptr<EncodedMediaSource>& source, std::stop_token stop = {});
+  Result<void> pump(const std::shared_ptr<EncodedMediaSource>& source,
+                    livekit::compat::stop_token stop = {});
 
  private:
   struct Impl;

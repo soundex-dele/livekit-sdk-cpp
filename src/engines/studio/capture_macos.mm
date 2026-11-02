@@ -1,3 +1,5 @@
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "audio_samples_macos.hpp"
 #include "internal.hpp"
 #include "support/utf8.hpp"
@@ -294,13 +296,13 @@ class MacCapture {
   SCStream* stream;
   AVCaptureSession* session;
   id runtimeObserver;
-  std::jthread worker;
+  livekit::compat::jthread worker;
 
   MacCapture(const StudioSource* source, bool system = false) {
     // Device startup and permission prompts must not stall program composition,
     // recording or the 10 ms audio clock on the Studio worker.
     auto copy = source ? std::optional<StudioSource>(*source) : std::nullopt;
-    worker = std::jthread(
+    worker = livekit::compat::jthread(
         [this, copy = std::move(copy), system] { configure(copy ? &*copy : nullptr, system); });
   }
 
@@ -587,7 +589,7 @@ Monitor::Monitor() : impl_(std::make_unique<Impl>()) {}
 
 Monitor::~Monitor() = default;
 
-void Monitor::write(std::span<const float> samples) {
+void Monitor::write(livekit::compat::span<const float> samples) {
   std::lock_guard lock(impl_->mutex);
   impl_->samples.insert(impl_->samples.end(), samples.begin(), samples.end());
   while (impl_->samples.size() > 9600)

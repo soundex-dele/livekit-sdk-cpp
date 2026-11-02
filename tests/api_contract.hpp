@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include <livekit/api.hpp>
 #include <iostream>
 #include <thread>
@@ -84,15 +85,15 @@ inline int api_contract(const std::string& url) {
               failure.error().backend_code == "not_found" &&
               Json::parse(failure.error().backend_metadata, nullptr, false)["detail"] == "test",
           "Structured Twirp error");
-  std::stop_source cancel;
+  livekit::compat::stop_source cancel;
   cancel.request_stop();
   RequestOptions options;
   options.stop = cancel.get_token();
   auto cancelled = api.room().list_rooms(Json::object(), options);
   require(!cancelled && cancelled.error().code == ErrorCode::cancelled, "Pre-request cancellation");
-  std::stop_source during;
+  livekit::compat::stop_source during;
   options.stop = during.get_token();
-  std::jthread timer([&] {
+  livekit::compat::jthread timer([&] {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     during.request_stop();
   });

@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "media_nodes/capture/video_source.hpp"
 #include <condition_variable>
 #include <cstring>
@@ -14,7 +15,7 @@ struct I420VideoSource::Impl {
   const I420SourceOptions options;
   Failure failure;
   mutable std::mutex mutex;
-  std::condition_variable_any changed;
+  livekit::compat::condition_variable_any changed;
   VideoSourceStats stats;
   std::optional<std::chrono::steady_clock::time_point> last_capture;
   std::deque<std::shared_ptr<const detail::I420SourceFrame>> frames;
@@ -271,7 +272,7 @@ void I420SourceReader::stop() {
   s.changed.notify_all();
 }
 
-std::shared_ptr<const I420SourceFrame> I420SourceReader::read(std::stop_token stop) {
+std::shared_ptr<const I420SourceFrame> I420SourceReader::read(livekit::compat::stop_token stop) {
   if (!attached_) {
     return {};
   }

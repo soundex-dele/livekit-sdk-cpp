@@ -1,7 +1,7 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include <chrono>
 #include <functional>
-#include <stop_token>
 #include <string>
 
 namespace livekit::sdk {
@@ -11,7 +11,7 @@ struct TokenRequest {
   std::string url;
   TokenRequestReason reason = TokenRequestReason::initial;
   std::chrono::steady_clock::time_point deadline;
-  std::stop_token stop;
+  livekit::compat::stop_token stop;
 };
 enum class TokenFailure { none, unavailable, denied };
 

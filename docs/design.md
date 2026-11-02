@@ -10,7 +10,7 @@
 
 ## 1. 职责与现状
 
-当前 SDK 是直接链接 libwebrtc 的 C++20 库，公开命名空间为 `livekit::sdk`，CMake target 为 `LiveKit::SDK`。提供 Room、Participant、TrackPublication、动态发布订阅、数据通道、状态快照、统计、I420 回调，以及可信后端使用的 Token 与管理 API 客户端。
+当前 SDK 是直接链接 libwebrtc 的 C++17 库，公开命名空间为 `livekit::sdk`，CMake target 为 `LiveKit::SDK`。提供 Room、Participant、TrackPublication、动态发布订阅、数据通道、状态快照、统计、I420 回调，以及可信后端使用的 Token 与管理 API 客户端。
 
 当前源码级集成已在 Windows x64 验证；Linux preset 不等于 SDK Linux 已验收。文件/FFmpeg 网络输入解码后由 WebRTC 编码发送；每轨 WAV/Y4M 录制不等于同步 MP4 或云录制。六类管理客户端、49 个 RPC 存在，不等于本项目媒体服务实现所有对应后端。
 

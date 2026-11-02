@@ -1,4 +1,6 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "livekit/result.hpp"
 #include "livekit/operation.hpp"
 #include <chrono>
@@ -8,7 +10,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <vector>
 
@@ -46,10 +47,12 @@ class StreamReader {
  public:
   StreamInfo info() const;
   Result<std::optional<std::vector<uint8_t>>> read(
-      std::chrono::milliseconds timeout = std::chrono::seconds(30), std::stop_token stop = {});
+      std::chrono::milliseconds timeout = std::chrono::seconds(30),
+      livekit::compat::stop_token stop = {});
   Result<std::vector<uint8_t>> read_all(size_t max_bytes = 16 * 1024 * 1024,
-                                        std::stop_token stop = {});
-  Result<std::string> read_all_text(size_t max_bytes = 16 * 1024 * 1024, std::stop_token stop = {});
+                                        livekit::compat::stop_token stop = {});
+  Result<std::string> read_all_text(size_t max_bytes = 16 * 1024 * 1024,
+                                    livekit::compat::stop_token stop = {});
   void close();
 
  private:
@@ -71,7 +74,7 @@ class StreamWriter {
     return info_;
   }
 
-  std::future<Result<void>> write(std::span<const uint8_t> bytes,
+  std::future<Result<void>> write(livekit::compat::span<const uint8_t> bytes,
                                   const OperationOptions& operation = {});
   std::future<Result<void>> write(const std::string& text, const OperationOptions& operation = {});
   std::future<Result<void>> close(const std::string& reason = {},

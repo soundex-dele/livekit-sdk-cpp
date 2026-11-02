@@ -1,9 +1,9 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/media.hpp"
 #include "livekit/json.hpp"
 #include "livekit/result.hpp"
 #include <filesystem>
-#include <stop_token>
 
 namespace livekit::cli {
 struct SessionOptions {
@@ -17,6 +17,6 @@ struct SessionOptions {
 };
 
 sdk::Result<void> run_session(const SessionOptions&, std::function<void(const sdk::Json&)>,
-                              std::stop_token);
+                              livekit::compat::stop_token);
 sdk::Result<void> doctor(std::function<void(const sdk::Json&)>);
 }  // namespace livekit::cli

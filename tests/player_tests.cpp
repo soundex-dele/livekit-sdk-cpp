@@ -8,7 +8,7 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
-#include <source_location>
+#include "test_source_location.hpp"
 
 using namespace livekit::sdk;
 using namespace std::chrono_literals;
@@ -22,7 +22,8 @@ void require(bool value, const char* message) {
 }
 
 template <class T>
-T get(AsyncResult<T> future, std::source_location where = std::source_location::current()) {
+T get(AsyncResult<T> future,
+      livekit::sdk::test::SourceLocation where = livekit::sdk::test::SourceLocation::current()) {
   require(future.wait_for(5s) == std::future_status::ready, "control operation timed out");
   auto result = future.get();
   if (!result) {
@@ -44,11 +45,19 @@ struct Counts {
   int64_t first_audio = -1;
 };
 
+template <class T, class = void>
+struct HasPollVideo : std::false_type {};
+
 template <class T>
-concept HasPollVideo = requires(T& value) { value.poll_video(); };
+struct HasPollVideo<T, std::void_t<decltype(std::declval<T&>().poll_video())>> : std::true_type {};
+
+template <class T, class = void>
+struct HasPollAudio : std::false_type {};
+
 template <class T>
-concept HasPollAudio = requires(T& value) { value.poll_audio(); };
-static_assert(!HasPollVideo<Player> && !HasPollAudio<Player>);
+struct HasPollAudio<T, std::void_t<decltype(std::declval<T&>().poll_audio())>> : std::true_type {};
+
+static_assert(!HasPollVideo<Player>::value && !HasPollAudio<Player>::value);
 
 // Install before playback. Media callbacks validate/count frames; the test waits
 // for state notifications instead of driving SDK progress by draining queues.
@@ -128,7 +137,7 @@ class Collector {
 
   media::VideoFrame preview(uint64_t generation) {
     std::unique_lock lock(mutex_);
-    require(changed_.wait_for(lock, 3s, [&] { return previews_.contains(generation); }),
+    require(changed_.wait_for(lock, 3s, [&] { return previews_.count(generation); }),
             "paused seek did not deliver preview");
     return previews_.find(generation)->second;
   }

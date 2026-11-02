@@ -1,4 +1,6 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
+#include "livekit/compat/span.hpp"
 #include "backends/rtc/livekit/service_result.hpp"
 #include "livekit/streams.hpp"
 #include "livekit.pb.h"
@@ -11,12 +13,12 @@ namespace livekit::sdk::detail {
 struct Utf8State {
   uint32_t value = 0, minimum = 0;
   unsigned remaining = 0;
-  bool append(std::span<const uint8_t> bytes);
+  bool append(livekit::compat::span<const uint8_t> bytes);
 };
 
 struct StreamReaderState {
   std::mutex mutex;
-  std::condition_variable_any ready;
+  livekit::compat::condition_variable_any ready;
   StreamInfo info;
   std::deque<std::vector<uint8_t>> chunks;
   size_t bytes = 0;
@@ -44,7 +46,7 @@ class StreamSession : public std::enable_shared_from_this<StreamSession> {
   std::future<Result<StreamInfo>> send_file(std::filesystem::path path, StreamOptions options,
                                             OperationOptions operation);
   std::future<Result<void>> enqueue(uint64_t generation, const std::string& id,
-                                    std::span<const uint8_t> bytes,
+                                    livekit::compat::span<const uint8_t> bytes,
                                     std::optional<std::string> reason, OperationOptions operation);
   void receive(const livekit::DataPacket& packet);
   bool has_outgoing();

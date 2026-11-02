@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "media_nodes/capture/encoded_source.hpp"
 #include "livekit/result.hpp"
 #include <algorithm>
@@ -9,7 +10,7 @@ namespace livekit::sdk {
 struct EncodedMediaSource::Impl {
   EncodedSourceOptions options;
   mutable std::mutex mutex;
-  std::condition_variable_any ready;
+  livekit::compat::condition_variable_any ready;
   EncodedMediaStats stats;
   std::deque<EncodedMediaFrame> frames;
   uint64_t lease = 0;
@@ -136,7 +137,7 @@ Result<EncodedWriteStatus> EncodedMediaSource::write(EncodedMediaFrame frame) {
 
 struct EncodedMediaStream::Impl {
   mutable std::mutex mutex;
-  std::condition_variable_any ready;
+  livekit::compat::condition_variable_any ready;
   std::deque<std::shared_ptr<const EncodedMediaFrame>> frames;
   size_t max_frames, max_bytes;
   EncodedMediaStats stats;
@@ -175,7 +176,7 @@ void EncodedMediaStream::close() {
 }
 
 Result<std::shared_ptr<const EncodedMediaFrame>> EncodedMediaStream::read(
-    std::chrono::milliseconds timeout, std::stop_token stop) {
+    std::chrono::milliseconds timeout, livekit::compat::stop_token stop) {
   using ReadResult = Result<std::shared_ptr<const EncodedMediaFrame>>;
   if (impl_->failure) {
     return ReadResult::failure(impl_->failure);
@@ -264,7 +265,8 @@ void EncodedSourceReader::stop() {
   s.ready.notify_all();
 }
 
-std::optional<EncodedMediaFrame> EncodedSourceReader::read(std::stop_token stop, bool wait) {
+std::optional<EncodedMediaFrame> EncodedSourceReader::read(livekit::compat::stop_token stop,
+                                                           bool wait) {
   if (!attached_) {
     return {};
   }

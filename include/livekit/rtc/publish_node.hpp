@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/rtc/track_endpoint.hpp"
 #include "livekit/rtc/events.hpp"
 #include "core/graph_node.h"
@@ -53,7 +54,7 @@ class RtcPublishNode final : public graphflow::core::GraphNode {
   std::atomic<uint64_t> accepted_{0}, rejected_{0};
   mutable std::mutex failure_mutex_;
   Failure failure_;
-  std::jthread worker_;
+  livekit::compat::jthread worker_;
   std::function<void()> terminal_;
 };
 }  // namespace livekit::sdk::rtc::nodes

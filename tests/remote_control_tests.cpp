@@ -1,3 +1,4 @@
+#include "livekit/compat/span.hpp"
 #include <livekit/remote_control.hpp>
 #include "backends/platform/windows/control_input_win.hpp"
 #include "scenarios/remote_control/text.hpp"
@@ -289,7 +290,7 @@ int main(int argc, char** argv) {
         return {1, -1920, 0, 3840, 1080};
       }
 
-      unsigned send(std::span<const INPUT> value) noexcept override {
+      unsigned send(livekit::compat::span<const INPUT> value) noexcept override {
         ++calls;
         inputs.assign(value.begin(), value.end());
         return limit < 0

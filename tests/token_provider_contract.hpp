@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include <cstdlib>
 #include "backends/rtc/livekit/token_request.hpp"
 #include <future>
@@ -20,7 +21,7 @@ inline void token_provider_contract() {
   auto accepted = [&](Result<std::string> result, const std::string& expected) {
     require(result && *result == expected);
   };
-  const auto fetch = [&](const TokenProvider& provider, std::stop_token stop = {}) {
+  const auto fetch = [&](const TokenProvider& provider, livekit::compat::stop_token stop = {}) {
     return detail::request_token(provider, "https://rtc.example", TokenRequestReason::initial,
                                  Clock::now() + 1s, stop);
   };
@@ -32,9 +33,9 @@ inline void token_provider_contract() {
              complete({"second"});
            }),
            "first");
-  std::jthread worker;
+  livekit::compat::jthread worker;
   accepted(fetch([&](TokenRequest, TokenCompletion complete) {
-             worker = std::jthread([complete] { complete({"async"}); });
+             worker = livekit::compat::jthread([complete] { complete({"async"}); });
            }),
            "async");
   worker.join();
@@ -47,7 +48,7 @@ inline void token_provider_contract() {
   expect([&] { return fetch([](auto, auto done) { done({std::string(65537, 'x')}); }); },
          ErrorCode::permission_denied, false);
   TokenCompletion late;
-  std::stop_token provider_stop;
+  livekit::compat::stop_token provider_stop;
   const auto started = Clock::now();
   expect(
       [&] {
@@ -61,7 +62,7 @@ inline void token_provider_contract() {
       ErrorCode::timeout, true);
   require(provider_stop.stop_requested() && Clock::now() - started < 1s);
   late({"late-timeout"});  // safe after request and its result storage are destroyed
-  std::stop_source cancel;
+  livekit::compat::stop_source cancel;
   std::promise<void> provider_started;
   auto pending = std::async(std::launch::async, [&] {
     expect(

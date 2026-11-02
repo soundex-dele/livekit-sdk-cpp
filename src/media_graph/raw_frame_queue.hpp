@@ -1,9 +1,9 @@
 #pragma once
+#include "livekit/compat/thread.hpp"
 #include "livekit/rtc/media_types.hpp"
 #include <condition_variable>
 #include <deque>
 #include <mutex>
-#include <stop_token>
 #include <variant>
 
 namespace livekit::sdk::rtc::detail {
@@ -75,7 +75,7 @@ class RawFrameQueue final {
     return true;
   }
 
-  std::optional<Sample> read(std::stop_token stop) {
+  std::optional<Sample> read(livekit::compat::stop_token stop) {
     std::unique_lock lock(mutex_);
     changed_.wait(lock, stop, [&] { return !queue_.empty() || !active_; });
     expire();
@@ -103,7 +103,7 @@ class RawFrameQueue final {
   Failure failure_;
   const QueueLimits limits_;
   mutable std::mutex mutex_;
-  std::condition_variable_any changed_;
+  livekit::compat::condition_variable_any changed_;
   std::deque<Sample> queue_;
   size_t bytes_ = 0;
   uint64_t generation_ = 0;

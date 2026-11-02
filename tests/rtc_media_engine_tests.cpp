@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "media_result.hpp"
 #include "rtc_blocking_bridge.hpp"
 #include "livekit/rtc/livekit.hpp"
@@ -106,8 +107,10 @@ class Transport final : public RoomTransport {
   livekit::sdk::Result<void> remove(const BindingToken& binding, bool,
                                     Removed completed = {}) override {
     std::lock_guard lock(w->mutex);
-    std::erase_if(w->subscribers, [&](const auto& item) { return item.second == binding; });
-    std::erase_if(w->publishers, [&](const auto& item) { return item.second == binding; });
+    livekit::compat::erase_if(w->subscribers,
+                              [&](const auto& item) { return item.second == binding; });
+    livekit::compat::erase_if(w->publishers,
+                              [&](const auto& item) { return item.second == binding; });
     if (completed) {
       completed({});
     }
@@ -129,7 +132,7 @@ class Transport final : public RoomTransport {
   void request_keyframe(const BindingToken& binding) override {
     std::unique_lock lock(w->mutex);
     for (const auto& [id, subscriber] : w->subscribers) {
-      if (subscriber != binding || !w->publishers.contains(id))
+      if (subscriber != binding || !w->publishers.count(id))
         continue;
       const auto publisher = w->publishers.at(id);
       SenderFeedback feedback;

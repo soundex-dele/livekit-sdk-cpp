@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "livekit/api.hpp"
 #include "session.hpp"
 #include <thread>
@@ -262,8 +263,8 @@ int run(int argc, char** argv) {
         options.media.push_back({"", ffmpeg, false, true, false, width, height, fps});
       std::signal(SIGINT, signal_handler);
       std::signal(SIGTERM, signal_handler);
-      std::stop_source session_stop;
-      std::jthread cancellation([&](std::stop_token stop) {
+      livekit::compat::stop_source session_stop;
+      livekit::compat::jthread cancellation([&](livekit::compat::stop_token stop) {
         while (!stop.stop_requested()) {
           if (interrupted) {
             session_stop.request_stop();

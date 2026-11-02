@@ -1,3 +1,4 @@
+#include "livekit/compat/algorithm.hpp"
 #include "studio_graph.hpp"
 #include "livekit/player.hpp"
 #include "engine/graph_engine.h"
@@ -167,7 +168,7 @@ class ClockNode final : public Node {
       data->audio = s.settings;
       data->recording = s.recordWanted;
       data->path = s.recordPath;
-      std::erase_if(s.remoteSeen, [&](const auto& entry) {
+      livekit::compat::erase_if(s.remoteSeen, [&](const auto& entry) {
         if (now - entry.second < std::chrono::seconds(5))
           return false;
         s.remoteVideo.erase(entry.first);
@@ -476,7 +477,8 @@ class SourcesNode final : public Node {
         }
       }
     }
-    std::erase_if(sources_, [&](const auto& entry) { return !active.contains(entry.first); });
+    livekit::compat::erase_if(sources_,
+                              [&](const auto& entry) { return !active.count(entry.first); });
     if (microphone_ && !microphone_->error().empty())
       errors["microphone"] = microphone_->error();
     if (system_ && !system_->error().empty())

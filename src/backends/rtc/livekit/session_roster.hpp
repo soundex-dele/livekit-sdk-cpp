@@ -34,7 +34,7 @@ class SessionRoster {
       return Result<bool>::failure(make_failure(ErrorDomain::protocol, ErrorCode::malformed_message,
                                                 "Participant has no SID/identity", false, 0,
                                                 {"session_roster"}));
-    if (departed_.contains(p.sid()))
+    if (departed_.count(p.sid()))
       return Result<bool>::success(false);
     const auto version = versions_.find(p.sid());
     if (version != versions_.end() && p.version() < version->second)
@@ -44,8 +44,7 @@ class SessionRoster {
           make_failure(ErrorDomain::protocol, ErrorCode::resource_exhausted,
                        "Session participant history exhausted", false, 0, {"session_roster"}));
     const bool local = p.sid() == state_.local.sid;
-    if (!local && p.state() != 3 && !state_.remote.contains(p.sid()) &&
-        state_.remote.size() >= 4096 &&
+    if (!local && p.state() != 3 && !state_.remote.count(p.sid()) && state_.remote.size() >= 4096 &&
         std::none_of(state_.remote.begin(), state_.remote.end(),
                      [&](const auto& row) { return row.second.identity == p.identity(); }))
       return Result<bool>::failure(
@@ -111,7 +110,7 @@ class SessionRoster {
   }
 
   bool local_publication(const livekit::TrackInfo& value) {
-    if (value.sid().empty() || unpublished_.contains(value.sid()))
+    if (value.sid().empty() || unpublished_.count(value.sid()))
       return false;
     state_.local.publications[value.sid()] = parse(value);
     ++state_.revision;
@@ -121,7 +120,7 @@ class SessionRoster {
   Result<bool> local_unpublished(const std::string& sid) {
     if (sid.empty())
       return Result<bool>::success(false);
-    if (!unpublished_.contains(sid) && unpublished_.size() >= 16384)
+    if (!unpublished_.count(sid) && unpublished_.size() >= 16384)
       return Result<bool>::failure(
           make_failure(ErrorDomain::protocol, ErrorCode::resource_exhausted,
                        "Session publication history exhausted", false, 0, {"session_roster"}));
@@ -161,7 +160,7 @@ class SessionRoster {
     }
     if (full) {
       auto clear = [&](ParticipantSnapshot& p) {
-        if (!active.contains(p.sid) && (p.speaking || p.audio_level != 0)) {
+        if (!active.count(p.sid) && (p.speaking || p.audio_level != 0)) {
           p.speaking = false;
           p.audio_level = 0;
           changed = true;

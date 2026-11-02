@@ -1,9 +1,9 @@
 #pragma once
+#include "livekit/compat/span.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <vector>
 
 namespace livekit::sdk::media {
@@ -34,7 +34,7 @@ enum class FrameFormat { i420, rgba8, pcm_s16, pcm_f32 };
 struct FrameView {
   std::shared_ptr<const void> owner;
   FrameFormat format = FrameFormat::i420;
-  std::vector<std::span<const std::byte>> planes;
+  std::vector<livekit::compat::span<const std::byte>> planes;
   std::vector<size_t> strides;
   uint32_t width = 0, height = 0, sample_rate = 0;
   uint16_t channels = 0;

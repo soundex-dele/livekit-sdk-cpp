@@ -1,3 +1,4 @@
+#include "livekit/compat/thread.hpp"
 #include "livekit/encoded_file.hpp"
 #include "livekit/result.hpp"
 #include <condition_variable>
@@ -238,7 +239,7 @@ Result<void> EncodedFileReader::rewind() {
 }
 
 Result<void> EncodedFileReader::pump(const std::shared_ptr<EncodedMediaSource>& source,
-                                     std::stop_token stop) {
+                                     livekit::compat::stop_token stop) {
   if (impl_->failure) {
     return Result<void>::failure(impl_->failure);
   }
@@ -251,7 +252,7 @@ Result<void> EncodedFileReader::pump(const std::shared_ptr<EncodedMediaSource>& 
     return Result<void>::failure(make_failure(ErrorDomain::media, ErrorCode::processing_failed,
                                               "Encoded file source mismatch"));
   std::mutex mutex;
-  std::condition_variable_any ready;
+  livekit::compat::condition_variable_any ready;
   std::unique_lock lock(mutex);
   auto wait = [&](std::chrono::steady_clock::time_point time) -> Result<void> {
     ready.wait_until(lock, stop, time, [] { return false; });

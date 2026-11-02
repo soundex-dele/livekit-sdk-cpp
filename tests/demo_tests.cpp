@@ -462,7 +462,7 @@ int main(int argc, char** argv) {
       state.pause_unused_video = true;
       state.video_demand = {{"TR_local1", true}, {"TR_local2", false}, {"removed", true}};
       state.update(local, {alice, bob, guest});
-      check(!state.video_demand.contains("removed") && state.video_demand.size() == 2,
+      check(!state.video_demand.count("removed") && state.video_demand.size() == 2,
             "Removed demand state retained");
       check(demo::tiles(state).size() == 4 &&
                 demo::tiles(state)[0].label == "Alice / Test video 1" &&
@@ -543,13 +543,13 @@ int main(int argc, char** argv) {
       render(state);
       alice.tracks.erase(alice.tracks.begin());
       state.update(local, {alice, bob, guest});
-      check(!state.frames.contains("TR_one") && state.frames.contains("TR_three"),
+      check(!state.frames.count("TR_one") && state.frames.count("TR_three"),
             "Stopping one stream removed another");
       state.changing_video = true;
       render(state);
       state.changing_video = false;
       state.update(local, {bob, guest});
-      check(!state.frames.contains("TR_one"), "departed pixels retained");
+      check(!state.frames.count("TR_one"), "departed pixels retained");
       render(state);
       state.quality = quality_fixture;
       auto second_sender = state.quality.peers[0].streams.at("rtp");
