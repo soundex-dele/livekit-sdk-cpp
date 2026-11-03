@@ -50,11 +50,14 @@ bool RoomSession::connect(ConnectionOptions options) {
       LOG_ERROR("LiveKitClient", "Room is already used");
       return false;
     }
-    if (options.url.empty() || options.token.empty() || options.connect_timeout <= 0 ||
-        options.operation_timeout.count() <= 0 || !options.max_tracks || !options.max_events ||
-        !options.max_queued_bytes || options.reconnect.initial_delay.count() < 0 ||
+    if (options.url.empty() || (options.token.empty() && !options.token_provider) ||
+        options.connect_timeout <= 0 || options.operation_timeout.count() <= 0 ||
+        !options.max_tracks || !options.max_events || !options.max_queued_bytes ||
+        options.reconnect.initial_delay.count() < 0 ||
         options.reconnect.max_delay < options.reconnect.initial_delay ||
-        options.reconnect.timeout.count() <= 0) {
+        options.reconnect.timeout.count() <= 0 || options.regions.endpoint_timeout.count() <= 0 ||
+        options.regions.discovery_timeout.count() <= 0 || options.regions.max_redirects > 16 ||
+        options.regions.fallback_endpoints.size() > 32) {
       LOG_ERROR("LiveKitClient", "Invalid connection options");
       return false;
     }
@@ -321,6 +324,10 @@ void RoomSession::participant(ParticipantSnapshot snapshot) {
 }
 
 void RoomSession::on_event(SessionEvent event) {
+  if (event.kind == SessionEvent::Kind::service && event.service_event) {
+    notify(std::move(*event.service_event));
+    return;
+  }
   if (event.kind == SessionEvent::Kind::feedback || event.kind == SessionEvent::Kind::mute) {
     if (local_) {
       local_->on_event(event);
@@ -375,6 +382,12 @@ void RoomSession::notify(RoomEvent event) {
     return;
   }
   size_t bytes = event.data ? event.data->payload.size() : 0;
+  if (event.transcription) {
+    for (const auto& segment : event.transcription->segments) {
+      bytes += segment.text.size();
+    }
+  }
+
   if (notifications_.size() >= max_events_ || notification_bytes_ + bytes > 4 * 1024 * 1024) {
     LOG_ERROR("LiveKitClient", "Observer queue overflow; closing session");
     // Never silently lose a state change. Request cancellation without joining
@@ -406,7 +419,13 @@ void RoomSession::run_notifications() {
     }
     auto event = std::move(notifications_.front());
     notifications_.pop_front();
-    notification_bytes_ -= event.data ? event.data->payload.size() : 0;
+    size_t bytes = event.data ? event.data->payload.size() : 0;
+    if (event.transcription) {
+      for (const auto& segment : event.transcription->segments) {
+        bytes += segment.text.size();
+      }
+    }
+    notification_bytes_ -= bytes;
     auto observer = observer_;
     notifying_ = observer != nullptr;
     lock.unlock();

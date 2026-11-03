@@ -1,4 +1,5 @@
 #include "backends/livekit/peer_transport.hpp"
+#include "backends/livekit/data/frame_cryptor.hpp"
 #include "api/make_ref_counted.h"
 #include "api/media_stream_interface.h"
 #include "api/stats/rtc_stats_collector_callback.h"
@@ -96,6 +97,7 @@ class PeerTransport::Receiver : public webrtc::FrameTransformerInterface {
  public:
   std::mutex mutex;
   std::weak_ptr<TrackData> track;
+  webrtc::scoped_refptr<webrtc::FrameDecryptorInterface> decryptor;
   std::optional<uint32_t> previous;
   uint64_t timestamp = 0;
 
@@ -105,7 +107,24 @@ class PeerTransport::Receiver : public webrtc::FrameTransformerInterface {
     if (!target || !native) {
       return;
     }
-    const auto bytes = native->GetData();
+    auto bytes = native->GetData();
+    std::vector<uint8_t> plaintext;
+    if (decryptor) {
+      if (bytes.size() > 16 * 1024 * 1024) {
+        return;
+      }
+      plaintext.resize(bytes.size());
+      auto result =
+          decryptor->Decrypt(dynamic_cast<webrtc::TransformableAudioFrameInterface*>(native.get())
+                                 ? webrtc::MediaType::AUDIO
+                                 : webrtc::MediaType::VIDEO,
+                             {}, {}, bytes, plaintext);
+      if (!result.IsOk() || result.bytes_written > plaintext.size()) {
+        return;
+      }
+      plaintext.resize(result.bytes_written);
+      bytes = webrtc::ArrayView<const uint8_t>(plaintext);
+    }
     if (bytes.empty()) {
       return;
     }
@@ -180,14 +199,17 @@ struct PeerTransport::Channel : webrtc::DataChannelObserver {
           make_failure(ErrorDomain::data, ErrorCode::resource_exhausted, "Data channel inbox full");
       return;
     }
-    owner.data_.emplace_back(reinterpret_cast<const char*>(buffer.data.data()), buffer.data.size());
+    owner.data_.push_back(
+        {native->label(),
+         std::string(reinterpret_cast<const char*>(buffer.data.data()), buffer.data.size())});
     owner.data_bytes_ += buffer.data.size();
   }
 };
 
 PeerTransport::PeerTransport(WebRtcContext& context, const livekit::JoinResponse& join,
-                             size_t max_events, MediaTransport transport)
-    : context_(context), max_events_(max_events) {
+                             size_t max_events, MediaTransport transport,
+                             std::shared_ptr<MediaCryptorContext> cryptor)
+    : context_(context), max_events_(max_events), cryptor_(std::move(cryptor)) {
   webrtc::PeerConnectionInterface::RTCConfiguration config;
   using PC = webrtc::PeerConnectionInterface;
   switch (transport) {
@@ -418,6 +440,11 @@ void PeerTransport::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterfac
   }
   OnRemoveTrack(receiver);
   auto sink = webrtc::make_ref_counted<Receiver>();
+  if (cryptor_ && cryptor_->options.keys && cryptor_->options.media) {
+    // WebRTC's video FrameDecryptor path bypasses its terminal transformer and
+    // forwards into a decoder. Decrypt here to preserve Room's encoded-only boundary.
+    sink->decryptor = webrtc::make_ref_counted<NativeFrameDecryptor>(cryptor_, sid);
+  }
   receiver->SetDepacketizerToDecoderFrameTransformer(sink);
   receivers_[sid] = {receiver, sink};
 }
@@ -477,7 +504,8 @@ Result<void> PeerTransport::keyframe(const TrackSid& sid) {
 }
 
 void PeerTransport::OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) {
-  if (channels_.size() >= 2 || (channel->label() != "_reliable" && channel->label() != "_lossy")) {
+  if (channels_.size() >= 3 || (channel->label() != "_reliable" && channel->label() != "_lossy" &&
+                                channel->label() != "_data_track")) {
     channel->Close();
     return;
   }
@@ -487,13 +515,14 @@ void PeerTransport::OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInter
 Result<void> PeerTransport::create_data_channels() {
   auto result = Result<void>::success();
   context_.signaling->BlockingCall([&] {
-    for (bool reliable : {true, false}) {
+    for (const auto* label : {"_reliable", "_lossy", "_data_track"}) {
+      const bool reliable = std::string(label) == "_reliable";
       webrtc::DataChannelInit init;
       init.ordered = reliable;
       if (!reliable) {
         init.maxRetransmits = 0;
       }
-      auto channel = pc->CreateDataChannelOrError(reliable ? "_reliable" : "_lossy", &init);
+      auto channel = pc->CreateDataChannelOrError(label, &init);
       if (!channel.ok()) {
         result = Result<void>::failure(native_error(channel.error()));
         return;
@@ -518,9 +547,9 @@ bool PeerTransport::send_data(const std::string& label, const std::string& bytes
   });
 }
 
-std::vector<std::string> PeerTransport::take_data() {
+std::vector<PeerTransport::DataMessage> PeerTransport::take_data() {
   std::lock_guard lock(mutex_);
-  std::vector<std::string> out;
+  std::vector<DataMessage> out;
   while (!data_.empty()) {
     out.push_back(std::move(data_.front()));
     data_.pop_front();

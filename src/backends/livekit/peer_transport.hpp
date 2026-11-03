@@ -6,9 +6,12 @@
 #include "livekit.pb.h"
 
 namespace livekit::sdk::client::detail {
+struct MediaCryptorContext;
+
 class PeerTransport : public webrtc::PeerConnectionObserver {
  public:
-  PeerTransport(WebRtcContext&, const livekit::JoinResponse&, size_t max_events, MediaTransport);
+  PeerTransport(WebRtcContext&, const livekit::JoinResponse&, size_t max_events, MediaTransport,
+                std::shared_ptr<MediaCryptorContext> cryptor = {});
   ~PeerTransport() override;
   Result<std::string> local_description(bool offer, const Operation&);
   Result<void> remote_description(const livekit::SessionDescription&, const Operation&);
@@ -16,7 +19,12 @@ class PeerTransport : public webrtc::PeerConnectionObserver {
   std::vector<std::string> take_ice();
   Result<void> create_data_channels();
   bool send_data(const std::string&, const std::string&);
-  std::vector<std::string> take_data();
+
+  struct DataMessage {
+    std::string label, bytes;
+  };
+
+  std::vector<DataMessage> take_data();
   bool bind_receiver(const TrackSid&, std::shared_ptr<TrackData>);
   void unbind_receiver(const TrackSid&);
   Result<void> keyframe(const TrackSid&);
@@ -53,7 +61,9 @@ class PeerTransport : public webrtc::PeerConnectionObserver {
   const size_t max_events_;
   mutable std::mutex mutex_;
   Failure failure_;
-  std::deque<std::string> ice_, data_;
+  std::deque<std::string> ice_;
+  std::deque<DataMessage> data_;
+  std::shared_ptr<MediaCryptorContext> cryptor_;
   size_t data_bytes_ = 0;
   // WebRTC signaling thread owns these registries.
   std::map<std::string, std::string> mids_;

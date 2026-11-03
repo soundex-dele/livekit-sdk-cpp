@@ -10,6 +10,8 @@ using VideoSample = rtc::engine::VideoSample;
 using AudioSample = rtc::engine::AudioSample;
 using AudioOutputOptions = rtc::AudioOutputOptions;
 
+struct MediaGraphOptions;  // Optional GraphEngine extension: livekit/media_graph.hpp.
+
 struct MediaPublishSpec {
   std::string name;
   MediaKind kind = MediaKind::video;
@@ -20,6 +22,7 @@ struct MediaPublishSpec {
   MediaOutput preview;
   rtc::VideoCodecOptions video;
   rtc::AudioCodecOptions audio;
+  std::shared_ptr<const MediaGraphOptions> graph;
 };
 
 struct MediaSubscribeSpec {
@@ -33,6 +36,7 @@ struct MediaSubscribeSpec {
   }();
   bool synchronize = true;
   std::chrono::milliseconds presentation_delay{80};
+  std::shared_ptr<const MediaGraphOptions> graph;
 };
 
 struct MediaTrackSnapshot {

@@ -27,7 +27,7 @@
 
 RoomSession 不再拥有 publish/unpublish/mute/data 等业务操作的实现。成员拥有自己的 publications；Publication 拥有订阅意图；Track 拥有媒体状态。RtcEngine 管恢复，RtcSession 管一次底层连接。
 
-这次不是把旧 RoomTransport 改名。新实现不包含或链接旧 RoomEngine、RoomTransport、Endpoint、NativePeer、SignalSession 或 RTCBackend。旧后端文件和构建关系恢复原样。公共值类型也不再 alias 到 `rtc::*`。
+这次不是把旧 RoomTransport 改名。新实现不包含或链接旧 RoomEngine、RoomTransport、Endpoint、NativePeer、SignalSession 或 RTCBackend。旧后端文件和构建目标已删除。公共值类型也不再 alias 到 `rtc::*`。
 
 `media/` 保留并适配了原有已编码帧注入 WebRTC 的底层算法，包括 Opus transformer、视频 packet envelope、codec 元数据和预算计数；这些代码使用新客户端自己的值类型和生命周期，不调用旧传输对象。视频 envelope 的 Encode 接口只交付已有编码数据；音频 envelope 不编码 PCM。
 
@@ -96,13 +96,13 @@ AddTrack 超时可能留下服务端未知结果；不存在针对未创建 send
 
 构建目标 `LiveKit::Client`，开关 `LIVEKIT_BUILD_CLIENT`。无 native 构建支持公共 API 和 fake session 测试，真实连接要求 `LIVEKIT_BUILD_RTC_NATIVE=ON`。
 
-直接依赖：WebRTC、协议生成库、ixwebsocket、JSON、Threads、utoolkit logging。自动检查源文件 include 和实际项目依赖闭包，禁止旧 RTC 后端和 GraphEngine 混入。
+直接依赖：WebRTC、协议生成库、ixwebsocket、JSON、OpenSSL、zlib、Threads、utoolkit logging。自动检查源文件 include 和实际项目依赖闭包，禁止旧 RTC 后端和 GraphEngine 混入。
 
-本轮范围是基础 Room 客户端，不宣称 Rust SDK 全功能等价。仅双 PC、单编码发布、全量重连；尚未提供保持 PC 的 signal resume、single-PC、simulcast、区域切换、TokenProvider、E2EE、RPC 和数据流扩展。普通 WebRTC DTLS/SRTP 仍由 WebRTC 执行。这些扩展需要在相应对象层加入，不应重新集中到 RoomSession。
+当前仍为双 PC、单编码发布、全量重连，不宣称 Rust SDK 全功能等价。RPC、文本/字节流、数据轨、E2EE、同步 TokenProvider 和区域选择已接入对应服务对象，见 [房间服务](room-services.md)。保持 PC 的 signal resume、single-PC 和 simulcast 尚未提供。普通 WebRTC DTLS/SRTP 仍由 WebRTC 执行。
 
 示例 `examples/basic_room_encoded` 输入已编码 Opus 静音帧。集成测试使用独立本地 SFU；Opus 和收到的 VP8 仅在测试程序/FFmpeg 中解码。
 
-## 本轮验证
+## 基础客户端历史验证（2026-11-02）
 
 代码调整完成后统一执行：无 native 契约测试、native 构建、头文件独立编译、依赖边界检查、旧 public_room 回归、真实 SFU 编码媒体和服务重启测试。
 

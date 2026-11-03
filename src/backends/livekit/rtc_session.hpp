@@ -6,6 +6,7 @@
 
 namespace livekit::sdk::client::detail {
 struct TrackData;
+class RoomData;
 
 struct Operation {
   SteadyClock::time_point deadline;
@@ -31,7 +32,17 @@ struct JoinState {
 };
 
 struct SessionEvent {
-  enum class Kind { participant, room, data, token, feedback, mute, quality, speakers } kind;
+  enum class Kind {
+    participant,
+    room,
+    data,
+    token,
+    feedback,
+    mute,
+    quality,
+    speakers,
+    service
+  } kind;
   ParticipantSnapshot participant;
   std::vector<ParticipantSnapshot> speakers;
   bool full_speaker_update = false;
@@ -43,6 +54,7 @@ struct SessionEvent {
   SenderFeedback feedback;
   bool muted = false;
   Failure failure;
+  std::optional<RoomEvent> service_event;
 };
 
 // Engine-owner operations. This internal test seam owns no room business state.
@@ -67,10 +79,23 @@ class RtcSession {
   virtual Result<void> publish_data(const DataPacket&, const Operation&) = 0;
   virtual Result<void> update(const ParticipantUpdate&, const Operation&) = 0;
 
+  virtual Result<void> publish_dtmf(const DtmfDigit&, const std::vector<std::string>&,
+                                    const Operation&) {
+    return Result<void>::failure(
+        make_failure(ErrorDomain::data, ErrorCode::unsupported, "DTMF unavailable"));
+  }
+
+  virtual Result<void> publish_transcription(const Transcription&, const std::vector<std::string>&,
+                                             const Operation&) {
+    return Result<void>::failure(
+        make_failure(ErrorDomain::data, ErrorCode::unsupported, "Transcription unavailable"));
+  }
+
   virtual Result<std::vector<PeerStatistics>> statistics(const Operation&) {
     return Result<std::vector<PeerStatistics>>::success({});
   }
 
+  std::shared_ptr<RoomData> data_services;
   Events events;
 };
 

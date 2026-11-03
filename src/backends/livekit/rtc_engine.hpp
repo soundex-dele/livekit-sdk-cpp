@@ -1,5 +1,6 @@
 #pragma once
 #include "backends/livekit/rtc_session.hpp"
+#include "backends/livekit/room_data.hpp"
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -13,6 +14,10 @@ class RtcEngine : public std::enable_shared_from_this<RtcEngine> {
   ~RtcEngine();
   Result<void> connect(ConnectionOptions);
   void close();
+
+  std::shared_ptr<RoomData> data_services() const {
+    return data_services_;
+  }
 
   bool available() const {
     return connected_;
@@ -40,6 +45,7 @@ class RtcEngine : public std::enable_shared_from_this<RtcEngine> {
       terminal_failure_ = std::move(error);
     }
     stopped_ = true;
+    provider_stop_.request_stop();
     changed_.notify_all();
   }
 
@@ -134,6 +140,12 @@ class RtcEngine : public std::enable_shared_from_this<RtcEngine> {
  private:
   void run();
   void recover(Failure);
+  Result<JoinState> join(const Operation&, bool initial);
+  Result<void> refresh_token(TokenRequestReason, const Operation&);
+  livekit::compat::stop_source provider_stop_;
+  std::string original_url_;
+  std::vector<std::string> region_candidates_;
+  size_t region_cursor_ = 0;
 
   void on_event(SessionEvent event) {
     if (event.kind == SessionEvent::Kind::token) {
@@ -145,6 +157,7 @@ class RtcEngine : public std::enable_shared_from_this<RtcEngine> {
 
   void state(ConnectionState, Failure = {});
   SessionFactory factory_;
+  std::shared_ptr<RoomData> data_services_;
   std::unique_ptr<RtcSession> session_;
   ConnectionOptions options_;
   std::atomic<bool> stopped_{false}, connected_{false};

@@ -5,6 +5,9 @@
 #include "backends/livekit/media/encoded_video_sender.hpp"
 #include "api/make_ref_counted.h"
 #include "support/logger.h"
+#include "backends/livekit/data/native_room_data.hpp"
+#include "backends/livekit/data/frame_cryptor.hpp"
+#include "backends/livekit/data/data_message_wire.hpp"
 #include <algorithm>
 #include <set>
 #include <thread>
@@ -98,6 +101,10 @@ class NativeRtcSession final : public RtcSession {
 
   Result<void> publish_data(const DataPacket&, const Operation&) override;
   Result<void> update(const ParticipantUpdate&, const Operation&) override;
+  Result<void> publish_dtmf(const DtmfDigit&, const std::vector<std::string>&,
+                            const Operation&) override;
+  Result<void> publish_transcription(const Transcription&, const std::vector<std::string>&,
+                                     const Operation&) override;
 
   Result<std::vector<PeerStatistics>> statistics(const Operation& op) override {
     std::vector<PeerStatistics> values;
@@ -150,6 +157,32 @@ class NativeRtcSession final : public RtcSession {
   }
 
   Result<void> negotiate(const Operation&);
+  Result<bool> send_packet(livekit::DataPacket);
+  Result<void> send_packet_wait(livekit::DataPacket, const Operation&);
+
+  void service_event(RoomEvent value) {
+    SessionEvent event{SessionEvent::Kind::service};
+    event.service_event = std::move(value);
+    if (events) {
+      events(std::move(event));
+    }
+  }
+
+  struct CryptorReports {
+    std::mutex mutex;
+    std::deque<EncryptionStateEvent> events;
+
+    void push(EncryptionStateEvent event) {
+      std::lock_guard lock(mutex);
+      if (events.size() < 256) {
+        events.push_back(std::move(event));
+      }
+    }
+  };
+
+  std::shared_ptr<NativeRoomData> services_;
+  std::shared_ptr<MediaCryptorContext> cryptor_;
+  std::shared_ptr<CryptorReports> cryptor_reports_ = std::make_shared<CryptorReports>();
   Result<void> response(livekit::SignalResponse, const Operation&);
   ConnectionOptions options_;
   Epoch epoch_ = 0;
@@ -179,8 +212,10 @@ Result<JoinState> NativeRtcSession::connect(const ConnectionOptions& options, Ep
   if (auto result = signal_->connect(options); !result) {
     return Result<JoinState>::failure(result.failure_record());
   }
+  Operation handshake{std::min(op.deadline, SteadyClock::now() + options.regions.endpoint_timeout),
+                      op.stopped};
   while (!join_) {
-    if (auto result = op.status(); !result) {
+    if (auto result = handshake.status(); !result) {
       return Result<JoinState>::failure(result.failure_record());
     }
     if (auto result = signal_->status(); !result) {
@@ -197,14 +232,41 @@ Result<JoinState> NativeRtcSession::connect(const ConnectionOptions& options, Ep
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
   }
+  if (!join_->alternative_url().empty()) {
+    auto failure = std::make_shared<FailureInfo>(*make_failure(
+        ErrorDomain::signaling, ErrorCode::request_failed, "Server requested a region redirect"));
+    failure->backend_code = "region_redirect";
+    failure->backend_data = join_->alternative_url();
+    return Result<JoinState>::failure(std::move(failure));
+  }
+  services_ = std::static_pointer_cast<NativeRoomData>(data_services);
+  if (services_) {
+    auto result = services_->connect(options.encryption);
+    if (!result) {
+      return Result<JoinState>::failure(result.failure_record());
+    }
+  }
+  cryptor_ = std::make_shared<MediaCryptorContext>();
+  cryptor_->options = options.encryption;
+  cryptor_->sif.assign(join_->sif_trailer().begin(), join_->sif_trailer().end());
+  cryptor_->report = [reports = cryptor_reports_](const std::string& sid, bool ok, int key) {
+    reports->push({sid, true, false, ok, key});
+  };
+  cryptor_->participant(join_->participant());
+  for (const auto& p : join_->other_participants()) {
+    cryptor_->participant(p);
+    if (services_) {
+      services_->participant(p);
+    }
+  }
   context_ = std::make_shared<WebRtcContext>();
   if (auto status = context_->status(); !status) {
     return Result<JoinState>::failure(status.failure_record());
   }
   publisher_ = std::make_unique<PeerTransport>(*context_, *join_, options.max_events,
-                                               options.media_transport);
+                                               options.media_transport, cryptor_);
   subscriber_ = std::make_unique<PeerTransport>(*context_, *join_, options.max_events,
-                                                options.media_transport);
+                                                options.media_transport, cryptor_);
   if (auto result = publisher_->status(); !result) {
     return Result<JoinState>::failure(result.failure_record());
   }
@@ -253,6 +315,11 @@ Result<void> NativeRtcSession::negotiate(const Operation& op) {
 }
 
 Result<void> NativeRtcSession::response(livekit::SignalResponse message, const Operation& op) {
+  if (services_) {
+    if (auto result = services_->signal(message); !result) {
+      return result;
+    }
+  }
   if (message.has_offer()) {
     if (auto result = subscriber_->remote_description(message.offer(), op); !result) {
       return result;
@@ -277,6 +344,12 @@ Result<void> NativeRtcSession::response(livekit::SignalResponse message, const O
         ->add_ice(message.trickle());
   } else if (message.has_update()) {
     for (const auto& p : message.update().participants()) {
+      if (cryptor_) {
+        cryptor_->participant(p);
+      }
+      if (services_) {
+        services_->participant(p);
+      }
       if (!ready_) {
         if (p.identity() == join_->participant().identity()) {
           *join_->mutable_participant() = p;
@@ -298,6 +371,10 @@ Result<void> NativeRtcSession::response(livekit::SignalResponse message, const O
       if (events) {
         events(std::move(event));
       }
+      RoomEvent data_event;
+      data_event.kind = RoomEventKind::data_tracks_changed;
+      data_event.participant_identity = p.identity();
+      service_event(std::move(data_event));
     }
   } else if (message.has_speakers_changed()) {
     SessionEvent event{SessionEvent::Kind::speakers};
@@ -436,10 +513,62 @@ Result<void> NativeRtcSession::poll(const Operation& op) {
         return result;
       }
     }
-    for (const auto& bytes : peer->take_data()) {
-      livekit::DataPacket data;
-      if (!data.ParseFromString(bytes)) {
+    for (const auto& incoming : peer->take_data()) {
+      if (incoming.label == "_data_track") {
+        if (services_) {
+          auto result = services_->receive_track(
+              {reinterpret_cast<const uint8_t*>(incoming.bytes.data()), incoming.bytes.size()});
+          if (!result) {
+            RoomEvent event;
+            event.kind = RoomEventKind::data_error;
+            event.failure = result.failure_record();
+            service_event(std::move(event));
+          }
+        }
         continue;
+      }
+      livekit::DataPacket data;
+      if (!data.ParseFromString(incoming.bytes)) {
+        continue;
+      }
+      auto decrypted = decrypt_packet(data, options_.encryption);
+      if (!decrypted) {
+        RoomEvent event;
+        event.kind = RoomEventKind::data_error;
+        event.failure = decrypted.failure_record();
+        event.participant_identity = data.participant_identity();
+        service_event(std::move(event));
+        continue;
+      }
+      data = std::move(*decrypted);
+      if (services_) {
+        services_->receive(data);
+      }
+      if (data.has_sip_dtmf()) {
+        DtmfDigit value{data.sip_dtmf().code(), data.sip_dtmf().digit()};
+        if (validate_dtmf(value)) {
+          RoomEvent event;
+          event.kind = RoomEventKind::dtmf_received;
+          event.dtmf = std::move(value);
+          event.participant_identity = data.participant_identity();
+          service_event(std::move(event));
+        }
+      }
+      if (data.has_transcription()) {
+        Transcription value;
+        value.participant_identity = data.transcription().transcribed_participant_identity();
+        value.track_id = data.transcription().track_id();
+        for (const auto& segment : data.transcription().segments()) {
+          value.segments.push_back({segment.id(), segment.text(), segment.start_time(),
+                                    segment.end_time(), segment.final(), segment.language()});
+        }
+        if (validate_transcription(value)) {
+          RoomEvent event;
+          event.kind = RoomEventKind::transcription_received;
+          event.transcription = std::move(value);
+          event.participant_identity = data.participant_identity();
+          service_event(std::move(event));
+        }
       }
       if (data.has_speaker()) {
         SessionEvent event{SessionEvent::Kind::speakers};
@@ -468,6 +597,28 @@ Result<void> NativeRtcSession::poll(const Operation& op) {
         events(std::move(event));
       }
     }
+  }
+  if (ready_ && services_) {
+    auto result = services_->pump(
+        [this](const livekit::DataPacket& packet) { return send_packet(packet); },
+        [this](const livekit::SignalRequest& request) { return signal_->send(request); },
+        [this](const std::vector<uint8_t>& bytes) {
+          return publisher_->send_data("_data_track", std::string(bytes.begin(), bytes.end()));
+        });
+    if (!result) {
+      return result;
+    }
+  }
+  std::deque<EncryptionStateEvent> reports;
+  {
+    std::lock_guard lock(cryptor_reports_->mutex);
+    reports.swap(cryptor_reports_->events);
+  }
+  for (auto& report : reports) {
+    RoomEvent event;
+    event.kind = RoomEventKind::encryption_changed;
+    event.encryption = std::move(report);
+    service_event(std::move(event));
   }
   for (auto& [sid, weak] : receivers_) {
     if (auto track = weak.lock()) {
@@ -530,6 +681,13 @@ Result<PublicationInfo> NativeRtcSession::add_track(const TrackConfig& config,
   add->set_stream(config.stream_group.empty() ? "livekit" : config.stream_group);
   add->set_muted(config.muted);
   add->set_disable_red(true);
+  if (options_.encryption.keys && options_.encryption.media) {
+    auto supported = encryption_codec(codec(config.format.codec));
+    if (!supported) {
+      return Result<PublicationInfo>::failure(supported.failure_record());
+    }
+    add->set_encryption(livekit::Encryption::GCM);
+  }
   if (config.kind == MediaKind::audio) {
     add->set_stereo(config.format.channels == 2);
   } else {
@@ -611,6 +769,16 @@ Result<void> NativeRtcSession::create_sender(const TrackSid& sid, std::shared_pt
         make_failure(ErrorDomain::transport, ErrorCode::request_failed, added.error().message()));
   }
   sender.native = added.value()->sender();
+  if (options_.encryption.keys && options_.encryption.media) {
+    auto format = encryption_codec(codec(config.format.codec));
+    if (!format) {
+      return Result<void>::failure(format.failure_record());
+    }
+    sender.native->SetFrameEncryptor(webrtc::make_ref_counted<NativeFrameEncryptor>(
+        options_.encryption.keys, *format, [reports = cryptor_reports_, sid](bool ok, int key) {
+          reports->push({sid, true, true, ok, key});
+        }));
+  }
   senders_[sid] = sender;
   if (sender.audio) {
     sender.native->SetEncoderToPacketizerFrameTransformer(sender.audio);
@@ -768,13 +936,67 @@ Result<void> NativeRtcSession::publish_data(const DataPacket& packet, const Oper
     data.add_destination_identities(identity);
     user->add_destination_identities(identity);
   }
-  auto bytes = data.SerializeAsString();
+  return send_packet_wait(std::move(data), op);
+}
+
+Result<bool> NativeRtcSession::send_packet(livekit::DataPacket packet) {
+  packet.set_participant_identity(join_->participant().identity());
+  auto sealed = encrypt_packet(packet, options_.encryption);
+  if (!sealed) {
+    return Result<bool>::failure(sealed.failure_record());
+  }
+  auto bytes = sealed->SerializeAsString();
   if (bytes.size() > 16384) {
-    return Result<void>::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
+    return Result<bool>::failure(make_failure(ErrorDomain::data, ErrorCode::invalid_argument,
                                               "Data packet exceeds 16 KiB wire limit"));
   }
-  return wait(
-      [&] { return publisher_->send_data(packet.reliable ? "_reliable" : "_lossy", bytes); }, op);
+  return Result<bool>::success(
+      publisher_->send_data(packet.kind() == 0 ? "_reliable" : "_lossy", bytes));
+}
+
+Result<void> NativeRtcSession::send_packet_wait(livekit::DataPacket packet, const Operation& op) {
+  for (;;) {
+    if (auto result = op.status(); !result) {
+      return result;
+    }
+    auto result = send_packet(packet);
+    if (!result) {
+      return Result<void>::failure(result.failure_record());
+    }
+    if (*result) {
+      return Result<void>::success();
+    }
+    if (auto polled = poll(op); !polled) {
+      return polled;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+}
+
+Result<void> NativeRtcSession::publish_dtmf(const DtmfDigit& value,
+                                            const std::vector<std::string>& destinations,
+                                            const Operation& op) {
+  auto packet = encode_dtmf(value);
+  if (!packet) {
+    return Result<void>::failure(packet.failure_record());
+  }
+  for (const auto& identity : destinations) {
+    packet->add_destination_identities(identity);
+  }
+  return send_packet_wait(std::move(*packet), op);
+}
+
+Result<void> NativeRtcSession::publish_transcription(const Transcription& value,
+                                                     const std::vector<std::string>& destinations,
+                                                     const Operation& op) {
+  auto packet = encode_transcription(value);
+  if (!packet) {
+    return Result<void>::failure(packet.failure_record());
+  }
+  for (const auto& identity : destinations) {
+    packet->add_destination_identities(identity);
+  }
+  return send_packet_wait(std::move(*packet), op);
 }
 
 Result<void> NativeRtcSession::update(const ParticipantUpdate& update, const Operation& op) {

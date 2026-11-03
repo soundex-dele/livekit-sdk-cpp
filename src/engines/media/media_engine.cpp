@@ -87,7 +87,7 @@ bool MediaEngine::connect(ConnectionOptions options) {
 }
 
 void MediaEngine::close() {
-  if (callback_thread()) {
+  if (callback_thread() || detail::service_handler_thread) {
     LOG_ERROR("MediaEngine", "close: invalid callback thread");
     return;
   }

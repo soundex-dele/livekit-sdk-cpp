@@ -1,5 +1,6 @@
 #pragma once
 #include "livekit/media_engine.hpp"
+#include "livekit/media_graph.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "livekit/rtc/audio_output.hpp"
 #include "livekit/rtc/recording_node.hpp"
@@ -35,7 +36,7 @@ class MediaPipeline : public std::enable_shared_from_this<MediaPipeline> {
 
   void outputs(const std::shared_ptr<graphflow::core::GraphNode>&, MediaOutput,
                const rtc::TrackDescriptor&, std::shared_ptr<rtc::AudioOutputSession>);
-  Result<void> build();
+  Result<void> build(const std::shared_ptr<const MediaGraphOptions>&, const rtc::TrackDescriptor&);
   void stop_nodes();
   void fail(Failure);
   mutable std::mutex state_mutex_, lifecycle_;
@@ -53,5 +54,7 @@ class MediaPipeline : public std::enable_shared_from_this<MediaPipeline> {
   std::shared_ptr<rtc::engine::ApplicationOutput> output_;
   std::shared_ptr<rtc::nodes::AudioOutputNode> speaker_;
   std::shared_ptr<rtc::nodes::RecordingNode> recording_;
+  std::function<bool()> custom_activate_;
+  std::function<void()> custom_quiesce_;
 };
 }  // namespace livekit::sdk::client::detail

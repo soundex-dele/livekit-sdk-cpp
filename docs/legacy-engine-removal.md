@@ -22,7 +22,7 @@ SDK CLI、全部 SDK 示例和会议、投屏、远控、直播工作台都已�
 
 MediaTrackSnapshot 的 frames/bytes 是编码媒体边界计数，input 提供输入完成状态，CLI 使用它保留文件播完退出行为。
 
-旧 RPC、流、数据轨、E2EE、区域选择、异步 TokenProvider、自定义发布/订阅图 API 和共享采集句柄未在新接口提供。删除旧底层不表示这些能力已经迁移。新 Room 内部的 `src/backends/livekit/rtc_engine.*` 属于 Rust 风格会话恢复层，继续保留；它不是被移除的公共 RtcEngine。
+后续迁移已将 RPC、流、数据轨、E2EE、区域选择和同步 TokenProvider 接入新 Room，详见 [房间服务](room-services.md)。自定义发布/订阅图使用 [MediaEngine 的同步构图接口](media-engine.md#自定义媒体图)；共享采集句柄尚未迁移，旧异步 API 不恢复。新 Room 内部的 `src/backends/livekit/rtc_engine.*` 属于 Rust 风格会话恢复层，继续保留；它不是被移除的公共 RtcEngine。
 
 验证使用编译、契约测试、无窗口测试和本机隔离 SFU，不代表真实设备人工验收。
 

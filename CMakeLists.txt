@@ -194,6 +194,10 @@ if(LIVEKIT_BUILD_RTC_MEDIA)
     target_include_directories(livekit_media_engine PUBLIC include PRIVATE src)
     target_link_libraries(livekit_media_engine PUBLIC LiveKit::Client
       PRIVATE LiveKit::RTCMedia LiveKit::RTCInputs LiveKit::RTCOutputs graphflow::engine utoolkit_logging)
+    add_library(livekit_media_engine_graph INTERFACE)
+    add_library(LiveKit::MediaEngineGraph ALIAS livekit_media_engine_graph)
+    target_link_libraries(livekit_media_engine_graph INTERFACE LiveKit::MediaEngine
+      LiveKit::RTCMedia LiveKit::RTCInputs LiveKit::RTCOutputs graphflow::engine)
     if(WIN32)
       target_compile_definitions(livekit_media_engine PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     endif()
@@ -202,9 +206,16 @@ if(LIVEKIT_BUILD_RTC_MEDIA)
       target_link_libraries(livekit_media_engine_tests PRIVATE LiveKit::MediaEngine)
       add_test(NAME media_engine COMMAND livekit_media_engine_tests)
       set_tests_properties(media_engine PROPERTIES TIMEOUT 30)
+      add_executable(livekit_media_graph_tests tests/media_graph_tests.cpp)
+      target_include_directories(livekit_media_graph_tests PRIVATE src examples/custom_media_graph)
+      target_link_libraries(livekit_media_graph_tests PRIVATE LiveKit::MediaEngineGraph)
+      add_test(NAME media_graph COMMAND livekit_media_graph_tests)
+      set_tests_properties(media_graph PROPERTIES TIMEOUT 45)
     endif()
   endif()
   if(LIVEKIT_BUILD_EXAMPLES AND LIVEKIT_BUILD_CLIENT)
+    add_executable(livekit_custom_media_graph_example examples/custom_media_graph/main.cpp)
+    target_link_libraries(livekit_custom_media_graph_example PRIVATE LiveKit::MediaEngineGraph)
     add_executable(livekit_automatic_session_example examples/automatic_session/main.cpp)
     target_link_libraries(livekit_automatic_session_example PRIVATE LiveKit::MediaEngine)
     add_executable(livekit_video_source_example examples/video_source/main.cpp)
@@ -251,9 +262,10 @@ if(LIVEKIT_BUILD_RTC_MEDIA)
     endif()
     if(TARGET livekit_media_engine_tests)
       livekit_player_runtime(livekit_media_engine_tests)
+      livekit_player_runtime(livekit_media_graph_tests)
     endif()
     if(LIVEKIT_BUILD_EXAMPLES AND LIVEKIT_BUILD_CLIENT)
-      foreach(example automatic_session video_source video_stream audio_source audio_stream)
+      foreach(example automatic_session video_source video_stream audio_source audio_stream custom_media_graph)
         livekit_player_runtime(livekit_${example}_example)
       endforeach()
     endif()
@@ -375,7 +387,7 @@ endif()
 # Business targets propagate explicit results. Third-party parser/WinRT adapters
 # are separate exception-enabled object targets.
 foreach(target IN ITEMS
-      livekit_media_engine livekit_media_engine_tests
+      livekit_media_engine livekit_media_engine_tests livekit_media_graph_tests livekit_custom_media_graph_example
     livekit_encoded_media livekit_media_inputs livekit_media_display
     livekit_rtc_media livekit_rtc_inputs livekit_rtc_outputs
       livekit_remote_control

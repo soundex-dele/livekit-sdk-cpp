@@ -11,6 +11,7 @@ C++17 LiveKit 收发 SDK。新增同步接口 `client::Room` 只处理已编码�
 | 使用方式 | 公共头文件 | 链接目标 |
 | --- | --- | --- |
 | 同步采集、编解码、预览、播放、录制 | livekit/media_engine.hpp | LiveKit::MediaEngine |
+| 自定义发布/订阅媒体图、水印与处理分支 | livekit/media_graph.hpp | LiveKit::MediaEngineGraph |
 | 同步入会与编码帧收发 | livekit/client/room.hpp | LiveKit::Client |
 | VP8/H264/H265/Opus 编解码节点 | livekit/rtc/video_nodes.hpp、audio_nodes.hpp | LiveKit::RTCMedia |
 | 文件、设备、应用供帧输入节点 | livekit/rtc/input_node.hpp | LiveKit::RTCInputs |
@@ -52,6 +53,7 @@ MediaEngine 独占 Room 和各轨道媒体图。Room 只处理编码帧、参与
 - automatic_session：使用同步 MediaEngine 发布合成音频、按成员快照订阅。
 - video_source / audio_source：使用同步 MediaEngine，输入 → codec → Room。
 - video_stream / audio_stream：使用同步 MediaEngine，Room → codec → 应用消费；设备播放显式启用。
+- custom_media_graph：生成视频 → 自定义水印节点 → 编码 → Room，同时将处理后的帧送给预览分支。
 - CLI lk：[命令说明](docs/cli.md)，支持多流、录制及逐轨统计。
 - conference_viewer：每轨图、动态发布、静音、质量和录制。
 - livekit-app 的会议、投屏、远控、直播工作台均使用新 MediaEngine。
@@ -62,4 +64,4 @@ MediaEngine 独占 Room 和各轨道媒体图。Room 只处理编码帧、参与
 
 支持独立音视频轨、编码帧收发、逐轨静音/订阅需求、数据包、成员快照和完整重新入会。MediaEngine 支持 VP8/Opus 及可选 FFmpeg H264/H265 编解码、录制与媒体输出。
 
-旧 RoomServices 的 RPC、流、数据轨和 E2EE 没有在新接口中实现；单 PC、信令 resume、无缝迁移及 simulcast/SVC 也未提供。当前可用接口以 [MediaEngine](docs/media-engine.md) 和 [Room 设计](docs/livekit-client-design.md) 为准。历史接口文档和验收记录不代表当前版本的能力。
+RPC、文本/字节流、文件流、数据轨、DTMF/转写、E2EE、同步 TokenProvider 和区域切换已接入新 Room，见 [房间服务](docs/room-services.md)。单 PC、信令 resume、无缝迁移及 simulcast/SVC 尚未提供。当前可用接口以 [MediaEngine](docs/media-engine.md) 和 [Room 设计](docs/livekit-client-design.md) 为准。历史接口文档和验收记录不代表当前版本的能力。

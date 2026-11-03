@@ -16,7 +16,12 @@ enum class RoomEventKind {
   track_republished,
   track_muted,
   sender_feedback,
-  data_received
+  data_received,
+  dtmf_received,
+  transcription_received,
+  encryption_changed,
+  data_error,
+  data_tracks_changed
 };
 
 // Owned snapshot values may be retained after the callback returns.
@@ -30,6 +35,9 @@ struct RoomEvent {
   TrackSid previous_sid;
   std::optional<SenderFeedback> feedback;
   std::optional<DataPacket> data;
+  std::optional<DtmfDigit> dtmf;
+  std::optional<Transcription> transcription;
+  std::optional<EncryptionStateEvent> encryption;
   Failure failure;
 };
 }  // namespace livekit::sdk::client

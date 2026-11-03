@@ -53,6 +53,9 @@ rtc:
   udp_port: {udp}
   use_external_ip: false
   enable_loopback_candidate: true
+  node_ip: 127.0.0.1
+  ips:
+    includes: [127.0.0.1/32]
 keys:
   {key}: {secret}
 logging:

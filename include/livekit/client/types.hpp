@@ -3,6 +3,8 @@
 #include "livekit/compat/thread.hpp"
 #include "livekit/result.hpp"
 #include "livekit/transport_options.hpp"
+#include "livekit/client/encryption.hpp"
+#include "livekit/client/connection_policy.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -235,6 +237,9 @@ struct ConnectionOptions {
   size_t max_queued_bytes = 64 * 1024 * 1024, max_tracks = 128, max_events = 4096;
   std::chrono::milliseconds operation_timeout{30000};
   ReconnectOptions reconnect;
+  EncryptionOptions encryption;
+  RegionOptions regions;
+  TokenProvider token_provider;
 };
 
 struct TrackPublishOptions {
