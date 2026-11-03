@@ -2,6 +2,10 @@
 #include "backends/livekit/room_session.hpp"
 
 namespace livekit::sdk::client {
+Result<std::vector<PeerStatistics>> Room::statistics() {
+  return session_->statistics();
+}
+
 Room::Room() : session_(std::make_shared<detail::RoomSession>()) {}
 
 Room::~Room() {

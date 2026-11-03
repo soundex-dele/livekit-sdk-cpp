@@ -14,7 +14,7 @@ add_library(livekit_demo_session STATIC session.cpp session_runtime.cpp quality.
 livekit_without_exceptions(livekit_demo_session)
 
 target_include_directories(livekit_demo_session PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(livekit_demo_session PUBLIC LiveKit::RTCMediaEngine LiveKit::ServerSDK)
+target_link_libraries(livekit_demo_session PUBLIC LiveKit::MediaEngine LiveKit::ServerSDK)
 add_executable(livekit_conference_demo main.cpp ui.cpp video_texture.cpp)
 livekit_without_exceptions(livekit_conference_demo)
 

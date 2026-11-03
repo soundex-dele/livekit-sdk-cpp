@@ -31,8 +31,10 @@ struct JoinState {
 };
 
 struct SessionEvent {
-  enum class Kind { participant, room, data, token, feedback, mute } kind;
+  enum class Kind { participant, room, data, token, feedback, mute, quality, speakers } kind;
   ParticipantSnapshot participant;
+  std::vector<ParticipantSnapshot> speakers;
+  bool full_speaker_update = false;
   RoomInfo room;
   TrackSid sid;
   DataPacket data;
@@ -64,6 +66,11 @@ class RtcSession {
   virtual Result<void> keyframe(const TrackSid&) = 0;
   virtual Result<void> publish_data(const DataPacket&, const Operation&) = 0;
   virtual Result<void> update(const ParticipantUpdate&, const Operation&) = 0;
+
+  virtual Result<std::vector<PeerStatistics>> statistics(const Operation&) {
+    return Result<std::vector<PeerStatistics>>::success({});
+  }
+
   Events events;
 };
 

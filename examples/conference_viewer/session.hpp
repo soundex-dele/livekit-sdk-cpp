@@ -1,7 +1,6 @@
 #include "livekit/compat/thread.hpp"
-#include "livekit/rtc/livekit.hpp"
 #pragma once
-#include <livekit/rtc/engine.hpp>
+#include <livekit/media_engine.hpp>
 #include <livekit/media.hpp>
 #include "quality.hpp"
 #include <map>
@@ -15,10 +14,10 @@
 
 namespace demo {
 namespace sdk = livekit::sdk;
-namespace rtc = sdk::rtc;
+namespace rtc = sdk::client;
 
 struct SessionOptions {
-  rtc::LiveKitRoomOptions connection;
+  rtc::ConnectionOptions connection;
   std::string room;
   std::vector<sdk::MediaSpec> media;
   bool audio_playout = false;
@@ -63,7 +62,7 @@ std::vector<Tile> tiles(const Snapshot& snapshot);
 
 class Session {
  public:
-  using EngineFactory = std::function<sdk::Result<std::unique_ptr<rtc::engine::RtcEngine>>()>;
+  using EngineFactory = std::function<sdk::Result<std::unique_ptr<rtc::MediaEngine>>()>;
   Session();
   // Factory runs on the session worker and returns an exclusively owned engine.
   explicit Session(EngineFactory);

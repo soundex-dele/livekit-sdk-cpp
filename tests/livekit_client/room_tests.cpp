@@ -48,6 +48,7 @@ struct State {
   std::atomic<int> connects{0}, publishes{0}, creates{0}, removes{0}, closes{0}, subscriptions{0};
   std::mutex mutex;
   std::vector<EncodedFrame> sent;
+  std::vector<impl::SessionEvent> pending;
   std::weak_ptr<impl::TrackData> received;
   Failure sender_failure, subscription_failure;  // Guarded by mutex.
 };
@@ -83,6 +84,14 @@ class FakeSession : public impl::RtcSession {
   }
 
   Result<void> poll(const impl::Operation&) override {
+    std::vector<impl::SessionEvent> pending;
+    {
+      std::lock_guard lock(state_->mutex);
+      pending.swap(state_->pending);
+    }
+    for (auto& event : pending) {
+      events(std::move(event));
+    }
     if (state_->disconnect.exchange(false)) {
       return Result<void>::failure(
           make_failure(ErrorDomain::transport, ErrorCode::connection_lost, "test restart", true));
@@ -426,7 +435,43 @@ void operation_results() {
         "success clears previous subscription error");
 }
 
+void participant_media_status() {
+  Room room;
+  auto state = fake(room);
+  check(room.connect(options()), "status room connects");
+  impl::SessionEvent quality{impl::SessionEvent::Kind::quality};
+  quality.participant.sid = "PA_remote";
+  quality.participant.connection_quality = 2;
+  impl::SessionEvent speakers{impl::SessionEvent::Kind::speakers};
+  ParticipantSnapshot speaker;
+  speaker.sid = "PA_remote";
+  speaker.speaking = true;
+  speaker.audio_level = .5f;
+  speakers.speakers.push_back(speaker);
+  {
+    std::lock_guard lock(state->mutex);
+    state->pending = {quality, speakers};
+  }
+  eventually(
+      [&] {
+        auto p = room.remote_participants()[0].snapshot();
+        return p.connection_quality == 2 && p.speaking && p.audio_level == .5f;
+      },
+      "quality and active speaker update roster");
+  speakers.speakers.clear();
+  speakers.full_speaker_update = true;
+  {
+    std::lock_guard lock(state->mutex);
+    state->pending.push_back(speakers);
+  }
+  eventually([&] { return !room.remote_participants()[0].snapshot().speaking; },
+             "full speaker update clears absent speaker");
+  check(room.remote_participants()[0].snapshot().connection_quality == 2,
+        "speaker update preserves quality");
+}
+
 int main() {
+  participant_media_status();
   operation_results();
   business_and_media();
   cancellation();

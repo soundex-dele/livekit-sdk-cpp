@@ -99,6 +99,24 @@ class NativeRtcSession final : public RtcSession {
   Result<void> publish_data(const DataPacket&, const Operation&) override;
   Result<void> update(const ParticipantUpdate&, const Operation&) override;
 
+  Result<std::vector<PeerStatistics>> statistics(const Operation& op) override {
+    std::vector<PeerStatistics> values;
+    for (auto* peer : {publisher_.get(), subscriber_.get()}) {
+      auto result = peer->statistics(op);
+      if (!result) {
+        return Result<std::vector<PeerStatistics>>::failure(result.failure_record());
+      }
+      result->target = peer == publisher_.get() ? 0 : 1;
+      if (peer == publisher_.get()) {
+        for (const auto& [sid, cid] : cids_) {
+          result->publication_tracks[cid] = sid;
+        }
+      }
+      values.push_back(std::move(*result));
+    }
+    return Result<std::vector<PeerStatistics>>::success(std::move(values));
+  }
+
  private:
   struct Sender {
     webrtc::scoped_refptr<webrtc::RtpSenderInterface> native;
@@ -183,8 +201,10 @@ Result<JoinState> NativeRtcSession::connect(const ConnectionOptions& options, Ep
   if (auto status = context_->status(); !status) {
     return Result<JoinState>::failure(status.failure_record());
   }
-  publisher_ = std::make_unique<PeerTransport>(*context_, *join_, options.max_events);
-  subscriber_ = std::make_unique<PeerTransport>(*context_, *join_, options.max_events);
+  publisher_ = std::make_unique<PeerTransport>(*context_, *join_, options.max_events,
+                                               options.media_transport);
+  subscriber_ = std::make_unique<PeerTransport>(*context_, *join_, options.max_events,
+                                                options.media_transport);
   if (auto result = publisher_->status(); !result) {
     return Result<JoinState>::failure(result.failure_record());
   }
@@ -279,6 +299,27 @@ Result<void> NativeRtcSession::response(livekit::SignalResponse message, const O
         events(std::move(event));
       }
     }
+  } else if (message.has_speakers_changed()) {
+    SessionEvent event{SessionEvent::Kind::speakers};
+    for (const auto& speaker : message.speakers_changed().speakers()) {
+      ParticipantSnapshot value;
+      value.sid = speaker.sid();
+      value.speaking = speaker.active();
+      value.audio_level = speaker.level();
+      event.speakers.push_back(std::move(value));
+    }
+    if (events) {
+      events(std::move(event));
+    }
+  } else if (message.has_connection_quality()) {
+    for (const auto& update : message.connection_quality().updates()) {
+      SessionEvent event{SessionEvent::Kind::quality};
+      event.participant.sid = update.participant_sid();
+      event.participant.connection_quality = update.quality();
+      if (events) {
+        events(std::move(event));
+      }
+    }
   } else if (message.has_room_update()) {
     SessionEvent event{SessionEvent::Kind::room};
     event.room = room(message.room_update().room());
@@ -358,6 +399,24 @@ Result<void> NativeRtcSession::poll(const Operation& op) {
   if (failure_) {
     return Result<void>::failure(failure_);
   }
+  // A server DISCONNECT can be followed immediately by a WebSocket close.
+  // Consume the explicit protocol decision before treating the socket error as retryable.
+  std::vector<livekit::SignalResponse> pending;
+  for (int i = 0; i < 64; ++i) {
+    auto message = signal_->next();
+    if (!message) {
+      break;
+    }
+    if (message->has_leave()) {
+      return response(std::move(*message), op);
+    }
+    pending.push_back(std::move(*message));
+  }
+  for (auto& message : pending) {
+    if (auto result = response(std::move(message), op); !result) {
+      return result;
+    }
+  }
   if (auto result = signal_->status(); !result) {
     return result;
   }
@@ -366,15 +425,6 @@ Result<void> NativeRtcSession::poll(const Operation& op) {
   }
   if (auto result = subscriber_->status(); !result) {
     return result;
-  }
-  for (int i = 0; i < 64; ++i) {
-    auto message = signal_->next();
-    if (!message) {
-      break;
-    }
-    if (auto result = response(std::move(*message), op); !result) {
-      return result;
-    }
   }
   for (auto* peer : {publisher_.get(), subscriber_.get()}) {
     for (const auto& ice : peer->take_ice()) {
@@ -388,7 +438,24 @@ Result<void> NativeRtcSession::poll(const Operation& op) {
     }
     for (const auto& bytes : peer->take_data()) {
       livekit::DataPacket data;
-      if (!data.ParseFromString(bytes) || !data.has_user()) {
+      if (!data.ParseFromString(bytes)) {
+        continue;
+      }
+      if (data.has_speaker()) {
+        SessionEvent event{SessionEvent::Kind::speakers};
+        event.full_speaker_update = true;
+        for (const auto& speaker : data.speaker().speakers()) {
+          ParticipantSnapshot value;
+          value.sid = speaker.sid();
+          value.speaking = speaker.active();
+          value.audio_level = speaker.level();
+          event.speakers.push_back(std::move(value));
+        }
+        if (events) {
+          events(std::move(event));
+        }
+      }
+      if (!data.has_user()) {
         continue;
       }
       SessionEvent event{SessionEvent::Kind::data};
@@ -732,6 +799,16 @@ Result<void> NativeRtcSession::update(const ParticipantUpdate& update, const Ope
 }
 
 void NativeRtcSession::close() {
+  // An intentional close must leave the room, not enter the server's reconnect grace period.
+  if (signal_ && ready_ && signal_->status()) {
+    livekit::SignalRequest request;
+    request.mutable_leave()->set_reason(1);  // CLIENT_INITIATED
+    auto result = signal_->send(request);
+    if (!result) {
+      LOG_ERROR("LiveKitClient", "leave: " << result.error().message);
+    }
+  }
+  ready_ = false;
   for (auto& [sid, sender] : senders_) {
     sender.close();
   }

@@ -1,22 +1,20 @@
 # livekit-sdk-cpp
 
-当前 RTC 接口见 [完成回调与持续 Observer](docs/rtc-simple-observer.md)。RtcEngine 和 RoomEngine 的控制接口返回 `void`，每次调用通过 `Completion<T>` 接收 `Result<T>`；持续状态交给 Observer。RtcEngine 在对应 GraphEngine 启动后交付发布/订阅结果。RtcEngine 与其 RoomEngine 共使用 control、lifecycle、notification 三线程（独立 RoomEngine 仅有 control 与 notification），应用无需调用 `poll()`；leave/close 保持同步。
+C++17 LiveKit 收发 SDK。新增同步接口 `client::Room` 只处理已编码媒体与房间状态；`client::MediaEngine` 在 Room 上用 GraphEngine 管理采集、编解码、预览、播放和录制。接口与线程规则见 [MediaEngine](docs/media-engine.md)。
 
-C++17 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传输及会话服务；发布和订阅分别是 GraphEngine 的 sink/source 节点。RtcEngine 是统一入口，协调 RoomEngine、可选媒体模块和每轨 GraphEngine 流水线，多路音视频共享一个房间连接。
+新接口的 connect 返回 bool，有值操作返回 Result<T>，void 控制直接记录错误日志；保留 Observer，不使用操作完成回调。SDK 原生示例和 livekit-app 的会议客户端已迁移到新接口。
+
+旧 RtcEngine / RoomEngine 继续供尚未迁移的应用使用，其异步契约见 [完成回调与持续 Observer](docs/rtc-simple-observer.md)。下文涉及 rtc::、RoomServices、自定义图和共享采集的说明属于这套旧接口。
 
 数据视图和线程取消类型使用 `livekit::compat` 命名空间，见 [C++17 迁移说明](../docs/development/cxx17-migration.md)。从旧版本升级时需重新编译 SDK 与使用方。
-
-普通媒体会话通过 RtcEngine 装配可选的 RtcMediaGraphBuilder 与 RtcMediaResources：Session 提交配置或应用数据源，引擎创建采集、编解码、预览、播放和录制图。共享采集源可供多个发布或多个房间复用，各路保留独立编码器与队列。
-
-旧 Room、Participant、TrackPublication、VideoFrameStream、AudioFrameStream API 和 LiveKit::SDK 目标已移除，没有兼容层。调用方与测试入口已迁移，支持边界与验证记录见 [实施清单](docs/rtc-backend-refactor.md)。
-
-旧公开 RtcMediaEngine / RoomSession 已移除。旧的异步调度和同步 Result 文档保留为历史记录，当前契约以上述最简方案为准。
 
 ## 入口
 
 | 使用方式 | 公共头文件 | 链接目标 |
 | --- | --- | --- |
-| 配置采集、编解码、预览、播放、录制与共享采集 | livekit/rtc/engine.hpp | LiveKit::RTCMediaEngine |
+| 同步采集、编解码、预览、播放、录制 | livekit/media_engine.hpp | LiveKit::MediaEngine |
+| 同步入会与编码帧收发 | livekit/client/room.hpp | LiveKit::Client |
+| 旧接口：配置采集、编解码、预览、播放、录制与共享采集 | livekit/rtc/engine.hpp | LiveKit::RTCMediaEngine |
 | 只入会、收发编码帧 | livekit/rtc/room_engine.hpp、livekit.hpp | LiveKit::RTCLiveKit |
 | 统一入口：编码传输与高级 GraphEngine 扩展 | livekit/rtc/engine.hpp、graph_api.hpp | LiveKit::RTCEngine |
 | 自行组合发布/订阅节点 | livekit/rtc/publish_node.hpp、subscribe_node.hpp | LiveKit::RTCNodes |
@@ -41,7 +39,7 @@ C++17 LiveKit 收发 SDK。RoomEngine 负责入会、信令、已编码媒体传
 
 RtcEngine 独占 RoomEngine，以两个 map 保存发布和订阅媒体图。控制 Completion 与 Observer 在 notification 队列执行，媒体输出使用独立有界 dispatcher。leave/close 是外部拥有者调用的同步屏障，close 是 leave 的别名，返回后可重新 join。回调不能阻塞等待其他回调、退会或销毁引擎；客户端负责 UI 线程交接。当前职责与所有权图见 [架构说明](docs/architecture.md)。
 
-## RTC 后端目录
+## 旧 RTC 后端目录
 
 公共入口为 `rtc::engine::RtcEngine`，头文件为 `livekit/rtc/engine.hpp`，状态和逻辑直接定义在该类中。
 RoomEngine 的公共头文件为 `livekit/rtc/room_engine.hpp`，可注入 RoomTransport 工厂做无窗口测试；普通应用使用 `create_livekit_engine()`。
@@ -83,6 +81,7 @@ LiveKit 数据消息、RPC、流、加密及重连策略实现在 `rtc/livekit/`
 
 | 选项 | 含义 |
 | --- | --- |
+| LIVEKIT_BUILD_CLIENT | 新同步 Room；同时启用 RTC_MEDIA 时提供 MediaEngine |
 | LIVEKIT_BUILD_RTC_NATIVE | LiveKit/WebRTC 编码媒体传输 |
 | LIVEKIT_BUILD_RTC_GRAPH_NODES | 发布/订阅节点及流水线 |
 | LIVEKIT_BUILD_RTC_MEDIA | 可选媒体引擎及实际 codec、输入、输出节点；需要前两项 |
@@ -98,12 +97,13 @@ LiveKit 数据消息、RPC、流、加密及重连策略实现在 `rtc/livekit/`
 
 ## 示例和产品
 
-- room_client：入会、房间快照、RoomServices 数据。
-- video_source / audio_source：输入 → codec → 发布节点。
-- video_stream / audio_stream：订阅 → codec → 应用消费；设备播放显式启用。
+- room_client / basic_room_encoded：使用新 Room 入会、直接收发编码帧。
+- automatic_session：使用同步 MediaEngine 发布合成音频、按成员快照订阅。
+- video_source / audio_source：使用同步 MediaEngine，输入 → codec → Room。
+- video_stream / audio_stream：使用同步 MediaEngine，Room → codec → 应用消费；设备播放显式启用。
 - CLI lk：[命令说明](docs/cli.md)，支持多流、录制及逐轨统计。
 - conference_viewer：每轨图、动态发布、静音、质量和录制。
-- livekit-app 中的会议、投屏、远控及直播工作台均由 Session 提交配置，RtcMediaEngine 负责构图。
+- livekit-app 的会议客户端使用新 MediaEngine；投屏、远控及直播工作台保留现有引擎。
 
 纯传输代码不隐式创建采集、音频设备或呈现窗口。程序测试使用合成输入、无窗口渲染和独立 SFU；自动化结果不代表物理设备人工验收。
 

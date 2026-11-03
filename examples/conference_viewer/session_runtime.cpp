@@ -1,10 +1,6 @@
-#include "livekit/compat/thread.hpp"
 #include "session.hpp"
-#include <livekit/rtc/engine.hpp>
 #include <algorithm>
-#include <condition_variable>
 #include <deque>
-#include <variant>
 
 namespace demo {
 namespace {
@@ -12,125 +8,92 @@ using namespace rtc;
 using namespace std::chrono_literals;
 using Json = sdk::Json;
 
-struct Track {
-  TrackDescriptor descriptor;
-  bool publication = false, ready = false, removing = false;
-  bool initial = false, video_command = false;
-  std::shared_ptr<engine::MediaTrack> media;
-
-  std::string sid() const {
-    return publication && media ? media->snapshot().transport.server_sid : descriptor.remote_sid;
-  }
-
-  std::map<std::string, uint64_t> metric_ids;
-
-  void metrics(Json& report, uint64_t& next_id) {
-    const auto state = media->snapshot();
-    for (const auto& node : state.nodes) {
-      auto [id, added] = metric_ids.try_emplace(node.name, next_id);
-      if (added)
-        ++next_id;
-      report["nodes"].push_back({{"id", id->second},
-                                 {"name", descriptor.id + "/" + node.name},
-                                 {"trackId", sid()},
-                                 {"kind", node.kind},
-                                 {"generation", state.transport.epoch},
-                                 {"outputs", node.outputs}});
-    }
-    for (const auto& edge : state.edges)
-      report["edges"].push_back({{"from", descriptor.id + "/" + edge.from},
-                                 {"to", descriptor.id + "/" + edge.to},
-                                 {"dataType", edge.data_type}});
-  }
-};
-
-struct Joined {
-  sdk::Result<RoomSnapshot> result;
-};
-
-struct Ready {
-  std::shared_ptr<Track> track;
-  std::shared_ptr<engine::MediaTrack> media;
+struct Events final : RoomObserver {
+  std::mutex mutex;
   sdk::Failure failure;
-};
-
-struct Removed {
-  std::shared_ptr<Track> track;
-  sdk::Result<void> result;
-};
-
-// Callbacks only enqueue owned values; the session worker owns all track/UI state.
-class SessionInbox final : public engine::RtcObserver {
- public:
-  using Message = std::variant<RoomEvent, Joined, Ready, Removed>;
-
-  struct Batch {
-    std::deque<Message> messages;
-    bool overflow = false;
-  };
-
-  void push(Message message) {
-    std::lock_guard lock(mutex_);
-    if (messages_.size() >= 4096) {
-      overflow_ = true;
-    } else {
-      messages_.push_back(std::move(message));
-    }
-    changed_.notify_one();
-  }
 
   void on_room_event(const RoomEvent& event) override {
-    push(event);
+    if (event.kind == RoomEventKind::connection_changed &&
+        event.connection == ConnectionState::failed) {
+      std::lock_guard lock(mutex);
+      failure = event.failure;
+    }
+  }
+};
+
+struct Track {
+  bool local = false;
+  MediaKind kind = MediaKind::video;
+  std::shared_ptr<MediaTrack> media;
+  LocalTrackPublication publication;
+  std::map<std::string, uint64_t> metric_ids;
+
+  std::string sid() const {
+    return media->snapshot().transport.server_sid;
   }
 
-  Batch take(livekit::compat::stop_token stop) {
-    std::unique_lock lock(mutex_);
-    changed_.wait_for(lock, stop, 5ms, [&] { return overflow_ || !messages_.empty(); });
-    Batch batch;
-    batch.messages.swap(messages_);
-    batch.overflow = overflow_;
-    return batch;
+  void metrics(Json& report, uint64_t& serial, const std::string& id) {
+    const auto value = media->snapshot();
+    for (const auto& node : value.nodes) {
+      auto [it, added] = metric_ids.try_emplace(node.name, serial);
+      if (added) {
+        ++serial;
+      }
+      report["nodes"].push_back({{"id", it->second},
+                                 {"name", id + "/" + node.name},
+                                 {"trackId", sid()},
+                                 {"kind", node.kind},
+                                 {"generation", value.transport.epoch},
+                                 {"outputs", node.outputs}});
+    }
+    for (const auto& edge : value.edges) {
+      report["edges"].push_back({{"from", id + "/" + edge.from},
+                                 {"to", id + "/" + edge.to},
+                                 {"dataType", edge.data_type}});
+    }
   }
-
- private:
-  std::mutex mutex_;
-  livekit::compat::condition_variable_any changed_;
-  std::deque<Message> messages_;
-  bool overflow_ = false;
 };
 
 Participant participant(const ParticipantSnapshot& value) {
   Participant result{value.sid, value.identity, value.name, value.state};
-  for (const auto& [sid, track] : value.publications)
+  for (const auto& [sid, track] : value.publications) {
     result.tracks.push_back(track);
+  }
   return result;
 }
 }  // namespace
 
-Session::Session() : Session([] { return engine::create_livekit_engine(AudioOutputOptions{}); }) {}
+Session::Session()
+    : Session([] {
+        return sdk::Result<std::unique_ptr<MediaEngine>>::success(std::make_unique<MediaEngine>());
+      }) {}
 
 Session::Session(EngineFactory factory) : engine_factory_(std::move(factory)) {}
 
 Session::~Session() {
   stop();
-  if (worker_.joinable())
+  if (worker_.joinable()) {
     worker_.join();
+  }
 }
 
 sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video) {
   if (std::count_if(options.media.begin(), options.media.end(),
-                    [](const auto& m) { return m.video; }) > max_test_videos)
+                    [](const auto& m) { return m.video; }) > max_test_videos) {
     return sdk::Result<void>::failure(sdk::make_failure(sdk::ErrorDomain::lifecycle,
                                                         sdk::ErrorCode::invalid_argument,
                                                         "Demo supports up to 8 test videos"));
+  }
   {
     std::lock_guard lock(mutex_);
-    if (!data_.finished)
+    if (!data_.finished) {
       return sdk::Result<void>::failure(sdk::make_failure(
           sdk::ErrorDomain::lifecycle, sdk::ErrorCode::invalid_state, "Session already active"));
+    }
   }
-  if (worker_.joinable())
+  if (worker_.joinable()) {
     worker_.join();
+  }
   {
     std::lock_guard lock(mutex_);
     data_ = {};
@@ -140,122 +103,103 @@ sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video
     data_.room = options.room;
     data_.pause_unused_video = pause_unused_video;
   }
-  {
-    worker_ = livekit::compat::jthread([this, options = std::move(options), pause_unused_video](
-                                           livekit::compat::stop_token stop) mutable {
-      std::string error;
-      const auto redact = [&](std::string message) {
-        const auto& token = options.connection.token;
-        if (!token.empty())
-          for (size_t pos; (pos = message.find(token)) != std::string::npos;)
-            message.replace(pos, token.size(), "[redacted]");
-        return message;
+  worker_ = livekit::compat::jthread([this, options = std::move(options), pause_unused_video](
+                                         livekit::compat::stop_token stop) mutable {
+    auto run = [&]() -> std::string {
+      Events events;
+      auto created = engine_factory_();
+      if (!created) {
+        return created.error().message;
+      }
+      auto engine = std::move(*created);
+      if (!engine) {
+        return "Engine factory returned null";
+      }
+      engine->set_observer(&events);
+      livekit::compat::stop_callback cancel(stop, [&] { engine->close(); });
+      options.connection.auto_subscribe = false;
+      if (!engine->connect(options.connection)) {
+        std::lock_guard lock(events.mutex);
+        return events.failure ? events.failure->message : "Room connection failed";
+      }
+      if (!options.room.empty() && engine->info().name != options.room) {
+        return "Joined room does not match the requested room";
+      }
+      std::map<TrackId, Track> tracks;
+      int video_number = 0;
+      uint64_t metric_number = 1;
+      auto publish = [&](const sdk::MediaSpec& spec) -> std::string {
+        MediaPublishSpec config;
+        config.name = spec.video ? "Test video " + std::to_string(++video_number) : "Test tone";
+        config.kind = spec.video ? MediaKind::video : MediaKind::audio;
+        config.format = {
+            spec.video ? Codec::vp8 : Codec::opus,  spec.video ? 90000u : 48000u,
+            uint16_t(spec.video ? 0 : 1),           uint32_t(spec.video ? spec.width : 0),
+            uint32_t(spec.video ? spec.height : 0), {}};
+        config.options.follow_subscriber_demand = spec.video && pause_unused_video;
+        auto& input = config.input;
+        input.generated = spec.demo;
+        input.input = spec.input;
+        input.ffmpeg = spec.ffmpeg;
+        input.loop = spec.loop;
+        input.fps = spec.fps;
+        input.capture = spec.capture;
+        input.device_index = spec.device_index;
+        input.screen_id = spec.screen_id;
+        input.video_source = spec.video_source;
+        input.audio_source = spec.audio_source;
+        input.encoded_source = spec.encoded_source;
+        auto result = engine->publish_media(std::move(config));
+        if (!result) {
+          return result.error().message;
+        }
+        tracks.emplace(result->publication.snapshot().track_id,
+                       Track{true,
+                             spec.video ? MediaKind::video : MediaKind::audio,
+                             result->track,
+                             result->publication,
+                             {}});
+        return {};
       };
-      {
-        const auto run = [&]() -> std::string {
-          auto inbox = std::make_shared<SessionInbox>();
-          std::map<TrackId, std::shared_ptr<Track>> tracks;
-          auto created = engine_factory_();
-          if (!created) {
-            return created.error().message.empty() ? "Engine creation failed"
-                                                   : created.error().message;
-          }
-          auto engine = *std::move(created);
-          if (!engine) {
-            return "Engine factory returned null";
-          }
-          if (engine->set_observer(inbox.get()) != sdk::ErrorCode::ok) {
-            return "Could not register session observer";
-          }
-          std::string failure;
-          bool joined = false;
-          size_t initial_pending = 0;
-          std::map<TrackId, TrackDescriptor> advertised;
-          const auto finish_video = [&](std::string message = {}) {
+      for (const auto& source : options.media) {
+        if (auto error = publish(source); !error.empty()) {
+          return error;
+        }
+      }
+      auto next_stats = SteadyClock::now();
+      while (!stop.stop_requested()) {
+        const auto state = engine->connection_state();
+        if (state == ConnectionState::failed || state == ConnectionState::closed) {
+          std::lock_guard lock(events.mutex);
+          return events.failure ? events.failure->message
+                                : "Disconnected by server. Join again to reconnect.";
+        }
+        if (state != ConnectionState::connected) {
+          {
             std::lock_guard lock(mutex_);
-            data_.changing_video = false;
-            data_.video_error = redact(std::move(message));
-          };
-          const auto erase_track = [&](const std::shared_ptr<Track>& track) {
-            {
-              std::lock_guard lock(mutex_);
-              data_.frames.erase(track->descriptor.id);
-              data_.frames.erase(track->sid());
+            data_.frames.clear();
+            data_.subscriptions.clear();
+            data_.quality = {};
+            if (data_.state != State::Disconnecting) {
+              data_.state = State::Connecting;
             }
-            auto it = tracks.find(track->descriptor.id);
-            if (it != tracks.end() && it->second == track) {
-              tracks.erase(it);
+          }
+          std::this_thread::sleep_for(5ms);
+          continue;
+        }
+        std::set<TrackSid> advertised;
+        for (const auto& peer : engine->remote_participants()) {
+          for (auto publication : peer.track_publications()) {
+            auto info = publication.snapshot();
+            advertised.insert(info.sid);
+            if (tracks.count(info.sid)) {
+              continue;
             }
-          };
-          const auto report = [&](const Json& event) {
-            {
-              std::lock_guard lock(mutex_);
-              if (data_.state != State::Disconnecting)
-                data_.quality.update(event);
-            }
-            if (options.log_sink) {
-              auto logged = options.log_sink(event);
-              if (!logged && failure.empty()) {
-                failure = logged.error().message;
-              }
-            }
-          };
-          options.connection.subscribe = false;
-          options.connection.subscribe_tracks.clear();
-          options.connection.stats_interval = 1000ms;
-          engine->join(options.connection, [inbox](sdk::Result<RoomSnapshot> result) {
-            inbox->push(Joined{std::move(result)});
-          });
-          int video_number = 0;
-          uint64_t track_number = 0, metric_number = 1;
-          const auto publish = [&](const sdk::MediaSpec& spec, bool initial) {
-            auto track = std::make_shared<Track>();
-            track->publication = true;
-            track->initial = initial;
-            track->video_command = !initial;
-            initial_pending += initial;
-            auto& d = track->descriptor;
-            d.id = "local-" + std::to_string(++track_number);
-            d.name = spec.video ? "Test video " + std::to_string(++video_number) : "Test tone";
-            d.kind = spec.video ? MediaKind::video : MediaKind::audio;
-            d.format.codec = spec.video ? Codec::vp8 : Codec::opus;
-            d.format.clock_rate = spec.video ? 90000 : 48000;
-            d.format.channels = spec.video ? 0 : 1;
-            d.format.width = spec.video ? spec.width : 0;
-            d.format.height = spec.video ? spec.height : 0;
-            d.stream_group = d.id;
-            d.follow_subscriber_demand = spec.video && pause_unused_video;
-            engine::MediaInput input;
-            input.generated = spec.demo;
-            input.input = spec.input;
-            input.ffmpeg = spec.ffmpeg;
-            input.loop = spec.loop;
-            input.fps = spec.fps;
-            input.capture = spec.capture;
-            input.device_index = spec.device_index;
-            input.screen_id = spec.screen_id;
-            input.video_source = spec.video_source;
-            input.audio_source = spec.audio_source;
-            input.encoded_source = spec.encoded_source;
-            engine::MediaPublishSpec config;
-            config.track = d;
-            config.input = input;
-            tracks.emplace(d.id, track);
-            engine->publish_media(std::move(config), [inbox, track](auto result) {
-              inbox->push(Ready{track, result ? result->track : nullptr,
-                                result ? nullptr : result.failure_record()});
-            });
-          };
-          const auto subscribe = [&](TrackDescriptor descriptor) {
-            if (tracks.count(descriptor.id))
-              return;
-            auto track = std::make_shared<Track>();
-            track->descriptor = descriptor;
-            engine::MediaSubscribeSpec config;
-            config.track = descriptor;
+            MediaSubscribeSpec config;
+            config.publication = publication;
             config.output.recording = options.record;
-            if (descriptor.kind == MediaKind::video)
-              config.output.video = [this, sid = descriptor.remote_sid](const auto& frame) {
+            if (info.kind == MediaKind::video) {
+              config.output.video = [this, sid = info.sid](const auto& frame) {
                 std::lock_guard lock(mutex_);
                 if (data_.state != State::Disconnecting) {
                   data_.frames[sid] = frame.pixels;
@@ -263,302 +207,217 @@ sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video
                 }
                 return sdk::Result<void>::success();
               };
-            else {
+            } else {
               config.output.playout = options.audio_playout;
             }
-            tracks.emplace(descriptor.id, track);
-            engine->subscribe_media(std::move(config), [inbox, track](auto result) {
-              inbox->push(Ready{track, result ? result->track : nullptr,
-                                result ? nullptr : result.failure_record()});
-            });
-          };
-          const auto remove = [&](const std::shared_ptr<Track>& track, bool command) {
-            if (track->removing) {
-              return;
+            auto result = engine->subscribe_media(std::move(config));
+            if (!result) {
+              if (publication.snapshot().state == TrackState::closed ||
+                  engine->connection_state() != ConnectionState::connected) {
+                continue;
+              }
+              return result.error().message;
             }
-            track->removing = true;
-            track->video_command = command;
-            auto done = [inbox, track](sdk::Result<void> result) {
-              inbox->push(Removed{track, std::move(result)});
-            };
-            if (track->publication) {
-              engine->unpublish(track->descriptor.id, std::move(done));
+            tracks.emplace(info.sid, Track{false, info.kind, result->track, {}, {}});
+          }
+        }
+        for (auto it = tracks.begin(); it != tracks.end();) {
+          const auto value = it->second.media->snapshot();
+          if (value.failure) {
+            return value.failure->message;
+          }
+          if ((!it->second.local && !advertised.count(it->first)) ||
+              value.transport.state == TrackState::closed) {
+            if (it->second.local) {
+              engine->unpublish_track(it->first);
             } else {
-              engine->unsubscribe(track->descriptor.id, std::move(done));
+              engine->unsubscribe_track(it->first);
             }
-          };
-          auto next_stats = SteadyClock::now();
-          while (!stop.stop_requested() && failure.empty()) {
-            auto batch = inbox->take(stop);
-            if (stop.stop_requested()) {
-              break;
-            }
-            if (batch.overflow) {
-              failure = "Session callback queue exhausted";
-              break;
-            }
-            for (auto& message : batch.messages) {
-              if (auto* done = std::get_if<Joined>(&message)) {
-                if (!done->result) {
-                  failure = done->result.error().message.empty() ? "Join failed"
-                                                                 : done->result.error().message;
-                  break;
-                }
-                const auto& session = done->result->session;
-                if (!session || session->room.name != options.room) {
-                  failure = "Joined room does not match the requested room";
-                  break;
-                }
-                joined = true;
-                for (const auto& media : options.media) {
-                  publish(media, true);
-                }
-                for (const auto& [id, descriptor] : advertised) {
-                  subscribe(descriptor);
-                }
-              } else if (auto* done = std::get_if<Ready>(&message)) {
-                auto track = done->track;
-                if (track->initial) {
-                  --initial_pending;
-                  track->initial = false;
-                }
-                const auto found = tracks.find(track->descriptor.id);
-                const bool current = found != tracks.end() && found->second == track;
-                std::string problem;
-                if (done->failure) {
-                  problem = done->failure->message.empty() ? "Media operation failed"
-                                                           : done->failure->message;
-                } else if (!done->media) {
-                  problem = "Media operation returned no track";
-                } else if (!current) {
-                  problem = "Track removed before media became ready";
-                }
-                if (track->video_command) {
-                  finish_video(problem);
-                  track->video_command = false;
-                } else if (!problem.empty() && !track->removing &&
-                           (current ||
-                            (done->failure && done->failure->code != sdk::ErrorCode::cancelled))) {
-                  failure = "Track " + track->descriptor.id + ": " + problem;
-                }
-                if (current && !track->removing) {
-                  if (problem.empty()) {
-                    track->media = std::move(done->media);
-                    track->ready = true;
-                  } else {
-                    erase_track(track);
-                  }
-                }
-              } else if (auto* done = std::get_if<Removed>(&message)) {
-                auto track = done->track;
-                const auto found = tracks.find(track->descriptor.id);
-                const bool current = found != tracks.end() && found->second == track;
-                const bool already_removed =
-                    !current && !done->result &&
-                    done->result.error().code == sdk::ErrorCode::invalid_argument;
-                const auto problem =
-                    done->result || already_removed
-                        ? std::string{}
-                        : (done->result.error().message.empty() ? "Track removal failed"
-                                                                : done->result.error().message);
-                if (track->video_command) {
-                  finish_video(problem);
-                  track->video_command = false;
-                } else if (!problem.empty() && current) {
-                  failure = "Track " + track->descriptor.id + ": " + problem;
-                }
-                if (problem.empty()) {
-                  erase_track(track);
-                } else {
-                  track->removing = false;
-                }
-              } else {
-                const auto& event = std::get<RoomEvent>(message);
-                if (event.kind == RoomEventKind::remote_track_added && event.descriptor) {
-                  advertised[event.track_id] = *event.descriptor;
-                  if (joined) {
-                    subscribe(*event.descriptor);
-                  }
-                } else if (event.kind == RoomEventKind::track_removed) {
-                  const auto found = tracks.find(event.track_id);
-                  if (found != tracks.end() &&
-                      (!event.publication || *event.publication == found->second->publication)) {
-                    // The engine already removed this endpoint; only drop local state.
-                    auto track = found->second;
-                    erase_track(track);
-                  }
-                } else if (event.kind == RoomEventKind::remote_track_removed) {
-                  advertised.erase(event.track_id);
-                  const auto found = tracks.find(event.track_id);
-                  if (found != tracks.end() && !found->second->publication) {
-                    remove(found->second, false);
-                  }
-                } else if (event.kind == RoomEventKind::track_failed) {
-                  const auto found = tracks.find(event.track_id);
-                  if (found != tracks.end() && found->second->ready && !found->second->removing) {
-                    failure = "Track " + event.track_id + ": " + event.message;
-                  }
-                } else if (event.kind == RoomEventKind::statistics && event.statistics) {
-                  const auto& stats = *event.statistics;
-                  auto json = Json::parse(stats.json, nullptr, false);
-                  if (json.is_discarded()) {
-                    failure = "Invalid transport statistics";
-                    break;
-                  }
-                  report({{"event", "rtc-stats"},
-                          {"target", stats.target},
-                          {"timestampUs", stats.timestamp_us},
-                          {"stats", std::move(json)},
-                          {"localTracks", stats.publication_tracks}});
-                } else if (event.kind == RoomEventKind::reconnecting) {
-                  std::lock_guard lock(mutex_);
-                  data_.frames.clear();
-                  data_.subscriptions.clear();
-                  data_.quality = {};
-                  if (data_.state != State::Disconnecting) {
-                    data_.state = State::Connecting;
-                  }
-                } else if (event.kind == RoomEventKind::closed ||
-                           event.kind == RoomEventKind::failed) {
-                  failure = event.message.empty()
-                                ? "Disconnected by server. Join again to reconnect."
-                                : event.message;
-                }
-              }
-              if (!failure.empty()) {
-                break;
-              }
-            }
-            if (!failure.empty() || !joined) {
-              continue;
-            }
-            std::optional<VideoCommand> command;
             {
               std::lock_guard lock(mutex_);
-              command.swap(video_command_);
+              data_.frames.erase(it->second.sid());
             }
-            if (command) {
-              if (command->remove_sid.empty()) {
-                sdk::MediaSpec spec;
-                spec.demo = true;
-                publish(spec, false);
-              } else {
-                const auto found =
-                    std::find_if(tracks.begin(), tracks.end(), [&](const auto& item) {
-                      return item.second->publication && item.second->sid() == command->remove_sid;
-                    });
-                if (found == tracks.end()) {
-                  finish_video("Publication no longer exists");
-                } else {
-                  remove(found->second, true);
-                }
-              }
-            }
-            const auto room = engine->snapshot();
-            if (room.session) {
-              std::vector<Participant> remote;
-              for (const auto& [id, value] : room.session->remote)
-                remote.push_back(participant(value));
-              std::lock_guard lock(mutex_);
-              data_.subscriptions.clear();
-              for (const auto& [id, track] : tracks)
-                if (!track->publication && track->ready &&
-                    track->media->snapshot().transport.state == TrackState::ready)
-                  data_.subscriptions.insert(track->sid());
-              data_.update(participant(room.session->local), remote);
-              data_.room = room.session->room.name;
-              if (data_.state != State::Disconnecting && room.state == ConnectionState::connected &&
-                  initial_pending == 0)
-                data_.state = State::Connected;
-              data_.quality.participants.clear();
-              for (const auto& [id, value] : room.session->remote)
-                if (value.connection_quality)
-                  data_.quality.participants[id] = *value.connection_quality;
-              if (room.session->local.connection_quality)
-                data_.quality.participants[room.session->local.sid] =
-                    *room.session->local.connection_quality;
-            }
-            if (SteadyClock::now() >= next_stats) {
-              Json graph{{"event", "media-graph-stats"},
-                         {"timestampUs", std::chrono::duration_cast<std::chrono::microseconds>(
-                                             SteadyClock::now().time_since_epoch())
-                                             .count()},
-                         {"nodes", Json::array()},
-                         {"edges", Json::array()}};
-              for (auto& [id, track] : tracks)
-                if (track->ready) {
-                  track->metrics(graph, metric_number);
-                  if (track->publication && track->descriptor.kind == MediaKind::video) {
-                    const auto feedback = engine->feedback(id);
-                    if (!feedback) {
-                      continue;
-                    }
-                    const bool enabled =
-                        std::any_of(feedback->encodings.begin(), feedback->encodings.end(),
-                                    [](const auto& entry) { return entry.second.active; });
-                    bool changed;
-                    {
-                      std::lock_guard lock(mutex_);
-                      auto [it, added] = data_.video_demand.try_emplace(track->sid(), enabled);
-                      changed = added || it->second != enabled;
-                      it->second = enabled;
-                    }
-                    if (changed && options.log_sink) {
-                      report({{"event", "source-demand"},
-                              {"sid", track->sid()},
-                              {"enabled", enabled}});
-                    }
-                  }
-                }
-              report(graph);
-              next_stats = SteadyClock::now() + 1s;
+            it = tracks.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        std::optional<VideoCommand> command;
+        {
+          std::lock_guard lock(mutex_);
+          command.swap(video_command_);
+        }
+        if (command) {
+          std::string error;
+          if (command->remove_sid.empty()) {
+            sdk::MediaSpec spec;
+            spec.demo = true;
+            error = publish(spec);
+          } else {
+            auto found = std::find_if(tracks.begin(), tracks.end(), [&](const auto& item) {
+              return item.second.local && item.second.sid() == command->remove_sid;
+            });
+            if (found == tracks.end()) {
+              error = "Publication no longer exists";
+            } else {
+              engine->unpublish_track(found->first);
+              tracks.erase(found);
             }
           }
-          // close remains a synchronous lifecycle barrier on the supervisor thread.
-          sdk::Failure close_failure;
-          engine->close([&](sdk::Result<void> result) {
-            if (!result) {
-              close_failure = result.failure_record();
+          if (!options.connection.token.empty()) {
+            for (size_t pos = 0;
+                 (pos = error.find(options.connection.token, pos)) != std::string::npos;
+                 pos += 10) {
+              error.replace(pos, options.connection.token.size(), "[redacted]");
             }
-          });
-          (void)engine->set_observer(nullptr);
-          if (failure.empty() && close_failure) {
-            failure =
-                close_failure->message.empty() ? "Engine close failed" : close_failure->message;
           }
+          std::lock_guard lock(mutex_);
+          data_.changing_video = false;
+          data_.video_error = std::move(error);
+        }
+        auto local = engine->local_participant().snapshot();
+        std::map<std::string, int> qualities;
+        if (local.connection_quality) {
+          qualities[local.sid] = *local.connection_quality;
+        }
+        for (const auto& peer : engine->remote_participants()) {
+          auto snapshot = peer.snapshot();
+          if (snapshot.connection_quality) {
+            qualities[snapshot.sid] = *snapshot.connection_quality;
+          }
+        }
+        std::vector<Participant> remote;
+        for (const auto& peer : engine->remote_participants()) {
+          remote.push_back(participant(peer.snapshot()));
+        }
+        {
+          std::lock_guard lock(mutex_);
+          data_.quality.participants = std::move(qualities);
+          data_.subscriptions.clear();
           for (const auto& [id, track] : tracks) {
-            if (track->media) {
-              auto checked = track->media->check();
-              if (checked != sdk::ErrorCode::ok && failure.empty()) {
-                const auto state = track->media->snapshot();
-                failure =
-                    "Track " + id + ": " +
-                    (state.transport.failure ? state.transport.failure->message : "Media failure");
+            if (!track.local && track.media->snapshot().transport.state == TrackState::ready) {
+              data_.subscriptions.insert(track.sid());
+            }
+          }
+          data_.update(participant(local), remote);
+          data_.room = engine->info().name;
+          if (data_.state != State::Disconnecting) {
+            data_.state = State::Connected;
+          }
+        }
+        if (SteadyClock::now() >= next_stats) {
+          auto report = [&](const Json& value) -> std::string {
+            {
+              std::lock_guard lock(mutex_);
+              data_.quality.update(value);
+            }
+            if (options.log_sink) {
+              auto result = options.log_sink(value);
+              if (!result) {
+                return result.error().message;
+              }
+            }
+            return {};
+          };
+          auto stats = engine->statistics();
+          if (!stats) {
+            if (engine->connection_state() == ConnectionState::connected) {
+              return stats.error().message;
+            }
+          } else {
+            for (const auto& value : *stats) {
+              Json mapping = Json::array();
+              for (const auto& [ssrc, sid] : value.received_tracks) {
+                mapping.push_back({{"track", sid}, {"ssrcs", Json::array({ssrc})}});
+              }
+              if (auto error = report({{"event", "graph-track-stats"},
+                                       {"target", value.target},
+                                       {"tracks", std::move(mapping)}});
+                  !error.empty()) {
+                return error;
+              }
+              auto json = Json::parse(value.json, nullptr, false);
+              if (json.is_discarded()) {
+                return "Invalid transport statistics";
+              }
+              auto error = report({{"event", "rtc-stats"},
+                                   {"target", value.target},
+                                   {"timestampUs", value.timestamp_us},
+                                   {"stats", std::move(json)},
+                                   {"localTracks", value.publication_tracks}});
+              if (!error.empty()) {
+                return error;
               }
             }
           }
-          return failure;
-        };
-        // Media failures are returned explicitly by the supervisor.
-        error = redact(run());
+          Json graph{{"event", "media-graph-stats"},
+                     {"timestampUs", std::chrono::duration_cast<std::chrono::microseconds>(
+                                         SteadyClock::now().time_since_epoch())
+                                         .count()},
+                     {"nodes", Json::array()},
+                     {"edges", Json::array()}};
+          for (auto& [id, track] : tracks) {
+            track.metrics(graph, metric_number, id);
+            if (track.local && track.kind == MediaKind::video) {
+              auto feedback = track.publication.track().feedback();
+              bool enabled = std::any_of(feedback.encodings.begin(), feedback.encodings.end(),
+                                         [](const auto& item) { return item.second.active; });
+              bool changed;
+              {
+                std::lock_guard lock(mutex_);
+                auto [it, added] = data_.video_demand.try_emplace(track.sid(), enabled);
+                changed = added || it->second != enabled;
+                it->second = enabled;
+              }
+              if (changed) {
+                if (auto error = report(
+                        {{"event", "source-demand"}, {"sid", track.sid()}, {"enabled", enabled}});
+                    !error.empty()) {
+                  return error;
+                }
+              }
+            }
+          }
+          if (auto error = report(graph); !error.empty()) {
+            return error;
+          }
+          next_stats = SteadyClock::now() + 1s;
+        }
+        std::this_thread::sleep_for(5ms);
       }
-      std::lock_guard lock(mutex_);
-      if (stop.stop_requested())
-        error.clear();
-      data_ = {};
-      data_.state = error.empty() ? State::Idle : State::Error;
-      data_.error = std::move(error);
-      video_command_.reset();
-    });
-  }
+      engine->close();
+      for (const auto& [id, track] : tracks) {
+        if (auto error = track.media->snapshot().failure) {
+          return error->message;
+        }
+      }
+      return {};
+    };
+    std::string error = run();
+    if (!options.connection.token.empty()) {
+      for (size_t pos = 0; (pos = error.find(options.connection.token, pos)) != std::string::npos;
+           pos += 10) {
+        error.replace(pos, options.connection.token.size(), "[redacted]");
+      }
+    }
+    std::lock_guard lock(mutex_);
+    if (stop.stop_requested()) {
+      error.clear();
+    }
+    data_ = {};
+    data_.state = error.empty() ? State::Idle : State::Error;
+    data_.error = std::move(error);
+    video_command_.reset();
+  });
   return sdk::Result<void>::success();
 }
 
 void Session::stop() {
   {
     std::lock_guard lock(mutex_);
-    if (data_.finished)
+    if (data_.finished) {
       return;
+    }
     data_.state = State::Disconnecting;
   }
   worker_.request_stop();

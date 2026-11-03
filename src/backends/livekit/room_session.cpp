@@ -179,6 +179,9 @@ void RoomSession::participant(ParticipantSnapshot snapshot) {
     if (local_) {
       std::lock_guard local_lock(local_->mutex);
       if (local_->info.identity == snapshot.identity) {
+        snapshot.connection_quality = local_->info.connection_quality;
+        snapshot.speaking = local_->info.speaking;
+        snapshot.audio_level = local_->info.audio_level;
         local_->info = std::move(snapshot);
         return;
       }
@@ -217,6 +220,9 @@ void RoomSession::participant(ParticipantSnapshot snapshot) {
   std::vector<std::shared_ptr<PublicationData>> discovered, removed;
   {
     std::lock_guard lock(data->mutex);
+    snapshot.connection_quality = data->info.connection_quality;
+    snapshot.speaking = data->info.speaking;
+    snapshot.audio_level = data->info.audio_level;
     data->info = snapshot;
     for (auto it = data->publications.begin(); it != data->publications.end();) {
       if (snapshot.state == 3 || !snapshot.publications.count(it->first)) {
@@ -321,7 +327,35 @@ void RoomSession::on_event(SessionEvent event) {
     }
     return;
   }
-  if (event.kind == SessionEvent::Kind::participant) {
+  if (event.kind == SessionEvent::Kind::quality || event.kind == SessionEvent::Kind::speakers) {
+    std::lock_guard lock(mutex_);
+    auto update = [&](const std::shared_ptr<ParticipantData>& data) {
+      if (!data) {
+        return;
+      }
+      std::lock_guard participant_lock(data->mutex);
+      if (event.kind == SessionEvent::Kind::quality) {
+        if (data->info.sid == event.participant.sid) {
+          data->info.connection_quality = event.participant.connection_quality;
+        }
+      } else {
+        if (event.full_speaker_update) {
+          data->info.speaking = false;
+          data->info.audio_level = 0;
+        }
+        for (const auto& speaker : event.speakers) {
+          if (data->info.sid == speaker.sid) {
+            data->info.speaking = speaker.speaking;
+            data->info.audio_level = speaker.audio_level;
+          }
+        }
+      }
+    };
+    update(local_);
+    for (const auto& [id, data] : remote_) {
+      update(data);
+    }
+  } else if (event.kind == SessionEvent::Kind::participant) {
     participant(std::move(event.participant));
   } else if (event.kind == SessionEvent::Kind::room) {
     std::lock_guard lock(mutex_);

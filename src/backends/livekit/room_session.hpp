@@ -16,6 +16,11 @@ class RoomSession : public std::enable_shared_from_this<RoomSession> {
   LocalParticipant local() const;
   std::vector<RemoteParticipant> remotes() const;
 
+  Result<std::vector<PeerStatistics>> statistics() {
+    return engine_->call<std::vector<PeerStatistics>>(
+        [](RtcSession& session, const Operation& op) { return session.statistics(op); });
+  }
+
  private:
   Result<void> on_join(const JoinState&, bool, RtcSession&, const Operation&);
   void on_event(SessionEvent);

@@ -25,6 +25,7 @@ class Room {
   RoomInfo info() const;
   LocalParticipant local_participant() const;
   std::vector<RemoteParticipant> remote_participants() const;
+  Result<std::vector<PeerStatistics>> statistics();
 
  private:
   friend struct detail::RoomTestAccess;

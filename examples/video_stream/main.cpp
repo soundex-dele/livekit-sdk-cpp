@@ -1,14 +1,12 @@
-#include "rtc_blocking_bridge.hpp"
 #include "../media_result.hpp"
 using livekit::sdk::examples::report_result;
-#include "rtc_event_mailbox.hpp"
-#include "livekit/rtc/livekit.hpp"
-#include <livekit/rtc/engine.hpp>
+#include <livekit/media_engine.hpp>
+#include <map>
+#include <thread>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
-#include <thread>
-using namespace livekit::sdk::rtc;
+using namespace livekit::sdk::client;
 using namespace std::chrono_literals;
 
 int main() {
@@ -18,62 +16,61 @@ int main() {
     return 1;
   }
   std::atomic<size_t> received{0};
-  auto engine_result =
-      livekit::sdk::app_support::create_blocking_engine(livekit::sdk::rtc::AudioOutputOptions{});
-  if (!report_result(engine_result)) {
-    return 1;
-  }
-  auto engine = *std::move(engine_result);
-  livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
-  if (!report_result(engine_events.status())) {
-    return 1;
-  }
-  LiveKitRoomOptions options;
+  MediaEngine engine;
+  std::map<TrackSid, std::shared_ptr<MediaTrack>> subscriptions;
+  ConnectionOptions options;
+  options.auto_subscribe = false;
   options.url = url;
   options.token = token;
-  if (!report_result(engine->join(options))) {
+  if (!engine.connect(options)) {
     return 1;
   }
   const auto deadline = SteadyClock::now() + 30s;
   while (received < 50 && SteadyClock::now() < deadline) {
-    auto event_result = engine_events.take_event(10ms);
-    if (!report_result(event_result)) {
-      return 1;
-    }
-    if (auto event = *std::move(event_result); event &&
-                                               event->kind == RoomEventKind::remote_track_added &&
-                                               event->descriptor->kind == MediaKind::video) {
-      auto descriptor = *event->descriptor;
-      engine::MediaSubscribeSpec config;
-      config.track = descriptor;
-      config.output.video = [&received](const auto& event) {
-        if (!event.pixels || event.pixels->y.empty()) {
-          return livekit::sdk::Result<void>::failure(livekit::sdk::make_failure(
-              livekit::sdk::ErrorDomain::media, livekit::sdk::ErrorCode::processing_failed,
-              "Empty decoded video"));
+    for (const auto& peer : engine.remote_participants()) {
+      for (const auto& publication : peer.track_publications()) {
+        const auto info = publication.snapshot();
+        if (info.kind != MediaKind::video || subscriptions.count(info.sid)) {
+          continue;
         }
-        ++received;
-        return livekit::sdk::Result<void>::success();
-      };
-      auto operation_result = engine->subscribe_media(std::move(config));
-      if (!report_result(operation_result)) {
-        return 1;
+        MediaSubscribeSpec config;
+        config.publication = publication;
+        config.output.video = [&received](const auto& event) {
+          if (!event.pixels || event.pixels->y.empty()) {
+            return livekit::sdk::Result<void>::failure(livekit::sdk::make_failure(
+                livekit::sdk::ErrorDomain::media, livekit::sdk::ErrorCode::processing_failed,
+                "Empty decoded video"));
+          }
+          ++received;
+          return livekit::sdk::Result<void>::success();
+        };
+        auto operation_result = engine.subscribe_media(std::move(config));
+        if (!report_result(operation_result)) {
+          return 1;
+        }
+        subscriptions[info.sid] = operation_result->track;
       }
-      auto operation = *std::move(operation_result);
     }
 
-    auto failure_result = engine_events.take_failure();
-    if (!report_result(failure_result)) {
+    for (auto it = subscriptions.begin(); it != subscriptions.end();) {
+      auto state = it->second->snapshot();
+      if (state.failure) {
+        std::cerr << state.failure->message << '\n';
+        return 1;
+      }
+      if (state.transport.state == TrackState::closed) {
+        engine.unsubscribe_track(it->first);
+        it = subscriptions.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (engine.connection_state() == ConnectionState::failed) {
       return 1;
     }
-    if (auto failure = *std::move(failure_result); failure && !failure->message.empty()) {
-      std::cerr << failure->message << "\n";
-      return 1;
-    }
+    std::this_thread::sleep_for(10ms);
   }
-  if (!report_result(engine->close())) {
-    return 1;
-  }
+  engine.close();
   std::cout << "frames=" << received << '\n';
   return received ? 0 : 1;
 }

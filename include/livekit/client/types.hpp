@@ -2,6 +2,7 @@
 #include "livekit/compat/span.hpp"
 #include "livekit/compat/thread.hpp"
 #include "livekit/result.hpp"
+#include "livekit/transport_options.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +52,14 @@ struct ParticipantSnapshot {
 struct RoomInfo {
   std::string sid, name, metadata;
   bool recording = false;
+};
+
+struct PeerStatistics {
+  int target = 0;  // 0: publisher, 1: subscriber.
+  int64_t timestamp_us = 0;
+  std::string json;  // WebRTC RTCStatsReport JSON, without native API types.
+  std::map<std::string, std::string> publication_tracks;
+  std::map<uint32_t, std::string> received_tracks;  // SSRC to remote Track SID.
 };
 
 struct ParticipantUpdate {
@@ -219,6 +228,7 @@ struct ReconnectOptions {
 };
 
 struct ConnectionOptions {
+  MediaTransport media_transport = MediaTransport::automatic;
   std::string url, token;
   int connect_timeout = 30;
   bool auto_subscribe = true;

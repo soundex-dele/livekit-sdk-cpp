@@ -8,7 +8,7 @@
 namespace livekit::sdk::client::detail {
 class PeerTransport : public webrtc::PeerConnectionObserver {
  public:
-  PeerTransport(WebRtcContext&, const livekit::JoinResponse&, size_t max_events);
+  PeerTransport(WebRtcContext&, const livekit::JoinResponse&, size_t max_events, MediaTransport);
   ~PeerTransport() override;
   Result<std::string> local_description(bool offer, const Operation&);
   Result<void> remote_description(const livekit::SessionDescription&, const Operation&);
@@ -22,6 +22,7 @@ class PeerTransport : public webrtc::PeerConnectionObserver {
   Result<void> keyframe(const TrackSid&);
   void close();
   Result<void> status() const;
+  Result<PeerStatistics> statistics(const Operation&);
 
   bool connected() const {
     return state_ == webrtc::PeerConnectionInterface::PeerConnectionState::kConnected;

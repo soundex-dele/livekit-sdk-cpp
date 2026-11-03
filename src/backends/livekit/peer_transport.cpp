@@ -1,8 +1,11 @@
 #include "backends/livekit/peer_transport.hpp"
 #include "api/make_ref_counted.h"
 #include "api/media_stream_interface.h"
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtc_stats_report.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include "p2p/base/port_allocator.h"
 
 namespace livekit::sdk::client::detail {
 namespace {
@@ -48,6 +51,23 @@ class SetDescription : public webrtc::SetSessionDescriptionObserver {
 
  private:
   std::shared_ptr<Answer<void>> answer_;
+};
+
+class StatsObserver : public webrtc::RTCStatsCollectorCallback {
+ public:
+  explicit StatsObserver(std::shared_ptr<Answer<PeerStatistics>> answer)
+      : answer_(std::move(answer)) {}
+
+  void OnStatsDelivered(
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    PeerStatistics result;
+    result.timestamp_us = report->timestamp().us();
+    result.json = report->ToJson();
+    answer_->finish(Result<PeerStatistics>::success(std::move(result)));
+  }
+
+ private:
+  std::shared_ptr<Answer<PeerStatistics>> answer_;
 };
 
 class CreateDescription : public webrtc::CreateSessionDescriptionObserver {
@@ -166,9 +186,29 @@ struct PeerTransport::Channel : webrtc::DataChannelObserver {
 };
 
 PeerTransport::PeerTransport(WebRtcContext& context, const livekit::JoinResponse& join,
-                             size_t max_events)
+                             size_t max_events, MediaTransport transport)
     : context_(context), max_events_(max_events) {
   webrtc::PeerConnectionInterface::RTCConfiguration config;
+  using PC = webrtc::PeerConnectionInterface;
+  switch (transport) {
+    case MediaTransport::automatic:
+      break;
+    case MediaTransport::udp_only:
+      config.tcp_candidate_policy = PC::kTcpCandidatePolicyDisabled;
+      config.port_allocator_config.flags |=
+          webrtc::PORTALLOCATOR_DISABLE_TCP | webrtc::PORTALLOCATOR_DISABLE_RELAY;
+      break;
+    case MediaTransport::tcp_only:
+      config.tcp_candidate_policy = PC::kTcpCandidatePolicyEnabled;
+      config.port_allocator_config.flags |= webrtc::PORTALLOCATOR_DISABLE_UDP |
+                                            webrtc::PORTALLOCATOR_DISABLE_STUN |
+                                            webrtc::PORTALLOCATOR_DISABLE_RELAY;
+      break;
+    default:
+      failure_ = make_failure(ErrorDomain::transport, ErrorCode::invalid_argument,
+                              "Invalid media transport");
+      return;
+  }
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
   config.continual_gathering_policy = webrtc::PeerConnectionInterface::GATHER_CONTINUALLY;
   if (join.client_configuration().force_relay() == livekit::ENABLED) {
@@ -192,6 +232,25 @@ PeerTransport::PeerTransport(WebRtcContext& context, const livekit::JoinResponse
 
 PeerTransport::~PeerTransport() {
   close();
+}
+
+Result<PeerStatistics> PeerTransport::statistics(const Operation& op) {
+  auto answer = std::make_shared<Answer<PeerStatistics>>();
+  auto observer = webrtc::make_ref_counted<StatsObserver>(answer);
+  pc->GetStats(observer.get());
+  auto result = answer->wait(op);
+  if (result) {
+    context_.signaling->BlockingCall([&] {
+      for (const auto& [sid, remote] : receivers_) {
+        for (const auto& encoding : remote.receiver->GetParameters().encodings) {
+          if (encoding.ssrc) {
+            result->received_tracks[*encoding.ssrc] = sid;
+          }
+        }
+      }
+    });
+  }
+  return result;
 }
 
 Result<std::string> PeerTransport::local_description(bool offer, const Operation& op) {

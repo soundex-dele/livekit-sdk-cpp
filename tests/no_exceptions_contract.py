@@ -6,8 +6,10 @@ import sys
 root = Path(__file__).resolve().parents[1]
 # Keep only the external-library adapters exception-enabled.
 boundaries = {
-    "tools/cli/main.cpp": "CLI::ParseError",
-    "src/engines/studio/capture_windows.cpp": "hresult_error",
+    "tools/cli/main.cpp": ("CLI::ParseError",),
+    "src/engines/studio/capture_windows.cpp": ("hresult_error",),
+    # Existing exception-enabled logging initialization adapter, separate from Client.
+    "src/backends/livekit/logging.cpp": ("std::exception", "..."),
 }
 trivia = re.compile(
     r"""/\*.*?\*/|//[^\n]*|R"([^ ()\\\t\r\n]{0,16})\(.*?\)\1"|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'""",
@@ -27,7 +29,7 @@ for directory in ("include", "src", "support", "examples", "tools", "tests"):
         if relative in boundaries:
             expected = boundaries[relative]
             catches = re.findall(r"\bcatch\s*\(([^)]*)\)", code)
-            if not catches or any(expected not in item for item in catches):
+            if not catches or any(not any(kind in item for kind in expected) for item in catches):
                 errors.append(f"{relative}: unexpected external exception boundary")
             code = re.sub(r"\b(?:try|catch)\b", "", code)
         for match in forbidden.finditer(code):
@@ -36,4 +38,4 @@ for directory in ("include", "src", "support", "examples", "tools", "tests"):
 if errors:
     print("\n".join(errors), file=sys.stderr)
     sys.exit(1)
-print(f"PASS: {checked} project C++ files; only CLI11 and WinRT typed adapter catches allowed")
+print(f"PASS: {checked} project C++ files; only declared CLI11, WinRT and logging adapter catches allowed")

@@ -145,12 +145,11 @@ python livekit-sdk-cpp/tests/demo_dynacast_integration.py `
 
 ## 架构与公开 API
 
-- `Session` 直接使用原生 `RtcEngine` 的 `join`、`publish_media`、`subscribe_media` 和撤销接口，结果由每次调用的 Completion 交付，不再使用 BlockingEngine、future 或 `require_result` 等待网络操作。
-- `RtcObserver` 事件与 Completion 结果进入同一个有容量上限的会话队列；会话线程消费结果，管理待完成/就绪/移除中的轨道，并更新 UI 快照。入会成功后才提交初始发布；初始发布全部成功后界面进入 Connected。动态视频操作在回调结果到达后结束忙碌状态，失败保留原始错误信息并脱敏。
-- 会话循环不等待入会、发布或订阅结果。停止令牌唤醒会话队列，由会话线程调用同步 `close` 屏障，取消未完成请求并停止媒体图，再释放观察者和回调状态。再次入会前先等待上一轮工作线程退出。
-- `track_removed` 表示引擎已经完成移除，示例只清理本地状态；远端撤销公告则发起一次异步 unsubscribe。晚到的完成结果不会重新插入已移除的轨道。
-- 视频输出回调仅替换每条轨道的最新 `shared_ptr<const VideoFrame>`。I420 纹理上传和 SDL/ImGui 渲染仍由主线程执行，移除轨道或离会时清理画面。
-- `Session::EngineFactory` 可注入原生 RtcEngine，用于无服务器测试延迟结果、失败和停止；正常构造使用 `create_livekit_engine(AudioOutputOptions{})`。
+- `Session` 的工作线程同步调用新 `client::MediaEngine` 的 `connect`、`publish_media`、`subscribe_media` 和撤销接口。`connect` 返回 bool，有值操作返回 `Result<T>`，void 控制通过日志报告错误；没有完成回调。
+- 保留 `RoomObserver` 接收连接失败。工作线程通过成员与 publication 快照协调订阅，初始发布全部成功后进入 Connected。动态视频失败保留错误并脱敏。
+- 停止令牌调用 `close` 取消阻塞操作并停止媒体图。Observer 和视频输出回调不重入同步控制。再次入会前等待上一轮工作线程退出。
+- 视频输出回调只替换每条轨道的最新 `shared_ptr<const VideoFrame>`，SDL/ImGui 渲染仍在主线程。媒体图与 RTP 统计由同步 `statistics` 和 MediaTrack 快照提供。
+- `Session::EngineFactory` 可注入独占 MediaEngine，测试通过内部 RtcSession 接口模拟阻塞、失败和轨道撤销；正常构造直接创建 MediaEngine。
 
 ## 测试与验证
 
