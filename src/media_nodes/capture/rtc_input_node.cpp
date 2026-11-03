@@ -1,7 +1,7 @@
 #include "livekit/compat/thread.hpp"
 #include "livekit/compat/algorithm.hpp"
 #include "media_graph/failure.hpp"
-#include "backends/rtc/control_context.hpp"
+#include "media_graph/callback_context.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "media_graph/raw_frame_queue.hpp"
 #include "media_nodes/capture/audio_processor.hpp"

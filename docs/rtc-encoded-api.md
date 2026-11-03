@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # 编码媒体 RTC API
 
 接口与执行边界于 2026-11-02 按源码核对。普通媒体接入见 [媒体 API](rtc-media-engine.md)，线程和结果契约见 [Completion / Observer](rtc-simple-observer.md)。底层节点的回调线程与门面控制通知不同。

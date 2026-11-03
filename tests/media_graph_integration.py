@@ -115,18 +115,18 @@ def main():
             "--duration", "6", "--publish-demo", "--publish-tone", "--publish-data", "graph-test", "--stats-interval-ms", "500"])
         wait_connected("publisher", publisher)
         assert publisher.wait(timeout=30) == 0 and subscriber.wait(timeout=30) == 0, f"RTC client failure; see {root}"
-        for kind in ("MediaInputNode", "RtcPublishNode", "VideoEncoderNode", "AudioEncoderNode"):
+        for kind in ("MediaInputNode", "RoomPublishPort", "VideoEncoderNode", "AudioEncoderNode"):
             require_node("publisher", kind)
-        for kind in ("VideoDecoderNode", "AudioDecoderNode", "RtcSubscribeNode", "ApplicationOutputNode", "RecordingNode"):
+        for kind in ("VideoDecoderNode", "AudioDecoderNode", "RoomSubscribePort", "ApplicationOutputNode", "RecordingNode"):
             require_node("subscriber", kind)
         require_edge("publisher", "MediaInputNode", "VideoEncoderNode", "VideoFrameEvent")
         require_edge("publisher", "MediaInputNode", "AudioEncoderNode", "AudioFrameEvent")
-        require_edge("publisher", "VideoEncoderNode", "RtcPublishNode", "EncodedFrameEvent")
-        require_edge("publisher", "AudioEncoderNode", "RtcPublishNode", "EncodedFrameEvent")
+        require_edge("publisher", "VideoEncoderNode", "RoomPublishPort", "EncodedFrameEvent")
+        require_edge("publisher", "AudioEncoderNode", "RoomPublishPort", "EncodedFrameEvent")
         assert not any(node["kind"] == "VideoEncodeInputNode" for event in events("publisher")
                        if event.get("event") == "media-graph-stats" for node in event["nodes"])
-        require_edge("subscriber", "RtcSubscribeNode", "VideoDecoderNode", "EncodedFrameEvent")
-        require_edge("subscriber", "RtcSubscribeNode", "AudioDecoderNode", "EncodedFrameEvent")
+        require_edge("subscriber", "RoomSubscribePort", "VideoDecoderNode", "EncodedFrameEvent")
+        require_edge("subscriber", "RoomSubscribePort", "AudioDecoderNode", "EncodedFrameEvent")
         require_edge("subscriber", "VideoDecoderNode", "ApplicationOutputNode", "VideoFrameEvent", allow_sync=True)
         require_edge("subscriber", "VideoDecoderNode", "RecordingNode", "VideoFrameEvent", allow_sync=True)
         require_edge("subscriber", "AudioDecoderNode", "RecordingNode", "AudioFrameEvent", allow_sync=True)
@@ -161,7 +161,7 @@ def main():
                     env["LIVEKIT_URL"], env["LIVEKIT_API_KEY"], env["LIVEKIT_API_SECRET"],
                     str(root / f"conference-demand-{mode}"), mode])
                 assert client.wait(timeout=180) == 0, f"Conference aggregate demand {mode} regression; see {root}"
-        report = {"ok": True, "transportBackend": True, "separatePublishSubscribeNodes": True, "graphDrivenVideoEncoding": True, "graphEngineTopology": True,
+        report = {"ok": True, "transportBackend": True, "roomMediaPorts": True, "graphDrivenVideoEncoding": True, "graphEngineTopology": True,
                   "headlessVideoPlayout": args.headless_video,
                   "directGraphVideoReceive": True,
                   "headlessConferenceRegression": bool(args.demo_client),

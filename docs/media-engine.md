@@ -12,7 +12,7 @@ MediaPublishSpec 使用新 Room 的 CodecFormat、TrackPublishOptions 和 QueueL
 
 会议 demo 使用 Session 工作线程调用 MediaEngine，Qt 线程不执行 connect/publish/subscribe。聊天和成员状态直接使用新 Room 数据包、Observer 和成员句柄。新 Room 使用 SFU 下发的 refresh_token 重连；不提供旧异步 TokenProvider，重新加入会议时由业务 API 重新获取凭据。当前不提供旧 RtcEngine 的自定义图、共享采集句柄、H265 自动降级和订阅权限管理接口。
 
-MediaEngine 撤销本地发布与静音使用 publication.snapshot().track_id；撤销订阅和接收选项使用远端 SID。MediaTrackSnapshot.frames 统计已交给 Room 的编码帧或从 Room 读出的编码帧，细分节点计数在 nodes 中。
+MediaEngine 撤销本地发布与静音使用 publication.snapshot().track_id；撤销订阅和接收选项使用远端 SID。MediaTrackSnapshot.frames 统计已交给 Room 的编码帧或从 Room 读出的编码帧，bytes 统计相同边界的编码字节数，input 提供输入节点完成状态；细分节点计数在 nodes 中。
 
 SDK 的 automatic_session、video_source、audio_source、video_stream、audio_stream 和 conference_viewer 使用 MediaEngine；room_client 和 basic_room_encoded 只演示编码数据，直接使用 Room。web_viewer 使用 JavaScript SDK，不涉及 C++ 引擎。旧引擎和其他应用仍保留。
 
@@ -29,3 +29,5 @@ statistics 同步返回两条 PeerConnection 的 RTCStatsReport JSON、采样时
 - Visual Studio 项目依赖闭包检查确认 MediaEngine 不链接旧 RTC backend、RtcEngine 或 RoomEngine；Room 仍不依赖 GraphEngine。修改的原生文件通过 clang-format 20.1.8 检查，Git diff 空白检查通过。
 
 这些结果来自合成媒体、无窗口渲染和本地服务器，未进行真实摄像头、麦克风、扬声器人工验收，也未验证 macOS/Linux。
+
+旧引擎及所有应用迁移见 [移除说明](legacy-engine-removal.md)。CLI、投屏、远控、直播工作台现也使用此接口。

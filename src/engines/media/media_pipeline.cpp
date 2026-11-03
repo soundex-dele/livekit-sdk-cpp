@@ -52,10 +52,11 @@ class MediaPort final : public graphflow::core::GraphNode {
 
   LocalTrack local;
   std::atomic<bool> keyframe{false};
-  std::atomic<uint64_t> frames{0};
+  std::atomic<uint64_t> frames{0}, bytes{0};
 
   void receive(EncodedFrame value) {
     ++frames;
+    bytes += value.buffer.size();
     publish(rtc::nodes::EncodedFrameEvent(frame_copy<rtc::EncodedFrame>(value)));
   }
 
@@ -79,6 +80,7 @@ class MediaPort final : public graphflow::core::GraphNode {
     subscribe<rtc::nodes::EncodedFrameEvent>([this](const auto& event) {
       if (local.try_write(frame_copy<EncodedFrame>(event.frame)) == WriteStatus::accepted) {
         ++frames;
+        bytes += event.frame.buffer.size();
       }
     });
     subscribe<rtc::nodes::KeyframeRequestEvent>([this](const auto&) { keyframe = true; });
@@ -320,11 +322,13 @@ MediaTrackSnapshot MediaPipeline::snapshot() const {
   MediaTrackSnapshot value;
   value.transport = publishing_ ? local.snapshot() : remote.snapshot();
   value.frames = port_ ? port_->frames.load() : 0;
+  value.bytes = port_ ? port_->bytes.load() : 0;
   auto row = [&](const auto& node, const char* kind, uint64_t in, uint64_t out, uint64_t dropped) {
     value.nodes.push_back({node->getName(), kind, in, out, dropped, 0});
   };
   if (input_) {
     auto s = input_->snapshot();
+    value.input = s;
     row(input_, "MediaInputNode", s.emitted + s.dropped, s.emitted, s.dropped);
   }
   if (video_) {
@@ -338,7 +342,19 @@ MediaTrackSnapshot MediaPipeline::snapshot() const {
         s.dropped);
   }
   if (port_) {
-    row(port_, publishing_ ? "RtcPublishNode" : "RtcSubscribeNode", value.frames, value.frames, 0);
+    row(port_, publishing_ ? "RoomPublishPort" : "RoomSubscribePort", value.frames, value.frames,
+        0);
+  }
+  if (output_) {
+    const auto frames = output_->frames.load();
+    const auto dropped = output_->dropped.load();
+    row(output_, "ApplicationOutputNode", frames + dropped, frames, dropped);
+    value.nodes.back().errors = output_->status() ? 0 : 1;
+  }
+  if (recording_) {
+    const auto state = recording_->snapshot();
+    row(recording_, "RecordingNode", state.admitted, state.written, 0);
+    value.nodes.back().errors = state.error.empty() ? 0 : 1;
   }
   for (const auto& edge : edges_) {
     value.edges.push_back({edge.from, edge.to, edge.dataType});

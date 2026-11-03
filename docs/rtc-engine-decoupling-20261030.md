@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 引擎解耦（2026-10-30）
 
 > 历史重构记录。2026-11-02 核对：当前 RtcEngine 直接持有发布/订阅 map，不再使用下述 TrackGraphRegistry / SessionControl；控制 Completion/Observer、线程和关闭契约见 [当前架构](architecture.md) 与 [媒体 API](rtc-media-engine.md)。本文件验证结果仅对应当时版本。

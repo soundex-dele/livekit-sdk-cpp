@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 控制链路简化（2026-10-29）
 
 本次保留 RoomEngine、媒体图和 LiveKit 后端的职责边界，优化内部等待和重复状态管理。

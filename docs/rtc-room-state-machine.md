@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 房间状态机与执行边界
 
 本文按 2026-11-02 的 [RoomEngine 声明](../include/livekit/rtc/room_engine.hpp)、

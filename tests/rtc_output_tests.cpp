@@ -2,7 +2,7 @@
 #include "media_result.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include "media_nodes/playout/audio_output_transport.hpp"
-#include "livekit/rtc/stream_pipeline.hpp"
+#include "graph_connections.hpp"
 #include "livekit/rtc/recording_node.hpp"
 #include <fstream>
 #include <algorithm>
@@ -234,7 +234,7 @@ void graph_sink() {
   graphflow::engine::GraphEngine graph{1};
   check(graph.loadFromNodes(
             {output, source},
-            {engine::TrackGraphSpec::connect<nodes::AudioFrameEvent>(source, output)}) &&
+            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(source, output)}) &&
             graph.init() && graph.start(),
         "Output graph startup failed");
   source->push(pcm(0, 4000));
@@ -327,8 +327,8 @@ void recording() {
   graphflow::engine::GraphEngine graph{1};
   check(graph.loadFromNodes(
             {audio, video, source},
-            {engine::TrackGraphSpec::connect<nodes::AudioFrameEvent>(source, audio),
-             engine::TrackGraphSpec::connect<nodes::VideoFrameEvent>(source, video)}) &&
+            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(source, audio),
+             livekit::sdk::test::connect<nodes::VideoFrameEvent>(source, video)}) &&
             graph.init() && graph.start(),
         "Recording graph failed");
   source->push(pcm(0, -1234, 960));
@@ -369,7 +369,7 @@ void recording() {
   graphflow::engine::GraphEngine duplicate{1};
   check(duplicate.loadFromNodes(
             {collision, second},
-            {engine::TrackGraphSpec::connect<nodes::AudioFrameEvent>(second, collision)}) &&
+            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(second, collision)}) &&
             duplicate.init() && duplicate.start(),
         "Collision graph failed before recording");
   second->push(pcm(0, 0));

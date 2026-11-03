@@ -1,6 +1,6 @@
 #pragma once
 #include "api/video/video_frame.h"
-#include "backends/rtc/events.hpp"
+#include "support/event_emitter.hpp"
 #include <memory>
 #include <string>
 

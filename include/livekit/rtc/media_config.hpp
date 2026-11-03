@@ -61,56 +61,6 @@ struct MediaOutput {
   QueueLimits queue{4, 32 * 1024 * 1024, std::chrono::milliseconds(250)};
 };
 
-struct SharedInputSnapshot {
-  size_t consumers = 0;
-  bool running = false;
-  uint64_t emitted = 0;
-};
-
-// One raw capture/reader feeding bounded queues for multiple publications,
-// including publications in different rooms. First active graph starts capture;
-// the last graph detaches and stops it. Keep this handle to share a device.
-class SharedMediaInput {
- public:
-  ~SharedMediaInput();
-  SharedInputSnapshot snapshot() const;
-
- private:
-  friend class RtcMediaGraphBuilder;
-  struct Impl;
-
-  explicit SharedMediaInput(std::shared_ptr<Impl> value) : impl_(std::move(value)) {}
-
-  std::shared_ptr<Impl> impl_;
-};
-
-struct MediaPublishSpec {
-  TrackDescriptor track;
-  MediaInput input;
-  MediaOutput preview;
-  VideoCodecOptions video;
-  AudioCodecOptions audio;
-  std::shared_ptr<SharedMediaInput> shared_input;  // Replaces input; raw format must match track.
-  // Optional replacement for an encoded H265 input. Called on the control worker
-  // after the old graph has stopped; return an H264 encoded or raw input. Must
-  // return promptly, must not call engine controls, and return a failure to fail the
-  // replacement. Without this callback an encoded source cannot be downgraded.
-  std::function<Result<MediaInput>()> h264_fallback_input;
-};
-
-struct MediaSubscribeSpec {
-  bool synchronize = true;
-  std::chrono::milliseconds presentation_delay{80};
-  TrackDescriptor track;
-  MediaOutput output;
-  VideoCodecOptions video;
-  AudioCodecOptions audio = [] {
-    AudioCodecOptions options;
-    options.jitter_buffer = true;
-    return options;
-  }();
-};
-
 struct MediaNodeSnapshot {
   std::string name, kind;
   uint64_t inputs = 0, outputs = 0, dropped = 0, errors = 0;
@@ -118,42 +68,6 @@ struct MediaNodeSnapshot {
 
 struct MediaEdgeSnapshot {
   std::string from, to, data_type;
-};
-
-struct MediaTrackSnapshot {
-  TrackSnapshot transport;
-  std::optional<MediaInputSnapshot> input;
-  std::optional<VideoCodecSnapshot> video;
-  std::optional<AudioCodecSnapshot> audio;
-  uint64_t frames = 0, bytes = 0;
-  std::vector<MediaNodeSnapshot> nodes;
-  std::vector<MediaEdgeSnapshot> edges;
-};
-
-class MediaTrack {
- public:
-  MediaTrackSnapshot snapshot() const;
-  // Returns ErrorCode::ok while healthy; detailed failures remain in the snapshot.
-  [[nodiscard]] ErrorCode check() const;
-
- private:
-  friend class RtcMediaGraphBuilder;
-  friend class RtcEngine;
-  struct State;
-
-  explicit MediaTrack(std::shared_ptr<State> state) : state_(std::move(state)) {}
-
-  std::shared_ptr<State> state_;
-};
-
-struct MediaPublication {
-  TrackId id;
-  std::shared_ptr<MediaTrack> track;
-};
-
-struct MediaSubscription {
-  TrackId id;
-  std::shared_ptr<MediaTrack> track;
 };
 
 }  // namespace livekit::sdk::rtc::engine

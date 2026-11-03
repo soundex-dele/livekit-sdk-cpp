@@ -2,16 +2,10 @@
 #include <cstdlib>
 #include <livekit/livekit.hpp>
 #include "api_contract.hpp"
-#include "backends/rtc/events.hpp"
-#include "backends/rtc/livekit/reconnect_policy.hpp"
-#include "token_provider_contract.hpp"
-#include "region_policy_contract.hpp"
-#include "backends/rtc/livekit/client_configuration.hpp"
+#include "support/event_emitter.hpp"
+#include "pcm_resampler_contract.hpp"
 #include "video_source_contract.hpp"
 #include "audio_source_contract.hpp"
-#include "data_messages_contract.hpp"
-#include "rpc_contract.hpp"
-#include "subscribed_quality_contract.hpp"
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -29,21 +23,9 @@ int main(int argc, char** argv) {
   {
     if (argc == 2)
       return api_contract(argv[1]);
-    token_provider_contract();
-    region_policy_contract();
     video_source_contract();
     audio_source_contract();
-    data_messages_contract();
-    rpc_contract();
-    subscribed_quality_contract();
-    livekit::ClientConfiguration client_config;
-    check(!*sdk::detail::relay_required(false, false, client_config), "Default relay policy");
-    client_config.set_force_relay(livekit::ENABLED);
-    check(*sdk::detail::relay_required(false, false, client_config), "Server must force relay");
-    check(!sdk::detail::relay_required(false, true, client_config), "Conflicting relay policy");
-    client_config.set_force_relay(livekit::DISABLED);
-    check(*sdk::detail::relay_required(true, false, client_config),
-          "Server cannot undo user relay policy");
+    pcm_resampler_contract();
     // No global event sink: two sessions route to different handlers, on the caller thread.
     int first = 0, second = 0;
     auto caller = std::this_thread::get_id();
@@ -73,33 +55,9 @@ int main(int argc, char** argv) {
           "Event queue overflow must be explicit");
 
     check(sdk::version == "0.3.0" && sdk::protocol_version == 12, "Version/protocol baseline");
-    sdk::ReconnectOptions reconnect;
-    check(sdk::detail::reconnect_delay(reconnect, 1, 0).count() == 100,
-          "Reconnect lower jitter bound");
-    check(sdk::detail::reconnect_delay(reconnect, 2, 1).count() == 400,
-          "Reconnect exponential backoff");
-    check(sdk::detail::reconnect_delay(reconnect, 1000, 1).count() == 5000, "Reconnect delay cap");
-    reconnect.max_attempts = 0;
-    check(!sdk::detail::validate_reconnect(reconnect), "Invalid reconnect budget accepted");
     auto typed = sdk::make_failure(sdk::ErrorDomain::signaling, sdk::ErrorCode::permission_denied,
                                    "denied", false, 403);
     check(!typed->retryable && typed->backend_reason == 403, "Typed failure semantics");
-    sdk::ReconnectOptions budget_options;
-    budget_options.max_attempts = 2;
-    sdk::detail::RecoveryBudget budget(budget_options);
-    const auto first_attempt = budget.next_attempt();
-    const auto original_deadline = budget.deadline();
-    const auto second_attempt = budget.next_attempt();
-    check(first_attempt && *first_attempt == 1 && second_attempt && *second_attempt == 2 &&
-              budget.deadline() == original_deadline,
-          "Resume/rejoin must share attempt and time budget");
-    check(!budget.next_attempt(), "Exhausted budget accepted another attempt");
-    budget.reset();
-    const auto reset_attempt = budget.next_attempt();
-    check(reset_attempt && *reset_attempt == 1, "Successful recovery resets attempt budget");
-    check(sdk::detail::terminal_leave(2) && sdk::detail::terminal_leave(4) &&
-              sdk::detail::terminal_leave(5) && !sdk::detail::terminal_leave(6),
-          "Lifecycle removal must override reconnect requests");
     check(!sdk::RoomServiceClient("http://localhost:7880", {}).status(),
           "Invalid service credentials");
     check(!sdk::make_token("key", "secret", "id", {}, 0), "Invalid token TTL");

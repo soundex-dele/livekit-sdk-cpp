@@ -1,7 +1,7 @@
 #include "livekit/compat/algorithm.hpp"
 #include "test_failure.hpp"
 #pragma once
-#include "backends/webrtc/pcm_resampler.hpp"
+#include "media_nodes/codecs/pcm_resampler.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -20,7 +20,9 @@ inline void pcm_resampler_contract() {
             6000 * std::sin(2 * livekit::compat::pi * 1000 * (block * (rate / 100) + i) / rate));
         input[i * 2 + 1] = 0;
       }
-      auto out = resampler.process(input);
+      auto result = resampler.process(input);
+      require(bool(result));
+      auto out = *result;
       require(out.size() == 960);
       for (size_t i = 0; i < 480; ++i) {
         require(out[i * 2 + 1] == 0);
@@ -32,7 +34,9 @@ inline void pcm_resampler_contract() {
     require(std::abs(crossings - 1000) <= 2);
     resampler.reset();
     std::fill(input.begin(), input.end(), 0);
-    const auto zero = resampler.process(input);
+    const auto result = resampler.process(input);
+    require(bool(result));
+    const auto zero = *result;
     require(std::all_of(zero.begin(), zero.end(), [](auto sample) { return sample == 0; }));
   }
 }

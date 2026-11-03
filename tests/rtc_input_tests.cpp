@@ -1,7 +1,7 @@
 #include "livekit/compat/algorithm.hpp"
 #include "media_result.hpp"
 #include "livekit/rtc/input_node.hpp"
-#include "livekit/rtc/stream_pipeline.hpp"
+#include "graph_connections.hpp"
 #include "media_nodes/capture/microphone_driver.hpp"
 #include "media_nodes/capture/microphone_transport.hpp"
 #include "media_nodes/capture/audio_source.hpp"
@@ -117,12 +117,12 @@ struct Graph {
 
   Graph(TrackDescriptor d, nodes::MediaInputOptions options) {
     input = std::make_shared<nodes::MediaInputNode>("input", d, std::move(options));
-    using G = engine::TrackGraphSpec;
+
     check(graph.loadFromNodes({output, input, feedback},
-                              {G::connect<nodes::SenderFeedbackEvent>(feedback, input),
-                               G::connect<nodes::VideoFrameEvent>(input, output),
-                               G::connect<nodes::AudioFrameEvent>(input, output),
-                               G::connect<nodes::EncodedFrameEvent>(input, output)}) &&
+                              {livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(feedback, input),
+                               livekit::sdk::test::connect<nodes::VideoFrameEvent>(input, output),
+                               livekit::sdk::test::connect<nodes::AudioFrameEvent>(input, output),
+                               livekit::sdk::test::connect<nodes::EncodedFrameEvent>(input, output)}) &&
               graph.init() && graph.start(),
           "Input graph start failed");
   }

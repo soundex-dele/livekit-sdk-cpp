@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 同步 Result 重构验证记录
 
 更新：2026-10-30。文件名沿用方案日期；下列本机测试日志目录时间为 2026-10-29。平台：Windows x64，MSVC / C++20，Release。

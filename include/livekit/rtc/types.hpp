@@ -2,10 +2,6 @@
 #include <tuple>
 #include "livekit/compat/span.hpp"
 #include "livekit/failure.hpp"
-#include "livekit/rtc/backend_options.hpp"
-#include "livekit/rtc/session_info.hpp"
-#include "livekit/rtc/video_codec_policy.hpp"
-#include "livekit/encryption.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -18,10 +14,6 @@
 
 namespace livekit::sdk::rtc {
 
-namespace detail {
-struct QueueBudget;
-}
-
 using TrackId = std::string;
 using Epoch = uint64_t;
 using SteadyClock = std::chrono::steady_clock;
@@ -29,7 +21,13 @@ using SteadyClock = std::chrono::steady_clock;
 enum class MediaKind { audio, video };
 enum class Codec { opus, vp8, h264, h265 };
 enum class TrackState { pending, ready, suspended, closed, failed };
-enum class ConnectionState { disconnected, connecting, connected, reconnecting, closed, failed };
+enum class PublicationSource {
+  unknown = 0,
+  camera = 1,
+  microphone = 2,
+  screen = 3,
+  screen_audio = 4
+};
 
 // Immutable, owned encoded payload. Copies share storage; construction takes
 // ownership. No native transport/codec/graph types cross this boundary.
@@ -50,11 +48,7 @@ class EncodedBuffer {
   }
 
  private:
-  friend struct detail::QueueBudget;
   std::shared_ptr<const std::vector<uint8_t>> bytes_;
-  std::shared_ptr<void> reservation_;
-  const detail::QueueBudget* budget_ = nullptr;
-  SteadyClock::time_point admitted_{};
 };
 
 struct CodecFormat {
@@ -98,7 +92,7 @@ struct ReceiveDemand {
 };
 
 struct TrackDescriptor {
-  TrackId id;  // Stable within this RtcEngine, never a server SID.
+  TrackId id;  // Local media graph identifier.
   std::string name;
   std::string source_id;
   std::string stream_group;
@@ -178,93 +172,6 @@ struct TrackSnapshot {
   std::shared_ptr<const FailureInfo> failure;
   bool muted = false;            // Current local publication gate, preserved on rejoin.
   ReceiveDemand receive_demand;  // Last locally submitted demand, not a server acknowledgement.
-};
-
-struct ParticipantTrackPermission {
-  std::string participant_identity;
-  bool all_tracks = false;
-  std::vector<TrackId> track_ids;  // Stable local publication IDs, including future publications.
-};
-
-struct SubscriptionPermissions {
-  bool all_participants = true;
-  std::vector<ParticipantTrackPermission> participants;
-};
-
-struct SubscriptionPermissionChange {
-  std::string participant_sid, track_sid;
-  bool allowed = false;
-};
-
-struct RoomSettings {
-  std::optional<SubscriptionPermissions> subscription_permissions;
-  size_t max_queued_bytes = 64 * 1024 * 1024;
-  size_t max_tracks = 128;
-  size_t max_events = 4096;
-  std::chrono::milliseconds operation_timeout{30000};
-  std::chrono::milliseconds stats_interval{0};  // Disabled, or 200..60000 ms.
-};
-
-struct RoomOptions : RoomSettings {
-  std::shared_ptr<const BackendOptions> backend;
-};
-
-struct TransportStatistics {
-  int target = 0;  // 0 publisher, 1 subscriber.
-  int64_t timestamp_us = 0;
-  // JSON array of native W3C media/transport records. No candidate addresses,
-  // certificates or credentials; absent native fields are not synthesized.
-  std::string json;
-  std::map<std::string, std::string>
-      publication_tracks;  // Native track identifier -> current server SID.
-};
-
-struct RoomSnapshot {
-  BackendCapabilities capabilities;
-  ConnectionState state = ConnectionState::disconnected;
-  Epoch epoch = 0;
-  size_t queued_bytes = 0;
-  size_t publications = 0, subscriptions = 0;
-  std::string error;
-  // Null before the join response, after interruption and after termination.
-  // Native join observations are released after transport establishment. Retained
-  // snapshots remain historical values; compare epoch before using server SIDs.
-  std::shared_ptr<const SessionInfo> session;
-  // Controller diagnostics are cumulative for this room. Track work
-  // counts only notified/expired instances, not registry-wide readiness scans.
-  uint64_t controller_wakeups = 0, tracks_serviced = 0;
-  size_t scheduled_deadlines = 0, ready_work = 0;
-};
-
-enum class RoomEventKind {
-  connected,
-  reconnecting,
-  closed,
-  failed,
-  remote_track_added,
-  remote_track_removed,
-  track_ready,
-  track_removed,
-  track_failed,
-  encryption_state_changed,
-  session_changed,
-  track_mute_changed,
-  subscription_permission_changed,
-  statistics
-};
-
-struct RoomEvent {
-  RoomEventKind kind;
-  TrackId track_id;
-  std::optional<TrackDescriptor> descriptor;
-  Epoch epoch = 0;
-  std::string message;
-  std::optional<EncryptionStateEvent> encryption;
-  std::optional<SubscriptionPermissionChange> permission;
-  std::shared_ptr<const TransportStatistics> statistics;
-  std::shared_ptr<const FailureInfo> failure;
-  // Present only for local endpoint events; distinguishes equal publish/subscribe IDs.
-  std::optional<bool> publication;
 };
 
 }  // namespace livekit::sdk::rtc

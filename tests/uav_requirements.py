@@ -1,9 +1,6 @@
-"""Go SFU + native C++ SDK evidence runner (stdlib only, no desktop/devices).
+"""Historical requirement reports and reusable isolated SFU/dynacast fixtures.
 
-Builds the specified Go checkout, never substitutes a historical server binary.
-Returns 1 for failed probes/known requirement gaps, 2 for setup failure, 0 only
-when executed checks pass without a detected gap. Even 0 is NOT full acceptance:
-the report retains untested requirements, device tests and capacity separately.
+The legacy RoomEngine executable and its command-line runner have been removed.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -295,70 +292,5 @@ def finish(report, root):
     print(root / "report.md", flush=True)
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--server-source", type=Path, default=WORKSPACE.parent / "livekit")
-    p.add_argument("--go", type=Path, default=WORKSPACE / "out/tools/go/bin/go.exe")
-    p.add_argument("--client", type=Path, default=SDK / "out/windows-x64/Release/livekit_uav_requirements.exe")
-    p.add_argument("--goproxy", help="Process-local module proxy; go.mod/go.sum stay readonly")
-    p.add_argument("--output", type=Path)
-    p.add_argument("--tcp-repeats", type=int, default=1, help="Total isolated TCP video rounds per codec (1..20)")
-    args = p.parse_args()
-    if not 1 <= args.tcp_repeats <= 20:
-        p.error("--tcp-repeats must be 1..20")
-    args.server_source, args.go, args.client = (x.resolve() for x in (args.server_source, args.go, args.client))
-    now = datetime.now(timezone(timedelta(hours=8)))
-    root = (args.output or WORKSPACE / "out/uav-sfu-go" / now.strftime("%Y%m%d-%H%M%S-%f")).resolve()
-    root.mkdir(parents=True, exist_ok=False)
-    report = {"started_at": now.isoformat(), "scenarios": []}
-    env = dict(os.environ)
-    if args.goproxy:
-        env["GOPROXY"] = args.goproxy
-    try:
-        report["server_source"] = git_info(args.server_source)
-        report["cpp_source"] = git_info(SDK)
-        report["webrtc_source"] = git_info(WORKSPACE / "webrtc")
-        report["go_version"] = subprocess.check_output([str(args.go), "version"], text=True).strip()
-        if not args.client.is_file():
-            raise RuntimeError("Build livekit_uav_requirements CMake target first")
-        server = root / ("livekit-server.exe" if os.name == "nt" else "livekit-server")
-        rc = command([args.go, "build", "-mod=readonly", "-o", server, "./cmd/server"], args.server_source, root / "go-build.log", env)
-        if rc:
-            raise RuntimeError(f"Go source build failed ({rc}); see go-build.log")
-        report["sha256"] = {"server": digest(server), "cpp_client": digest(args.client),
-                            "go_mod": digest(args.server_source / "go.mod"), "go_sum": digest(args.server_source / "go.sum")}
-        report["cpp_client"] = str(args.client)
-        command([args.go, "version", "-m", server], args.server_source, root / "server-build-info.txt", env)
-        report["go"] = go_probes(args, root, env)
-        for protocol, scenario, codec in [("udp", "video", "h264"), ("tcp", "video", "h264"),
-                                          ("udp", "audio", "h264"), ("udp", "video", "h265"),
-                                          ("udp", "dynacast", "h264"), ("udp", "dynacast", "h265"),
-                                          ("tcp", "video", "h265"),
-                                          ("udp", "transport-reject", "h264"), ("tcp", "transport-reject", "h264")]:
-            report["scenarios"].append(run_case(server, args.client, root, protocol, scenario, codec))
-        mixed_root = root / "simultaneous"
-        mixed_root.mkdir()
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            jobs = [pool.submit(run_case, server, args.client, mixed_root, protocol, scenario, "h265")
-                    for protocol, scenario in [("udp", "mixed"), ("tcp", "video")]]
-            for job in jobs:
-                result = job.result()
-                result["folder"] = "simultaneous/" + result["folder"]
-                report["scenarios"].append(result)
-        for repeat in range(2, args.tcp_repeats + 1):
-            repeat_root = root / f"tcp-repeat-{repeat}"
-            repeat_root.mkdir()
-            for codec in ("h264", "h265"):
-                result = run_case(server, args.client, repeat_root, "tcp", "video", codec)
-                result["folder"] = repeat_root.name + "/" + result["folder"]
-                report["scenarios"].append(result)
-        finish(report, root)
-        return 1 if report["gaps"] or report["go"]["exit_code"] or any(not r["ok"] for r in report["scenarios"]) else 0
-    except Exception as e:
-        report["setup_error"] = str(e)
-        finish(report, root)
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# Historical requirement/report helpers remain importable by simulation_report and
+# demo_dynacast_integration. The old engine executable and launcher were removed.

@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 同步控制与 Result 重构方案
 
 日期：2026-10-29。版本：锁串行化简化方案。

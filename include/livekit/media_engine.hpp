@@ -37,7 +37,8 @@ struct MediaSubscribeSpec {
 
 struct MediaTrackSnapshot {
   TrackSnapshot transport;
-  uint64_t frames = 0;
+  uint64_t frames = 0, bytes = 0;
+  std::optional<rtc::MediaInputSnapshot> input;
   Failure failure;
   std::vector<rtc::engine::MediaNodeSnapshot> nodes;
   std::vector<rtc::engine::MediaEdgeSnapshot> edges;

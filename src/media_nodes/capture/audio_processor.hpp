@@ -2,7 +2,7 @@
 #include "livekit/compat/span.hpp"
 #include "livekit/rtc/audio_processing.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
-#include "backends/webrtc/pcm_resampler.hpp"
+#include "media_nodes/codecs/pcm_resampler.hpp"
 #include "api/audio/builtin_audio_processing_builder.h"
 #include "api/environment/environment_factory.h"
 #include <cmath>

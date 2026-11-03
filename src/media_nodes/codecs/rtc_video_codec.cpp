@@ -1,7 +1,7 @@
 #include "livekit/compat/thread.hpp"
 #include "livekit/result.hpp"
 #include "media_graph/failure.hpp"
-#include "backends/rtc/control_context.hpp"
+#include "media_graph/callback_context.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "api/environment/environment_factory.h"
 #include "api/video/i420_buffer.h"
@@ -10,7 +10,7 @@
 #include "api/video_codecs/video_codec.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #ifdef LIVEKIT_RTC_FFMPEG_CODECS
-#include "backends/webrtc/ffmpeg_video_codecs.hpp"
+#include "media_nodes/codecs/ffmpeg_video_codecs.hpp"
 #endif
 #include <algorithm>
 #include <condition_variable>

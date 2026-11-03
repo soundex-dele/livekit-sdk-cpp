@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 > 历史记录：本文同步控制契约已被 [observer 异步控制](rtc-observers.md) 替代。当前 RtcEngine、RoomEngine 和 RtcGraphApi 的返回码仅表示受理，完成结果通过分职责 observer 通知。以下代码和验证记录描述旧版本。
 
 > 历史设计记录。当前控制 API 和支持范围见 [最简 Observer / 回调方案](rtc-simple-observer.md)。

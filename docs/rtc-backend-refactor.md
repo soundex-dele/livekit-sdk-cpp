@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC backend / nodes / engine 重构
 
 状态：本次 backend / nodes / engine 分层迁移已完成，旧 Room API 已删除且不保留兼容层。当前恢复方式是完整重新入会；单 PC、信令 resume、无缝迁房、simulcast/SVC、AEC/APM、播放抖动缓冲/PLC 和跨轨同步不在已完成能力中。下方实施记录按时间保留，早期“仍待迁移”描述由末尾收尾记录取代。

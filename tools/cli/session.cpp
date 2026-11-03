@@ -1,18 +1,18 @@
 #include "livekit/compat/thread.hpp"
-#include "rtc_blocking_bridge.hpp"
-#include "data_event_mailbox.hpp"
-#include "rtc_event_mailbox.hpp"
-#include "livekit/rtc/livekit.hpp"
 #include "session.hpp"
-#include "livekit/rtc/engine.hpp"
+#include "livekit/media_engine.hpp"
 #include "media_nodes/render/video_playout.hpp"
-#include "backends/webrtc/native_peer.hpp"
+#include "backends/livekit/peer_transport.hpp"
 #include "api/video/i420_buffer.h"
 #include <algorithm>
 #include <thread>
+#include <set>
+#include <mutex>
 
 namespace livekit::cli {
-using namespace sdk::rtc;
+using namespace sdk::client;
+using sdk::client::Codec;
+using sdk::client::DataPacket;
 using namespace std::chrono_literals;
 using Json = sdk::Json;
 using sdk::ErrorCode;
@@ -77,7 +77,7 @@ class Output final {
     }
   }
 
-  void video(const engine::VideoSample& event) {
+  void video(const VideoSample& event) {
     if (!display_)
       return;
     const auto& p = *event.pixels;
@@ -94,20 +94,56 @@ class Output final {
   std::shared_ptr<lk::VideoPlayout> display_;
 };
 
+// CLI-only display/publication metadata; not a transport API.
+struct TrackDescriptor {
+  std::string id, name, remote_sid, stream_group;
+  MediaKind kind = MediaKind::video;
+  CodecFormat format;
+  PublicationSource source = PublicationSource::unknown;
+};
+
+class Inbox final : public RoomObserver {
+ public:
+  void on_room_event(const RoomEvent& event) override {
+    std::lock_guard lock(mutex);
+    if (events.size() >= 4096) {
+      overflow = true;
+    } else {
+      events.push_back(event);
+    }
+  }
+
+  Result<std::vector<RoomEvent>> take() {
+    std::lock_guard lock(mutex);
+    if (overflow) {
+      return Result<std::vector<RoomEvent>>::failure(make_failure(
+          ErrorDomain::lifecycle, ErrorCode::resource_exhausted, "CLI event queue overflow"));
+    }
+    std::vector<RoomEvent> result;
+    result.swap(events);
+    return Result<std::vector<RoomEvent>>::success(std::move(result));
+  }
+
+ private:
+  std::mutex mutex;
+  std::vector<RoomEvent> events;
+  bool overflow = false;
+};
+
 struct Track {
   TrackDescriptor descriptor;
   bool publication = false, closing = false, reported = false, ready = false;
-  std::shared_ptr<engine::MediaTrack> media;
+  std::shared_ptr<MediaTrack> media;
   std::shared_ptr<Output> output;
 
   Result<void> check() const {
-    if (!media || media->check() == ErrorCode::ok) {
+    if (!media || !media->snapshot().failure) {
       return Result<void>::success();
     }
     const auto snapshot = media->snapshot();
     return Result<void>::failure(
-        snapshot.transport.failure
-            ? snapshot.transport.failure
+        snapshot.failure
+            ? snapshot.failure
             : make_failure(ErrorDomain::media, ErrorCode::processing_failed, "Media track failed"));
   }
 
@@ -142,22 +178,17 @@ struct Track {
 }  // namespace
 
 Result<void> doctor(std::function<void(const Json&)> report) {
-  sdk::rtc::detail::TransportRuntime runtime;
+  sdk::client::detail::WebRtcContext runtime;
   LK_CLI_TRY(runtime.status());
-  sdk::rtc::detail::NativePeer peer(runtime, {});
+  sdk::client::detail::PeerTransport peer(runtime, {}, 64, sdk::MediaTransport::automatic);
   LK_CLI_TRY(peer.status());
-  LK_CLI_TRY(peer.create_data_channel("doctor", true));
-  auto promise = std::make_shared<std::promise<Result<sdk::rtc::detail::NativeDescription>>>();
-  auto offer = promise->get_future();
-  peer.create_local(true, false, [promise](auto result) { promise->set_value(std::move(result)); });
-  if (offer.wait_for(10s) != std::future_status::ready) {
-    return Result<void>::failure(
-        make_failure(ErrorDomain::transport, ErrorCode::timeout, "Native SDP creation timed out"));
-  }
-  LK_CLI_ASSIGN(description, offer.get());
+  LK_CLI_TRY(peer.create_data_channels());
+  std::atomic<bool> stopped{false};
+  sdk::client::detail::Operation operation{SteadyClock::now() + 10s, &stopped};
+  LK_CLI_ASSIGN(description, peer.local_description(true, operation));
   report({{"event", "webrtc-smoke"},
           {"ok", true},
-          {"sdpBytes", description.sdp.size()},
+          {"sdpBytes", description.size()},
           {"transportOnly", true}});
   peer.close();
   return Result<void>::success();
@@ -175,14 +206,9 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
       options.video_playout ? std::make_shared<lk::VideoPlayout>(display_events) : nullptr;
   if (display)
     LK_CLI_TRY(display->status());
-  LK_CLI_ASSIGN(engine,
-                livekit::sdk::app_support::create_blocking_engine(
-                    livekit::sdk::rtc::AudioOutputOptions{}));  // Destroy before consumers/display.
-  livekit::sdk::app_support::RtcEventMailbox engine_events(*engine);
-  LK_CLI_ASSIGN(services, engine->room().services());
-  livekit::sdk::app_support::DataEventMailbox data_events(services);
-  LK_CLI_TRY(engine_events.status());
-  LK_CLI_TRY(data_events.status());
+  Inbox inbox;
+  auto engine = std::make_unique<MediaEngine>();
+  engine->set_observer(&inbox);
 
   struct CloseEngine {
     decltype(engine)& value;
@@ -194,22 +220,28 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
     }
   } cleanup{engine};
 
-  LiveKitRoomOptions room;
+  ConnectionOptions room;
   room.url = options.url;
   room.token = options.token;
   room.connect_timeout = options.connect_timeout;
   room.operation_timeout = std::chrono::seconds(options.connect_timeout);
-  room.stats_interval = std::chrono::milliseconds(options.stats_interval_ms);
+  room.auto_subscribe = false;
   // Subscriptions are explicit graph operations; server auto-subscribe stays off.
-  auto joining = engine->join(room);
-  LK_CLI_TRY(std::move(joining));
+  livekit::compat::stop_callback cancel(stop, [&] { engine->close(); });
+  if (!engine->connect(room)) {
+    if (stop.stop_requested()) {
+      return Result<void>::success();
+    }
+    return Result<void>::failure(make_failure(ErrorDomain::transport, ErrorCode::connection_lost,
+                                              "CLI room connection failed"));
+  }
   if (stop.stop_requested()) {
-    LK_CLI_TRY(engine->close());
+    engine->close();
     return Result<void>::success();
   }
   report({{"event", "joined"}, {"room", options.room}});
-  const auto joined = engine->room().snapshot().session;
-  if (!joined || joined->room.name != options.room)
+  const auto joined = engine->info();
+  if (joined.name != options.room)
     return Result<void>::failure(make_failure(ErrorDomain::protocol, ErrorCode::invalid_state,
                                               "Joined room does not match the CLI room argument"));
   LK_CLI_ASSIGN(video_codec, codec(options.codec));
@@ -232,7 +264,7 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
     d.format.width = spec.video ? spec.width : 0;
     d.format.height = spec.video ? spec.height : 0;
     d.stream_group = "input-" + std::to_string(index);
-    engine::MediaInput input;
+    MediaInput input;
     input.generated = spec.demo;
     input.input = spec.input;
     input.ffmpeg = spec.ffmpeg;
@@ -248,25 +280,37 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
       d.source = PublicationSource::camera;
     else if (spec.capture == sdk::CaptureKind::screen)
       d.source = PublicationSource::screen;
-    engine::MediaPublishSpec config;
-    config.track = d;
+    MediaPublishSpec config;
+    config.name = d.name;
+    config.kind = d.kind;
+    config.format = d.format;
+    config.options.source = d.source;
+    config.options.stream_group = d.stream_group;
     config.input = input;
     LK_CLI_ASSIGN(operation, engine->publish_media(std::move(config)));
+    d.id = operation.publication.snapshot().track_id;
+    d.remote_sid = operation.publication.snapshot().sid;
     track->media = std::move(operation.track);
     track->ready = true;
     tracks.emplace(d.id, std::move(track));
   }
-  std::optional<std::future<Result<void>>> sending;
   if (!options.publish_data.empty()) {
-    DataSendOptions data;
+    DataPacket data;
     data.topic = options.topic;
-    sending = services->send_data({options.publish_data.begin(), options.publish_data.end()}, data);
+    data.payload.assign(options.publish_data.begin(), options.publish_data.end());
+    engine->publish_data(std::move(data));
+    report({{"event", "data-sent"}, {"localSubmission", true}});
   }
   const auto start = SteadyClock::now();
   auto next_stats = start;
   std::optional<SteadyClock::time_point> eof;
   bool announced = false;
-  const auto subscribe = [&](TrackDescriptor d) -> Result<void> {
+  const auto subscribe = [&](RemoteTrackPublication publication) -> Result<void> {
+    const auto state = publication.snapshot();
+    TrackDescriptor d;
+    d.id = d.remote_sid = state.sid;
+    d.kind = state.kind;
+    d.name = state.name;
     if (!options.subscribe || tracks.count(d.id))
       return Result<void>::success();
     if (!options.subscribe_tracks.empty() &&
@@ -275,8 +319,8 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
       return Result<void>::success();
     auto track = std::make_shared<Track>();
     track->descriptor = d;
-    engine::MediaSubscribeSpec config;
-    config.track = d;
+    MediaSubscribeSpec config;
+    config.publication = publication;
     config.output.recording = options.record;
     if (d.kind == MediaKind::video && display) {
       track->output = std::make_shared<Output>(d.id, display);
@@ -297,66 +341,52 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
     while (!stop.stop_requested() &&
            (!options.duration ||
             SteadyClock::now() - start < std::chrono::seconds(options.duration))) {
-      for (;;) {
-        LK_CLI_ASSIGN(event, engine_events.take_event(0ms));
-        if (!event) {
-          break;
+      LK_CLI_ASSIGN(events, inbox.take());
+      for (const auto& event : events) {
+        if (event.kind == RoomEventKind::data_received && event.data) {
+          report({{"event", "data"},
+                  {"identity", event.participant_identity},
+                  {"topic", event.data->topic},
+                  {"bytes", event.data->payload}});
+        } else if (event.kind == RoomEventKind::connection_changed) {
+          if (event.connection == ConnectionState::failed ||
+              event.connection == ConnectionState::closed) {
+            if (stop.stop_requested()) {
+              break;
+            }
+            return Result<void>::failure(event.failure ? event.failure
+                                                       : make_failure(ErrorDomain::transport,
+                                                                      ErrorCode::connection_lost,
+                                                                      "Room disconnected"));
+          }
+          if (event.connection == ConnectionState::reconnecting) {
+            report({{"event", "reconnecting"}, {"epoch", event.epoch}});
+          }
+        } else if (event.kind == RoomEventKind::track_muted && event.publication) {
+          report({{"event", "track-muted"},
+                  {"track", event.publication->sid},
+                  {"muted", event.publication->muted}});
         }
-        if (event->kind == RoomEventKind::remote_track_added && event->descriptor)
-          LK_CLI_TRY(subscribe(*event->descriptor));
-        else if (event->kind == RoomEventKind::track_removed) {
-          auto found = tracks.find(event->track_id);
-          if (found != tracks.end()) {
-            found->second->closing = true;
-            auto removing = found->second->publication ? engine->unpublish(found->first)
-                                                       : engine->unsubscribe(found->first);
-            LK_CLI_TRY(std::move(removing));
-          }
-          report(
-              {{"event", "track-removed"}, {"track", event->track_id}, {"reason", event->message}});
-        } else if (event->kind == RoomEventKind::remote_track_removed) {
-          auto found = tracks.find(event->track_id);
-          if (found != tracks.end() && !found->second->publication) {
-            found->second->closing = true;
-            LK_CLI_TRY(engine->unsubscribe(found->first));
-          }
-        } else if (event->kind == RoomEventKind::failed || event->kind == RoomEventKind::closed)
-          return Result<void>::failure(
-              event->failure
-                  ? event->failure
-                  : make_failure(ErrorDomain::transport, ErrorCode::connection_lost,
-                                 event->message.empty() ? "Room disconnected" : event->message));
-        else if (event->kind == RoomEventKind::reconnecting)
-          report({{"event", "reconnecting"}, {"epoch", event->epoch}});
-        else if (event->kind == RoomEventKind::track_mute_changed) {
-          auto it = tracks.find(event->track_id);
-          if (it != tracks.end() && it->second->media)
-            report({{"event", "track-muted"},
-                    {"track", it->second->media->snapshot().transport.server_sid},
-                    {"muted", it->second->media->snapshot().transport.muted}});
-        } else if (event->kind == RoomEventKind::statistics && event->statistics)
-          report({{"event", "rtc-stats"},
-                  {"target", event->statistics->target},
-                  {"epoch", event->epoch},
-                  {"timestampUs", event->statistics->timestamp_us},
-                  {"stats", Json::parse(event->statistics->json, nullptr, false)}});
       }
-
-      for (;;) {
-        LK_CLI_ASSIGN(failure, engine_events.take_failure());
-        if (!failure) {
-          break;
+      std::set<TrackSid> available;
+      if (engine->connection_state() == ConnectionState::connected) {
+        for (const auto& participant : engine->remote_participants()) {
+          for (const auto& pub : participant.track_publications()) {
+            available.insert(pub.snapshot().sid);
+            LK_CLI_TRY(subscribe(pub));
+          }
         }
-        auto it = tracks.find(failure->id);
-        if (it != tracks.end() && it->second->closing)
-          continue;
-        return Result<void>::failure(
-            make_failure(ErrorDomain::media, ErrorCode::processing_failed,
-                         "Track " + failure->id + ": " + failure->message));
+        for (const auto& [id, track] : tracks) {
+          if (!track->publication && !available.count(id)) {
+            engine->unsubscribe_track(id);
+            track->closing = true;
+          }
+        }
       }
       bool publications_ready = true, inputs_finished = !media.empty();
       for (auto it = tracks.begin(); it != tracks.end();) {
         auto& track = *it->second;
+        LK_CLI_TRY(track.check());
         if (track.publication) {
           publications_ready &= track.ready;
           inputs_finished &=
@@ -375,27 +405,6 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
         report({{"event", "connected"}, {"room", options.room}});
         announced = true;
       }
-      if (sending && sending->wait_for(0ms) == std::future_status::ready) {
-        LK_CLI_TRY(sending->get());
-        sending.reset();
-        report({{"event", "data-sent"}});
-      }
-      for (;;) {
-        LK_CLI_ASSIGN(data, data_events.take_event(0ms));
-        if (!data) {
-          break;
-        }
-        if (const auto* value = std::get_if<ReceivedData>(&data->value))
-          report({{"event", "data"},
-                  {"identity", data->sender_identity},
-                  {"topic", value->topic},
-                  {"bytes", value->bytes}});
-        if (const auto* error = std::get_if<DataServiceError>(&data->value))
-          return Result<void>::failure(
-              error->failure
-                  ? error->failure
-                  : make_failure(ErrorDomain::data, ErrorCode::processing_failed, error->message));
-      }
       if (options.exit_after_publish && inputs_finished) {
         if (!eof)
           eof = SteadyClock::now();
@@ -409,7 +418,26 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
       }
       display_events.dispatch();
       LK_CLI_TRY(display_events.status());
-      if (options.stats_interval_ms && SteadyClock::now() >= next_stats) {
+      if (options.stats_interval_ms && SteadyClock::now() >= next_stats &&
+          engine->connection_state() == ConnectionState::connected) {
+        LK_CLI_ASSIGN(reports, engine->statistics());
+        for (const auto& stats : reports) {
+          const auto native = Json::parse(stats.json, nullptr, false);
+          Json selected = Json::array();
+          if (native.is_array()) {
+            for (const auto& entry : native) {
+              const auto type = entry.value("type", "");
+              if (type == "outbound-rtp" || type == "inbound-rtp" || type == "remote-inbound-rtp" ||
+                  type == "media-source" || type == "candidate-pair" || type == "transport") {
+                selected.push_back(entry);
+              }
+            }
+          }
+          report({{"event", "rtc-stats"},
+                  {"target", stats.target},
+                  {"timestampUs", stats.timestamp_us},
+                  {"stats", std::move(selected)}});
+        }
         for (const auto& [id, track] : tracks)
           if (track->ready)
             report(track->metrics());
@@ -417,7 +445,7 @@ Result<void> run_session(const SessionOptions& options, std::function<void(const
       }
       std::this_thread::sleep_for(5ms);
     }
-    LK_CLI_TRY(engine->close());
+    engine->close();
     for (const auto& [id, track] : tracks) {
       LK_CLI_TRY(track->check());
       report(track->summary());

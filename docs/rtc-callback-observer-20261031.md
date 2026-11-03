@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 单次完成回调重构（2026-10-31）
 
 控制操作现在通过每次调用的 Completion<T> 交付 Result<T>，持续状态通过 RoomObserver /

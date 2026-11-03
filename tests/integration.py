@@ -15,8 +15,8 @@ import time
 import wave
 
 
-def free_port():
-    with socket.socket() as sock:
+def free_port(kind=socket.SOCK_STREAM):
+    with socket.socket(socket.AF_INET, kind) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
@@ -31,7 +31,7 @@ def main():
     root = Path(args.output).resolve() / time.strftime("%Y%m%d-%H%M%S")
     root.mkdir(parents=True)
     lk = str(Path(args.lk).resolve())
-    port, rtc_port, udp_port = free_port(), free_port(), free_port()
+    port, rtc_port, udp_port = free_port(), free_port(), free_port(socket.SOCK_DGRAM)
     env = os.environ.copy()
     env.update(LIVEKIT_URL=f"http://127.0.0.1:{port}", LIVEKIT_API_KEY="testkey",
                LIVEKIT_API_SECRET="integration-test-secret-32-characters", LIVEKIT_TOKEN="")
@@ -89,6 +89,7 @@ def main():
         config = (f"port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n"
                   f"  tcp_port: {rtc_port}\n  udp_port: {udp_port}\n  use_external_ip: false\n"
                   "  node_ip: 127.0.0.1\n  enable_loopback_candidate: true\n"
+                  "  ips:\n    includes: [127.0.0.1/32]\n"
                   f"keys:\n  testkey: {env['LIVEKIT_API_SECRET']}\nlogging:\n  level: info\n")
         (root / "server.yaml").write_text(config, encoding="utf-8")
         server = start("server", [args.server, "--config", str(root / "server.yaml")])
@@ -129,14 +130,16 @@ def main():
         print("PASS: JWT, room API, native video/Opus, data channel, decoded recording", flush=True)
         fixture = root / "media sample 测试.mkv"
         subprocess.run([args.ffmpeg, "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-t", "4", "-c:v", "libvpx", "-c:a", "libopus", str(fixture)], check=True, timeout=30, creationflags=creationflags)
+        # Four synchronous publications may start sequentially on a busy build host.
+        # Keep receiving through the entire publisher lifetime, not just its first track.
         file_recording = root / "file-recording"
-        sub = start("file-sub", [lk, "room", "subscribe", "test", "--identity", "file-subscriber", "--record", str(file_recording), "--duration", "10"])
+        sub = start("file-sub", [lk, "room", "subscribe", "test", "--identity", "file-subscriber", "--record", str(file_recording), "--duration", "30"])
         wait_event("file-sub", sub, "connected")
         # Repeating the flag exercises independent tracks and simultaneous child
         # pipes, and catches CLI parsers that accidentally limit the total to one.
         pub = start("file-pub", [lk, "room", "publish", "test", "--identity", "file-publisher", "--publish", str(fixture), "--publish", str(fixture), "--ffmpeg", args.ffmpeg, "--exit-after-publish"])
         assert pub.wait(timeout=35) == 0, "File publish failed"
-        assert sub.wait(timeout=20) == 0
+        assert sub.wait(timeout=40) == 0
         check_recording(file_recording)
         received = [e for e in events("file-sub") if e.get("event") == "track-summary"]
         assert len(received) == 4 and all(e["frames"] > 20 for e in received), received

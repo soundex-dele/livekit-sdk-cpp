@@ -3,8 +3,8 @@
 #include "livekit/rtc/input_node.hpp"
 #include "livekit/rtc/audio_output.hpp"
 #include "livekit/rtc/recording_node.hpp"
-#include "engines/rtc/application_output.hpp"
-#include "engines/rtc/sync_node.hpp"
+#include "engines/media/application_output.hpp"
+#include "engines/media/sync_node.hpp"
 #include "engine/graph_engine.h"
 
 namespace livekit::sdk::client::detail {

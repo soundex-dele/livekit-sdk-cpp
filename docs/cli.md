@@ -1,13 +1,13 @@
 # GraphEngine-based LiveKit CLI
 
-CLI 已使用新的 `rtc::RoomEngine` 和 `rtc::engine::RtcEngine`，不再包含或链接旧 `Room` API。每条发布独立创建 `MediaInputNode → CodecNode → RtcPublishNode`，每条订阅创建 `RtcSubscribeNode → CodecNode → 输出/录制节点`，所有图共享同一个房间后端。房间管理和 Token 命令仍使用 ServerSDK。
+CLI 已使用新的 `rtc::client::Room` 和 `rtc::engine::client::MediaEngine`，不再包含或链接旧 `Room` API。每条发布独立创建 `MediaInputNode → CodecNode → RtcPublishNode`，每条订阅创建 `RtcSubscribeNode → CodecNode → 输出/录制节点`，所有图共享同一个房间后端。房间管理和 Token 命令仍使用 ServerSDK。
 
 `room join/publish/subscribe --stats-interval-ms 500` 可输出 `rtc-stats` 事件。
 默认关闭；启用时范围为 200–60000 ms。`target=0` 是发布连接，`target=1` 是
 订阅连接；`stats` 保留 libwebrtc 原生 W3C 字段，包括帧数、编码器质量限制
 原因、码率、RTT、丢包、NACK/PLI 和候选连接对统计。未定义字段不会伪造为零。
 不输出 candidate 地址或 certificate 记录；采集为异步，每条连接最多一个
-未完成请求。统计通过 `rtc::RoomOptions::stats_interval` 启用，再用 `RoomEngine::set_event_handler()` 接收 `RoomEventKind::statistics`。报告带连接 epoch；每个目标最多保留一条待读报告，控制事件优先。CLI 在自身控制线程串行输出 JSON。
+未完成请求。统计通过 `rtc::RoomOptions::stats_interval` 启用，再用 `client::Room::set_event_handler()` 接收 `RoomEventKind::statistics`。报告带连接 epoch；每个目标最多保留一条待读报告，控制事件优先。CLI 在自身控制线程串行输出 JSON。
 
 原生 W3C 指标描述传输 PeerConnection；实际编解码位于上层，使用 `media-graph-stats` 的节点计数查看其准入、完成、丢弃和错误。该事件的 `edges` 来自运行中 GraphEngine 节点的真实连接。带宽估计、探测参数和 RTP/RTCP 算法由 libwebrtc 决定，设备不放进传输 PeerConnection。
 
@@ -243,7 +243,7 @@ CTest 覆盖 Token/URL 基础逻辑、Protobuf wire 字段、子进程参数、�
 
 ```powershell
 python tests/integration.py --lk out/windows-x64/Release/lk.exe --server D:\path\livekit-server.exe
-python tests/stream_integration.py --lk out/windows-x64/Release/lk.exe --server D:\path\livekit-server.exe
+python tests/media_graph_integration.py --lk out/windows-x64/Release/lk.exe --server D:\path\livekit-server.exe
 ```
 
 所有子进程会清理，测试日志和录制保存在 `out/integration/<时间>/`。迁移后的验证结果见根目录 `VALIDATION.md`。
@@ -252,13 +252,12 @@ python tests/stream_integration.py --lk out/windows-x64/Release/lk.exe --server 
 
 | 路径 | 职责 |
 | --- | --- |
-| `tools/cli/main.cpp` | 命令解析和房间 API 操作 |
-| `src/server_sdk/auth.cpp` | HS256 JWT、URL、JSON 事件 |
-| `src/support/net.cpp` | HTTP/Twirp 和 WSS 信令 |
-| `src/engines/rtc/room.cpp` | LiveKit 双 PeerConnection、协商与轨道生命周期 |
-| `src/engines/rtc/media.cpp` | FFmpeg 输入、音视频源、订阅录制 |
-| `src/backends/webrtc/headless_audio.hpp` | 无声音频播放时钟，驱动订阅解码 |
-| `src/support/process.cpp` | Windows/POSIX 子进程与管道；不经过 shell |
-| `protocol/livekit.proto` | 保留官方字段编号的 Protobuf 子集 |
+| tools/cli/main.cpp | 命令解析和服务端 API 操作 |
+| tools/cli/session.cpp | 同步 MediaEngine 会话、媒体图统计、输入完成和数据事件 |
+| src/engines/media | 采集、编解码、预览、播放、录制流水线 |
+| src/backends/livekit | Room 状态、信令和编码传输 |
+| src/server_sdk | Token 与 HTTP/Twirp 管理 API |
+| src/support/process.cpp | Windows/POSIX 子进程与管道，不经过 shell |
+| protocol/livekit.proto | LiveKit 协议字段 |
 
-协议参考快照保留在 `protocol/upstream_*.txt`；未实现的 protobuf 字段由运行库忽略。
+旧引擎已删除，参见 [迁移说明](legacy-engine-removal.md)。data-sent 事件表示本地提交，不是对端交付确认。

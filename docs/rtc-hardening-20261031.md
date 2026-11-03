@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 三线程精简实现（2026-10-31）
 
 > 三线程基线记录。后续接口已迁移为[单次完成回调与持续 Observer](rtc-callback-observer-20261031.md)，线程与同步退出模型保持。

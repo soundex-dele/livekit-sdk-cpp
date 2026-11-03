@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # 统一 RTC 引擎与配置式媒体 API
 
 本文按 2026-11-02 当前源码整理。公共声明以 [engine.hpp](../include/livekit/rtc/engine.hpp)、[media_config.hpp](../include/livekit/rtc/media_config.hpp) 为准；线程与完成语义见 [Completion / Observer 契约](rtc-simple-observer.md)。本文描述已实现接口，不将后续 API 简化建议视为已有能力。

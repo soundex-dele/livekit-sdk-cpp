@@ -1,4 +1,4 @@
-#include "backends/webrtc/ffmpeg_video_codecs.hpp"
+#include "media_nodes/codecs/ffmpeg_video_codecs.hpp"
 #include "api/environment/environment_factory.h"
 #include "api/video/i420_buffer.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"

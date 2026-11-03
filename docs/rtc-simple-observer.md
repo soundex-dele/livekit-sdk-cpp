@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RTC 完成回调与持续 Observer
 
 当前契约（2026-11-02 按源码核对）：控制方法保持 `void`，每次调用可传入 `Completion<T>`

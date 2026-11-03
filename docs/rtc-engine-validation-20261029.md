@@ -1,3 +1,5 @@
+> 历史文档：旧 RtcEngine / RoomEngine 及底层实现已移除。本文仅记录当时设计或验证，不代表当前 API；参见 [迁移说明](legacy-engine-removal.md)。
+
 # RtcEngine 统一入口验证（2026-10-29）
 
 实现与接口见 [RTC 引擎 API](rtc-media-engine.md)。本次是无兼容层的 API 调整：RoomSession 演进为 RoomEngine，RtcMediaEngine 成为内部可选模块，应用统一使用 RtcEngine。

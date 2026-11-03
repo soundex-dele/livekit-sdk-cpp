@@ -1,6 +1,6 @@
 #include "media_result.hpp"
 #include "rtc_audio_fixtures.hpp"
-#include "livekit/rtc/stream_pipeline.hpp"
+#include "graph_connections.hpp"
 #include <condition_variable>
 #include <iostream>
 #include <limits>
@@ -80,7 +80,7 @@ class Output : public graphflow::core::GraphNode {
   }
 };
 
-using G = engine::TrackGraphSpec;
+
 
 void roundtrip(uint16_t channels, uint32_t rate, bool floating) {
   auto input = std::make_shared<Input>();
@@ -90,11 +90,11 @@ void roundtrip(uint16_t channels, uint32_t rate, bool floating) {
   auto decoder = std::make_shared<nodes::AudioCodecNode>("decoder", d, false);
   graphflow::engine::GraphEngine graph{1};
   check(graph.loadFromNodes({output, decoder, encoder, input},
-                            {G::connect<nodes::AudioFrameEvent>(input, encoder),
-                             G::connect<nodes::SenderFeedbackEvent>(input, encoder),
-                             G::connect<nodes::EncodedFrameEvent>(encoder, decoder),
-                             G::connect<nodes::EncodedFrameEvent>(encoder, output),
-                             G::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
+                            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(input, encoder),
+                             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(input, encoder),
+                             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, decoder),
+                             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, output),
+                             livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
             graph.init() && graph.start(),
         "Audio graph start failed");
   input->feedback(1);
@@ -144,9 +144,9 @@ void jitter_loss_and_reordering() {
   auto encoder = std::make_shared<nodes::AudioCodecNode>("encoder", descriptor, true);
   graphflow::engine::GraphEngine encoding{1};
   check(encoding.loadFromNodes({packets, encoder, source},
-                               {G::connect<nodes::AudioFrameEvent>(source, encoder),
-                                G::connect<nodes::SenderFeedbackEvent>(source, encoder),
-                                G::connect<nodes::EncodedFrameEvent>(encoder, packets)}) &&
+                               {livekit::sdk::test::connect<nodes::AudioFrameEvent>(source, encoder),
+                                livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(source, encoder),
+                                livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, packets)}) &&
             encoding.init() && encoding.start(),
         "Jitter fixture encoder failed");
   source->feedback(1);
@@ -171,8 +171,8 @@ void jitter_loss_and_reordering() {
       std::make_shared<nodes::AudioCodecNode>("jitter.decoder", descriptor, false, options);
   graphflow::engine::GraphEngine graph{1};
   check(graph.loadFromNodes({output, decoder, input},
-                            {G::connect<nodes::EncodedFrameEvent>(input, decoder),
-                             G::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
+                            {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(input, decoder),
+                             livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
             graph.init() && graph.start(),
         "Jitter graph failed");
   const auto send = [&](int i, Epoch epoch = 1) {
@@ -226,9 +226,9 @@ void overload_and_epoch() {
       "encoder", rtc_audio_test::descriptor("bounded"), true, options);
   graphflow::engine::GraphEngine graph{1};
   check(graph.loadFromNodes({out, encoder, in},
-                            {G::connect<nodes::AudioFrameEvent>(in, encoder),
-                             G::connect<nodes::SenderFeedbackEvent>(in, encoder),
-                             G::connect<nodes::EncodedFrameEvent>(encoder, out)}) &&
+                            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(in, encoder),
+                             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(in, encoder),
+                             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, out)}) &&
             graph.init() && graph.start(),
         "Bounded audio graph start failed");
 
@@ -301,8 +301,8 @@ void decode_gaps() {
       "decoder", rtc_audio_test::descriptor("receive"), false);
   graphflow::engine::GraphEngine graph{1};
   check(
-      graph.loadFromNodes({out, decoder, in}, {G::connect<nodes::EncodedFrameEvent>(in, decoder),
-                                               G::connect<nodes::AudioFrameEvent>(decoder, out)}) &&
+      graph.loadFromNodes({out, decoder, in}, {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, decoder),
+                                               livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, out)}) &&
           graph.init() && graph.start(),
       "Receive graph failed");
   const auto send = [&](Epoch epoch, uint64_t timestamp,

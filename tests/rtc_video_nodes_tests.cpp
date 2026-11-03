@@ -1,6 +1,6 @@
 #include "media_result.hpp"
 #include "livekit/rtc/video_nodes.hpp"
-#include "livekit/rtc/stream_pipeline.hpp"
+#include "graph_connections.hpp"
 #include "rtc_video_fixtures.hpp"
 #include <condition_variable>
 #include <iostream>
@@ -125,10 +125,10 @@ void encoder_queue() {
   out->block = true;
   auto codec = std::make_shared<nodes::VideoCodecNode>("encoder", video(), true);
   graphflow::engine::GraphEngine graph{1};
-  using G = engine::TrackGraphSpec;
-  check(graph.loadFromNodes({out, codec, in}, {G::connect<nodes::VideoFrameEvent>(in, codec),
-                                               G::connect<nodes::SenderFeedbackEvent>(in, codec),
-                                               G::connect<nodes::EncodedFrameEvent>(codec, out)}) &&
+
+  check(graph.loadFromNodes({out, codec, in}, {livekit::sdk::test::connect<nodes::VideoFrameEvent>(in, codec),
+                                               livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(in, codec),
+                                               livekit::sdk::test::connect<nodes::EncodedFrameEvent>(codec, out)}) &&
             graph.init() && graph.start(),
         "Encoder graph start failed");
 
@@ -204,11 +204,11 @@ void decoder_recovery() {
   auto out = std::make_shared<Output>();
   auto codec = std::make_shared<nodes::VideoCodecNode>("decoder", video(), false);
   graphflow::engine::GraphEngine graph{1};
-  using G = engine::TrackGraphSpec;
+
   check(
-      graph.loadFromNodes({out, in, codec}, {G::connect<nodes::EncodedFrameEvent>(in, codec),
-                                             G::connect<nodes::VideoFrameEvent>(codec, out),
-                                             G::connect<nodes::KeyframeRequestEvent>(codec, in)}) &&
+      graph.loadFromNodes({out, in, codec}, {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, codec),
+                                             livekit::sdk::test::connect<nodes::VideoFrameEvent>(codec, out),
+                                             livekit::sdk::test::connect<nodes::KeyframeRequestEvent>(codec, in)}) &&
           graph.init() && graph.start(),
       "Decoder graph start failed");
   in->encoded(1, 3001, false);
@@ -247,9 +247,9 @@ void decoded_output_bound() {
   options.max_bytes = 2000;
   auto codec = std::make_shared<nodes::VideoCodecNode>("decoder", video(), false, options);
   graphflow::engine::GraphEngine graph{1};
-  using G = engine::TrackGraphSpec;
-  check(graph.loadFromNodes({out, codec, in}, {G::connect<nodes::EncodedFrameEvent>(in, codec),
-                                               G::connect<nodes::VideoFrameEvent>(codec, out)}) &&
+
+  check(graph.loadFromNodes({out, codec, in}, {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, codec),
+                                               livekit::sdk::test::connect<nodes::VideoFrameEvent>(codec, out)}) &&
             graph.init() && graph.start(),
         "Bounded decoder start failed");
   in->encoded(1, 3001);
