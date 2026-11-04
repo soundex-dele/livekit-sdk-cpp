@@ -151,6 +151,15 @@ int main() {
   ivf.close();
   check(audio_count > 20 && video_count > 10, "sustained encoded media delivery");
   check(events.data > 0, "data message observed");
+  const auto keyframe_requests = video->feedback().encodings.begin()->second.keyframe_requests;
+  rx_video->request_keyframe();
+  const auto request_deadline = SteadyClock::now() + 2s;
+  while (video->feedback().encodings.begin()->second.keyframe_requests == keyframe_requests &&
+         SteadyClock::now() < request_deadline) {
+    std::this_thread::sleep_for(20ms);
+  }
+  check(video->feedback().encodings.begin()->second.keyframe_requests > keyframe_requests,
+        "explicit receiver keyframe request reaches publisher");
   if (const char* marker = std::getenv("LIVEKIT_CLIENT_RESTART_MARKER")) {
     const auto old_epoch = audio->feedback().epoch;
     const auto old_sid = audio->snapshot().server_sid;

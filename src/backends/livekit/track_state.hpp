@@ -20,7 +20,7 @@ struct TrackData {
   std::function<void(bool)> mute_sender;
   void transition(TrackState, Epoch = 0, TrackSid = {});
   WriteStatus write(EncodedFrame);
-  void receive(EncodedFrame);
+  bool receive(EncodedFrame);
   ReadResult read(WaitOptions);
   TrackSnapshot snapshot() const;
 };

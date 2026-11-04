@@ -87,7 +87,8 @@ void View::draw_quality(const Snapshot& snapshot) {
       show_quality = false;
     ImGui::TextUnformatted("CONNECTION & MEDIA QUALITY");
     ImGui::TextWrapped(
-        "Refresh: 1 s. -- = unavailable or waiting for samples. Close with X or Escape.");
+        "RTP/graph refresh: 1 s. Stall status: live. -- = unavailable or waiting for samples. "
+        "Close with X or Escape.");
     ImGui::Separator();
     if (snapshot.finished) {
       ImGui::TextWrapped("No active session. Join a room to collect live quality data.");
@@ -211,6 +212,84 @@ void View::draw_quality(const Snapshot& snapshot) {
       ImGui::TextWrapped(
           "Receive counts complete encoded frames entering the graph; decode counts completed "
           "outputs. Send uses RTP framesSent (all layers of this track).");
+      ImGui::Separator();
+      ImGui::TextUnformatted("VIDEO STALLS / REMOTE TRACK");
+      ImGui::TextWrapped(
+          "No new presentation-output frame for >300 ms = stalled. Only time beyond 300 ms "
+          "counts. Stall % = stalled time / active time since first frame; muted and "
+          "unsubscribed time excluded. This measures frame output, not GPU refresh.");
+      if (ImGui::BeginTable("Video stalls", 5,
+                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                ImGuiTableFlags_ScrollY,
+                            {0, 175 * scale})) {
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableSetupColumn("Video track / SID", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Stall %", ImGuiTableColumnFlags_WidthFixed, 62 * scale);
+        ImGui::TableSetupColumn("Stall (s)", ImGuiTableColumnFlags_WidthFixed, 65 * scale);
+        ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 48 * scale);
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 90 * scale);
+        ImGui::TableHeadersRow();
+        const auto now = VideoStalls::Clock::now();
+        bool any = false;
+        for (const auto& [sid, participant] : snapshot.participants) {
+          if (sid == snapshot.local_sid) {
+            continue;
+          }
+          for (const auto& track : participant.tracks) {
+            if (track.kind != rtc::PublicationKind::video) {
+              continue;
+            }
+            any = true;
+            const auto found = snapshot.video_stalls.find(track.sid);
+            const auto sample = found == snapshot.video_stalls.end()
+                                    ? VideoStalls::Sample{}
+                                    : found->second.sample(now);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextWrapped(
+                "%s / %s",
+                (participant.name.empty() ? participant.identity : participant.name).c_str(),
+                track.name.empty() ? "Video" : track.name.c_str());
+            ImGui::TextWrapped("%s", track.sid.c_str());
+            ImGui::TableNextColumn();
+            if (sample.rate_percent) {
+              ImGui::Text("%.2f%%", *sample.rate_percent);
+            } else {
+              ImGui::TextUnformatted("--");
+            }
+            ImGui::TableNextColumn();
+            if (sample.rate_percent) {
+              ImGui::Text("%.2f", sample.stalled_seconds);
+            } else {
+              ImGui::TextUnformatted("--");
+            }
+            ImGui::TableNextColumn();
+            if (sample.rate_percent) {
+              ImGui::Text("%llu", static_cast<unsigned long long>(sample.count));
+            } else {
+              ImGui::TextUnformatted("--");
+            }
+            ImGui::TableNextColumn();
+            if (track.muted) {
+              ImGui::TextUnformatted("Muted");
+            } else if (!snapshot.subscriptions.count(track.sid)) {
+              ImGui::TextUnformatted("Unsubscribed");
+            } else if (!sample.active || sample.waiting) {
+              ImGui::TextUnformatted("Waiting");
+            } else if (sample.stalled) {
+              ImGui::TextColored({1.f, .55f, .25f, 1.f}, "Stalled");
+            } else {
+              ImGui::TextUnformatted("Playing");
+            }
+          }
+        }
+        if (!any) {
+          ImGui::TableNextRow();
+          ImGui::TableNextColumn();
+          ImGui::TextWrapped("No remote video tracks yet.");
+        }
+        ImGui::EndTable();
+      }
       ImGui::Separator();
       if (ImGui::BeginTable("Connections", 2, ImGuiTableFlags_SizingStretchSame)) {
         for (size_t i = 0; i < snapshot.quality.peers.size(); ++i) {

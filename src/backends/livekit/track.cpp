@@ -89,10 +89,10 @@ WriteStatus TrackData::write(EncodedFrame frame) {
   return status;
 }
 
-void TrackData::receive(EncodedFrame frame) {
+bool TrackData::receive(EncodedFrame frame) {
   std::lock_guard lock(mutex);
   if (info.state != TrackState::ready) {
-    return;
+    return false;
   }
   auto now = SteadyClock::now();
   while (!frames.empty() &&
@@ -103,19 +103,20 @@ void TrackData::receive(EncodedFrame frame) {
   }
   if (config.kind == MediaKind::video && needs_keyframe && !frame.keyframe) {
     ++info.dropped;
-    return;
+    return false;
   }
   if (!budget || !budget->charge(frame.buffer)) {
     frames.clear();
     ++info.dropped;
     needs_keyframe = true;
-    return;
+    return false;
   }
   frame.epoch = info.epoch;
   frames.push_back(std::move(frame));
   needs_keyframe = false;
   ++info.accepted;
   changed.notify_one();
+  return true;
 }
 
 ReadResult TrackData::read(WaitOptions options) {

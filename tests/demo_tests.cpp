@@ -171,7 +171,7 @@ static demo::QualitySnapshot test_quality() {
                                {{"id", 7u},
                                 {"name", "receive"},
                                 {"trackId", "TR_two"},
-                                {"kind", "RtcSubscribeNode"},
+                                {"kind", "RoomSubscribePort"},
                                 {"generation", generation},
                                 {"outputs", count * 27}}})},
         {"localTracks", {{"video-1", "TR_local1"}}},
@@ -352,12 +352,61 @@ static std::shared_ptr<demo::sdk::VideoFrame> pixels(const std::string& id, int 
   return f;
 }
 
+static void test_video_stalls() {
+  using namespace std::chrono_literals;
+  using Stalls = demo::VideoStalls;
+  const auto start = Stalls::Time{};
+  const auto close = [](double a, double b) { return std::abs(a - b) < 1e-8; };
+  Stalls first, second;
+  first.set_active(true, start);
+  check(!first.sample(start + 10s).rate_percent, "No stalls before first frame");
+  first.frame(1, start + 10s);
+  auto boundary = first.sample(start + 10300ms);
+  check(!boundary.stalled && boundary.count == 0 && boundary.rate_percent == 0,
+        "Exactly 300 ms is not a stall");
+  auto ongoing = first.sample(start + 10600ms);
+  check(ongoing.stalled && ongoing.count == 1 && close(ongoing.stalled_seconds, .3) &&
+            close(*ongoing.rate_percent, 50),
+        "Ongoing stall updates without a new frame; only excess time counts");
+  check(first.sample(start + 10600ms).count == 1, "Sampling cannot double count stalls");
+  first.frame(1, start + 11s);
+  auto recovered = first.sample(start + 11s);
+  check(!recovered.stalled && recovered.count == 1 && close(recovered.stalled_seconds, .7) &&
+            close(*recovered.rate_percent, 70),
+        "Recovery closes the existing stall exactly once");
+  second.set_active(true, start + 10s);
+  for (int i = 0; i <= 30; ++i) {
+    second.frame(1, start + 10s + i * 33ms);
+  }
+  check(second.sample(start + 11s).count == 0 && first.sample(start + 11s).count == 1,
+        "Each track has independent stall counters");
+  first.set_active(false, start + 11500ms);
+  const auto paused = first.sample(start + 20s);
+  check(!paused.active && paused.count == 2 && close(paused.observed_seconds, 1.5) &&
+            close(paused.stalled_seconds, .9),
+        "Pause closes current interval and excludes paused time");
+  first.frame(1, start + 21s);
+  check(first.sample(start + 22s).observed_seconds == paused.observed_seconds,
+        "Late frames while muted do not restart accounting");
+  first.set_active(true, start + 23s);
+  check(first.sample(start + 24s).waiting &&
+            first.sample(start + 24s).observed_seconds == paused.observed_seconds,
+        "Resume waits for a new first frame");
+  first.frame(1, start + 25s);
+  first.frame(1, start + 25033ms);
+  check(first.sample(start + 25033ms).count == 2, "Pause/resume does not invent a stall");
+  first.frame(2, start + 26s);
+  check(!first.sample(start + 26s).rate_percent && first.sample(start + 26s).count == 0,
+        "New media generation resets the baseline");
+}
+
 int main(int argc, char** argv) {
   {
     test_repair_rates();
     test_transport_track_mappings();
     const auto quality_fixture = test_quality();
     test_track_bitrates(quality_fixture);
+    test_video_stalls();
     SDL_SetMainReady();
     check(SDL_Init(SDL_INIT_VIDEO) == 0, "SDL init");
     auto* window =
@@ -470,6 +519,16 @@ int main(int argc, char** argv) {
             "Same participant video labels");
       float quality_scroll = -1;
       auto render = [&](demo::Snapshot snapshot) {
+        // Keep the smooth screenshot fixture live even when saving previous
+        // images takes longer than the stall threshold on a loaded host.
+        if (snapshot.video_stalls.count("TR_smooth")) {
+          auto& smooth_stalls = snapshot.video_stalls["TR_smooth"];
+          smooth_stalls = {};
+          const auto now = demo::VideoStalls::Clock::now();
+          smooth_stalls.set_active(true, now);
+          smooth_stalls.frame(1, now - std::chrono::milliseconds(100));
+          smooth_stalls.frame(1, now);
+        }
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
@@ -550,6 +609,9 @@ int main(int argc, char** argv) {
       state.changing_video = false;
       state.update(local, {bob, guest});
       check(!state.frames.count("TR_one"), "departed pixels retained");
+      check(!state.video_stalls.count("TR_one") && state.video_stalls.count("TR_two") &&
+                !state.video_stalls.count("TR_local1"),
+            "Removed/local tracks must not retain remote stall counters");
       render(state);
       state.quality = quality_fixture;
       auto second_sender = state.quality.peers[0].streams.at("rtp");
@@ -569,6 +631,17 @@ int main(int argc, char** argv) {
       refresh_quality();
       state.quality.participants[bob.sid] = 2;
       state.received_frames = 1234;
+      auto smooth = bob.tracks.front();
+      smooth.sid = "TR_smooth";
+      smooth.name = "Smooth video";
+      bob.tracks.push_back(smooth);
+      state.subscriptions.insert(smooth.sid);
+      state.update(local, {bob, guest});
+      const auto stall_now = demo::VideoStalls::Clock::now();
+      for (int i = 0; i <= 100; ++i) {
+        state.video_stalls["TR_two"].frame(1, stall_now - std::chrono::milliseconds(4000 - i * 33));
+        state.video_stalls["TR_smooth"].frame(1, stall_now - std::chrono::milliseconds(3300 - i * 33));
+      }
       view.show_quality = true;
       render(state);
       render(state);
@@ -591,6 +664,10 @@ int main(int argc, char** argv) {
       render(state);
       render(state);
       save_dashboard("quality-media.bmp", 1100, 720);
+      quality_scroll = 620;
+      render(state);
+      render(state);
+      save_dashboard("quality-stalls.bmp", 1100, 720);
       quality_scroll = 0;
       render(state);
       render(state);
@@ -610,6 +687,10 @@ int main(int argc, char** argv) {
       render(state);
       render(state);
       save_dashboard("quality-media-small.bmp", 640, 480);
+      quality_scroll = 650;
+      render(state);
+      render(state);
+      save_dashboard("quality-stalls-small.bmp", 640, 480);
       quality_scroll = -1;
       state.quality.peers[1].updated -= std::chrono::seconds(4);
       render(state);

@@ -92,9 +92,22 @@ class CreateDescription : public webrtc::CreateSessionDescriptionObserver {
 };
 }  // namespace
 
-// Terminal transformer: native codecs never see received encoded media.
+// Audio keeps its encoded-only transformer. Video is dispatched by
+// DecoderBoundary after WebRTC's reference finder and decode scheduler.
 class PeerTransport::Receiver : public webrtc::FrameTransformerInterface {
  public:
+  std::shared_ptr<VideoReceiveRoute> video = std::make_shared<VideoReceiveRoute>();
+  std::shared_ptr<VideoReceiveRoutes> routes;
+  std::vector<uint32_t> ssrcs;
+
+  ~Receiver() override {
+    if (routes) {
+      for (const auto ssrc : ssrcs) {
+        routes->remove(ssrc, video);
+      }
+    }
+  }
+
   std::mutex mutex;
   std::weak_ptr<TrackData> track;
   webrtc::scoped_refptr<webrtc::FrameDecryptorInterface> decryptor;
@@ -441,11 +454,26 @@ void PeerTransport::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterfac
   OnRemoveTrack(receiver);
   auto sink = webrtc::make_ref_counted<Receiver>();
   if (cryptor_ && cryptor_->options.keys && cryptor_->options.media) {
-    // WebRTC's video FrameDecryptor path bypasses its terminal transformer and
-    // forwards into a decoder. Decrypt here to preserve Room's encoded-only boundary.
     sink->decryptor = webrtc::make_ref_counted<NativeFrameDecryptor>(cryptor_, sid);
   }
-  receiver->SetDepacketizerToDecoderFrameTransformer(sink);
+  if (receiver->track()->kind() == "video") {
+    sink->routes = context_.video_receivers;
+    for (const auto& encoding : parameters.encodings) {
+      if (encoding.ssrc && *encoding.ssrc) {
+        if (!sink->routes->add(*encoding.ssrc, sink->video)) {
+          failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_state,
+                                  "Ambiguous remote video SSRC");
+          return;
+        }
+        sink->ssrcs.push_back(*encoding.ssrc);
+      }
+    }
+    if (sink->decryptor) {
+      receiver->SetFrameDecryptor(sink->decryptor);
+    }
+  } else {
+    receiver->SetDepacketizerToDecoderFrameTransformer(sink);
+  }
   receivers_[sid] = {receiver, sink};
 }
 
@@ -455,6 +483,11 @@ void PeerTransport::OnRemoveTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInter
       auto sink = it->second.sink;
       std::lock_guard lock(sink->mutex);
       sink->track.reset();
+      {
+        std::lock_guard video_lock(sink->video->mutex);
+        sink->video->track.reset();
+        ++sink->video->generation;
+      }
       it = receivers_.erase(it);
     } else {
       ++it;
@@ -470,6 +503,13 @@ bool PeerTransport::bind_receiver(const TrackSid& sid, std::shared_ptr<TrackData
     }
     std::lock_guard lock(found->second.sink->mutex);
     found->second.sink->track = track;
+    auto& video = found->second.sink->video;
+    std::lock_guard video_lock(video->mutex);
+    if (video->track.lock() != track) {
+      video->track = track;
+      video->previous.reset();
+      ++video->generation;
+    }
     return true;
   });
 }
@@ -483,6 +523,11 @@ void PeerTransport::unbind_receiver(const TrackSid& sid) {
     std::lock_guard lock(found->second.sink->mutex);
     found->second.sink->track.reset();
     found->second.sink->previous.reset();
+    auto& video = found->second.sink->video;
+    std::lock_guard video_lock(video->mutex);
+    video->track.reset();
+    video->previous.reset();
+    ++video->generation;
   });
 }
 

@@ -74,7 +74,7 @@ WebRtcContext::WebRtcContext(bool enable_flexfec,
     }
     install_transport_audio_codecs(deps, codec_counters);
     deps.video_encoder_factory = create_transport_video_encoder_factory();
-    deps.video_decoder_factory = create_transport_video_decoder_factory(codec_counters);
+    deps.video_decoder_factory = create_transport_video_decoder_factory(video_receivers);
     // EnableMedia preserves our explicit boundaries and does not install the
     // built-in audio processing or codec factories.
     webrtc::EnableMedia(deps);

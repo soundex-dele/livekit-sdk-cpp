@@ -1,4 +1,5 @@
 #pragma once
+#include "livekit/media_core/video_decode_completion.hpp"
 #include <tuple>
 #include "livekit/compat/span.hpp"
 #include "livekit/failure.hpp"
@@ -126,6 +127,7 @@ struct EncodedFrame {
   // clock value, never interpreted as a local steady_clock timestamp.
   std::optional<uint16_t> sequence_number;
   std::optional<int64_t> sender_capture_time_us;
+  std::shared_ptr<media::VideoDecodeCompletion> decode_completion;
 };
 
 enum class WriteStatus {

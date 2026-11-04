@@ -5,6 +5,7 @@
 #include "livekit/transport_options.hpp"
 #include "livekit/client/encryption.hpp"
 #include "livekit/client/connection_policy.hpp"
+#include "livekit/media_core/video_decode_completion.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -163,6 +164,7 @@ struct EncodedFrame {
   // clock value, never interpreted as a local steady_clock timestamp.
   std::optional<uint16_t> sequence_number;
   std::optional<int64_t> sender_capture_time_us;
+  std::shared_ptr<media::VideoDecodeCompletion> decode_completion;
 };
 
 enum class WriteStatus {

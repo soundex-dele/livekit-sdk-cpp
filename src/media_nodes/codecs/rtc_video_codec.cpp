@@ -66,6 +66,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     uint64_t timestamp, generation;
     SteadyClock::time_point captured;
     std::optional<int64_t> sender_capture_time_us;
+    std::shared_ptr<media::VideoDecodeCompletion> decode_completion;
   };
 
   struct Job {
@@ -260,7 +261,8 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
   void encoded(const EncodedFrame& frame) {
     if (frame.buffer.size())
       enqueue({frame,
-               {frame.epoch, frame.timestamp, 0, SteadyClock::now(), frame.sender_capture_time_us},
+               {frame.epoch, frame.timestamp, 0, SteadyClock::now(), frame.sender_capture_time_us,
+                frame.decode_completion},
                frame.buffer.size()},
               frame.keyframe);
   }
@@ -525,6 +527,9 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
         copy(pixels->y, i420->DataY(), i420->StrideY(), pixels->width, pixels->height);
         copy(pixels->u, i420->DataU(), i420->StrideU(), pixels->stride_u, (pixels->height + 1) / 2);
         copy(pixels->v, i420->DataV(), i420->StrideV(), pixels->stride_v, (pixels->height + 1) / 2);
+        if (timing->decode_completion) {
+          timing->decode_completion->decoded(pixels);
+        }
         VideoFrameEvent output;
         output.pixels = std::move(pixels);
         output.timestamp = timing->timestamp;

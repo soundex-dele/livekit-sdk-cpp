@@ -1,6 +1,7 @@
 #pragma once
 #include "livekit/result.hpp"
 #include "backends/livekit/media/codec_envelopes.hpp"
+#include "backends/livekit/media/video_receive_bridge.hpp"
 #include "rtc_base/thread.h"
 #ifdef _WIN32
 #include "rtc_base/win32_socket_init.h"
@@ -27,6 +28,7 @@ class WebRtcContext {
   std::unique_ptr<webrtc::Thread> network, worker, signaling;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
   std::shared_ptr<CodecBoundaryCounters> codec_counters = std::make_shared<CodecBoundaryCounters>();
+  std::shared_ptr<VideoReceiveRoutes> video_receivers = std::make_shared<VideoReceiveRoutes>();
 
  private:
 #ifdef _WIN32

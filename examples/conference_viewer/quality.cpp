@@ -177,7 +177,7 @@ void QualitySnapshot::update_graph(const Json& event) {
       stage = Stage::encode;
     else if (kind == "VideoDecoderNode")
       stage = Stage::decode;
-    else if (kind == "RtcSubscribeNode")
+    else if (kind == "RtcSubscribeNode" || kind == "RoomSubscribePort")
       stage = Stage::receive;
     else if (kind == "MediaInputNode" && raw_sources.count(name))
       stage = Stage::capture;

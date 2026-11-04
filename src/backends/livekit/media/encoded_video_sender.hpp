@@ -10,6 +10,7 @@
 namespace livekit::sdk::client::detail {
 struct VideoSenderState;
 struct CodecBoundaryCounters;
+class VideoReceiveRoutes;
 
 // One encoded track, one transport source. This is a native packet envelope;
 // it owns no pixels and cannot perform capture, scaling or encoding.
@@ -52,5 +53,5 @@ class EncodedVideoSender : public webrtc::VideoTrackSource {
 
 std::unique_ptr<webrtc::VideoEncoderFactory> create_transport_video_encoder_factory();
 std::unique_ptr<webrtc::VideoDecoderFactory> create_transport_video_decoder_factory(
-    std::shared_ptr<CodecBoundaryCounters> counters);
+    std::shared_ptr<VideoReceiveRoutes> routes);
 }  // namespace livekit::sdk::client::detail

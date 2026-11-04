@@ -3,6 +3,7 @@
 #include <livekit/media_engine.hpp>
 #include <livekit/media.hpp>
 #include "quality.hpp"
+#include "video_stalls.hpp"
 #include <map>
 #include <mutex>
 #include <optional>
@@ -50,6 +51,7 @@ struct Snapshot {
   std::map<std::string, std::shared_ptr<const sdk::VideoFrame>> frames;
   uint64_t received_frames = 0;
   QualitySnapshot quality;
+  std::map<std::string, VideoStalls> video_stalls;
   void update(Participant local, const std::vector<Participant>& remote);
 };
 

@@ -144,6 +144,7 @@ To frame_copy(const From& value) {
   frame.keyframe = value.keyframe;
   frame.sequence_number = value.sequence_number;
   frame.sender_capture_time_us = value.sender_capture_time_us;
+  frame.decode_completion = value.decode_completion;
   return frame;
 }
 }  // namespace

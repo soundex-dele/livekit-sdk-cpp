@@ -2,11 +2,13 @@
 #include "server_result.hpp"
 #include "session.hpp"
 #include <livekit/api.hpp>
+#include <livekit/media_engine.hpp>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <atomic>
 
 namespace sdk = livekit::sdk;
 using namespace std::chrono_literals;
@@ -69,6 +71,7 @@ int main(int argc, char** argv) {
     const std::string name = "imgui-integration";
     std::filesystem::create_directories(std::filesystem::u8path(argv[1]));
     std::ofstream stats_log(std::filesystem::u8path(argv[1]) / "dashboard-stats.jsonl");
+    std::atomic<uint64_t> receive_plis{0}, native_decoded{0}, receive_samples{0};
     server_result(api.room().create_room(name));
 
     struct Cleanup {
@@ -87,6 +90,22 @@ int main(int argc, char** argv) {
       if (identity == "Viewer")
         o.log_sink = [&](const sdk::Json& event) {
           stats_log << event.dump() << '\n';
+          if (event.value("event", "") == "rtc-stats" && event.value("target", -1) == 1) {
+            uint64_t plis = 0, decoded = 0;
+            size_t videos = 0;
+            for (const auto& row : event["stats"]) {
+              if (row.value("type", "") == "inbound-rtp" && row.value("kind", "") == "video") {
+                ++videos;
+                plis += row.value("pliCount", uint64_t{0});
+                decoded += row.value("framesDecoded", uint64_t{0});
+              }
+            }
+            if (videos == 2) {
+              receive_plis = plis;
+              native_decoded = decoded;
+              ++receive_samples;
+            }
+          }
           return sdk::Result<void>::success();
         };
       o.connection.token = server_result(api.room()
@@ -158,6 +177,26 @@ int main(int argc, char** argv) {
           return true;
         },
         "Dashboard per-track receive/decode FPS or bitrate missing");
+    until([&] { return receive_samples >= 3 && native_decoded >= 30; },
+          "External decoder did not report real frames to WebRTC");
+    const auto initial_plis = receive_plis.load();
+    const auto initial_decoded = native_decoded.load();
+    const auto initial_samples = receive_samples.load();
+    until([&] { return receive_samples >= initial_samples + 4; },
+          "Receiver statistics stopped during sustained decode");
+    check(native_decoded > initial_decoded + 60, "Native decode callbacks must keep progressing");
+    check(receive_plis == initial_plis, "Healthy external decode must not generate timeout PLIs");
+    for (const auto& sid : {first_video, second_video}) {
+      const auto snapshot = viewer.snapshot();
+      const auto it = snapshot.video_stalls.find(sid);
+      check(it != snapshot.video_stalls.end(), "Per-track stall tracker missing");
+      const auto sample = it->second.sample();
+      check(sample.active && !sample.waiting && sample.observed_seconds > 1 &&
+                sample.rate_percent && *sample.rate_percent >= 0 && *sample.rate_percent <= 100,
+            "Presentation frames must update per-track stall accounting");
+    }
+    std::cout << "PASS native_decode_feedback frames=" << native_decoded - initial_decoded
+              << " timeout_pli_delta=" << receive_plis - initial_plis << '\n';
     server_result(api.room().mute_published_track(name, "Alice", first_video, true));
     until(
         [&] {
@@ -167,6 +206,8 @@ int main(int argc, char** argv) {
           return false;
         },
         "Remote mute missing");
+    check(!viewer.snapshot().video_stalls.at(first_video).sample().active,
+          "Muted video must pause stall accounting");
     server_result(api.room().mute_published_track(name, "Alice", first_video, false));
     until(
         [&] {
@@ -179,6 +220,7 @@ int main(int argc, char** argv) {
     check(second.remove_video(second_video), "Remove second video rejected");
     until([&] { return !viewer.snapshot().frames.count(second_video); },
           "Unpublished frame retained");
+    check(!viewer.snapshot().video_stalls.count(second_video), "Unpublished stall tracker retained");
     stopped(second);
     until([&] { return viewer.snapshot().participants.size() == 2; },
           "Departed participant retained");
@@ -314,6 +356,45 @@ int main(int argc, char** argv) {
     check(viewer.snapshot().state == demo::State::Error && viewer.snapshot().frames.empty(),
           "Server removal state");
     stopped(first);
+    // Exercise the same viewer with FFmpeg H265, not only the demo's VP8 source.
+    sdk::client::MediaEngine hevc_publisher;
+    auto hevc_options = options("H265 publisher");
+    check(hevc_publisher.connect(hevc_options.connection), "H265 publisher connect");
+    sdk::client::MediaPublishSpec hevc_spec;
+    hevc_spec.name = "H265 bridge";
+    hevc_spec.format = {sdk::client::Codec::h265, 90000, 0, 640, 360, {}};
+    hevc_spec.input.generated = true;
+    auto hevc_track = server_result(hevc_publisher.publish_media(hevc_spec));
+    std::atomic<uint64_t> hevc_plis{0}, hevc_decoded{0}, hevc_samples{0};
+    demo::Session hevc_viewer;
+    auto hevc_view = options("H265 viewer");
+    hevc_view.log_sink = [&](const sdk::Json& event) {
+      stats_log << event.dump() << '\n';
+      if (event.value("event", "") == "rtc-stats" && event.value("target", -1) == 1) {
+        for (const auto& row : event["stats"]) {
+          if (row.value("type", "") == "inbound-rtp" && row.value("kind", "") == "video") {
+            hevc_plis = row.value("pliCount", uint64_t{0});
+            hevc_decoded = row.value("framesDecoded", uint64_t{0});
+            ++hevc_samples;
+          }
+        }
+      }
+      return sdk::Result<void>::success();
+    };
+    server_result(hevc_viewer.start(hevc_view));
+    until([&] { return hevc_samples >= 3 && hevc_decoded >= 30; },
+          "FFmpeg H265 decode feedback missing");
+    const auto hevc_initial_plis = hevc_plis.load();
+    const auto hevc_initial_frames = hevc_decoded.load();
+    const auto hevc_initial_samples = hevc_samples.load();
+    until([&] { return hevc_samples >= hevc_initial_samples + 4; }, "H265 stats stopped");
+    check(hevc_decoded > hevc_initial_frames + 60, "H265 decoding did not continue");
+    check(hevc_plis == hevc_initial_plis, "Healthy H265 decode generated timeout PLIs");
+    check(!hevc_viewer.snapshot().frames.empty(), "H265 graph presentation output missing");
+    std::cout << "PASS h265_decode_feedback frames=" << hevc_decoded - hevc_initial_frames
+              << " timeout_pli_delta=" << hevc_plis - hevc_initial_plis << '\n';
+    stopped(hevc_viewer);
+    hevc_publisher.close();
     std::cout << sdk::Json{{"ok", true},
                            {"separateTrackGraphs", true},
                            {"simultaneousVideos", 2},

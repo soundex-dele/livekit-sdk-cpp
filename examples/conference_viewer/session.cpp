@@ -22,6 +22,8 @@ const char* state_name(State state) {
 
 void Snapshot::update(Participant local, const std::vector<Participant>& remote) {
   std::set<std::string> current;
+  std::set<std::string> videos;
+  const auto now = VideoStalls::Clock::now();
   participants.clear();
   local_sid = local.sid;
   if (!local.sid.empty())
@@ -30,9 +32,16 @@ void Snapshot::update(Participant local, const std::vector<Participant>& remote)
     if (p.state == 3)
       continue;
     participants[p.sid] = p;
-    for (const auto& t : p.tracks)
+    for (const auto& t : p.tracks) {
       current.insert(t.sid);
+      if (t.kind == rtc::PublicationKind::video) {
+        videos.insert(t.sid);
+        video_stalls[t.sid].set_active(!t.muted && subscriptions.count(t.sid), now);
+      }
+    }
   }
+  livekit::compat::erase_if(video_stalls,
+                            [&](const auto& item) { return !videos.count(item.first); });
   // Unknown/removed tracks cannot accumulate pixels indefinitely. A frame that
   // precedes metadata is replaced by the next decoded frame once subscribed.
   livekit::compat::erase_if(frames, [&](const auto& item) { return !current.count(item.first); });

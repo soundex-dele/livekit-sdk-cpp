@@ -178,6 +178,7 @@ sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video
           {
             std::lock_guard lock(mutex_);
             data_.frames.clear();
+            data_.video_stalls.clear();
             data_.subscriptions.clear();
             data_.quality = {};
             if (data_.state != State::Disconnecting) {
@@ -203,6 +204,10 @@ sdk::Result<void> Session::start(SessionOptions options, bool pause_unused_video
                 std::lock_guard lock(mutex_);
                 if (data_.state != State::Disconnecting) {
                   data_.frames[sid] = frame.pixels;
+                  if (auto it = data_.video_stalls.find(sid);
+                      it != data_.video_stalls.end() && frame.pixels) {
+                    it->second.frame(frame.pixels->stream_generation);
+                  }
                   ++data_.received_frames;
                 }
                 return sdk::Result<void>::success();
@@ -419,6 +424,10 @@ void Session::stop() {
       return;
     }
     data_.state = State::Disconnecting;
+    const auto now = VideoStalls::Clock::now();
+    for (auto& [sid, stalls] : data_.video_stalls) {
+      stalls.set_active(false, now);
+    }
   }
   worker_.request_stop();
 }
