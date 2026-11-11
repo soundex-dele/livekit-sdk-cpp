@@ -1,0 +1,28 @@
+get_filename_component(sdk_root "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+include(${sdk_root}/cmake/PlayerFFmpeg.cmake)
+add_library(livekit_editor STATIC document.cpp render_graph.cpp session.cpp export.cpp)
+add_library(LiveKit::Editor ALIAS livekit_editor)
+target_compile_features(livekit_editor PUBLIC cxx_std_17)
+target_include_directories(livekit_editor PUBLIC "${sdk_root}/include")
+target_link_libraries(livekit_editor PRIVATE graphflow::engine Threads::Threads
+  livekit_ffmpeg_avformat livekit_ffmpeg_avcodec livekit_ffmpeg_avutil
+  livekit_ffmpeg_swscale livekit_ffmpeg_swresample)
+livekit_without_exceptions(livekit_editor)
+option(LIVEKIT_EDITOR_BUILD_TESTS "Build editor tests" ${PROJECT_IS_TOP_LEVEL})
+if(LIVEKIT_EDITOR_BUILD_TESTS)
+  enable_testing()
+  add_executable(livekit_editor_tests "${sdk_root}/tests/editor_tests.cpp")
+  target_link_libraries(livekit_editor_tests PRIVATE LiveKit::Editor)
+  livekit_player_runtime(livekit_editor_tests)
+  add_test(NAME editor_model COMMAND livekit_editor_tests model "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  find_program(LIVEKIT_EDITOR_FFMPEG_EXECUTABLE ffmpeg HINTS "${LIVEKIT_FFMPEG_ROOT}/bin" REQUIRED NO_DEFAULT_PATH)
+  add_test(NAME editor_fixtures COMMAND "${Python3_EXECUTABLE}" "${sdk_root}/tests/editor_media.py"
+    fixtures "${LIVEKIT_EDITOR_FFMPEG_EXECUTABLE}" "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  set_tests_properties(editor_fixtures PROPERTIES FIXTURES_SETUP editor_media TIMEOUT 30)
+  add_test(NAME editor_media COMMAND livekit_editor_tests media "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  set_tests_properties(editor_media PROPERTIES FIXTURES_REQUIRED editor_media FIXTURES_SETUP editor_export TIMEOUT 90)
+  add_test(NAME editor_export_verify COMMAND "${Python3_EXECUTABLE}" "${sdk_root}/tests/editor_media.py"
+    verify "${LIVEKIT_EDITOR_FFMPEG_EXECUTABLE}" "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  set_tests_properties(editor_export_verify PROPERTIES FIXTURES_REQUIRED editor_export TIMEOUT 30)
+endif()
