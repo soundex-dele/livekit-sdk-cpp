@@ -1,4 +1,5 @@
 #include "editor_internal.hpp"
+#include "effects.hpp"
 #include "engine/graph_engine.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -308,13 +309,22 @@ class Decoder {
 void composite(EditorImage& out, const EditorImage& input, const EditorClip& c) {
   const double factor =
       std::min(double(out.width) / input.width, double(out.height) / input.height) * c.scale;
-  const int w = std::max(1, int(input.width * factor)), h = std::max(1, int(input.height * factor));
-  const int left = (out.width - w) / 2 + int(c.x * out.width);
-  const int top = (out.height - h) / 2 + int(c.y * out.height);
-  for (int y = std::max(0, top); y < std::min(out.height, top + h); ++y) {
-    const int sy = std::min(input.height - 1, int((y - top) / factor));
-    for (int x = std::max(0, left); x < std::min(out.width, left + w); ++x) {
-      const int sx = std::min(input.width - 1, int((x - left) / factor));
+  const double angle = c.rotation * 3.141592653589793 / 180;
+  const double cs = std::cos(angle), sn = std::sin(angle);
+  const double cx = out.width * (.5 + c.x), cy = out.height * (.5 + c.y);
+  const double half_w = input.width * factor / 2, half_h = input.height * factor / 2;
+  const double bound_x = std::abs(cs) * half_w + std::abs(sn) * half_h;
+  const double bound_y = std::abs(sn) * half_w + std::abs(cs) * half_h;
+  for (int y = std::max(0, int(cy - bound_y));
+       y < std::min(out.height, int(std::ceil(cy + bound_y))); ++y) {
+    for (int x = std::max(0, int(cx - bound_x));
+         x < std::min(out.width, int(std::ceil(cx + bound_x))); ++x) {
+      const double dx = x + .5 - cx, dy = y + .5 - cy;
+      const int sx = int(std::floor((dx * cs + dy * sn) / factor + input.width / 2.));
+      const int sy = int(std::floor((-dx * sn + dy * cs) / factor + input.height / 2.));
+      if (sx < 0 || sy < 0 || sx >= input.width || sy >= input.height) {
+        continue;
+      }
       const auto* src = input.rgba.data() + (size_t(sy) * input.width + sx) * 4;
       auto* dst = out.rgba.data() + (size_t(y) * out.width + x) * 4;
       const double alpha = src[3] / 255. * c.opacity;
@@ -425,6 +435,28 @@ Result<EditorProbe> probe(const std::string& path, std::atomic<bool>& cancel) {
     EditorClip transform;
     composite(result.thumbnail, **frame, transform);
   }
+  if (a.audio) {
+    Decoder decoder(cancel);
+    auto opened = decoder.open(a.path, false);
+    if (!opened) {
+      return Result<EditorProbe>::failure(opened.failure_record());
+    }
+    const int64_t samples = a.duration_us * 48000 / 1000000;
+    const size_t bins = size_t(std::min<int64_t>(512, std::max<int64_t>(1, samples / 960)));
+    result.waveform.resize(bins);
+    for (size_t i = 0; i < bins; ++i) {
+      if (cancel) {
+        return Result<EditorProbe>::failure(failure("waveform: cancelled", ErrorCode::cancelled));
+      }
+      auto audio = decoder.audio(int64_t(i) * samples / int64_t(bins), 960);
+      if (!audio) {
+        return Result<EditorProbe>::failure(audio.failure_record());
+      }
+      for (float value : *audio) {
+        result.waveform[i] = std::max(result.waveform[i], std::abs(value));
+      }
+    }
+  }
   return Result<EditorProbe>::success(std::move(result));
 }
 
@@ -493,6 +525,30 @@ class RenderGraph::Impl {
       w.error = failure("render: cancelled", ErrorCode::cancelled);
       return;
     }
+    if (!w.clip->text.content.empty()) {
+      auto found = text_cache.find(w.clip->id);
+      if (found == text_cache.end()) {
+        auto text_image = std::make_shared<EditorImage>();
+        text_image->width = project.width;
+        text_image->height = project.height;
+        text_image->rgba.resize(size_t(project.width) * project.height * 4, 0);
+        std::string error;
+        if (!render_text(*text_image, w.clip->text, error)) {
+          w.error = failure(error);
+          return;
+        }
+        const size_t bytes = text_image->rgba.size();
+        while (!text_cache.empty() &&
+               (text_cache.size() >= 8 || (text_cache.size() + 1) * bytes > 128 * 1024 * 1024)) {
+          text_cache.erase(text_cache.begin());
+        }
+        found = text_cache.emplace(w.clip->id, text_image).first;
+      }
+      if (!w.track->hidden) {
+        w.image = found->second;
+      }
+      return;
+    }
     if (w.asset->video && !w.track->audio_only && !w.track->hidden) {
       auto decoder = get(*w.asset, true);
       if (!decoder) {
@@ -505,6 +561,17 @@ class RenderGraph::Impl {
         return;
       }
       w.image = *image;
+      const auto& color = w.clip->color;
+      if (color.brightness != 0 || color.contrast != 1 || color.saturation != 1 ||
+          color.temperature != 0) {
+        auto processed = std::make_shared<EditorImage>(**image);
+        std::string error;
+        if (!effects.grade(*processed, color, error)) {
+          w.error = failure(error);
+          return;
+        }
+        w.image = std::move(processed);
+      }
     }
     if (w.asset->audio && !w.track->muted && w.clip->volume > 0) {
       auto decoder = get(*w.asset, false);
@@ -512,14 +579,66 @@ class RenderGraph::Impl {
         w.error = decoder.failure_record();
         return;
       }
-      const int64_t sample =
-          w.source_frame * int64_t(project.rate.denominator) * 48000 / project.rate.numerator;
-      auto audio = (*decoder)->audio(sample, int(w.output->audio.size() / 2));
-      if (!audio) {
-        w.error = audio.failure_record();
-        return;
+      const int64_t local = w.output->frame - w.clip->position;
+      const int64_t target_sample =
+          local * int64_t(project.rate.denominator) * 48000 / project.rate.numerator;
+      const int count = int(w.output->audio.size() / 2);
+      const int64_t source_start =
+          w.clip->source_in * int64_t(project.rate.denominator) * 48000 / project.rate.numerator;
+      if (w.clip->speed == 1) {
+        auto audio = (*decoder)->audio(source_start + target_sample, count);
+        if (!audio) {
+          w.error = audio.failure_record();
+          return;
+        }
+        w.audio = std::move(*audio);
+      } else {
+        // Fixed output blocks with context make seeks deterministic and bound memory.
+        const int64_t block = int64_t(std::floor(double(target_sample) / 96000));
+        if (!audio_cache.count(w.clip->id) && audio_cache.size() >= 8) {
+          audio_cache.erase(audio_cache.begin());
+        }
+        auto& cached = audio_cache[w.clip->id];
+        if (cached.block != block) {
+          const int64_t first =
+              std::max<int64_t>(-int64_t(source_start / w.clip->speed), block * 96000 - 4800);
+          const int64_t last = (block + 1) * 96000 + 4800;
+          auto audio =
+              (*decoder)->audio(source_start + int64_t(std::llround(first * w.clip->speed)),
+                                int(std::ceil((last - first) * w.clip->speed)));
+          if (!audio) {
+            w.error = audio.failure_record();
+            return;
+          }
+          std::string error;
+          if (!effects.stretch_audio(*audio, w.clip->speed, error)) {
+            w.error = failure(error);
+            return;
+          }
+          cached.samples = std::move(*audio);
+          cached.first = first;
+          cached.block = block;
+        }
+        w.audio.assign(size_t(count) * 2, 0);
+        const size_t offset = size_t(target_sample - cached.first) * 2;
+        if (offset < cached.samples.size()) {
+          std::copy_n(cached.samples.begin() + offset,
+                      std::min(w.audio.size(), cached.samples.size() - offset), w.audio.begin());
+        }
       }
-      w.audio = std::move(*audio);
+      const double fps = double(project.rate.numerator) / project.rate.denominator;
+      for (size_t i = 0; i < w.audio.size() / 2; ++i) {
+        const double f = local + double(i) * fps / 48000;
+        double gain = 1;
+        if (w.clip->fade_in > 0) {
+          gain *= std::clamp(f / w.clip->fade_in, 0., 1.);
+        }
+        if (w.clip->fade_out > 0) {
+          gain *= std::clamp((w.clip->duration - f) / w.clip->fade_out, 0., 1.);
+        }
+        w.audio[i * 2] *= float(gain);
+        w.audio[i * 2 + 1] *= float(gain);
+      }
     }
   }
 
@@ -543,22 +662,84 @@ class RenderGraph::Impl {
         (frame + 1) * int64_t(project.rate.denominator) * 48000 / project.rate.numerator;
     out->audio.resize(size_t(end_sample - first_sample) * 2, 0);
     for (const auto& track : project.tracks) {
+      bool transitioned = false;
+      for (const auto& left : track.clips) {
+        if (!left.transition.duration) {
+          continue;
+        }
+        const int64_t start = left.position + left.duration - left.transition.duration / 2;
+        if (frame < start || frame >= start + left.transition.duration) {
+          continue;
+        }
+        auto next = std::find_if(track.clips.begin(), track.clips.end(), [&](const auto& c) {
+          return c.id == left.transition.next_clip_id;
+        });
+        if (next == track.clips.end()) {
+          continue;
+        }
+        std::shared_ptr<EditorFrame> layers[2];
+        const EditorClip* clips[]{&left, &*next};
+        for (int i = 0; i < 2; ++i) {
+          layers[i] = std::make_shared<EditorFrame>(*out);
+          std::fill(layers[i]->audio.begin(), layers[i]->audio.end(), 0.f);
+          const auto& clip = *clips[i];
+          auto evaluated = editor_evaluate(clip, frame - clip.position);
+          auto asset = std::find_if(project.assets.begin(), project.assets.end(),
+                                    [&](const auto& a) { return a.id == clip.asset_id; });
+          if (asset == project.assets.end()) {
+            return Result<std::shared_ptr<EditorFrame>>::failure(
+                failure("transition: missing media"));
+          }
+          auto work = std::make_shared<Work>();
+          work->output = layers[i];
+          work->track = &track;
+          work->clip = &evaluated;
+          work->asset = &*asset;
+          work->source_frame =
+              asset->image
+                  ? 0
+                  : clip.source_in + int64_t(std::floor((frame - clip.position) * clip.speed));
+          clock->send(work);
+          if (work->error || !work->delivered) {
+            return Result<std::shared_ptr<EditorFrame>>::failure(
+                work->error ? work->error : failure("transition: disconnected graph"));
+          }
+        }
+        const double progress = double(frame - start) / (left.transition.duration - 1);
+        std::string error;
+        if (!effects.transition(layers[0]->image, layers[1]->image, left.transition.effect,
+                                progress, error)) {
+          return Result<std::shared_ptr<EditorFrame>>::failure(failure(error));
+        }
+        out->image = std::move(layers[0]->image);
+        for (size_t n = 0; n < out->audio.size(); ++n) {
+          out->audio[n] +=
+              float(layers[0]->audio[n] * (1 - progress) + layers[1]->audio[n] * progress);
+        }
+        transitioned = true;
+        break;
+      }
+      if (transitioned) {
+        continue;
+      }
       for (const auto& clip : track.clips) {
         if (frame < clip.position || frame >= clip.position + clip.duration) {
           continue;
         }
         auto asset = std::find_if(project.assets.begin(), project.assets.end(),
                                   [&](const auto& a) { return a.id == clip.asset_id; });
-        if (asset == project.assets.end()) {
+        if (asset == project.assets.end() && clip.text.content.empty()) {
           return Result<std::shared_ptr<EditorFrame>>::failure(
               failure("render: missing asset reference"));
         }
         auto work = std::make_shared<Work>();
         work->output = out;
         work->track = &track;
-        work->clip = &clip;
-        work->asset = &*asset;
-        work->source_frame = clip.source_in + frame - clip.position;
+        auto evaluated = editor_evaluate(clip, frame - clip.position);
+        work->clip = &evaluated;
+        work->asset = asset == project.assets.end() ? nullptr : &*asset;
+        work->source_frame =
+            clip.source_in + int64_t(std::floor((frame - clip.position) * clip.speed));
         clock->send(work);
         if (work->error) {
           return Result<std::shared_ptr<EditorFrame>>::failure(
@@ -582,6 +763,14 @@ class RenderGraph::Impl {
     size_t weight;
   };
 
+  struct AudioBlock {
+    int64_t block = INT64_MIN, first = 0;
+    std::vector<float> samples;
+  };
+
+  std::map<std::string, AudioBlock> audio_cache;
+  std::map<std::string, std::shared_ptr<EditorImage>> text_cache;
+  EffectSession effects;
   EditorProject project;
   std::atomic<bool>& cancel;
   graphflow::engine::GraphEngine engine{1};

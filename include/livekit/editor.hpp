@@ -27,10 +27,45 @@ struct EditorAsset {
   bool video = false, audio = false, image = false;
 };
 
+enum class EditorInterpolation { linear, smooth };
+
+struct EditorKeyframe {
+  int64_t frame = 0;
+  double value = 0;
+  EditorInterpolation interpolation = EditorInterpolation::linear;
+};
+
+struct EditorAnimation {
+  std::string property;
+  std::vector<EditorKeyframe> keys;
+};
+
+struct EditorText {
+  std::string content, font = "Microsoft YaHei";
+  int size = 48, alignment = 2;
+  uint32_t color = 0xFFFFFF, outline_color = 0;
+  double outline = 2;
+};
+
+struct EditorColor {
+  double brightness = 0, contrast = 1, saturation = 1, temperature = 0;
+};
+
+struct EditorTransition {
+  std::string next_clip_id, effect = "fade";
+  int64_t duration = 0;
+};
+
 struct EditorClip {
   std::string id, asset_id;
   int64_t position = 0, source_in = 0, duration = 1;  // Project frames; [in, out).
   double x = 0, y = 0, scale = 1, opacity = 1, volume = 1;
+  double rotation = 0, speed = 1;
+  int64_t fade_in = 0, fade_out = 0;
+  EditorText text;
+  EditorColor color;
+  EditorTransition transition;
+  std::vector<EditorAnimation> animations;
 };
 
 struct EditorTrack {
@@ -46,8 +81,12 @@ struct EditorProject {
   std::vector<EditorAsset> assets;
   // Increasing order: bottom to top. No overlapping clips within a track.
   std::vector<EditorTrack> tracks;
+  std::string main_track_id;
+  bool magnetic = false;
 };
 
+EditorClip editor_evaluate(const EditorClip& clip, int64_t local_frame);
+void editor_retime(EditorClip& clip, int64_t offset, double scale = 1);
 int64_t editor_time_us(int64_t frame, EditorRate rate);
 int64_t editor_duration(const EditorProject& project);
 Result<void> editor_validate(const EditorProject& project);
@@ -81,6 +120,7 @@ class EditorDocument {
 struct EditorProbe {
   EditorAsset asset;
   EditorImage thumbnail;
+  std::vector<float> waveform;  // Sampled peak envelope across the full asset.
 };
 
 struct EditorFrame {

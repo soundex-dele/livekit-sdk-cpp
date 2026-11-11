@@ -6,6 +6,8 @@ import sys
 root = Path(__file__).resolve().parents[1]
 # Keep only the external-library adapters exception-enabled.
 boundaries = {
+    # Private nndeploy/OpenCV boundary returns explicit errors to the exception-free editor.
+    "src/engines/editor/effects.cpp": ("std::exception",),
     "tools/cli/main.cpp": ("CLI::ParseError",),
     "src/engines/studio/capture_windows.cpp": ("hresult_error",),
     # Existing exception-enabled logging initialization adapter, separate from Client.
@@ -38,4 +40,4 @@ for directory in ("include", "src", "support", "examples", "tools", "tests"):
 if errors:
     print("\n".join(errors), file=sys.stderr)
     sys.exit(1)
-print(f"PASS: {checked} project C++ files; only declared CLI11, WinRT and logging adapter catches allowed")
+print(f"PASS: {checked} project C++ files; only declared external-library adapter catches allowed")

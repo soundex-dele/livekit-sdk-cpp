@@ -1,7 +1,11 @@
 include_guard(GLOBAL)
 set(LIVEKIT_FFMPEG_ROOT "" CACHE PATH "FFmpeg shared prefix (include and lib or bin)")
 find_path(LIVEKIT_FFMPEG_INCLUDE libavformat/avformat.h HINTS "${LIVEKIT_FFMPEG_ROOT}/include" REQUIRED)
-foreach(component avformat avcodec avutil swscale swresample)
+set(_livekit_ffmpeg_components avformat avcodec avutil swscale swresample)
+if(LIVEKIT_BUILD_EDITOR)
+  list(APPEND _livekit_ffmpeg_components avfilter)
+endif()
+foreach(component IN LISTS _livekit_ffmpeg_components)
   find_library(LIVEKIT_FFMPEG_${component}_LIBRARY NAMES ${component}
     HINTS "${LIVEKIT_FFMPEG_ROOT}/lib" "${LIVEKIT_FFMPEG_ROOT}/bin")
   if(WIN32)
@@ -39,6 +43,9 @@ function(livekit_player_runtime target)
   if(WIN32)
     # Include transitive codec dependencies from this particular FFmpeg build.
     file(GLOB runtime_dlls "${LIVEKIT_FFMPEG_ROOT}/bin/*.dll")
+    if(TARGET opencv_world)
+      list(APPEND runtime_dlls "$<TARGET_FILE:opencv_world>")
+    endif()
     add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
       ${runtime_dlls} "$<TARGET_FILE_DIR:${target}>" COMMAND_EXPAND_LISTS VERBATIM)
   endif()

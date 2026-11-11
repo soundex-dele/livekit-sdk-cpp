@@ -1,10 +1,19 @@
 get_filename_component(sdk_root "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
 include(${sdk_root}/cmake/PlayerFFmpeg.cmake)
-add_library(livekit_editor STATIC document.cpp render_graph.cpp session.cpp export.cpp)
+set(LIVEKIT_NNDEPLOY_ROOT "${sdk_root}/../nndeploy-flow" CACHE PATH "nndeploy-flow source")
+set(NNDEPLOY_FLOW_MEDIA_ONLY ON CACHE BOOL "" FORCE)
+add_subdirectory("${LIVEKIT_NNDEPLOY_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/nndeploy-media" EXCLUDE_FROM_ALL)
+add_library(livekit_editor_effects STATIC effects.cpp)
+target_include_directories(livekit_editor_effects PRIVATE "${sdk_root}/include")
+target_link_libraries(livekit_editor_effects PRIVATE nndeploy_flow::media livekit_ffmpeg_avfilter livekit_ffmpeg_avutil)
+if(MSVC)
+  target_compile_options(livekit_editor_effects PRIVATE /utf-8 /EHsc)
+endif()
+add_library(livekit_editor STATIC document.cpp animation.cpp render_graph.cpp session.cpp export.cpp)
 add_library(LiveKit::Editor ALIAS livekit_editor)
 target_compile_features(livekit_editor PUBLIC cxx_std_17)
 target_include_directories(livekit_editor PUBLIC "${sdk_root}/include")
-target_link_libraries(livekit_editor PRIVATE graphflow::engine Threads::Threads
+target_link_libraries(livekit_editor PRIVATE graphflow::engine Threads::Threads livekit_editor_effects
   livekit_ffmpeg_avformat livekit_ffmpeg_avcodec livekit_ffmpeg_avutil
   livekit_ffmpeg_swscale livekit_ffmpeg_swresample)
 livekit_without_exceptions(livekit_editor)
@@ -20,6 +29,8 @@ if(LIVEKIT_EDITOR_BUILD_TESTS)
   add_test(NAME editor_fixtures COMMAND "${Python3_EXECUTABLE}" "${sdk_root}/tests/editor_media.py"
     fixtures "${LIVEKIT_EDITOR_FFMPEG_EXECUTABLE}" "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
   set_tests_properties(editor_fixtures PROPERTIES FIXTURES_SETUP editor_media TIMEOUT 30)
+  add_test(NAME editor_advanced COMMAND livekit_editor_tests advanced "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  set_tests_properties(editor_advanced PROPERTIES FIXTURES_REQUIRED editor_media TIMEOUT 120)
   add_test(NAME editor_media COMMAND livekit_editor_tests media "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
   set_tests_properties(editor_media PROPERTIES FIXTURES_REQUIRED editor_media FIXTURES_SETUP editor_export TIMEOUT 90)
   add_test(NAME editor_export_verify COMMAND "${Python3_EXECUTABLE}" "${sdk_root}/tests/editor_media.py"

@@ -1,4 +1,5 @@
 #include "editor_internal.hpp"
+#include "clip_json.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
@@ -85,6 +86,14 @@ Result<void> editor_validate(const EditorProject& p) {
     return Result<void>::failure(failure("project: invalid canvas, frame rate or resource limit",
                                          ErrorCode::invalid_argument));
   }
+  if (!p.main_track_id.empty() &&
+      std::none_of(p.tracks.begin(), p.tracks.end(),
+                   [&](const auto& t) { return t.id == p.main_track_id && !t.audio_only; })) {
+    return Result<void>::failure(failure("project: main video track is missing"));
+  }
+  if (p.magnetic && p.main_track_id.empty()) {
+    return Result<void>::failure(failure("project: magnetic editing requires a main track"));
+  }
   std::set<std::string> assets, tracks, clips;
   for (const auto& a : p.assets) {
     if (a.id.empty() || !assets.insert(a.id).second || a.path.empty() ||
@@ -101,20 +110,105 @@ Result<void> editor_validate(const EditorProject& p) {
     std::vector<const EditorClip*> ordered;
     for (const auto& c : t.clips) {
       const auto* a = asset_for(p, c.asset_id);
-      if (!a || c.id.empty() || !clips.insert(c.id).second || c.position < 0 || c.source_in < 0 ||
-          c.duration <= 0 || c.duration > kMaxFrames || c.position > kMaxFrames - c.duration ||
-          c.source_in > kMaxFrames - c.duration || !finite(c.x, -4, 4) || !finite(c.y, -4, 4) ||
-          !finite(c.scale, .01, 8) || !finite(c.opacity, 0, 1) || !finite(c.volume, 0, 4) ||
-          (t.audio_only && !a->audio) ||
-          (!a->image && editor_time_us(c.source_in + c.duration, p.rate) >
-                            a->duration_us + editor_time_us(1, p.rate))) {
+      if (!finite(c.speed, .25, 4) || (!a && c.text.content.empty()) || c.id.empty() ||
+          !clips.insert(c.id).second || c.position < 0 || c.source_in < 0 || c.duration <= 0 ||
+          c.duration > kMaxFrames || c.position > kMaxFrames - c.duration ||
+          c.source_in > kMaxFrames - int64_t(std::ceil(c.duration * c.speed)) ||
+          !finite(c.x, -4, 4) || !finite(c.y, -4, 4) || !finite(c.scale, .01, 8) ||
+          !finite(c.opacity, 0, 1) || !finite(c.volume, 0, 4) ||
+          (t.audio_only && (!a || !a->audio)) ||
+          (a && !a->image &&
+           editor_time_us(c.source_in + int64_t(std::ceil(c.duration * c.speed)), p.rate) >
+               a->duration_us + editor_time_us(1, p.rate))) {
         return Result<void>::failure(
             failure("clip " + c.id + ": invalid range or properties", ErrorCode::invalid_argument));
+      }
+      if (!finite(c.speed, .25, 4) || !finite(c.rotation, -36000, 36000) || c.fade_in < 0 ||
+          c.fade_out < 0 || c.fade_in + c.fade_out > c.duration ||
+          !finite(c.color.brightness, -2, 2) || !finite(c.color.contrast, 0, 3) ||
+          !finite(c.color.saturation, 0, 3) || !finite(c.color.temperature, -1, 1) ||
+          c.text.color > 0xFFFFFF || c.text.outline_color > 0xFFFFFF ||
+          c.text.content.size() > 65536 || c.text.size < 8 || c.text.size > 512 ||
+          c.text.alignment < 1 || c.text.alignment > 9 || !finite(c.text.outline, 0, 20)) {
+        return Result<void>::failure(failure("clip: invalid effect properties"));
+      }
+      std::set<std::string> properties;
+      for (const auto& animation : c.animations) {
+        const std::set<std::string> supported{"x", "y", "scale", "rotation", "opacity", "volume"};
+        if (!supported.count(animation.property) || !properties.insert(animation.property).second ||
+            animation.keys.empty() || animation.keys.size() > 10000) {
+          return Result<void>::failure(failure("clip: invalid animation"));
+        }
+        int64_t previous = -1;
+        for (const auto& key : animation.keys) {
+          const double low =
+              animation.property == "scale"
+                  ? .01
+                  : (animation.property == "opacity" || animation.property == "volume" ? 0 : -4);
+          const double high = animation.property == "opacity"
+                                  ? 1
+                                  : (animation.property == "volume"  ? 4
+                                     : animation.property == "scale" ? 8
+                                                                     : 4);
+          if (key.frame <= previous || key.frame > c.duration ||
+              !finite(key.value, animation.property == "rotation" ? -36000 : low,
+                      animation.property == "rotation" ? 36000 : high) ||
+              (key.interpolation != EditorInterpolation::linear &&
+               key.interpolation != EditorInterpolation::smooth)) {
+            return Result<void>::failure(failure("clip: invalid keyframe"));
+          }
+          previous = key.frame;
+        }
       }
       ordered.push_back(&c);
     }
     std::sort(ordered.begin(), ordered.end(),
               [](auto a, auto b) { return a->position < b->position; });
+    for (size_t i = 0; i < ordered.size(); ++i) {
+      const auto& c = *ordered[i];
+      if (c.transition.duration == 0) {
+        continue;
+      }
+      const auto& tr = c.transition;
+      if (i + 1 >= ordered.size() || tr.next_clip_id != ordered[i + 1]->id ||
+          c.position + c.duration != ordered[i + 1]->position || tr.duration < 2 ||
+          (tr.effect != "fade" && tr.effect != "wipe" && tr.effect != "slide") ||
+          !c.text.content.empty() || !ordered[i + 1]->text.content.empty() || t.audio_only) {
+        return Result<void>::failure(failure("transition: requires adjacent video clips"));
+      }
+      const auto& next = *ordered[i + 1];
+      const auto* left_asset = asset_for(p, c.asset_id);
+      const auto* right_asset = asset_for(p, next.asset_id);
+      const int64_t before = tr.duration / 2, after = tr.duration - before;
+      if (!left_asset || !right_asset || !left_asset->video || !right_asset->video ||
+          before > c.duration || after > next.duration ||
+          (!right_asset->image && next.source_in < int64_t(std::ceil(before * next.speed))) ||
+          (!left_asset->image &&
+           editor_time_us(c.source_in + int64_t(std::ceil((c.duration + after) * c.speed)),
+                          p.rate) > left_asset->duration_us)) {
+        int64_t available = 0;
+        if (left_asset && right_asset && left_asset->video && right_asset->video) {
+          const double source_frames =
+              left_asset->duration_us * double(p.rate.numerator) / (1000000. * p.rate.denominator);
+          const int64_t left_handle =
+              left_asset->image
+                  ? c.duration
+                  : std::max<int64_t>(
+                        0,
+                        int64_t(std::floor((source_frames - c.source_in) / c.speed)) - c.duration);
+          const int64_t right_handle =
+              right_asset->image ? next.duration : int64_t(std::floor(next.source_in / next.speed));
+          available = 2 * std::min({left_handle, right_handle, c.duration, next.duration});
+        }
+        return Result<void>::failure(
+            failure("transition: insufficient source handles; available duration " +
+                    std::to_string(available) + " frames. Trim source endpoints before applying."));
+      }
+      if (i > 0 && ordered[i - 1]->transition.duration > 0 &&
+          (ordered[i - 1]->transition.duration + 1) / 2 + before > c.duration) {
+        return Result<void>::failure(failure("transition: intervals overlap"));
+      }
+    }
     for (size_t i = 1; i < ordered.size(); ++i) {
       if (ordered[i]->position < ordered[i - 1]->position + ordered[i - 1]->duration) {
         return Result<void>::failure(
@@ -148,7 +242,9 @@ Result<void> editor_save(const std::filesystem::path& path, const EditorProject&
   if (!valid) {
     return valid;
   }
-  Json root = {{"version", 1},
+  Json root = {{"version", 2},
+               {"main_track_id", p.main_track_id},
+               {"magnetic", p.magnetic},
                {"name", p.name},
                {"width", p.width},
                {"height", p.height},
@@ -192,7 +288,8 @@ Result<void> editor_save(const std::filesystem::path& path, const EditorProject&
                                 {"y", c.y},
                                 {"scale", c.scale},
                                 {"opacity", c.opacity},
-                                {"volume", c.volume}});
+                                {"volume", c.volume},
+                                {"effects", editor_detail::clip_extra(c)}});
     }
     root["tracks"].push_back(std::move(track));
   }
@@ -227,13 +324,20 @@ Result<EditorProject> editor_load(const std::filesystem::path& path) {
   std::ifstream file(path, std::ios::binary);
   const auto j = Json::parse(file, nullptr, false);
   if (j.is_discarded() || !fields(j, "name", "version width height fps_num fps_den", "") ||
-      j["version"] != 1 || !j.contains("assets") || !j["assets"].is_array() ||
-      !j.contains("tracks") || !j["tracks"].is_array() || !integer(j["width"], 2, 4096) ||
-      !integer(j["height"], 2, 4096) || !integer(j["fps_num"], 1, 240000) ||
-      !integer(j["fps_den"], 1, 1001000)) {
+      (j["version"] != 1 && j["version"] != 2) || !j.contains("assets") ||
+      !j["assets"].is_array() || !j.contains("tracks") || !j["tracks"].is_array() ||
+      !integer(j["width"], 2, 4096) || !integer(j["height"], 2, 4096) ||
+      !integer(j["fps_num"], 1, 240000) || !integer(j["fps_den"], 1, 1001000)) {
     return bad();
   }
   EditorProject p;
+  if (j["version"] == 2) {
+    if (!fields(j, "main_track_id", "", "magnetic")) {
+      return bad();
+    }
+    p.main_track_id = j["main_track_id"];
+    p.magnetic = j["magnetic"];
+  }
   p.name = j["name"].get<std::string>();
   p.width = j["width"].get<int>();
   p.height = j["height"].get<int>();
@@ -266,6 +370,52 @@ Result<EditorProject> editor_load(const std::filesystem::path& path) {
       }
       track.clips.push_back({c["id"], c["asset_id"], c["position"], c["source_in"], c["duration"],
                              c["x"], c["y"], c["scale"], c["opacity"], c["volume"]});
+      if (j["version"] == 2) {
+        if (!c.contains("effects")) {
+          return bad();
+        }
+        const auto& e = c["effects"];
+        if (!fields(e, "", "rotation speed fade_in fade_out", "") ||
+            !integer(e["fade_in"], 0, kMaxFrames) || !integer(e["fade_out"], 0, kMaxFrames) ||
+            !e.contains("text") || !e.contains("color") || !e.contains("transition") ||
+            !e.contains("animations") || !e["animations"].is_array()) {
+          return bad();
+        }
+        const auto& tx = e["text"];
+        const auto& co = e["color"];
+        const auto& tr = e["transition"];
+        if (!fields(tx, "content font", "size alignment color outline_color outline", "") ||
+            !integer(tx["size"], 8, 512) || !integer(tx["alignment"], 1, 9) ||
+            !integer(tx["color"], 0, 0xFFFFFF) || !integer(tx["outline_color"], 0, 0xFFFFFF) ||
+            !fields(co, "", "brightness contrast saturation temperature", "") ||
+            !fields(tr, "next effect", "duration", "") || !integer(tr["duration"], 0, kMaxFrames)) {
+          return bad();
+        }
+        auto& out = track.clips.back();
+        out.rotation = e["rotation"];
+        out.speed = e["speed"];
+        out.fade_in = e["fade_in"];
+        out.fade_out = e["fade_out"];
+        out.text = {tx["content"], tx["font"],          tx["size"],   tx["alignment"],
+                    tx["color"],   tx["outline_color"], tx["outline"]};
+        out.color = {co["brightness"], co["contrast"], co["saturation"], co["temperature"]};
+        out.transition = {tr["next"], tr["effect"], tr["duration"]};
+        for (const auto& a : e["animations"]) {
+          if (!fields(a, "property", "", "") || !a.contains("keys") || !a["keys"].is_array()) {
+            return bad();
+          }
+          EditorAnimation animation;
+          animation.property = a["property"];
+          for (const auto& k : a["keys"]) {
+            if (!k.is_array() || k.size() != 3 || !integer(k[0], 0, kMaxFrames) ||
+                !k[1].is_number() || !integer(k[2], 0, 1)) {
+              return bad();
+            }
+            animation.keys.push_back({k[0], k[1], EditorInterpolation(k[2].get<int>())});
+          }
+          out.animations.push_back(std::move(animation));
+        }
+      }
     }
     p.tracks.push_back(std::move(track));
   }
@@ -293,6 +443,34 @@ Result<void> EditorDocument::replace(EditorProject project) {
 }
 
 Result<void> EditorDocument::edit(EditorProject project) {
+  if (project.magnetic) {
+    for (auto& track : project.tracks) {
+      if (track.id != project.main_track_id) {
+        continue;
+      }
+      auto changed = [&](const EditorClip& clip) {
+        for (const auto& old_track : project_.tracks) {
+          for (const auto& old : old_track.clips) {
+            if (old.id == clip.id) {
+              return old.position != clip.position || old_track.id != track.id;
+            }
+          }
+        }
+        return true;
+      };
+      std::stable_sort(track.clips.begin(), track.clips.end(), [&](const auto& a, const auto& b) {
+        if (a.position != b.position) {
+          return a.position < b.position;
+        }
+        return changed(a) && !changed(b);
+      });
+      int64_t position = 0;
+      for (auto& clip : track.clips) {
+        clip.position = position;
+        position += clip.duration;
+      }
+    }
+  }
   auto valid = editor_validate(project);
   if (!valid) {
     return valid;
@@ -310,7 +488,8 @@ Result<void> EditorDocument::edit(EditorProject project) {
     auto same_clip = [](const EditorClip& a, const EditorClip& b) {
       return a.id == b.id && a.asset_id == b.asset_id && a.position == b.position &&
              a.source_in == b.source_in && a.duration == b.duration && a.x == b.x && a.y == b.y &&
-             a.scale == b.scale && a.opacity == b.opacity && a.volume == b.volume;
+             a.scale == b.scale && a.opacity == b.opacity && a.volume == b.volume &&
+             editor_detail::clip_extra(a) == editor_detail::clip_extra(b);
     };
     if (old.clips.size() != found->clips.size() ||
         !std::equal(old.clips.begin(), old.clips.end(), found->clips.begin(), same_clip)) {
@@ -344,9 +523,12 @@ Result<void> EditorDocument::split(const std::string& id, int64_t frame, std::st
       auto right = c;
       right.id = std::move(new_id);
       right.position = frame;
-      right.source_in += offset;
+      right.source_in += int64_t(std::llround(offset * c.speed));
       right.duration -= offset;
+      editor_retime(right, offset);
       c.duration = offset;
+      editor_retime(c, 0);
+      c.transition = {};
       t.clips.push_back(std::move(right));
       return edit(std::move(p));
     }
@@ -384,8 +566,10 @@ Result<void> EditorDocument::trim(const std::string& id, int64_t source_in, int6
   for (auto& t : p.tracks) {
     for (auto& c : t.clips) {
       if (c.id == id) {
+        const int64_t offset = int64_t(std::llround((source_in - c.source_in) / c.speed));
         c.source_in = source_in;
         c.duration = duration;
+        editor_retime(c, offset);
         return edit(std::move(p));
       }
     }

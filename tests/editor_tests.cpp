@@ -1,4 +1,5 @@
 #include "livekit/editor.hpp"
+#include "../src/engines/editor/editor_internal.hpp"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -84,6 +85,153 @@ void model(const std::filesystem::path& dir) {
   check(!d.edit(invalid), "invalid edit rejected");
   const auto before = d.project().tracks[1].clips[0].duration;
   check(before == 40, "failed edits preserve document");
+}
+
+void advanced(const std::filesystem::path& dir) {
+  auto p = sample();
+  p.main_track_id = "v1";
+  p.magnetic = true;
+  EditorDocument d;
+  good(d.replace(p), "magnetic replace");
+  p.tracks[0].clips.push_back({"c2", "a", 90, 0, 30});
+  good(d.edit(p), "magnetic append");
+  check(d.project().tracks[0].clips[1].position == 60, "magnetic closes gap");
+  check(d.undo() && d.project().tracks[0].clips.size() == 1, "magnetic transaction undo");
+  p = d.project();
+  p.tracks[0].clips[0].animations = {{"x", {{0, 0}, {60, 1}}}};
+  good(d.edit(p), "keyframes accepted");
+  good(d.split("c1", 30, "right"), "animated split");
+  check(std::abs(editor_evaluate(d.project().tracks[0].clips[1], 0).x - .5) < 1e-9,
+        "split animation continuity");
+  good(editor_save(dir / "v2.freecut.json", d.project()), "v2 save");
+  auto loaded = editor_load(dir / "v2.freecut.json");
+  check(loaded && loaded->magnetic && loaded->tracks[0].clips[0].animations.size() == 1,
+        "v2 effect roundtrip");
+  {
+    std::ofstream old(dir / "legacy.freecut.json");
+    old << R"({"version":1,"name":"Legacy","width":320,"height":180,"fps_num":30,"fps_den":1,"assets":[],"tracks":[]})";
+  }
+  auto legacy = editor_load(dir / "legacy.freecut.json");
+  check(legacy && !legacy->magnetic, "v1 retains nonmagnetic behavior");
+  {
+    std::ofstream future(dir / "future.freecut.json");
+    future
+        << R"({"version":3,"name":"Future","width":320,"height":180,"fps_num":30,"fps_den":1,"assets":[],"tracks":[]})";
+  }
+  check(!editor_load(dir / "future.freecut.json"), "future schema refused");
+  EditorSession probe;
+  auto red = probe.probe((dir / "red.mp4").u8string()).get();
+  auto blue = probe.probe((dir / "blue.png").u8string()).get();
+  if (!good(red, "advanced video") || !good(blue, "advanced image")) {
+    return;
+  }
+  check(!red->waveform.empty(), "real waveform generated");
+  p = {};
+  p.width = 320;
+  p.height = 180;
+  p.assets = {red->asset, blue->asset};
+  p.tracks = {{"v",
+               "Video",
+               false,
+               false,
+               false,
+               false,
+               {{"red", red->asset.id, 0, 0, 30}, {"blue", blue->asset.id, 30, 0, 30}}}};
+  p.tracks[0].clips[0].transition = {"blue", "fade", 10};
+  good(editor_validate(p), "transition handles valid");
+  auto invalid_transition = p;
+  invalid_transition.tracks[0].clips[0].transition.duration = 120;
+  check(!editor_validate(invalid_transition), "insufficient transition handles rejected");
+  std::atomic<bool> cancel{false};
+  editor_detail::RenderGraph graph(p, cancel);
+  auto start = graph.render(25, 1), middle = graph.render(30, 1), end = graph.render(34, 1);
+  if (good(start, "transition start") && good(middle, "transition midpoint") &&
+      good(end, "transition end")) {
+    check((*start)->image.rgba[0] > 200 && (*end)->image.rgba[2] > 200, "transition endpoints");
+    check((*middle)->image.rgba[0] > 50 && (*middle)->image.rgba[2] > 50,
+          "transition blends pixels");
+  }
+  p.tracks[0].clips.resize(1);
+  auto& clip = p.tracks[0].clips[0];
+  clip.transition = {};
+  clip.color.saturation = 0;
+  editor_detail::RenderGraph gray(p, cancel);
+  auto gray_frame = gray.render(5, 1);
+  if (good(gray_frame, "native color grade")) {
+    check(std::abs(int((*gray_frame)->image.rgba[0]) - int((*gray_frame)->image.rgba[1])) < 2,
+          "zero saturation gray");
+  }
+  clip.color = {};
+  clip.speed = 2;
+  clip.duration = 30;
+  clip.fade_in = 10;
+  editor_detail::RenderGraph speed(p, cancel);
+  auto fast = speed.render(5, 1);
+  good(fast, "native time stretch with fade");
+  EditorTrack text;
+  text.id = "text";
+  text.name = "Text";
+  EditorClip title;
+  title.id = "title";
+  title.duration = 30;
+  title.text.content = "FreeCut 中文";
+  title.text.size = 28;
+  text.clips.push_back(title);
+  p.tracks.push_back(text);
+  editor_detail::RenderGraph subtitles(p, cancel);
+  auto caption = subtitles.render(5, 1);
+  if (good(caption, "libass Chinese subtitle") && fast) {
+    check((*caption)->image.rgba != (*fast)->image.rgba, "subtitle changes rendered pixels");
+  }
+  EditorExport exporter;
+  good(editor_save(dir / "advanced.freecut.json", p), "save advanced editable project");
+  good(exporter.start(p, dir / "advanced.mp4").get(), "advanced export");
+  auto exported = probe.probe((dir / "advanced.mp4").u8string()).get();
+  good(exported, "advanced exported media readable");
+  if (exported && caption) {
+    EditorProject verification;
+    verification.width = p.width;
+    verification.height = p.height;
+    verification.assets = {exported->asset};
+    verification.tracks = {
+        {"v", "Export", false, false, false, false, {{"check", exported->asset.id, 0, 0, 30}}}};
+    editor_detail::RenderGraph decoded(verification, cancel);
+    auto actual = decoded.render(5, 1);
+    if (good(actual, "decode exported subtitle frame")) {
+      double error = 0;
+      for (size_t i = 0; i < (*actual)->image.rgba.size(); ++i) {
+        error += std::abs(int((*actual)->image.rgba[i]) - int((*caption)->image.rgba[i]));
+      }
+      check(error / (*actual)->image.rgba.size() < 12, "preview and H264 export agree");
+    }
+  }
+  p.tracks.resize(1);
+  auto& tone_clip = p.tracks[0].clips[0];
+  tone_clip.fade_in = 0;
+  editor_detail::RenderGraph pitch(p, cancel);
+  int crossings = 0;
+  float previous = 0;
+  size_t samples = 0;
+  for (int frame = 5; frame < 20; ++frame) {
+    auto audio = pitch.render(frame, 1);
+    if (!good(audio, "pitch render")) {
+      break;
+    }
+    for (size_t i = 0; i < (*audio)->audio.size(); i += 2) {
+      float value = (*audio)->audio[i];
+      if (previous <= 0 && value > 0) {
+        ++crossings;
+      }
+      previous = value;
+      ++samples;
+    }
+  }
+  const double frequency = samples ? crossings * 48000. / samples : 0;
+  check(std::abs(frequency - 440) < 25, "2x speed preserves 440Hz pitch");
+  auto again = pitch.render(5, 2);
+  editor_detail::RenderGraph fresh(p, cancel);
+  auto expected = fresh.render(5, 2);
+  check(again && expected && (*again)->audio == (*expected)->audio, "seek audio deterministic");
 }
 
 void media(const std::filesystem::path& dir) {
@@ -276,6 +424,8 @@ int main(int argc, char** argv) {
   const auto dir = std::filesystem::u8path(argv[2]);
   if (std::string(argv[1]) == "model") {
     model(dir);
+  } else if (std::string(argv[1]) == "advanced") {
+    advanced(dir);
   } else {
     media(dir);
   }
