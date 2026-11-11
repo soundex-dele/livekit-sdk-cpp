@@ -1,4 +1,5 @@
 #include "../media_result.hpp"
+#include "../media_transport.hpp"
 using livekit::sdk::examples::report_result;
 #include <livekit/media_engine.hpp>
 #include <algorithm>
@@ -17,6 +18,9 @@ int main(int argc, char** argv) {
   ConnectionOptions options;
   options.url = argv[1];
   options.token = argv[2];
+  if (!livekit::sdk::examples::configure_media_transport(options)) {
+    return 2;
+  }
   if (!engine.connect(options)) {
     return 1;
   }

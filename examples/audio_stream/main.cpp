@@ -1,4 +1,5 @@
 #include "../media_result.hpp"
+#include "../media_transport.hpp"
 using livekit::sdk::examples::report_result;
 #include <livekit/media_engine.hpp>
 #include <map>
@@ -70,6 +71,9 @@ int main(int argc, char** argv) {
   options.auto_subscribe = false;
   options.url = url;
   options.token = token;
+  if (!livekit::sdk::examples::configure_media_transport(options)) {
+    return 2;
+  }
   if (!engine.connect(options)) {
     return 1;
   }

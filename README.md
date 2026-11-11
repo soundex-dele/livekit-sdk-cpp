@@ -60,6 +60,23 @@ MediaEngine 独占 Room 和各轨道媒体图。Room 只处理编码帧、参与
 
 纯传输代码不隐式创建采集、音频设备或呈现窗口。程序测试使用合成输入、无窗口渲染和独立 SFU；自动化结果不代表物理设备人工验收。
 
+`video_source`、`video_stream`、`audio_source`、`audio_stream` 支持通过
+`LIVEKIT_MEDIA_TRANSPORT=automatic|udp|tcp` 选择媒体传输，默认 `automatic`。
+`tcp` 使用 SDK 的 `MediaTransport::tcp_only`，禁用本地 UDP、STUN、TURN 候选，
+只使用直接 ICE-TCP；信令仍使用原来的 WebSocket 地址。服务端需同时配置
+`rtc.udp_port` 和 `rtc.tcp_port` 并公布可达候选，无需按客户端模式重启。
+变量名中的传输指 ICE 媒体传输，不表示 TURN/TCP。
+
+同一 Go SFU 实例的音视频 UDP/TCP 组合验证：
+
+```powershell
+python tests/ice_transport_examples_integration.py --server /path/to/livekit-server.exe --bin out/windows-x64/Release --output out/ice-transport-run
+```
+
+脚本使用合成视频和 PCM 音频，检查接收端解码数量，以及 Go 日志中实际选中的
+发布/订阅 ICE 候选对、协议和端口；输出 `result.json`、`selected-pairs.json` 和日志。
+输出目录须尚不存在。测试不访问摄像头、麦克风或扬声器。
+
 ## 当前能力边界
 
 支持独立音视频轨、编码帧收发、逐轨静音/订阅需求、数据包、成员快照和完整重新入会。MediaEngine 支持 VP8/Opus 及可选 FFmpeg H264/H265 编解码、录制与媒体输出。
