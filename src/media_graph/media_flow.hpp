@@ -108,8 +108,13 @@ class MediaNode : public graphflow::core::GraphNode {
 
   template <class E>
   Result<bool> publish_media(E event, const std::string& route = "") {
+    auto lease = acquireDeliveryLease();
+    if (!lease) {
+      return Result<bool>::success(false);
+    }
+    const auto edges = getPubEdges();
     const graphflow::core::GraphEdge* selected = nullptr;
-    for (const auto& edge : getPubEdges()) {
+    for (const auto& edge : edges) {
       if (edge.condition() == route) {
         if (selected) {
           return Result<bool>::failure(make_failure(ErrorDomain::media, ErrorCode::invalid_state,
