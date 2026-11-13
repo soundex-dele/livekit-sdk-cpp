@@ -147,9 +147,11 @@ class EditorSession {
   EditorSession(const EditorSession&) = delete;
   EditorSession& operator=(const EditorSession&) = delete;
   AsyncResult<EditorProbe> probe(std::string path);
-  // Pauses and renders the requested frame, clamped to [0, timeline duration].
-  // The exclusive end is a black/silent frame, useful for append operations.
-  AsyncResult<void> set_project(EditorProject project, uint64_t generation, int64_t frame = 0);
+  // Hot-updates the existing graph and renders the requested frame, clamped to
+  // [0, duration]. By default pauses; play_after_update continues from the next
+  // frame using the new rate. The exclusive end is a black/silent frame.
+  AsyncResult<void> set_project(EditorProject project, uint64_t generation, int64_t frame = 0,
+                                bool play_after_update = false);
   // New seeks supersede queued seeks. Superseded operations complete cancelled.
   AsyncResult<void> seek(int64_t frame);
   AsyncResult<void> play();

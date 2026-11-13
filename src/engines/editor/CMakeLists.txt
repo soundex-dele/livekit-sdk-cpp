@@ -29,6 +29,8 @@ if(LIVEKIT_EDITOR_BUILD_TESTS)
   add_test(NAME editor_fixtures COMMAND "${Python3_EXECUTABLE}" "${sdk_root}/tests/editor_media.py"
     fixtures "${LIVEKIT_EDITOR_FFMPEG_EXECUTABLE}" "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
   set_tests_properties(editor_fixtures PROPERTIES FIXTURES_SETUP editor_media TIMEOUT 30)
+  add_test(NAME editor_hot_reload COMMAND livekit_editor_tests hot_reload "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  set_tests_properties(editor_hot_reload PROPERTIES FIXTURES_REQUIRED editor_media TIMEOUT 90)
   add_test(NAME editor_advanced COMMAND livekit_editor_tests advanced "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
   set_tests_properties(editor_advanced PROPERTIES FIXTURES_REQUIRED editor_media TIMEOUT 120)
   add_test(NAME editor_media COMMAND livekit_editor_tests media "${CMAKE_CURRENT_BINARY_DIR}/fixtures")

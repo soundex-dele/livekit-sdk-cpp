@@ -415,6 +415,320 @@ void media(const std::filesystem::path& dir) {
   check(!exporter.start(p, dir / "missing-output.mp4").get(), "missing source fails export");
   check(!std::filesystem::exists(dir / "missing-output.mp4"), "failed export not published");
 }
+
+void hot_reload(const std::filesystem::path& dir) {
+  std::atomic<bool> cancel{false};
+  auto red = editor_detail::probe((dir / "red.mp4").u8string(), cancel);
+  auto blue = editor_detail::probe((dir / "blue.png").u8string(), cancel);
+  if (!good(red, "reload red fixture") || !good(blue, "reload blue fixture")) {
+    return;
+  }
+  EditorProject p;
+  p.width = 160;
+  p.height = 90;
+  p.assets = {red->asset};
+  p.tracks = {{"video", "Video", false, false, false, false, {{"clip", red->asset.id, 0, 0, 60}}}};
+  editor_detail::RenderGraph graph(p, cancel);
+  if (!good(graph.render(5, 1), "warm graph")) {
+    return;
+  }
+  const auto initial = graph.stats();
+  check(initial.decoder_opens == 2 && initial.cached_decoders == 2, "video/audio decoders warmed");
+
+  auto matches_cold = [&](const EditorProject& project, int64_t frame) {
+    auto actual = graph.render(frame, 42);
+    editor_detail::RenderGraph cold(project, cancel);
+    auto expected = cold.render(frame, 42);
+    if (!good(actual, "hot render") || !good(expected, "cold reference")) {
+      return;
+    }
+    check((*actual)->generation == 42, "new generation delivered");
+    check((*actual)->image.rgba == (*expected)->image.rgba, "hot image equals cold image");
+    check((*actual)->audio.size() == (*expected)->audio.size(), "new rate audio block size");
+    if ((*actual)->audio.size() == (*expected)->audio.size()) {
+      double difference = 0;
+      for (size_t i = 0; i < (*actual)->audio.size(); ++i) {
+        difference += std::abs((*actual)->audio[i] - (*expected)->audio[i]);
+      }
+      const double mean = difference / std::max<size_t>(1, (*actual)->audio.size());
+      if (mean >= .0001) {
+        std::cerr << "audio difference=" << mean << " frame=" << frame
+                  << " speed=" << project.tracks[0].clips[0].speed
+                  << " source=" << project.tracks[0].clips[0].source_in << '\n';
+      }
+      check(mean < .0001, "hot audio agrees with cold reference");
+    }
+  };
+
+  p.tracks[0].clips[0].opacity = .5;
+  good(graph.update_project(p), "hot opacity edit");
+  matches_cold(p, 5);
+  check(graph.stats().decoder_opens == initial.decoder_opens, "opacity edit retains decoders");
+  check(graph.stats().topology_reloads == 1, "same graph hot-reloaded");
+  auto invalid = p;
+  invalid.width = 0;
+  check(!graph.update_project(invalid), "invalid edit rejected");
+  check(graph.stats().topology_reloads == 1, "invalid edit preserves old graph");
+  matches_cold(p, 5);
+
+  // Same clip ID, changed speed/source/rate: cached stretched audio must not survive.
+  p.tracks[0].clips[0].speed = 2;
+  p.tracks[0].clips[0].duration = 20;
+  good(graph.update_project(p), "hot speed 2");
+  matches_cold(p, 5);
+  p.tracks[0].clips[0].speed = .5;
+  p.tracks[0].clips[0].source_in = 5;
+  p.rate = {24, 1};
+  good(graph.update_project(p), "hot speed source and rate");
+  matches_cold(p, 5);
+  check(graph.stats().decoder_opens == initial.decoder_opens, "timing edits retain decoders");
+
+  EditorClip title;
+  title.id = "title";
+  title.duration = 20;
+  title.text.content = "Before";
+  title.text.size = 20;
+  p.tracks.push_back({"titles", "Titles", false, false, false, false, {title}});
+  good(graph.update_project(p), "add title");
+  auto before = graph.render(5, 3);
+  p.tracks[1].clips[0].text.content = "After";
+  good(graph.update_project(p), "edit same title ID");
+  auto after = graph.render(5, 4);
+  if (good(before, "old text") && good(after, "new text")) {
+    check((*before)->image.rgba != (*after)->image.rgba, "same-ID text cache invalidated");
+  }
+  matches_cold(p, 5);
+  p.width = 320;
+  p.height = 180;
+  good(graph.update_project(p), "hot canvas resize");
+  matches_cold(p, 5);
+
+  // Relink the same asset ID to another source; both old decoders must be retired.
+  const auto asset_id = p.assets[0].id;
+  p.assets[0] = blue->asset;
+  p.assets[0].id = asset_id;
+  good(graph.update_project(p), "same-ID relink");
+  check(graph.stats().cached_decoders == 0, "relinked decoders retired");
+  matches_cold(p, 5);
+  check(graph.stats().decoder_opens == initial.decoder_opens + 1, "new image decoder opened");
+
+  // Detect an on-disk change even when the asset ID/path/metadata are unchanged.
+  const auto local = dir / "reload-image.png";
+  std::error_code ec;
+  std::filesystem::copy_file(dir / "blue.png", local,
+                             std::filesystem::copy_options::overwrite_existing, ec);
+  check(!ec, "copy local reload fixture");
+  p.assets[0].path = local.u8string();
+  good(graph.update_project(p), "local image source");
+  good(graph.render(5, 5), "warm local image");
+  const auto old_stamp = std::filesystem::last_write_time(local, ec);
+  check(!ec, "read local image stamp");
+  std::filesystem::last_write_time(local, old_stamp + std::chrono::seconds(2), ec);
+  check(!ec, "change local image stamp");
+  good(graph.update_project(p), "same-path disk change");
+  check(graph.stats().cached_decoders == 0, "changed file invalidates decoder");
+  matches_cold(p, 5);
+  good(graph.update_project(EditorProject{}), "clear project");
+  check(graph.stats().cached_decoders == 0, "removed asset releases decoder");
+
+  // The actual main GraphEngine owns algorithms and converters. Parameter edits
+  // replace only affected algorithms; unchanged nodes keep their instances.
+  auto instance = [&](const std::string& id) -> uintptr_t {
+    for (const auto& node : graph.stats().nodes) {
+      if (node.id == id) {
+        return node.instance;
+      }
+    }
+    return 0;
+  };
+  check(graph.stats().nodes.size() == 7, "empty project has only main stages");
+  p = {};
+  p.width = 160;
+  p.height = 90;
+  p.assets = {red->asset, blue->asset};
+  p.tracks = {{"video",
+               "Video",
+               false,
+               false,
+               false,
+               false,
+               {{"red", red->asset.id, 0, 0, 30}, {"blue", blue->asset.id, 30, 0, 30}}}};
+  p.tracks[0].clips[0].color.saturation = .4;
+  good(graph.update_project(p), "add color algorithm branch");
+  const std::string color = "editor.clip.3:red.color";
+  const auto converter = instance(color + ".rgba_to_rgb");
+  const auto grade = instance(color + ".grade");
+  const auto saturation = instance(color + ".saturation_contrast");
+  const auto main_stage = instance("editor.decode");
+  check(graph.stats().nodes.size() == 11 && converter && grade && saturation &&
+            instance(color + ".rgb_to_rgba"),
+        "color algorithms and converters in main graph");
+  auto connected = [&](const std::string& from, const std::string& to) {
+    for (const auto& node : graph.stats().nodes) {
+      if (node.id == from) {
+        return std::find(node.outputs.begin(), node.outputs.end(), from + "->" + to) !=
+               node.outputs.end();
+      }
+    }
+    return false;
+  };
+  check(connected("editor.decode", "editor.route") &&
+            connected("editor.route", color + ".rgba_to_rgb") &&
+            connected(color + ".rgba_to_rgb", color + ".grade") &&
+            connected(color + ".grade", color + ".saturation_contrast") &&
+            connected(color + ".saturation_contrast", color + ".rgb_to_rgba") &&
+            connected(color + ".rgb_to_rgba", "editor.composite") &&
+            !connected("editor.decode", "editor.composite"),
+        "conversion and algorithm edges belong to main graph");
+  matches_cold(p, 5);
+  p.tracks[0].clips[0].color.brightness = .2;
+  good(graph.update_project(p), "change color algorithm parameters");
+  check(instance(color + ".grade") != grade && instance(color + ".rgba_to_rgb") == converter &&
+            instance(color + ".saturation_contrast") == saturation &&
+            instance("editor.decode") == main_stage && graph.stats().reused_effect_nodes == 3,
+        "only changed algorithm replaced, converters and main stage reused");
+  matches_cold(p, 5);
+  // A different clip must not receive this clip's effect or stale result.
+  matches_cold(p, 35);
+  p.tracks[0].clips[1].color.temperature = .5;
+  good(graph.update_project(p), "add second clip color branch");
+  check(graph.stats().nodes.size() == 15, "per-clip branches coexist");
+  matches_cold(p, 35);
+  matches_cold(p, 5);
+  p.tracks[0].clips[1].color = {};
+  p.tracks[0].clips[0].speed = 2;
+  p.tracks[0].clips[0].duration = 20;
+  good(graph.update_project(p), "add audio algorithm branch");
+  const std::string audio = "editor.clip.3:red.audio";
+  check(instance(audio + ".float_to_audio") && instance(audio + ".time_stretch") &&
+            instance(audio + ".audio_to_float"),
+        "audio algorithm and converters in main graph");
+  check(connected(color + ".rgb_to_rgba", audio + ".float_to_audio") &&
+            connected(audio + ".audio_to_float", audio + ".window") &&
+            connected(audio + ".window", "editor.composite") &&
+            connected(audio + ".float_to_audio", audio + ".window") &&
+            connected(color + ".rgba_to_rgb", audio + ".float_to_audio"),
+        "graph edges order color, stretch, audio window and composition");
+  matches_cold(p, 5);
+  // Cache hits and absent media still traverse explicit bypass edges to output.
+  matches_cold(p, 6);
+  p.tracks[0].hidden = true;
+  good(graph.update_project(p), "hide video with active algorithms");
+  matches_cold(p, 5);
+  p.tracks[0].muted = true;
+  good(graph.update_project(p), "mute audio with active algorithms");
+  matches_cold(p, 6);
+  p.tracks[0].hidden = false;
+  p.tracks[0].muted = false;
+  p.tracks[0].clips[0].fade_in = 8;
+  good(graph.update_project(p), "add audio fade algorithm");
+  check(instance("editor.clip.3:red.fade.audio_fade"), "fade is a main graph node");
+  matches_cold(p, 3);
+  p.tracks[0].clips[0].fade_in = 0;
+  p.tracks[0].clips[0].speed = 1;
+  p.tracks[0].clips[0].duration = 30;
+  p.tracks[0].clips[0].transition = {"blue", "fade", 10};
+  good(graph.update_project(p), "remove stretch and add transition branch");
+  const std::string transition = "editor.clip.3:red.transition";
+  const auto transition_converter = instance(transition + ".rgba_to_rgb");
+  const auto transition_algorithm = instance(transition + ".transition");
+  check(!instance(audio + ".time_stretch") && transition_converter && transition_algorithm &&
+            instance(transition + ".rgb_to_rgba"),
+        "dynamic audio removal and transition addition");
+  check(connected("editor.result_route", transition + ".join") &&
+            connected(transition + ".join", transition + ".rgba_to_rgb") &&
+            connected(transition + ".rgb_to_rgba", transition + ".commit") &&
+            connected(transition + ".commit", "editor.output"),
+        "transition joins both layer events and publishes through to output");
+  for (const auto frame : {25, 29, 34}) {
+    matches_cold(p, frame);
+  }
+  p.tracks[0].clips[0].transition.effect = "wipe";
+  good(graph.update_project(p), "replace transition algorithm");
+  check(instance(transition + ".transition") != transition_algorithm &&
+            instance(transition + ".rgba_to_rgb") == transition_converter,
+        "transition replacement reuses converter");
+  matches_cold(p, 29);
+  p.tracks[0].clips[0].transition = {};
+  p.tracks[0].clips[0].color = {};
+  good(graph.update_project(p), "remove all algorithm branches");
+  check(graph.stats().nodes.size() == 7 && instance("editor.decode") == main_stage,
+        "effect removal retains main stages");
+  matches_cold(p, 5);
+  p.tracks[0].clips[0].color.contrast = 1.2;
+  good(graph.update_project(p), "re-add removed effect");
+  matches_cold(p, 5);
+  p.tracks[0].clips.erase(p.tracks[0].clips.begin());
+  good(graph.update_project(p), "delete clip with effect");
+  check(graph.stats().nodes.size() == 7, "deleted clip retires its algorithm nodes");
+  matches_cold(p, 35);
+
+  // Exercise the public session path, including continuing and pausing playback.
+  p = {};
+  p.width = 160;
+  p.height = 90;
+  p.assets = {blue->asset};
+  p.tracks = {
+      {"video", "Video", false, false, false, false, {{"clip", blue->asset.id, 0, 0, 120}}}};
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::vector<std::pair<uint64_t, int64_t>> delivered;
+  int ended = 0;
+  EditorSession session({[&](auto frame) {
+                           std::lock_guard lock(mutex);
+                           delivered.emplace_back(frame->generation, frame->frame);
+                           ready.notify_all();
+                         },
+                         {},
+                         [&] {
+                           std::lock_guard lock(mutex);
+                           ++ended;
+                           ready.notify_all();
+                         }});
+  good(session.set_project(p, 100, 10, true).get(), "start playback at requested frame");
+  {
+    std::unique_lock lock(mutex);
+    check(ready.wait_for(lock, std::chrono::seconds(3),
+                         [&] {
+                           return !delivered.empty() && delivered.back().first == 100 &&
+                                  delivered.back().second >= 12;
+                         }),
+          "playback advances before edit");
+  }
+  p.tracks[0].clips[0].opacity = .25;
+  good(session.set_project(p, 101, 12, true).get(), "live edit keeps playback running");
+  {
+    std::unique_lock lock(mutex);
+    check(ready.wait_for(lock, std::chrono::seconds(3),
+                         [&] {
+                           return !delivered.empty() && delivered.back().first == 101 &&
+                                  delivered.back().second >= 15;
+                         }),
+          "playback advances after edit without play call");
+  }
+  good(session.pause().get(), "pause fences callbacks");
+  {
+    std::lock_guard lock(mutex);
+    int64_t expected = 12;
+    bool new_generation = false;
+    for (const auto& entry : delivered) {
+      if (entry.first == 101) {
+        new_generation = true;
+        check(entry.second == expected++, "hot update has no duplicated playback frame");
+      } else {
+        check(!new_generation, "old generation does not follow new generation");
+      }
+    }
+    check(new_generation, "new generation observed");
+  }
+  good(session.set_project(p, 102, 120, true).get(), "editing at exclusive end stops playback");
+  {
+    std::lock_guard lock(mutex);
+    check(ended == 1 && delivered.back() == std::make_pair(uint64_t(102), int64_t(120)),
+          "end update delivers terminal frame and ends once");
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -424,6 +738,8 @@ int main(int argc, char** argv) {
   const auto dir = std::filesystem::u8path(argv[2]);
   if (std::string(argv[1]) == "model") {
     model(dir);
+  } else if (std::string(argv[1]) == "hot_reload") {
+    hot_reload(dir);
   } else if (std::string(argv[1]) == "advanced") {
     advanced(dir);
   } else {

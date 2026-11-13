@@ -127,8 +127,12 @@ class Decoder {
   }
 
   Result<void> seek(int64_t us) {
-    const auto ts = av_rescale_q(std::max<int64_t>(0, us - 200000) + origin_, kUs,
-                                 format_->streams[stream_]->time_base);
+    // Audio priming packets may have negative timestamps (e.g. AAC at -1024).
+    // Seeking to zero skips that packet and changes the first decoded block,
+    // which also changes the phase of a subsequent TimeStretch operation.
+    const auto preroll =
+        codec_->codec_type == AVMEDIA_TYPE_AUDIO ? us - 200000 : std::max<int64_t>(0, us - 200000);
+    const auto ts = av_rescale_q(preroll + origin_, kUs, format_->streams[stream_]->time_base);
     int rc = av_seek_frame(format_, stream_, ts, AVSEEK_FLAG_BACKWARD);
     if (rc < 0) {
       return Result<void>::failure(ff_error(rc, "decode seek"));
@@ -219,8 +223,16 @@ class Decoder {
   }
 
   Result<std::vector<float>> audio(int64_t sample, int count) {
+    // Keep the last requested block as well as the current decoder packet.
+    // A hot edit may request the same frame, or a second clip may overlap it.
+    if (!audio_result_.empty() && sample >= audio_result_start_ &&
+        sample + count <= audio_result_start_ + int64_t(audio_result_.size() / 2)) {
+      auto begin = audio_result_.begin() + (sample - audio_result_start_) * 2;
+      return Result<std::vector<float>>::success(std::vector<float>(begin, begin + count * 2));
+    }
     if ((last_request_ < 0 && sample > 48000) ||
-        (last_request_ >= 0 && (sample < last_request_ || sample - last_request_ > 48000))) {
+        (last_request_ >= 0 && (sample < last_request_ || sample - last_request_ > 48000 ||
+                                (sample < next_pcm_ && (pcm_.empty() || sample < pcm_start_))))) {
       auto result = seek(av_rescale_q(sample, kSamples, kUs));
       if (!result) {
         return Result<std::vector<float>>::failure(result.failure_record());
@@ -287,6 +299,8 @@ class Decoder {
       pcm_start_ = next_pcm_;
       next_pcm_ += n;
     }
+    audio_result_start_ = sample;
+    audio_result_ = out;
     return Result<std::vector<float>>::success(std::move(out));
   }
 
@@ -303,7 +317,8 @@ class Decoder {
   int64_t pcm_start_ = 0, next_pcm_ = 0;
   bool eof_ = false;
   std::shared_ptr<const EditorImage> previous_, upcoming_;
-  std::vector<float> pcm_;
+  std::vector<float> pcm_, audio_result_;
+  int64_t audio_result_start_ = 0;
 };
 
 void composite(EditorImage& out, const EditorImage& input, const EditorClip& c) {
@@ -335,31 +350,18 @@ void composite(EditorImage& out, const EditorImage& input, const EditorClip& c) 
   }
 }
 
-struct Work {
-  std::shared_ptr<EditorFrame> output;
-  const EditorTrack* track = nullptr;
-  const EditorClip* clip = nullptr;
-  const EditorAsset* asset = nullptr;
-  int64_t source_frame = 0;
-  std::shared_ptr<const EditorImage> image;
-  std::vector<float> audio;
-  Failure error;
-  bool delivered = false;
-};
-
-struct Layer : graphflow::core::EventT<Layer> {
-  std::shared_ptr<Work> work;
-};
-
-class Stage final : public graphflow::core::GraphNode {
+class Stage final : public FlowNode {
  public:
-  Stage(std::string name, graphflow::core::EventBus* bus, std::function<void(Work&)> fn)
-      : GraphNode(name, bus), fn_(std::move(fn)) {}
+  enum class Routing { next, clip, result };
+
+  Stage(std::string name, graphflow::core::EventBus* bus, std::function<void(Work&)> fn,
+        Routing routing = Routing::next)
+      : FlowNode(name, bus), fn_(std::move(fn)), routing_(routing) {}
 
   void send(const std::shared_ptr<Work>& work) {
     Layer layer;
     layer.work = work;
-    publish(layer);
+    send_layer(layer);
   }
 
  protected:
@@ -368,13 +370,20 @@ class Stage final : public graphflow::core::GraphNode {
       if (!layer.work->error) {
         fn_(*layer.work);
       }
-      publish(layer);
+      if (routing_ == Routing::clip) {
+        send_layer(layer, effect_route(layer.work->clip->id, "pipeline"));
+      } else if (routing_ == Routing::result && layer.work->transition) {
+        send_layer(layer, effect_route(layer.work->transition->owner, "transition"));
+      } else {
+        send_layer(layer);
+      }
     });
     return true;
   }
 
  private:
   std::function<void(Work&)> fn_;
+  Routing routing_;
 };
 }  // namespace
 
@@ -476,18 +485,120 @@ class RenderGraph::Impl {
         w.output->audio[i] += w.audio[i] * float(w.clip->volume);
       }
     });
-    output = std::make_shared<Stage>("editor.output", engine.eventBus(),
-                                     [](Work& w) { w.delivered = true; });
-    ready = engine.loadFromNodes({output, mix, compose, decode, clock},
-                                 {{"editor.timeline", "editor.decode", "", ""},
-                                  {"editor.decode", "editor.composite", "", ""},
-                                  {"editor.composite", "editor.mix", "", ""},
-                                  {"editor.mix", "editor.output", "", ""}}) &&
-            engine.init() && engine.start();
+    route = std::make_shared<Stage>(
+        "editor.route", engine.eventBus(), [](Work&) {}, Stage::Routing::clip);
+    result_route = std::make_shared<Stage>(
+        "editor.result_route", engine.eventBus(), [](Work&) {}, Stage::Routing::result);
+    output = std::make_shared<Stage>("editor.output", engine.eventBus(), [](Work& w) {
+      w.delivered = true;
+      if (w.transition) {
+        w.transition->delivered = true;
+      }
+    });
+    auto plan =
+        EffectNodes::prepare(project, engine.eventBus(), [this](Work& w) { finish_audio(w); });
+    if (!plan) {
+      graph_error = plan.failure_record();
+      return;
+    }
+    effects = std::move(*plan);
+    auto nodes = base_nodes();
+    auto connections = base_connections();
+    effects->append_to(nodes, connections);
+    ready = engine.loadFromNodes(nodes, connections) && engine.init() && engine.start();
   }
 
   ~Impl() {
     engine.release();
+  }
+
+  std::vector<std::shared_ptr<graphflow::core::GraphNode>> base_nodes() const {
+    return {output, result_route, mix, compose, route, decode, clock};
+  }
+
+  static std::vector<graphflow::engine::NodeConnection> base_connections() {
+    return {{"editor.timeline", "editor.decode"},
+            {"editor.decode", "editor.route"},
+            {"editor.composite", "editor.mix"},
+            {"editor.mix", "editor.result_route"},
+            {"editor.result_route", "editor.output"}};
+  }
+
+  struct FileStamp {
+    uintmax_t size = 0;
+    std::filesystem::file_time_type modified{};
+    bool valid = false;
+  };
+
+  static FileStamp stamp(const std::string& path) {
+    std::error_code ec;
+    FileStamp value;
+    const auto local = std::filesystem::u8path(path);
+    value.size = std::filesystem::file_size(local, ec);
+    if (ec) {
+      return value;
+    }
+    value.modified = std::filesystem::last_write_time(local, ec);
+    value.valid = !ec;
+    return value;
+  }
+
+  Result<void> update_project(EditorProject next) {
+    auto valid = editor_validate(next);
+    if (!valid) {
+      return valid;
+    }
+    if (!ready || cancel) {
+      return Result<void>::failure(
+          failure("reload: graph unavailable or cancelled",
+                  cancel ? ErrorCode::cancelled : ErrorCode::invalid_state));
+    }
+    // All stages and synchronous Work pointers belong to the same owner worker.
+    // No previous render can still refer to project/clip storage at this point.
+    auto plan = EffectNodes::prepare(
+        next, engine.eventBus(), [this](Work& w) { finish_audio(w); }, effects.get());
+    if (!plan) {
+      return Result<void>::failure(plan.failure_record());
+    }
+    auto nodes = base_nodes();
+    auto connections = base_connections();
+    (*plan)->append_to(nodes, connections);
+    auto result = engine.reloadFromNodesDetailed(nodes, connections);
+    if (result.status != graphflow::engine::ReloadStatus::Committed) {
+      // A failed rollback or post-commit cleanup cannot safely use the old plan.
+      if (result.committed() || result.status == graphflow::engine::ReloadStatus::RecoveryFailed) {
+        ready = false;
+      }
+      return Result<void>::failure(
+          failure("reload: " + result.message, ErrorCode::recovery_failed));
+    }
+    effects = std::move(*plan);
+    ++topology_reloads;
+    for (auto it = decoders.begin(); it != decoders.end();) {
+      const auto& old = it->second.asset;
+      const auto found = std::find_if(next.assets.begin(), next.assets.end(),
+                                      [&](const auto& asset) { return asset.id == old.id; });
+      bool unchanged = found != next.assets.end() && found->path == old.path &&
+                       found->video == old.video && found->audio == old.audio &&
+                       found->image == old.image && found->width == old.width &&
+                       found->height == old.height && found->duration_us == old.duration_us;
+      if (unchanged) {
+        const auto current = stamp(found->path);
+        const auto& previous = it->second.file;
+        unchanged = previous.valid && current.valid && previous.size == current.size &&
+                    previous.modified == current.modified;
+      }
+      if (!unchanged) {
+        it = decoders.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    // Audio blocks depend on clip timing and project rate. Text caches belong
+    // to immutable TextRender nodes and survive unrelated project edits.
+    audio_cache.clear();
+    project = std::move(next);
+    return Result<void>::success();
   }
 
   Result<Decoder*> get(const EditorAsset& asset, bool video) {
@@ -514,7 +625,9 @@ class RenderGraph::Impl {
       if (!opened) {
         return Result<Decoder*>::failure(opened.failure_record());
       }
-      it = decoders.emplace(key, Entry{std::move(decoder), 0, weight}).first;
+      it = decoders.emplace(key, Entry{std::move(decoder), 0, weight, asset, stamp(asset.path)})
+               .first;
+      ++decoder_opens;
     }
     it->second.used = ++access;
     return Result<Decoder*>::success(it->second.decoder.get());
@@ -526,28 +639,7 @@ class RenderGraph::Impl {
       return;
     }
     if (!w.clip->text.content.empty()) {
-      auto found = text_cache.find(w.clip->id);
-      if (found == text_cache.end()) {
-        auto text_image = std::make_shared<EditorImage>();
-        text_image->width = project.width;
-        text_image->height = project.height;
-        text_image->rgba.resize(size_t(project.width) * project.height * 4, 0);
-        std::string error;
-        if (!render_text(*text_image, w.clip->text, error)) {
-          w.error = failure(error);
-          return;
-        }
-        const size_t bytes = text_image->rgba.size();
-        while (!text_cache.empty() &&
-               (text_cache.size() >= 8 || (text_cache.size() + 1) * bytes > 128 * 1024 * 1024)) {
-          text_cache.erase(text_cache.begin());
-        }
-        found = text_cache.emplace(w.clip->id, text_image).first;
-      }
-      if (!w.track->hidden) {
-        w.image = found->second;
-      }
-      return;
+      return;  // TextRender is the source node on this clip's graph path.
     }
     if (w.asset->video && !w.track->audio_only && !w.track->hidden) {
       auto decoder = get(*w.asset, true);
@@ -561,17 +653,6 @@ class RenderGraph::Impl {
         return;
       }
       w.image = *image;
-      const auto& color = w.clip->color;
-      if (color.brightness != 0 || color.contrast != 1 || color.saturation != 1 ||
-          color.temperature != 0) {
-        auto processed = std::make_shared<EditorImage>(**image);
-        std::string error;
-        if (!effects.grade(*processed, color, error)) {
-          w.error = failure(error);
-          return;
-        }
-        w.image = std::move(processed);
-      }
     }
     if (w.asset->audio && !w.track->muted && w.clip->volume > 0) {
       auto decoder = get(*w.asset, false);
@@ -610,43 +691,54 @@ class RenderGraph::Impl {
             w.error = audio.failure_record();
             return;
           }
-          std::string error;
-          if (!effects.stretch_audio(*audio, w.clip->speed, error)) {
-            w.error = failure(error);
-            return;
-          }
-          cached.samples = std::move(*audio);
-          cached.first = first;
-          cached.block = block;
+          w.audio = std::move(*audio);
+          w.stretch_needed = true;
+          w.audio_first = first;
         }
-        w.audio.assign(size_t(count) * 2, 0);
-        const size_t offset = size_t(target_sample - cached.first) * 2;
-        if (offset < cached.samples.size()) {
-          std::copy_n(cached.samples.begin() + offset,
-                      std::min(w.audio.size(), cached.samples.size() - offset), w.audio.begin());
-        }
+        w.audio_block = block;
+        w.target_sample = target_sample;
+        w.audio_count = count;
       }
-      const double fps = double(project.rate.numerator) / project.rate.denominator;
-      for (size_t i = 0; i < w.audio.size() / 2; ++i) {
-        const double f = local + double(i) * fps / 48000;
-        double gain = 1;
-        if (w.clip->fade_in > 0) {
-          gain *= std::clamp(f / w.clip->fade_in, 0., 1.);
-        }
-        if (w.clip->fade_out > 0) {
-          gain *= std::clamp((w.clip->duration - f) / w.clip->fade_out, 0., 1.);
-        }
-        w.audio[i * 2] *= float(gain);
-        w.audio[i * 2 + 1] *= float(gain);
-      }
+    }
+  }
+
+  // Called by the AudioWindow graph node after TimeStretch (or its cache bypass).
+  void finish_audio(Work& w) {
+    if (w.audio_count == 0) {
+      return;
+    }
+    auto& cached = audio_cache[w.clip->id];
+    if (w.stretch_needed) {
+      cached.samples = std::move(w.audio);
+      cached.first = w.audio_first;
+      cached.block = w.audio_block;
+    }
+    if (cached.block != w.audio_block) {
+      w.error = failure("audio window: missing processed block");
+      return;
+    }
+    w.audio.assign(size_t(w.audio_count) * 2, 0);
+    const size_t offset = size_t(w.target_sample - cached.first) * 2;
+    if (offset < cached.samples.size()) {
+      std::copy_n(cached.samples.begin() + offset,
+                  std::min(w.audio.size(), cached.samples.size() - offset), w.audio.begin());
     }
   }
 
   Result<std::shared_ptr<EditorFrame>> render(int64_t frame, uint64_t generation) {
     if (!ready) {
       return Result<std::shared_ptr<EditorFrame>>::failure(
-          failure("render: graph initialization failed"));
+          graph_error ? graph_error : failure("render: graph unavailable"));
     }
+
+    struct FrameCleanup {
+      EffectNodes& nodes;
+
+      ~FrameCleanup() {
+        nodes.finish_frame();
+      }
+    } cleanup{*effects};
+
     auto out = std::make_shared<EditorFrame>();
     out->frame = frame;
     out->generation = generation;
@@ -678,6 +770,10 @@ class RenderGraph::Impl {
           continue;
         }
         std::shared_ptr<EditorFrame> layers[2];
+        auto transition = std::make_shared<TransitionFrame>();
+        transition->owner = left.id;
+        transition->output = out;
+        transition->progress = double(frame - start) / (left.transition.duration - 1);
         const EditorClip* clips[]{&left, &*next};
         for (int i = 0; i < 2; ++i) {
           layers[i] = std::make_shared<EditorFrame>(*out);
@@ -692,29 +788,23 @@ class RenderGraph::Impl {
           }
           auto work = std::make_shared<Work>();
           work->output = layers[i];
+          work->transition = transition;
+          work->transition_input = i;
           work->track = &track;
-          work->clip = &evaluated;
+          work->clip = std::make_shared<EditorClip>(std::move(evaluated));
           work->asset = &*asset;
           work->source_frame =
               asset->image
                   ? 0
                   : clip.source_in + int64_t(std::floor((frame - clip.position) * clip.speed));
           clock->send(work);
-          if (work->error || !work->delivered) {
-            return Result<std::shared_ptr<EditorFrame>>::failure(
-                work->error ? work->error : failure("transition: disconnected graph"));
+          if (work->error) {
+            return Result<std::shared_ptr<EditorFrame>>::failure(work->error);
           }
         }
-        const double progress = double(frame - start) / (left.transition.duration - 1);
-        std::string error;
-        if (!effects.transition(layers[0]->image, layers[1]->image, left.transition.effect,
-                                progress, error)) {
-          return Result<std::shared_ptr<EditorFrame>>::failure(failure(error));
-        }
-        out->image = std::move(layers[0]->image);
-        for (size_t n = 0; n < out->audio.size(); ++n) {
-          out->audio[n] +=
-              float(layers[0]->audio[n] * (1 - progress) + layers[1]->audio[n] * progress);
+        if (!transition->delivered) {
+          return Result<std::shared_ptr<EditorFrame>>::failure(
+              failure("transition: incomplete graph output"));
         }
         transitioned = true;
         break;
@@ -736,7 +826,7 @@ class RenderGraph::Impl {
         work->output = out;
         work->track = &track;
         auto evaluated = editor_evaluate(clip, frame - clip.position);
-        work->clip = &evaluated;
+        work->clip = std::make_shared<EditorClip>(std::move(evaluated));
         work->asset = asset == project.assets.end() ? nullptr : &*asset;
         work->source_frame =
             clip.source_in + int64_t(std::floor((frame - clip.position) * clip.speed));
@@ -761,6 +851,8 @@ class RenderGraph::Impl {
     std::unique_ptr<Decoder> decoder;
     uint64_t used;
     size_t weight;
+    EditorAsset asset;
+    FileStamp file;
   };
 
   struct AudioBlock {
@@ -769,14 +861,15 @@ class RenderGraph::Impl {
   };
 
   std::map<std::string, AudioBlock> audio_cache;
-  std::map<std::string, std::shared_ptr<EditorImage>> text_cache;
-  EffectSession effects;
+  std::unique_ptr<EffectNodes> effects;
+  Failure graph_error;
   EditorProject project;
   std::atomic<bool>& cancel;
   graphflow::engine::GraphEngine engine{1};
-  std::shared_ptr<Stage> clock, decode, compose, mix, output;
+  std::shared_ptr<Stage> clock, decode, route, compose, mix, result_route, output;
   std::map<std::string, Entry> decoders;
   uint64_t access = 0;
+  size_t decoder_opens = 0, topology_reloads = 0;
   bool ready = false;
 };
 
@@ -784,6 +877,32 @@ RenderGraph::RenderGraph(const EditorProject& p, std::atomic<bool>& cancel)
     : impl_(std::make_unique<Impl>(p, cancel)) {}
 
 RenderGraph::~RenderGraph() = default;
+
+Result<void> RenderGraph::update_project(EditorProject project) {
+  return impl_->update_project(std::move(project));
+}
+
+RenderGraphStats RenderGraph::stats() const {
+  RenderGraphStats stats;
+  stats.decoder_opens = impl_->decoder_opens;
+  stats.cached_decoders = impl_->decoders.size();
+  stats.topology_reloads = impl_->topology_reloads;
+  stats.reused_effect_nodes = impl_->effects ? impl_->effects->reused_nodes() : 0;
+  // Inspect the actual engine, not merely the proposed effect plan.
+  for (const auto& path : impl_->engine.paths()) {
+    for (const auto& node : path->getNodes()) {
+      RenderGraphStats::Node info{node->getName(), reinterpret_cast<uintptr_t>(node.get()), {}};
+      auto graph_node = std::dynamic_pointer_cast<graphflow::core::GraphNode>(node);
+      if (graph_node) {
+        for (const auto& edge : graph_node->getPubEdges()) {
+          info.outputs.push_back(edge.name());
+        }
+      }
+      stats.nodes.push_back(std::move(info));
+    }
+  }
+  return stats;
+}
 
 Result<std::shared_ptr<EditorFrame>> RenderGraph::render(int64_t frame, uint64_t generation) {
   return impl_->render(frame, generation);

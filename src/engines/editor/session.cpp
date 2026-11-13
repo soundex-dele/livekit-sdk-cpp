@@ -148,20 +148,45 @@ AsyncResult<EditorProbe> EditorSession::probe(std::string path) {
 }
 
 AsyncResult<void> EditorSession::set_project(EditorProject project, uint64_t generation,
-                                             int64_t frame) {
-  return impl_->submit<void>(
-      [p = impl_.get(), project = std::move(project), generation, frame]() mutable {
-        auto valid = editor_validate(project);
-        if (!valid) {
-          return valid;
-        }
+                                             int64_t frame, bool play_after_update) {
+  return impl_->submit<void>([p = impl_.get(), project = std::move(project), generation, frame,
+                              play_after_update]() mutable {
+    auto valid = editor_validate(project);
+    if (!valid) {
+      return valid;
+    }
+    if (p->graph) {
+      auto updated = p->graph->update_project(project);
+      if (!updated) {
         p->playing = false;
-        p->project = std::move(project);
-        p->generation = generation;
-        p->position = std::clamp<int64_t>(frame, 0, editor_duration(p->project));
-        p->graph = std::make_unique<editor_detail::RenderGraph>(p->project, p->cancelled);
-        return p->render();
-      });
+        return updated;
+      }
+    } else {
+      p->graph = std::make_unique<editor_detail::RenderGraph>(project, p->cancelled);
+    }
+    p->playing = false;
+    p->project = std::move(project);
+    p->generation = generation;
+    p->position = std::clamp<int64_t>(frame, 0, editor_duration(p->project));
+    auto rendered = p->render();
+    if (!rendered || !play_after_update) {
+      return rendered;
+    }
+    const auto duration = editor_duration(p->project);
+    if (p->position < duration) {
+      p->start_frame = p->position;
+      p->start = std::chrono::steady_clock::now();
+      ++p->position;  // The requested frame has already been delivered.
+    }
+    p->playing = p->position < duration;
+    if (p->playing) {
+      p->deadline = p->start + std::chrono::microseconds(
+                                   editor_time_us(p->position - p->start_frame, p->project.rate));
+    } else if (p->callbacks.ended) {
+      p->callbacks.ended();
+    }
+    return rendered;
+  });
 }
 
 AsyncResult<void> EditorSession::seek(int64_t frame) {

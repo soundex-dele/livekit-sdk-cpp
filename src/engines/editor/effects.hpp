@@ -1,21 +1,36 @@
 #pragma once
-#include "livekit/editor.hpp"
+#include "render_events.hpp"
+#include "engine/graph_builder.h"
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace livekit::sdk::editor_detail {
-// Exception boundary: all failures returned as text, no backend types escape.
-// Owned by one render session and used only on its worker thread.
-class EffectSession {
+// Publication is compiled at the external-library exception boundary.
+class FlowNode : public graphflow::core::GraphNode {
  public:
-  EffectSession();
-  ~EffectSession();
-  EffectSession(const EffectSession&) = delete;
-  EffectSession& operator=(const EffectSession&) = delete;
-  bool grade(EditorImage& image, const EditorColor& color, std::string& error) noexcept;
-  bool transition(EditorImage& image, const EditorImage& next, const std::string& effect,
-                  double progress, std::string& error) noexcept;
-  bool stretch_audio(std::vector<float>& audio, double rate, std::string& error) noexcept;
+  using GraphNode::GraphNode;
+  bool send_layer(const Layer& layer, const std::string& route = "");
+};
+
+// A topology plan only. Nodes schedule downstream processing through graph edges.
+class EffectNodes {
+ public:
+  static Result<std::unique_ptr<EffectNodes>> prepare(const EditorProject& project,
+                                                      graphflow::core::EventBus* bus,
+                                                      std::function<void(Work&)> finish_audio,
+                                                      const EffectNodes* previous = nullptr);
+  ~EffectNodes();
+  void append_to(std::vector<std::shared_ptr<graphflow::core::GraphNode>>& nodes,
+                 std::vector<graphflow::engine::NodeConnection>& connections) const;
+  size_t reused_nodes() const;
+  // Owner worker, after every synchronous frame, including errors. Releases any
+  // backend event correlations whose branch failed to produce an output.
+  void finish_frame();
 
  private:
+  EffectNodes();
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
