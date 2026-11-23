@@ -26,7 +26,7 @@ not exposed to applications. Decoder entries use LRU eviction (up to eight strea
 decoders, estimated decoded-image cache budget 256 MiB). Decoder threads are limited
 to two per stream. Input and output images are limited to 4096×4096.
 
-Color correction runs in a per-clip inline `graphflow::Graph` from `graphflow-cpp-refactor`.
+Color correction runs in a per-clip inline `graphflow::Graph` from `graphflow-cpp`.
 The grade node applies an exposure/temperature lookup table; the saturation/contrast node
 consumes its quantized RGB values. Both operate on one private RGBA copy, preserving alpha
 and the decoded input. A project edit with unchanged color settings reuses that clip's

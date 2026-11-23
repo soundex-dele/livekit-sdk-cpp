@@ -15,7 +15,7 @@ cmake --build out/player-engine --config Release --parallel 4
 ctest --test-dir out/player-engine -C Release --output-on-failure
 ```
 
-Player 私有链接 `GraphFlow::core`。默认使用相邻的 `graphflow-cpp-refactor` 源码目录，可用 `LIVEKIT_TYPED_GRAPHFLOW_ROOT` 指定位置；这不替换其他 SDK 模块的旧 GraphFlow 依赖。
+Player 私有链接 `GraphFlow::core`。默认使用相邻的 `graphflow-cpp` 源码目录，可用 `LIVEKIT_TYPED_GRAPHFLOW_ROOT` 指定位置。
 
 需要匹配的 FFmpeg 头文件、库和运行时；可用 `LIVEKIT_FFMPEG_INCLUDE` 指定独立头文件目录。`LIVEKIT_PLAYER_BUILD_TESTS=OFF` 关闭引擎测试后不需要 ffmpeg 可执行文件。`LIVEKIT_BUILD_PLAYER` 默认关闭；目前仅提供源码集成，尚未提供安装包/C ABI。
 

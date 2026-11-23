@@ -1,5 +1,5 @@
 include_guard(GLOBAL)
-set(LIVEKIT_TYPED_GRAPHFLOW_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../graphflow-cpp-refactor" CACHE PATH "Typed GraphFlow source tree used by SDK engines")
+set(LIVEKIT_TYPED_GRAPHFLOW_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../graphflow-cpp" CACHE PATH "Typed GraphFlow source tree used by SDK engines")
 if(NOT TARGET GraphFlow::core)
   add_subdirectory("${LIVEKIT_TYPED_GRAPHFLOW_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/graphflow-typed" EXCLUDE_FROM_ALL)
 endif()
