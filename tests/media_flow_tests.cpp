@@ -1,5 +1,4 @@
 #include "media_graph/media_flow.hpp"
-#include "engine/graph_engine.h"
 #include <iostream>
 #include <cstdlib>
 
@@ -29,7 +28,7 @@ void fails(F f) {
 
 class Source : public MediaNode {
  public:
-  explicit Source(graphflow::core::EventBus* bus) : MediaNode("producer", bus) {}
+  Source() : MediaNode("producer") {}
 
   Result<bool> pump() override {
     if (finished_)
@@ -38,7 +37,7 @@ class Source : public MediaNode {
     event.eos = next == 4;
     event.frame.timestamp_us = next;
     event.frame.rgba = std::make_shared<const std::vector<uint8_t>>(4, static_cast<uint8_t>(next));
-    auto sent = publish_media(event);
+    auto sent = publish_media(output, event);
     if (!sent) {
       return sent;
     }
@@ -47,6 +46,12 @@ class Source : public MediaNode {
     finished_ = event.eos;
     ++next;
     return Result<bool>::success(true);
+  }
+
+  graphflow::Emitter<RGBA8> output;
+
+  void bind(graphflow::Binder& b) override {
+    output = b.output(graphflow::Out<RGBA8>{"out"});
   }
 
   int next = 0;
@@ -60,12 +65,12 @@ class Source : public MediaNode {
 
 class Transform : public MediaNode {
  public:
-  explicit Transform(graphflow::core::EventBus* bus) : MediaNode("processor", bus) {}
+  Transform() : MediaNode("processor") {}
 
   Result<bool> pump() override {
     if (!pending)
       return Result<bool>::success(false);
-    auto sent = publish_media(*pending);
+    auto sent = publish_media(output, *pending);
     if (!sent) {
       return sent;
     }
@@ -77,15 +82,15 @@ class Transform : public MediaNode {
   }
 
  protected:
-  bool doInit() override {
-    auto subscribed = subscribe_media<RGBA8>([this](const RGBA8& event) {
+  void bind(graphflow::Binder& b) override {
+    subscribe_media<RGBA8>(b, [this](const RGBA8& event) {
       if (pending)
         return Result<bool>::success(false);
       pending = event;
       pending->frame.timestamp_us += 10;
       return Result<bool>::success(true);
     });
-    return bool(subscribed);
+    output = b.output(graphflow::Out<RGBA8>{"out"});
   }
 
   Result<void> on_reset(int64_t) override {
@@ -94,19 +99,20 @@ class Transform : public MediaNode {
   }
 
  private:
+  graphflow::Emitter<RGBA8> output;
   std::optional<RGBA8> pending;
 };
 
 class Sink : public MediaNode {
  public:
-  explicit Sink(graphflow::core::EventBus* bus) : MediaNode("consumer", bus) {}
+  Sink() : MediaNode("consumer") {}
 
   bool blocked = true, broken = false;
   std::vector<livekit::sdk::media::VideoFrame> frames;
 
  protected:
-  bool doInit() override {
-    auto subscribed = subscribe_media<RGBA8>([this](const RGBA8& event) {
+  void bind(graphflow::Binder& b) override {
+    subscribe_media<RGBA8>(b, [this](const RGBA8& event) {
       if (broken)
         return Result<bool>::failure(
             make_failure(ErrorDomain::media, ErrorCode::processing_failed, "sink failure"));
@@ -118,7 +124,6 @@ class Sink : public MediaNode {
         frames.push_back(event.frame);
       return Result<bool>::success(true);
     });
-    return bool(subscribed);
   }
 
   Result<void> on_reset(int64_t) override {
@@ -129,71 +134,69 @@ class Sink : public MediaNode {
 }  // namespace
 
 int main() {
-    graphflow::engine::GraphEngine engine{1};
-    auto source = std::make_shared<Source>(nullptr);
-    auto transform = std::make_shared<Transform>(nullptr);
-    auto sink = std::make_shared<Sink>(nullptr);
-    require(
-        engine.loadFromNodes({sink, transform, source}, {{"producer", "processor", "RGBA8", ""},
-                                                         {"processor", "consumer", "RGBA8", ""}}),
-        "loadFromNodes failed");
-    require(
-        engine.paths().size() == 1 && engine.paths().front()->getEventBus() == engine.eventBus(),
-        "engine did not own graph");
-    auto edge_buses = engine.paths().front()->eventBusesSnapshot();
-    require(edge_buses.size() == 2, "engine did not retain both edge buses");
-    MediaExecutor executor({sink, source, transform});  // intentionally not in execution order
-    require(executor.nodes().front() == source && executor.nodes().back() == sink,
-            "executor ignored graph connections");
-    require(engine.init() && engine.start(), "engine init/start failed");
-    require(take(executor.step()) == MediaExecutor::Step::progress, "source did not publish");
-    require(take(executor.step()) == MediaExecutor::Step::backpressured,
-            "subscriber did not backpressure source");
-    require(source->next == 1 && sink->frames.empty(), "blocked subscriber lost or consumed data");
-    sink->blocked = false;
-    for (int i = 0; i < 20 && take(executor.step()) != MediaExecutor::Step::end; ++i) {
-    }
-    require(sink->finished() && sink->frames.size() == 4, "EOS overtook data or graph stalled");
-    for (int i = 0; i < 4; ++i)
-      require(sink->frames[i].timestamp_us == i + 10 && sink->frames[i].rgba->front() == i,
-              "subscription processing lost ordering or ownership");
-    auto retained = sink->frames.front();
-    engine.stop();
-    take(executor.reset(0));
-    require(engine.start(), "restart failed");
-    sink->blocked = true;
-    take(executor.step());
-    engine.stop();
-    take(executor.reset(0));  // discard a blocked in-flight frame
-    RGBA8 stale;
-    stale.epoch = 1;
-    stale.delivery = std::make_shared<MediaDelivery>();
-    const auto edge = source->getPubEdges().front();
-    edge.eventBus()->publish(edge.name(), stale);
-    require(stale.delivery->accepted && !stale.delivery->error, "stale epoch was not discarded");
-    sink->blocked = false;
-    require(engine.start(), "restart after flush failed");
-    for (int i = 0; i < 20 && take(executor.step()) != MediaExecutor::Step::end; ++i) {
-    }
-    require(sink->frames.size() == 4 && sink->frames.front().timestamp_us == 10,
-            "flush retained stale pending media");
-    engine.stop();
-    take(executor.reset(0));
-    engine.start();
-    sink->broken = true;
-    take(executor.step());
-    fails([&] { return executor.step(); });  // EventBus must not swallow processing errors
-    engine.release();
-    require(engine.paths().empty() && engine.eventBus()->isClosed(),
-            "engine did not release graph");
-    for (const auto& edge_bus : edge_buses)
-      require(edge_bus->isClosed(), "engine left an edge bus open");
-    for (const auto& node : executor.nodes())
-      require(node->state() == graphflow::core::LifecycleState::Released,
-              "engine left a node alive");
-    require(retained.rgba->front() == 0, "release invalidated retained payload");
-    fails([&] { return executor.step(); });
-    std::cout << "PASS: graph-driven subscriptions, ordering, backpressure, EOS, epochs, errors "
-                 "and owned payloads\n";
-    return 0;
+  graphflow::Graph engine({graphflow::Dispatch::Inline});
+  auto source = std::make_shared<Source>();
+  auto transform = std::make_shared<Transform>();
+  auto sink = std::make_shared<Sink>();
+  MediaBinding k(engine, sink), s(engine, source), t(engine, transform);
+  require(k.ref && s.ref && t.ref, "could not register media nodes");
+  std::vector<MediaEdge> edges;
+  require(bool(engine.rewire([&](graphflow::Wiring& w) {
+            connect_media<RGBA8>(w, edges, s, t);
+            connect_media<RGBA8>(w, edges, t, k);
+          })),
+          "could not wire media graph");
+  MediaExecutor executor({sink, source, transform}, edges);  // intentionally unordered
+  require(executor.nodes().front() == source && executor.nodes().back() == sink,
+          "executor ignored graph connections");
+  require(engine.start(graphflow::StartMode::PrepareOnly) && engine.start(),
+          "engine init/start failed");
+  require(take(executor.step()) == MediaExecutor::Step::progress, "source did not publish");
+  require(take(executor.step()) == MediaExecutor::Step::backpressured,
+          "subscriber did not backpressure source");
+  require(source->next == 1 && sink->frames.empty(), "blocked subscriber lost or consumed data");
+  sink->blocked = false;
+  for (int i = 0; i < 20 && take(executor.step()) != MediaExecutor::Step::end; ++i) {
+  }
+  require(sink->finished() && sink->frames.size() == 4, "EOS overtook data or graph stalled");
+  for (int i = 0; i < 4; ++i)
+    require(sink->frames[i].timestamp_us == i + 10 && sink->frames[i].rgba->front() == i,
+            "subscription processing lost ordering or ownership");
+  auto retained = sink->frames.front();
+  require(bool(engine.stop()), "stop failed");
+  take(executor.reset(0));
+  require(bool(engine.start()), "restart failed");
+  sink->blocked = true;
+  take(executor.step());
+  require(bool(engine.stop()), "stop failed");
+  take(executor.reset(0));  // discard a blocked in-flight frame
+  RGBA8 stale;
+  stale.epoch = 1;
+  stale.delivery = std::make_shared<MediaDelivery>();
+  require(bool(engine.start()), "restart after flush failed");
+  require(source->output.emit(stale).status == graphflow::Admission::Accepted,
+          "stale event not delivered");
+  require(stale.delivery->accepted && !stale.delivery->error, "stale epoch was not discarded");
+  sink->blocked = false;
+  for (int i = 0; i < 20 && take(executor.step()) != MediaExecutor::Step::end; ++i) {
+  }
+  require(sink->frames.size() == 4 && sink->frames.front().timestamp_us == 10,
+          "flush retained stale pending media");
+  require(bool(engine.stop()), "stop failed");
+  take(executor.reset(0));
+  require(bool(engine.start()), "restart failed");
+  sink->broken = true;
+  take(executor.step());
+  auto error = executor.step();
+  require(!error && error.error().message == "sink failure", "lost original sink failure");
+  require(bool(engine.close()), "close failed");
+  require(source->output.emit(stale).status == graphflow::Admission::Closed,
+          "released port still accepts media");
+  for (const auto& node : executor.nodes())
+    require(node->state() == MediaState::Released, "engine left a node alive");
+  require(retained.rgba->front() == 0, "release invalidated retained payload");
+  fails([&] { return executor.step(); });
+  std::cout << "PASS: graph-driven subscriptions, ordering, backpressure, EOS, epochs, errors "
+               "and owned payloads\n";
+  return 0;
 }

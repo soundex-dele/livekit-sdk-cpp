@@ -4,6 +4,7 @@
 #include "studio_result.hpp"
 #include <deque>
 #include <mutex>
+#include <optional>
 
 namespace livekit::sdk::studio_detail {
 using Layers = std::vector<std::pair<StudioSource, std::shared_ptr<const StudioImage>>>;
@@ -62,7 +63,9 @@ class Monitor {
 
 class Recorder {
  public:
-  Recorder(const std::filesystem::path&, int width, int height, int fps);
+  // Called serially by the graph mailbox; no secondary admission queue.
+  Recorder(const std::filesystem::path&, int width, int height, int fps,
+           std::optional<std::chrono::steady_clock::time_point> mediaOrigin = {});
   ~Recorder();
   Result<void> status() const;
   Result<void> video(const StudioImage&, std::chrono::steady_clock::time_point);
@@ -70,6 +73,9 @@ class Recorder {
   Result<void> finish();
 
  private:
+  friend class RecordingSession;
+  // Session owner only, after prepare and before either ingress becomes visible.
+  void setMediaOrigin(std::chrono::steady_clock::time_point);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

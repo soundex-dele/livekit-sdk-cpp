@@ -1,7 +1,6 @@
 #include "livekit/compat/thread.hpp"
 #include "livekit/compat/span.hpp"
 #include "livekit/result.hpp"
-#include "media_graph/failure.hpp"
 #include "media_graph/callback_context.hpp"
 #include "livekit/rtc/audio_nodes.hpp"
 #include "media_nodes/codecs/pcm_resampler.hpp"
@@ -89,8 +88,8 @@ struct AudioCodecNode::Impl {
       discard_locked();
       changed.notify_all();
     }
-    owner.reportError(livekit::sdk::detail::graph_error(
-        with_context(std::move(error), {"codec", descriptor.id, owner.getName(), epoch})));
+    owner.report_failure(
+        with_context(std::move(error), {"codec", descriptor.id, owner.name(), epoch}));
   }
 
   void fail(std::string message) {
@@ -383,7 +382,7 @@ struct AudioCodecNode::Impl {
           const auto distance = int64_t(timestamp) - int64_t(sender_anchor->first);
           output.sender_capture_time_us = sender_anchor->second + distance * 1000000 / 48000;
         }
-        owner.publish(output);
+        owner.send(output);
       }
       const auto metrics = neteq->GetLifetimeStatistics();
       const auto state = neteq->GetOperationsAndState();
@@ -540,7 +539,10 @@ struct AudioCodecNode::Impl {
               frame.captured = packet_start->captured;
               frame.duration = std::chrono::milliseconds(packet_chunks * 10);
               frame.encoding_id = descriptor.encodings.front().id;
-              owner.publish(EncodedFrameEvent(std::move(frame)));
+              owner.send(EncodedFrameEvent(std::move(frame)));
+              if (owner.after_packet_) {
+                owner.after_packet_();
+              }
             }
             packet_start.reset();
           } else if (packet_chunks >= packet_length)
@@ -582,7 +584,7 @@ struct AudioCodecNode::Impl {
             output.captured = timing.captured;
             output.discontinuity = boundary;
             output.sender_capture_time_us = frame.sender_capture_time_us;
-            owner.publish(output);
+            owner.send(output);
           }
         }
         codec_epoch = timing.epoch;
@@ -600,32 +602,42 @@ struct AudioCodecNode::Impl {
 
 AudioCodecNode::AudioCodecNode(std::string name, TrackDescriptor descriptor, bool encode,
                                AudioCodecOptions options)
-    : GraphNode(name, nullptr),
+    : TrackNode(name),
       impl_(std::make_unique<Impl>(*this, std::move(descriptor), encode, options)) {}
 
 AudioCodecNode::~AudioCodecNode() {
   quiesce();
-  release();
 }
 
-bool AudioCodecNode::doInit() {
-  if (impl_->initialization_failure) {
-    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
-    return false;
+void AudioCodecNode::bind(graphflow::Binder& ports) {
+  if (impl_->encode) {
+    output<EncodedFrameEvent>(ports);
+  } else {
+    output<AudioFrameEvent>(ports);
   }
   if (impl_->encode) {
-    subscribe<AudioFrameEvent>([this](const auto& value) { impl_->raw(value); });
-    subscribe<SenderFeedbackEvent>([this](const auto& value) { impl_->update(value.feedback); });
+    ports.input(livekit::sdk::rtc::TrackPort<AudioFrameEvent>::in,
+                [this](const auto& value) { impl_->raw(value); });
+    ports.input(livekit::sdk::rtc::TrackPort<SenderFeedbackEvent>::in,
+                [this](const auto& value) { impl_->update(value.feedback); });
   } else
-    subscribe<EncodedFrameEvent>([this](const auto& value) { impl_->encoded(value.frame); });
-  return true;
+    ports.input(livekit::sdk::rtc::TrackPort<EncodedFrameEvent>::in,
+                [this](const auto& value) { impl_->encoded(value.frame); });
 }
 
-bool AudioCodecNode::doStart() {
+livekit::sdk::Result<void> AudioCodecNode::prepare() {
+  if (impl_->initialization_failure) {
+    report_failure(impl_->initialization_failure);
+    return start_error();
+  }
+  return livekit::sdk::Result<void>::success();
+}
+
+livekit::sdk::Result<void> AudioCodecNode::activate_graph() {
   {
     std::lock_guard lock(impl_->mutex);
     if (impl_->closed)
-      return false;
+      return start_error();
     impl_->active = true;
   }
   std::promise<livekit::sdk::Result<void>> started;
@@ -638,9 +650,9 @@ bool AudioCodecNode::doStart() {
   auto status = result.get();
   if (!status) {
     quiesce();
-    return false;
+    return start_error();
   }
-  return true;
+  return livekit::sdk::Result<void>::success();
 }
 
 void AudioCodecNode::quiesce() {
@@ -656,7 +668,7 @@ void AudioCodecNode::quiesce() {
     impl_->worker.join();
 }
 
-void AudioCodecNode::doStop() {
+void AudioCodecNode::stop_graph() {
   quiesce();
 }
 
@@ -669,8 +681,8 @@ Result<void> AudioCodecNode::status() const {
   if (impl_->initialization_failure) {
     return livekit::sdk::Result<void>::failure(impl_->initialization_failure);
   }
-  if (auto value = error()) {
-    return livekit::sdk::Result<void>::failure(livekit::sdk::detail::graph_failure(*value));
+  if (auto value = last_failure()) {
+    return livekit::sdk::Result<void>::failure(value);
   }
   return livekit::sdk::Result<void>::success();
 }

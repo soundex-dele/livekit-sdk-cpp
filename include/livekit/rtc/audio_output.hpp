@@ -66,8 +66,8 @@ class AudioOutputTrack final {
   // timestamp jump beyond max_latency flushes this track and reanchors it.
   bool write(const nodes::AudioFrameEvent&);
   Result<void> set_gain(float);  // 0..4; saturation happens after mixing all tracks.
-  void set_muted(bool);  // Clears only this track's queue on each transition.
-  void close();          // Fences this track out of subsequent render callbacks.
+  void set_muted(bool);          // Clears only this track's queue on each transition.
+  void close();                  // Fences this track out of subsequent render callbacks.
   AudioOutputTrackSnapshot snapshot() const;
 
  private:
@@ -80,7 +80,7 @@ class AudioOutputTrack final {
 
 namespace nodes {
 // One subscription sink. Many sinks can share one AudioOutputSession.
-class AudioOutputNode final : public graphflow::core::GraphNode {
+class AudioOutputNode final : public livekit::sdk::rtc::TrackNode {
  public:
   AudioOutputNode(std::string name, TrackId, std::shared_ptr<AudioOutputSession>);
   ~AudioOutputNode() override;
@@ -91,9 +91,10 @@ class AudioOutputNode final : public graphflow::core::GraphNode {
   Result<void> status() const;
 
  protected:
-  bool doInit() override;
-  bool doStart() override;
-  void doStop() override;
+  void bind(graphflow::Binder& ports) override;
+  Result<void> prepare() override;
+  Result<void> activate_graph() override;
+  void stop_graph() override;
 
  private:
   struct Impl;

@@ -10,7 +10,7 @@ using VideoSample = rtc::engine::VideoSample;
 using AudioSample = rtc::engine::AudioSample;
 using AudioOutputOptions = rtc::AudioOutputOptions;
 
-struct MediaGraphOptions;  // Optional GraphEngine extension: livekit/media_graph.hpp.
+struct MediaGraphOptions;  // Optional typed graph extension: livekit/media_graph.hpp.
 
 struct MediaPublishSpec {
   std::string name;

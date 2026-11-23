@@ -3,24 +3,22 @@
 #include "livekit/rtc/media_types.hpp"
 #include "livekit/rtc/events.hpp"
 #include "livekit/media.hpp"
-#include "core/graph_node.h"
+#include "livekit/rtc/track_node.hpp"
+
+namespace livekit::sdk::test {
+struct CodecWorkerProbe;
+}
 
 namespace livekit::sdk::rtc::nodes {
 // Immutable upright I420 pixels. Timestamp uses the track's 90 kHz clock;
 // epoch is captured when input is admitted, never retagged after reconnect.
-struct VideoFrameEvent : graphflow::core::EventT<VideoFrameEvent>, media::FrameTiming {
-  VideoFrameEvent() {
-    clock_rate = 90000;
-  }
-  std::shared_ptr<const livekit::sdk::VideoFrame> pixels;
-};
 
 // Optional engine media nodes, linked through LiveKit::RTCMedia. Each owns a
 // bounded worker and actual codec; neither creates a room or PeerConnection.
 // Encoder: VideoFrameEvent -> EncodedFrameEvent, SenderFeedbackEvent input.
 // Decoder: EncodedFrameEvent -> VideoFrameEvent, KeyframeRequestEvent output.
-// Downstream callbacks execute on the codec worker and must be nonblocking.
-class VideoCodecNode final : public graphflow::core::GraphNode {
+// Codec workers emit owned frames into bounded receiver mailboxes.
+class VideoCodecNode final : public livekit::sdk::rtc::TrackNode {
  public:
   VideoCodecNode(std::string name, TrackDescriptor, bool encode, VideoCodecOptions = {});
   ~VideoCodecNode() override;
@@ -31,11 +29,15 @@ class VideoCodecNode final : public graphflow::core::GraphNode {
   void quiesce();
 
  protected:
-  bool doInit() override;
-  bool doStart() override;
-  void doStop() override;
+  void bind(graphflow::Binder& ports) override;
+  Result<void> prepare() override;
+  Result<void> activate_graph() override;
+  void stop_graph() override;
 
  private:
+  // Internal test observer: installed before binding, called on the encoder worker only.
+  friend struct livekit::sdk::test::CodecWorkerProbe;
+  std::function<void()> after_packet_;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

@@ -1,5 +1,5 @@
 if(NOT TARGET utoolkit_logging)
-  add_subdirectory("${LIVEKIT_GRAPHFLOW_ROOT}/utoolkit/logging" "utoolkit-logging" EXCLUDE_FROM_ALL)
+  add_subdirectory("${LIVEKIT_LOGGING_ROOT}" "utoolkit-logging" EXCLUDE_FROM_ALL)
 endif()
 
 add_library(livekit_client_logging STATIC src/backends/livekit/logging.cpp)

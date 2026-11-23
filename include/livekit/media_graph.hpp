@@ -1,28 +1,27 @@
 #pragma once
 #include "livekit/media_engine.hpp"
 #include "livekit/rtc/input_node.hpp"
-#include "engine/graph_builder.h"
+#include "livekit/rtc/track_graph.hpp"
 #include <functional>
 #include <utility>
 
 namespace livekit::sdk::client {
-// Opt-in GraphEngine API; link LiveKit::MediaEngineGraph. Room remains graph-independent.
+// Opt-in typed track graph API; link LiveKit::MediaEngineGraph. Room remains graph-independent.
 // Nodes must be fresh, uniquely named, and exclusively owned by this pipeline.
 // On adoption the engine owns init/start/stop/release; never drive nodes externally.
 struct MediaGraph {
-  std::vector<std::shared_ptr<graphflow::core::GraphNode>> nodes;
-  std::vector<graphflow::engine::NodeConnection> connections;
+  std::vector<std::shared_ptr<rtc::TrackNode>> nodes;
+  std::vector<rtc::TrackConnection> connections;
 
   template <class Event>
   void connect(std::string from, std::string to) {
-    connections.push_back(
-        {std::move(from), std::move(to), graphflow::core::detail::prettyName<Event>(), {}});
+    connections.push_back(rtc::TrackConnection::between<Event>(std::move(from), std::move(to)));
   }
 
   // Optional synchronous hooks for custom producers. activate runs after all
   // nodes start; false fails publication/subscription. quiesce must fence custom
   // workers before downstream nodes stop, including partial initialization failure.
-  // Hooks may report precise failures through GraphNode::reportError.
+  // Hooks may report precise failures through TrackNode::report_failure.
   std::function<bool()> activate;
   std::function<void()> quiesce;
 };

@@ -1,6 +1,5 @@
 #include "editor_internal.hpp"
 #include "effects.hpp"
-#include "engine/graph_engine.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -350,41 +349,6 @@ void composite(EditorImage& out, const EditorImage& input, const EditorClip& c) 
   }
 }
 
-class Stage final : public FlowNode {
- public:
-  enum class Routing { next, clip, result };
-
-  Stage(std::string name, graphflow::core::EventBus* bus, std::function<void(Work&)> fn,
-        Routing routing = Routing::next)
-      : FlowNode(name, bus), fn_(std::move(fn)), routing_(routing) {}
-
-  void send(const std::shared_ptr<Work>& work) {
-    Layer layer;
-    layer.work = work;
-    send_layer(layer);
-  }
-
- protected:
-  bool doInit() override {
-    subscribe<Layer>([this](Layer& layer) {
-      if (!layer.work->error) {
-        fn_(*layer.work);
-      }
-      if (routing_ == Routing::clip) {
-        send_layer(layer, effect_route(layer.work->clip->id, "pipeline"));
-      } else if (routing_ == Routing::result && layer.work->transition) {
-        send_layer(layer, effect_route(layer.work->transition->owner, "transition"));
-      } else {
-        send_layer(layer);
-      }
-    });
-    return true;
-  }
-
- private:
-  std::function<void(Work&)> fn_;
-  Routing routing_;
-};
 }  // namespace
 
 Result<EditorProbe> probe(const std::string& path, std::atomic<bool>& cancel) {
@@ -472,56 +436,28 @@ Result<EditorProbe> probe(const std::string& path, std::atomic<bool>& cancel) {
 class RenderGraph::Impl {
  public:
   Impl(const EditorProject& p, std::atomic<bool>& cancel) : project(p), cancel(cancel) {
-    clock = std::make_shared<Stage>("editor.timeline", engine.eventBus(), [](Work&) {});
-    decode =
-        std::make_shared<Stage>("editor.decode", engine.eventBus(), [this](Work& w) { read(w); });
-    compose = std::make_shared<Stage>("editor.composite", engine.eventBus(), [](Work& w) {
+    if (auto valid = editor_validate(project); !valid) {
+      graph_error = valid.failure_record();
+      return;
+    }
+    callbacks.decode = [this](Work& w) { read(w); };
+    callbacks.composite = [](Work& w) {
       if (w.image) {
         composite(w.output->image, *w.image, *w.clip);
       }
-    });
-    mix = std::make_shared<Stage>("editor.mix", engine.eventBus(), [](Work& w) {
+    };
+    callbacks.mix = [](Work& w) {
       for (size_t i = 0; i < w.audio.size(); ++i) {
         w.output->audio[i] += w.audio[i] * float(w.clip->volume);
       }
-    });
-    route = std::make_shared<Stage>(
-        "editor.route", engine.eventBus(), [](Work&) {}, Stage::Routing::clip);
-    result_route = std::make_shared<Stage>(
-        "editor.result_route", engine.eventBus(), [](Work&) {}, Stage::Routing::result);
-    output = std::make_shared<Stage>("editor.output", engine.eventBus(), [](Work& w) {
-      w.delivered = true;
-      if (w.transition) {
-        w.transition->delivered = true;
-      }
-    });
-    auto plan =
-        EffectNodes::prepare(project, engine.eventBus(), [this](Work& w) { finish_audio(w); });
-    if (!plan) {
-      graph_error = plan.failure_record();
-      return;
+    };
+    callbacks.finish_audio = [this](Work& w) { finish_audio(w); };
+    auto candidate = RenderPipeline::build(project, callbacks, nullptr);
+    if (candidate) {
+      pipeline = std::move(*candidate);
+    } else {
+      graph_error = candidate.failure_record();
     }
-    effects = std::move(*plan);
-    auto nodes = base_nodes();
-    auto connections = base_connections();
-    effects->append_to(nodes, connections);
-    ready = engine.loadFromNodes(nodes, connections) && engine.init() && engine.start();
-  }
-
-  ~Impl() {
-    engine.release();
-  }
-
-  std::vector<std::shared_ptr<graphflow::core::GraphNode>> base_nodes() const {
-    return {output, result_route, mix, compose, route, decode, clock};
-  }
-
-  static std::vector<graphflow::engine::NodeConnection> base_connections() {
-    return {{"editor.timeline", "editor.decode"},
-            {"editor.decode", "editor.route"},
-            {"editor.composite", "editor.mix"},
-            {"editor.mix", "editor.result_route"},
-            {"editor.result_route", "editor.output"}};
   }
 
   struct FileStamp {
@@ -548,31 +484,18 @@ class RenderGraph::Impl {
     if (!valid) {
       return valid;
     }
-    if (!ready || cancel) {
+    if (!pipeline || cancel) {
       return Result<void>::failure(
           failure("reload: graph unavailable or cancelled",
                   cancel ? ErrorCode::cancelled : ErrorCode::invalid_state));
     }
     // All stages and synchronous Work pointers belong to the same owner worker.
     // No previous render can still refer to project/clip storage at this point.
-    auto plan = EffectNodes::prepare(
-        next, engine.eventBus(), [this](Work& w) { finish_audio(w); }, effects.get());
-    if (!plan) {
-      return Result<void>::failure(plan.failure_record());
+    auto candidate = RenderPipeline::build(next, callbacks, pipeline.get());
+    if (!candidate) {
+      return Result<void>::failure(candidate.failure_record());
     }
-    auto nodes = base_nodes();
-    auto connections = base_connections();
-    (*plan)->append_to(nodes, connections);
-    auto result = engine.reloadFromNodesDetailed(nodes, connections);
-    if (result.status != graphflow::engine::ReloadStatus::Committed) {
-      // A failed rollback or post-commit cleanup cannot safely use the old plan.
-      if (result.committed() || result.status == graphflow::engine::ReloadStatus::RecoveryFailed) {
-        ready = false;
-      }
-      return Result<void>::failure(
-          failure("reload: " + result.message, ErrorCode::recovery_failed));
-    }
-    effects = std::move(*plan);
+    pipeline = std::move(*candidate);
     ++topology_reloads;
     for (auto it = decoders.begin(); it != decoders.end();) {
       const auto& old = it->second.asset;
@@ -726,18 +649,10 @@ class RenderGraph::Impl {
   }
 
   Result<std::shared_ptr<EditorFrame>> render(int64_t frame, uint64_t generation) {
-    if (!ready) {
+    if (!pipeline) {
       return Result<std::shared_ptr<EditorFrame>>::failure(
           graph_error ? graph_error : failure("render: graph unavailable"));
     }
-
-    struct FrameCleanup {
-      EffectNodes& nodes;
-
-      ~FrameCleanup() {
-        nodes.finish_frame();
-      }
-    } cleanup{*effects};
 
     auto out = std::make_shared<EditorFrame>();
     out->frame = frame;
@@ -797,7 +712,7 @@ class RenderGraph::Impl {
               asset->image
                   ? 0
                   : clip.source_in + int64_t(std::floor((frame - clip.position) * clip.speed));
-          clock->send(work);
+          pipeline->render(work);
           if (work->error) {
             return Result<std::shared_ptr<EditorFrame>>::failure(work->error);
           }
@@ -830,7 +745,7 @@ class RenderGraph::Impl {
         work->asset = asset == project.assets.end() ? nullptr : &*asset;
         work->source_frame =
             clip.source_in + int64_t(std::floor((frame - clip.position) * clip.speed));
-        clock->send(work);
+        pipeline->render(work);
         if (work->error) {
           return Result<std::shared_ptr<EditorFrame>>::failure(
               with_context(work->error, {"editor.render", track.id, clip.id, generation}));
@@ -861,16 +776,14 @@ class RenderGraph::Impl {
   };
 
   std::map<std::string, AudioBlock> audio_cache;
-  std::unique_ptr<EffectNodes> effects;
+  RenderPipeline::Callbacks callbacks;
+  std::unique_ptr<RenderPipeline> pipeline;
   Failure graph_error;
   EditorProject project;
   std::atomic<bool>& cancel;
-  graphflow::engine::GraphEngine engine{1};
-  std::shared_ptr<Stage> clock, decode, route, compose, mix, result_route, output;
   std::map<std::string, Entry> decoders;
   uint64_t access = 0;
   size_t decoder_opens = 0, topology_reloads = 0;
-  bool ready = false;
 };
 
 RenderGraph::RenderGraph(const EditorProject& p, std::atomic<bool>& cancel)
@@ -887,19 +800,8 @@ RenderGraphStats RenderGraph::stats() const {
   stats.decoder_opens = impl_->decoder_opens;
   stats.cached_decoders = impl_->decoders.size();
   stats.topology_reloads = impl_->topology_reloads;
-  stats.reused_effect_nodes = impl_->effects ? impl_->effects->reused_nodes() : 0;
-  // Inspect the actual engine, not merely the proposed effect plan.
-  for (const auto& path : impl_->engine.paths()) {
-    for (const auto& node : path->getNodes()) {
-      RenderGraphStats::Node info{node->getName(), reinterpret_cast<uintptr_t>(node.get()), {}};
-      auto graph_node = std::dynamic_pointer_cast<graphflow::core::GraphNode>(node);
-      if (graph_node) {
-        for (const auto& edge : graph_node->getPubEdges()) {
-          info.outputs.push_back(edge.name());
-        }
-      }
-      stats.nodes.push_back(std::move(info));
-    }
+  if (impl_->pipeline) {
+    impl_->pipeline->inspect(stats);
   }
   return stats;
 }

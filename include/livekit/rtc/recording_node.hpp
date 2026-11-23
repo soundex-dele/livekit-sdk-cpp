@@ -14,7 +14,7 @@ struct RecordingSnapshot {
 // a branch error, never a silent hole in a supposedly complete recording.
 // Y4M uses nominal 30 fps; these files do not preserve RTP timing or A/V sync.
 // A new epoch or format starts a new file. Existing paths are never overwritten.
-class RecordingNode final : public graphflow::core::GraphNode {
+class RecordingNode final : public livekit::sdk::rtc::TrackNode {
  public:
   RecordingNode(std::string name, std::filesystem::path directory, TrackId, MediaKind);
   ~RecordingNode() override;
@@ -23,9 +23,10 @@ class RecordingNode final : public graphflow::core::GraphNode {
   Result<void> status() const;
 
  protected:
-  bool doInit() override;
-  bool doStart() override;
-  void doStop() override;
+  void bind(graphflow::Binder& ports) override;
+  Result<void> prepare() override;
+  Result<void> activate_graph() override;
+  void stop_graph() override;
 
  private:
   struct Impl;

@@ -56,9 +56,13 @@ TrackDescriptor audio() {
   return d;
 }
 
-class Feedback : public graphflow::core::GraphNode {
+class Feedback : public livekit::sdk::rtc::TrackNode {
  public:
-  Feedback() : GraphNode("feedback", nullptr) {}
+  void bind(graphflow::Binder& ports) override {
+    output<nodes::SenderFeedbackEvent>(ports);
+  }
+
+  Feedback() : TrackNode("feedback") {}
 
   void send(Epoch epoch, uint64_t revision = 1, uint64_t generation = 0, bool key = false,
             bool active = true) {
@@ -67,13 +71,13 @@ class Feedback : public graphflow::core::GraphNode {
     value.revision = revision;
     value.media_generation = generation;
     value.encodings[""] = {64000, active, key, key ? revision : 0};
-    publish(nodes::SenderFeedbackEvent(value));
+    TrackNode::send(nodes::SenderFeedbackEvent(value));
   }
 };
 
-class Output : public graphflow::core::GraphNode {
+class Output : public livekit::sdk::rtc::TrackNode {
  public:
-  Output() : GraphNode("output", nullptr) {}
+  Output() : TrackNode("output") {}
 
   std::mutex mutex;
   std::condition_variable changed;
@@ -89,23 +93,25 @@ class Output : public graphflow::core::GraphNode {
   }
 
  protected:
-  bool doInit() override {
-    subscribe<nodes::VideoFrameEvent>([this](const auto& event) {
-      std::unique_lock lock(mutex);
-      videos.push_back(event);
-      entered = true;
-      changed.notify_all();
-      changed.wait(lock, [&] { return !block; });
-    });
-    subscribe<nodes::AudioFrameEvent>([this](const auto& event) {
-      std::lock_guard lock(mutex);
-      audios.push_back(event);
-    });
-    subscribe<nodes::EncodedFrameEvent>([this](const auto& event) {
-      std::lock_guard lock(mutex);
-      packets.push_back(event.frame);
-    });
-    return true;
+  void bind(graphflow::Binder& ports) override {
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::VideoFrameEvent>::in,
+                [this](const auto& event) {
+                  std::unique_lock lock(mutex);
+                  videos.push_back(event);
+                  entered = true;
+                  changed.notify_all();
+                  changed.wait(lock, [&] { return !block; });
+                });
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::AudioFrameEvent>::in,
+                [this](const auto& event) {
+                  std::lock_guard lock(mutex);
+                  audios.push_back(event);
+                });
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::EncodedFrameEvent>::in,
+                [this](const auto& event) {
+                  std::lock_guard lock(mutex);
+                  packets.push_back(event.frame);
+                });
   }
 };
 
@@ -113,25 +119,25 @@ struct Graph {
   std::shared_ptr<Feedback> feedback = std::make_shared<Feedback>();
   std::shared_ptr<Output> output = std::make_shared<Output>();
   std::shared_ptr<nodes::MediaInputNode> input;
-  graphflow::engine::GraphEngine graph{1};
+  graphflow::Graph graph;
 
   Graph(TrackDescriptor d, nodes::MediaInputOptions options) {
     input = std::make_shared<nodes::MediaInputNode>("input", d, std::move(options));
 
-    check(graph.loadFromNodes({output, input, feedback},
-                              {livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(feedback, input),
-                               livekit::sdk::test::connect<nodes::VideoFrameEvent>(input, output),
-                               livekit::sdk::test::connect<nodes::AudioFrameEvent>(input, output),
-                               livekit::sdk::test::connect<nodes::EncodedFrameEvent>(input, output)}) &&
-              graph.init() && graph.start(),
+    check(livekit::sdk::rtc::wire_track_graph(
+              graph, {output, input, feedback},
+              {livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(feedback, input),
+               livekit::sdk::test::connect<nodes::VideoFrameEvent>(input, output),
+               livekit::sdk::test::connect<nodes::AudioFrameEvent>(input, output),
+               livekit::sdk::test::connect<nodes::EncodedFrameEvent>(input, output)}) &&
+              graph.start(),
           "Input graph start failed");
   }
 
   ~Graph() {
     output->unblock();
     input->quiesce();
-    graph.stop();
-    graph.release();
+    (void)graph.close();
   }
 };
 
@@ -185,6 +191,7 @@ void microphone_input() {
   std::this_thread::sleep_for(20ms);
   check(driver->starts == 0, "Microphone opened before binding feedback");
   first.feedback->send(1);
+  livekit::sdk::test::wait_receiver(first.graph, "input");
   eventually([&] { return driver->starts == 1; }, "Microphone did not start with input graph");
   driver->push(std::vector<int16_t>(160, 5000), 16000);
   eventually(
@@ -207,6 +214,7 @@ void microphone_input() {
     check(peak > 1000, "Microphone resampler produced silence");
   }
   first.feedback->send(2);
+  livekit::sdk::test::wait_receiver(first.graph, "input");
   driver->push(std::vector<int16_t>(480, 7000));
   eventually(
       [&] {
@@ -228,6 +236,7 @@ void microphone_input() {
         "Microphone callback survived quiescence");
   Graph replacement(audio(), options);
   replacement.feedback->send(3);
+  livekit::sdk::test::wait_receiver(replacement.graph, "input");
   media_result(replacement.input->activate());
   eventually([&] { return driver->starts == 2; },
              "Retained microphone could not restart in replacement graph");
@@ -339,13 +348,16 @@ void generated_demand() {
   options.generated = true;
   Graph graph(descriptor, options);
   graph.feedback->send(1, 1, 0, false, false);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   media_result(graph.input->activate());
   std::this_thread::sleep_for(100ms);
   check(graph.input->snapshot().emitted == 0, "Generated source ran while initial demand was OFF");
   graph.feedback->send(1, 2, 0, true, true);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   eventually([&] { return graph.input->snapshot().emitted >= 3; },
              "Generated source did not resume");
   graph.feedback->send(1, 3, 0, false, false);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   // Allow already-admitted delivery to finish before taking the stable baseline.
   std::this_thread::sleep_for(50ms);
   const auto paused = graph.input->snapshot().emitted;
@@ -353,9 +365,11 @@ void generated_demand() {
   check(graph.input->snapshot().emitted == paused,
         "Generated source kept producing while demand was OFF");
   graph.feedback->send(1, 4, 0, true, true);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   eventually([&] { return graph.input->snapshot().emitted >= paused + 3; },
              "Generated source did not restart with same epoch");
   graph.feedback->send(1, 5, 0, false, false);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   graph.input->quiesce();
   media_result(graph.input->status());
 }
@@ -370,7 +384,9 @@ void generated() {
   check(a.input->snapshot().emitted == 0 && v.input->snapshot().emitted == 0,
         "Input produced before binding feedback");
   a.feedback->send(1);
+  livekit::sdk::test::wait_receiver(a.graph, "input");
   v.feedback->send(1);
+  livekit::sdk::test::wait_receiver(v.graph, "input");
   eventually(
       [&] {
         std::lock_guard lock(a.output->mutex);
@@ -430,6 +446,7 @@ void application_video() {
   options.video_source = source;
   Graph graph(video(), options);
   graph.feedback->send(1);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   media_result(graph.input->activate());
   {
     std::lock_guard lock(graph.output->mutex);
@@ -447,6 +464,7 @@ void application_video() {
       pixels(20),
       SteadyClock::now() + 50ms));  // Even a future-stamped old generation must be flushed.
   graph.feedback->send(2);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   check(source->stats().queued_frames == 0, "Epoch retained source queue");
   check(media_result(source->write(pixels(30))) == livekit::sdk::VideoWriteStatus::accepted,
         "New epoch pixels rejected");
@@ -454,7 +472,7 @@ void application_video() {
   eventually(
       [&] {
         std::lock_guard lock(graph.output->mutex);
-        return graph.output->videos.size() >= 2;
+        return !graph.output->videos.empty() && graph.output->videos.back().epoch == 2;
       },
       "New epoch first frame lost");
   {
@@ -463,6 +481,7 @@ void application_video() {
           "Old source frame retagged as current epoch");
   }
   graph.feedback->send(2, 2, 1);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   check(source->stats().queued_frames == 0, "Mute generation retained source queue");
   const auto begin = SteadyClock::now();
   graph.input->quiesce();
@@ -470,6 +489,7 @@ void application_video() {
         "Quiescence did not release blocked reader/lease");
   Graph replacement(video(), options);
   replacement.feedback->send(3);
+  livekit::sdk::test::wait_receiver(replacement.graph, "input");
   media_result(replacement.input->activate());
   check(media_result(source->write(pixels(40))) == livekit::sdk::VideoWriteStatus::accepted,
         "Quiesced source could not be rebound");
@@ -490,6 +510,7 @@ void application_audio() {
   options.audio_source = source;
   Graph graph(audio(), options);
   graph.feedback->send(1);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   media_result(graph.input->activate());
   livekit::sdk::PcmInputFrame data;
   data.samples.assign(441 * 2 * 4, 1234);
@@ -537,6 +558,7 @@ void encoded_audio() {
   options.encoded_source = source;
   Graph graph(audio(), options);
   graph.feedback->send(1);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   media_result(graph.input->activate());
   for (uint32_t timestamp : {0xffffff00u, 0x000002c0u}) {
     livekit::sdk::EncodedMediaFrame frame;
@@ -566,6 +588,7 @@ void encoded_audio() {
   std::this_thread::sleep_for(20ms);
   const auto reset = SteadyClock::now();
   graph.feedback->send(2);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   livekit::sdk::EncodedMediaFrame frame;
   frame.data = {0xf8, 0xff, 0xfe};
   frame.rtp_timestamp = 960;
@@ -593,6 +616,7 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://partial-pcm";
   Graph finite(audio(), options);
   finite.feedback->send(1);
+  livekit::sdk::test::wait_receiver(finite.graph, "input");
   media_result(finite.input->activate());
   eventually([&] { return finite.input->snapshot().finished; }, "Finite input did not finish");
   media_result(finite.input->status());
@@ -606,6 +630,7 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://blocked";
   Graph blocked(audio(), options);
   blocked.feedback->send(1);
+  livekit::sdk::test::wait_receiver(blocked.graph, "input");
   media_result(blocked.input->activate());
   eventually(
       [&] {
@@ -619,6 +644,7 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://eof-blocked";
   Graph eof(audio(), options);
   eof.feedback->send(1);
+  livekit::sdk::test::wait_receiver(eof.graph, "input");
   media_result(eof.input->activate());
   eventually(
       [&] {
@@ -633,6 +659,7 @@ void process_inputs(const std::string& executable) {
   options.input = "rtc-test://truncated-video";
   Graph malformed(video(), options);
   malformed.feedback->send(1);
+  livekit::sdk::test::wait_receiver(malformed.graph, "input");
   media_result(malformed.input->activate());
   eventually([&] { return malformed.input->snapshot().finished; }, "Malformed input hung");
   check(!malformed.input->snapshot().error.empty(), "Truncated I420 accepted");
@@ -720,6 +747,7 @@ void real_ffmpeg(const std::string& ffmpeg) {
   options.input = path;
   Graph graph(audio(), options);
   graph.feedback->send(1);
+  livekit::sdk::test::wait_receiver(graph.graph, "input");
   media_result(graph.input->activate());
   eventually([&] { return graph.input->snapshot().finished; }, "Real FFmpeg input did not finish");
   media_result(graph.input->status());

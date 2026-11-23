@@ -37,19 +37,20 @@ struct MediaInputOptions {
 // Raw sources emit VideoFrameEvent/AudioFrameEvent; encoded sources emit
 // EncodedFrameEvent directly. Connect SenderFeedbackEvent from the RTC sink.
 // Delivery is synchronous on the producer thread; consumers must not block.
-class MediaInputNode final : public graphflow::core::GraphNode {
+class MediaInputNode final : public livekit::sdk::rtc::TrackNode {
  public:
   MediaInputNode(std::string name, TrackDescriptor, MediaInputOptions);
   ~MediaInputNode() override;
   Result<void> activate();  // TrackGraphSpec::activate, after downstream graph start.
-  void quiesce();   // TrackGraphSpec::quiesce, before downstream graph stop.
+  void quiesce();           // TrackGraphSpec::quiesce, before downstream graph stop.
   MediaInputSnapshot snapshot() const;
   Result<void> status() const;
 
  protected:
-  bool doInit() override;
-  bool doStart() override;
-  void doStop() override;
+  void bind(graphflow::Binder& ports) override;
+  Result<void> prepare() override;
+  Result<void> activate_graph() override;
+  void stop_graph() override;
 
  private:
   struct Impl;

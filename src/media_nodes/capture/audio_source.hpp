@@ -5,6 +5,9 @@
 namespace livekit::sdk::detail {
 class PcmSourceWriter {
  public:
+  // Studio's independently paced program outputs keep three blocks of playout headroom.
+  // No change to capture timestamps, encoder admission, or other PCM producers.
+  static std::shared_ptr<PcmAudioSource> studioOutput(PcmSourceOptions);
   // Reject an in-flight device callback if the reader was reset meanwhile.
   static Result<AudioWriteStatus> write(PcmAudioSource& source, const PcmInputFrame& frame,
                                         uint64_t generation) {

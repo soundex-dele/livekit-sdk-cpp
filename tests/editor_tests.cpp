@@ -416,7 +416,7 @@ void media(const std::filesystem::path& dir) {
   check(!std::filesystem::exists(dir / "missing-output.mp4"), "failed export not published");
 }
 
-void hot_reload(const std::filesystem::path& dir) {
+void hot_reload(const std::filesystem::path& dir, std::ostream* capture = nullptr) {
   std::atomic<bool> cancel{false};
   auto red = editor_detail::probe((dir / "red.mp4").u8string(), cancel);
   auto blue = editor_detail::probe((dir / "blue.png").u8string(), cancel);
@@ -441,6 +441,11 @@ void hot_reload(const std::filesystem::path& dir) {
     auto expected = cold.render(frame, 42);
     if (!good(actual, "hot render") || !good(expected, "cold reference")) {
       return;
+    }
+    // Optional raw RGBA + native stereo float stream for migration A/B runs.
+    if (capture) {
+      capture->write(reinterpret_cast<const char*>((*actual)->image.rgba.data()), (*actual)->image.rgba.size());
+      capture->write(reinterpret_cast<const char*>((*actual)->audio.data()), (*actual)->audio.size() * sizeof(float));
     }
     check((*actual)->generation == 42, "new generation delivered");
     check((*actual)->image.rgba == (*expected)->image.rgba, "hot image equals cold image");
@@ -531,8 +536,7 @@ void hot_reload(const std::filesystem::path& dir) {
   good(graph.update_project(EditorProject{}), "clear project");
   check(graph.stats().cached_decoders == 0, "removed asset releases decoder");
 
-  // The actual main GraphEngine owns algorithms and converters. Parameter edits
-  // replace only affected algorithms; unchanged nodes keep their instances.
+  // Observe the installed render topology, not the candidate project description.
   auto instance = [&](const std::string& id) -> uintptr_t {
     for (const auto& node : graph.stats().nodes) {
       if (node.id == id) {
@@ -556,13 +560,9 @@ void hot_reload(const std::filesystem::path& dir) {
   p.tracks[0].clips[0].color.saturation = .4;
   good(graph.update_project(p), "add color algorithm branch");
   const std::string color = "editor.clip.3:red.color";
-  const auto converter = instance(color + ".rgba_to_rgb");
-  const auto grade = instance(color + ".grade");
-  const auto saturation = instance(color + ".saturation_contrast");
+  const auto color_stage = instance(color);
   const auto main_stage = instance("editor.decode");
-  check(graph.stats().nodes.size() == 11 && converter && grade && saturation &&
-            instance(color + ".rgb_to_rgba"),
-        "color algorithms and converters in main graph");
+  check(graph.stats().nodes.size() == 8 && color_stage, "typed color branch installed");
   auto connected = [&](const std::string& from, const std::string& to) {
     for (const auto& node : graph.stats().nodes) {
       if (node.id == from) {
@@ -572,27 +572,24 @@ void hot_reload(const std::filesystem::path& dir) {
     }
     return false;
   };
-  check(connected("editor.decode", "editor.route") &&
-            connected("editor.route", color + ".rgba_to_rgb") &&
-            connected(color + ".rgba_to_rgb", color + ".grade") &&
-            connected(color + ".grade", color + ".saturation_contrast") &&
-            connected(color + ".saturation_contrast", color + ".rgb_to_rgba") &&
-            connected(color + ".rgb_to_rgba", "editor.composite") &&
-            !connected("editor.decode", "editor.composite"),
-        "conversion and algorithm edges belong to main graph");
+  check(connected("editor.decode", "editor.route") && connected("editor.route", color) &&
+            connected(color, "editor.composite") && !connected("editor.decode", "editor.composite"),
+        "color branch rejoins composition");
   matches_cold(p, 5);
   p.tracks[0].clips[0].color.brightness = .2;
   good(graph.update_project(p), "change color algorithm parameters");
-  check(instance(color + ".grade") != grade && instance(color + ".rgba_to_rgb") == converter &&
-            instance(color + ".saturation_contrast") == saturation &&
-            instance("editor.decode") == main_stage && graph.stats().reused_effect_nodes == 3,
-        "only changed algorithm replaced, converters and main stage reused");
+  check(
+      instance(color) && instance(color) != color_stage && instance("editor.decode") == main_stage,
+      "changed color branch replaced without rebuilding main stages");
   matches_cold(p, 5);
   // A different clip must not receive this clip's effect or stale result.
   matches_cold(p, 35);
+  const auto red_color_branch = instance(color);
   p.tracks[0].clips[1].color.temperature = .5;
   good(graph.update_project(p), "add second clip color branch");
-  check(graph.stats().nodes.size() == 15, "per-clip branches coexist");
+  check(graph.stats().nodes.size() == 9 && instance(color) == red_color_branch &&
+            graph.stats().reused_effect_nodes == 1,
+        "unchanged clip retains its color graph");
   matches_cold(p, 35);
   matches_cold(p, 5);
   p.tracks[0].clips[1].color = {};
@@ -600,15 +597,9 @@ void hot_reload(const std::filesystem::path& dir) {
   p.tracks[0].clips[0].duration = 20;
   good(graph.update_project(p), "add audio algorithm branch");
   const std::string audio = "editor.clip.3:red.audio";
-  check(instance(audio + ".float_to_audio") && instance(audio + ".time_stretch") &&
-            instance(audio + ".audio_to_float"),
-        "audio algorithm and converters in main graph");
-  check(connected(color + ".rgb_to_rgba", audio + ".float_to_audio") &&
-            connected(audio + ".audio_to_float", audio + ".window") &&
-            connected(audio + ".window", "editor.composite") &&
-            connected(audio + ".float_to_audio", audio + ".window") &&
-            connected(color + ".rgba_to_rgb", audio + ".float_to_audio"),
-        "graph edges order color, stretch, audio window and composition");
+  check(instance(audio + ".time_stretch") && connected(color,audio + ".time_stretch") &&
+        connected(audio + ".time_stretch",audio + ".window") && connected(audio + ".window","editor.composite"),
+        "working PCM passes through stretch, window and composition");
   matches_cold(p, 5);
   // Cache hits and absent media still traverse explicit bypass edges to output.
   matches_cold(p, 6);
@@ -630,14 +621,13 @@ void hot_reload(const std::filesystem::path& dir) {
   p.tracks[0].clips[0].transition = {"blue", "fade", 10};
   good(graph.update_project(p), "remove stretch and add transition branch");
   const std::string transition = "editor.clip.3:red.transition";
-  const auto transition_converter = instance(transition + ".rgba_to_rgb");
+  const auto transition_join = instance(transition + ".join");
   const auto transition_algorithm = instance(transition + ".transition");
-  check(!instance(audio + ".time_stretch") && transition_converter && transition_algorithm &&
-            instance(transition + ".rgb_to_rgba"),
+  check(!instance(audio + ".time_stretch") && transition_join && transition_algorithm,
         "dynamic audio removal and transition addition");
   check(connected("editor.result_route", transition + ".join") &&
-            connected(transition + ".join", transition + ".rgba_to_rgb") &&
-            connected(transition + ".rgb_to_rgba", transition + ".commit") &&
+            connected(transition + ".join", transition + ".transition") &&
+            connected(transition + ".transition", transition + ".commit") &&
             connected(transition + ".commit", "editor.output"),
         "transition joins both layer events and publishes through to output");
   for (const auto frame : {25, 29, 34}) {
@@ -646,8 +636,8 @@ void hot_reload(const std::filesystem::path& dir) {
   p.tracks[0].clips[0].transition.effect = "wipe";
   good(graph.update_project(p), "replace transition algorithm");
   check(instance(transition + ".transition") != transition_algorithm &&
-            instance(transition + ".rgba_to_rgb") == transition_converter,
-        "transition replacement reuses converter");
+            instance(transition + ".join") == transition_join,
+        "transition replacement reuses join processor");
   matches_cold(p, 29);
   p.tracks[0].clips[0].transition = {};
   p.tracks[0].clips[0].color = {};
@@ -732,14 +722,22 @@ void hot_reload(const std::filesystem::path& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3) {
+  if (argc != 3 && !(argc == 4 && std::string(argv[1]) == "hot_reload")) {
     return 2;
   }
   const auto dir = std::filesystem::u8path(argv[2]);
   if (std::string(argv[1]) == "model") {
     model(dir);
   } else if (std::string(argv[1]) == "hot_reload") {
-    hot_reload(dir);
+    if (argc == 4) {
+      std::ofstream capture(std::filesystem::u8path(argv[3]), std::ios::binary);
+      if (!capture) { return 2; }
+      hot_reload(dir,&capture);
+      capture.close();
+      check(bool(capture),"frame capture written");
+    } else {
+      hot_reload(dir);
+    }
   } else if (std::string(argv[1]) == "advanced") {
     advanced(dir);
   } else {

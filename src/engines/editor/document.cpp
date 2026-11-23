@@ -125,11 +125,10 @@ Result<void> editor_validate(const EditorProject& p) {
       }
       if (!finite(c.speed, .25, 4) || !finite(c.rotation, -36000, 36000) || c.fade_in < 0 ||
           c.fade_out < 0 || c.fade_in + c.fade_out > c.duration ||
-          !finite(c.color.brightness, -2, 2) || !finite(c.color.contrast, 0, 3) ||
-          !finite(c.color.saturation, 0, 3) || !finite(c.color.temperature, -1, 1) ||
-          c.text.color > 0xFFFFFF || c.text.outline_color > 0xFFFFFF ||
-          c.text.content.size() > 65536 || c.text.size < 8 || c.text.size > 512 ||
-          c.text.alignment < 1 || c.text.alignment > 9 || !finite(c.text.outline, 0, 20)) {
+          !editor_detail::valid_color(c.color) || c.text.color > 0xFFFFFF ||
+          c.text.outline_color > 0xFFFFFF || c.text.content.size() > 65536 || c.text.size < 8 ||
+          c.text.size > 512 || c.text.alignment < 1 || c.text.alignment > 9 ||
+          !finite(c.text.outline, 0, 20)) {
         return Result<void>::failure(failure("clip: invalid effect properties"));
       }
       std::set<std::string> properties;

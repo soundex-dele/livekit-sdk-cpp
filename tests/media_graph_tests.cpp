@@ -181,51 +181,61 @@ MediaPublishSpec video() {
   return spec;
 }
 
-class EncodedSource final : public graphflow::core::GraphNode {
+class EncodedSource final : public livekit::sdk::rtc::TrackNode {
  public:
-  explicit EncodedSource(std::string name = "source") : GraphNode(std::move(name), nullptr) {}
+  explicit EncodedSource(std::string name = "source") : TrackNode(std::move(name)) {}
 
+  std::thread::id owner;
   std::atomic<int> emitted{0}, stopped{0}, released{0};
   Failure failure;
   bool fail_init = false, fail_start = false;
 
   void fail() {
-    reportError({failure->message, failure});
+    report_failure(failure);
   }
 
  protected:
-  bool doInit() override {
+  void bind(graphflow::Binder& ports) override {
+    output<nodes::EncodedFrameEvent>(ports);
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::SenderFeedbackEvent>::in,
+                [this](const auto& event) {
+                  const auto encoding = event.feedback.encodings.find("");
+                  if (encoding == event.feedback.encodings.end() || !encoding->second.active) {
+                    return;
+                  }
+                  rtc::EncodedFrame frame;
+                  frame.buffer = rtc::EncodedBuffer(fixture_video(rtc::Codec::vp8, false));
+                  frame.timestamp = uint64_t(++emitted) * 6000;
+                  frame.duration = 66667us;
+                  frame.epoch = event.feedback.epoch;
+                  frame.config_revision = 1;
+                  frame.keyframe = true;
+                  frame.captured = SteadyClock::now();
+                  send(nodes::EncodedFrameEvent(std::move(frame)));
+                });
+  }
+
+  livekit::sdk::Result<void> prepare() override {
+    owner = std::this_thread::get_id();
     if (fail_init) {
       fail();
-      return false;
+      return start_error();
     }
-    subscribe<nodes::SenderFeedbackEvent>([this](const auto& event) {
-      const auto encoding = event.feedback.encodings.find("");
-      if (encoding == event.feedback.encodings.end() || !encoding->second.active) {
-        return;
-      }
-      rtc::EncodedFrame frame;
-      frame.buffer = rtc::EncodedBuffer(fixture_video(rtc::Codec::vp8, false));
-      frame.timestamp = uint64_t(++emitted) * 6000;
-      frame.duration = 66667us;
-      frame.epoch = event.feedback.epoch;
-      frame.config_revision = 1;
-      frame.keyframe = true;
-      frame.captured = SteadyClock::now();
-      publish(nodes::EncodedFrameEvent(std::move(frame)));
-    });
-    return true;
+    return livekit::sdk::Result<void>::success();
   }
 
-  bool doStart() override {
-    return !fail_start;
+  livekit::sdk::Result<void> activate_graph() override {
+    check(owner == std::this_thread::get_id(), "graph starts on initialization thread");
+    return fail_start ? start_error() : livekit::sdk::Result<void>::success();
   }
 
-  void doStop() override {
+  void stop_graph() override {
+    check(owner == std::this_thread::get_id(), "graph stops on initialization thread");
     ++stopped;
   }
 
-  void doRelease() override {
+  void release_graph() override {
+    check(owner == std::this_thread::get_id(), "graph releases on initialization thread");
     ++released;
   }
 };
@@ -235,31 +245,33 @@ std::shared_ptr<MediaGraphOptions> source_graph(const std::shared_ptr<EncodedSou
   options->build = [source](MediaGraphContext context) {
     MediaGraph graph;
     graph.nodes = {context.defaults.nodes.front(), source};
-    graph.connect<nodes::EncodedFrameEvent>(source->getName(), context.port);
-    graph.connect<nodes::SenderFeedbackEvent>(context.port, source->getName());
+    graph.connect<nodes::EncodedFrameEvent>(source->name(), context.port);
+    graph.connect<nodes::SenderFeedbackEvent>(context.port, source->name());
     return Result<MediaGraph>::success(std::move(graph));
   };
   return options;
 }
 
-class EncodedSink final : public graphflow::core::GraphNode {
+class EncodedSink final : public livekit::sdk::rtc::TrackNode {
  public:
-  EncodedSink() : GraphNode("sink", nullptr) {}
+  EncodedSink() : TrackNode("sink") {}
 
   std::atomic<int> received{0};
 
  protected:
-  bool doInit() override {
-    subscribe<nodes::EncodedFrameEvent>([this](const auto& event) {
-      const auto expected = fixture_video(rtc::Codec::vp8, false);
-      auto bytes = event.frame.buffer.bytes();
-      check(std::vector<uint8_t>(bytes.begin(), bytes.end()) == expected,
-            "custom subscription receives exact encoded bytes");
-      if (++received == 1) {
-        publish(nodes::KeyframeRequestEvent{});
-      }
-    });
-    return true;
+  void bind(graphflow::Binder& ports) override {
+    output<nodes::KeyframeRequestEvent>(ports);
+
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::EncodedFrameEvent>::in,
+                [this](const auto& event) {
+                  const auto expected = fixture_video(rtc::Codec::vp8, false);
+                  auto bytes = event.frame.buffer.bytes();
+                  check(std::vector<uint8_t>(bytes.begin(), bytes.end()) == expected,
+                        "custom subscription receives exact encoded bytes");
+                  if (++received == 1) {
+                    send(nodes::KeyframeRequestEvent{});
+                  }
+                });
   }
 };
 
@@ -334,21 +346,23 @@ void watermark_loopback() {
   f.engine->close();
 }
 
-class SilenceNode final : public graphflow::core::GraphNode {
+class SilenceNode final : public livekit::sdk::rtc::TrackNode {
  public:
-  SilenceNode() : GraphNode("silence", nullptr) {}
+  SilenceNode() : TrackNode("silence") {}
 
  protected:
-  bool doInit() override {
-    subscribe<nodes::AudioFrameEvent>([this](const auto& event) {
-      auto pcm = std::make_shared<rtc::PcmAudioFrame>(*event.pcm);
-      std::fill(pcm->samples.begin(), pcm->samples.end(), 0);
-      std::fill(pcm->float_samples.begin(), pcm->float_samples.end(), 0.0f);
-      auto output = event;
-      output.pcm = std::move(pcm);
-      publish(output);
-    });
-    return true;
+  void bind(graphflow::Binder& ports) override {
+    output<nodes::AudioFrameEvent>(ports);
+
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::AudioFrameEvent>::in,
+                [this](const auto& event) {
+                  auto pcm = std::make_shared<rtc::PcmAudioFrame>(*event.pcm);
+                  std::fill(pcm->samples.begin(), pcm->samples.end(), 0);
+                  std::fill(pcm->float_samples.begin(), pcm->float_samples.end(), 0.0f);
+                  auto output = event;
+                  output.pcm = std::move(pcm);
+                  send(output);
+                });
   }
 };
 
@@ -377,9 +391,10 @@ void audio_loopback() {
   auto options = std::make_shared<MediaGraphOptions>();
   options->build = [](MediaGraphContext context) {
     auto graph = std::move(context.defaults);
-    const auto type = graphflow::core::detail::prettyName<nodes::AudioFrameEvent>();
+    const auto type =
+        std::string_view(livekit::sdk::rtc::TrackPort<nodes::AudioFrameEvent>::out.name);
     for (auto& edge : graph.connections) {
-      if (edge.from == context.input && edge.dataType == type) {
+      if (edge.from == context.input && edge.type() == type) {
         edge.from = "silence";
       }
     }
@@ -416,7 +431,8 @@ void rejection_and_rollback() {
       } else if (mode == 3) {
         graph.nodes.push_back(std::make_shared<EncodedSource>("isolated"));
       } else {
-        graph.connections.front().dataType = "wrong-port-event";
+        graph.connections.front() =
+            rtc::TrackConnection::between<nodes::VideoFrameEvent>(context.port, context.input);
       }
       return Result<MediaGraph>::success(std::move(graph));
     };
@@ -472,7 +488,7 @@ void rejection_and_rollback() {
   until([&] { return source->released == 1; }, "runtime failure stops graph");
   const auto failure = published->track->snapshot().failure;
   check(failure && failure->code == expected->code && failure->message == expected->message &&
-            failure->context.node == source->getName(),
+            failure->context.node == source->name(),
         "runtime error retained with node context in snapshot");
   f.engine->unpublish_track(published->publication.snapshot().track_id);
   MediaSubscribeSpec receive;

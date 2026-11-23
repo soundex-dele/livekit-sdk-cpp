@@ -6,20 +6,15 @@ AudioResamplerNode::~AudioResamplerNode() {
   doRelease();
 }
 
-bool AudioResamplerNode::doInit() {
-  auto subscribed =
-      subscribe_media<DecodedAudio>([this](const DecodedAudio& event) -> Result<bool> {
-        if (input_ || finished_) {
-          return Result<bool>::success(false);
-        }
-        input_ = event;
-        return Result<bool>::success(true);
-      });
-  if (!subscribed) {
-    reportError(graph_error(subscribed.failure_record()));
-    return false;
-  }
-  return true;
+void AudioResamplerNode::bind(graphflow::Binder& b) {
+  output_ = b.output(graphflow::Out<StereoFloat48k>{"out", graphflow::Connections::ExactlyOne});
+  subscribe_media<DecodedAudio>(b, [this](const DecodedAudio& event) -> Result<bool> {
+    if (input_ || finished_) {
+      return Result<bool>::success(false);
+    }
+    input_ = event;
+    return Result<bool>::success(true);
+  });
 }
 
 void AudioResamplerNode::doRelease() {
@@ -162,7 +157,7 @@ Result<bool> AudioResamplerNode::pump() {
     return Result<bool>::success(false);
   }
   if (pending_) {
-    auto published = publish_media(*pending_);
+    auto published = publish_media(output_, *pending_);
     if (!published) {
       return Result<bool>::failure(published.failure_record());
     }

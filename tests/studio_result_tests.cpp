@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <thread>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -101,6 +102,18 @@ int main() {
     check(!graph.step(), "step before start");
     check(bool(graph.start()), "graph starts");
     check(bool(graph.step()) && state.status.frames == 1, "graph produces preview");
+    // Force a clock resync, then inspect a delay relative to that known deadline.
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(150ms);
+    const auto anchor = std::chrono::steady_clock::now();
+    check(bool(graph.step(anchor)), "resync video clock");
+    const auto before = state.status.dropped;
+    const auto frames = state.status.frames;
+    const auto late = anchor + 115ms;  // due at +33, +66 and +99 ms; one rendered
+    std::this_thread::sleep_until(late);
+    check(bool(graph.step(late)) && state.status.frames == frames + 1 &&
+              state.status.dropped == before + 2,
+          "count every skipped video deadline when resetting the clock");
     graph.stop();
     check(!graph.step(), "step after stop");
   }
@@ -109,9 +122,8 @@ int main() {
     state.scene = scene;
     state.settings.microphone_volume = 5;
     studio_detail::StudioGraph graph(state);
-    check(bool(graph.start()), "error graph starts");
-    auto first = graph.step();
-    auto second = graph.step();
+    auto first = graph.start();
+    auto second = graph.start();
     check(!first && !second && first.failure_record() == second.failure_record(),
           "graph preserves processing failure");
   }

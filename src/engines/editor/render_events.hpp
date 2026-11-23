@@ -1,6 +1,5 @@
 #pragma once
 #include "livekit/editor.hpp"
-#include "core/event.h"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -33,10 +32,6 @@ struct Work {
   int transition_input = 0;
   Failure error;
   bool delivered = false;
-};
-
-struct Layer : graphflow::core::EventT<Layer> {
-  std::shared_ptr<Work> work;
 };
 
 inline std::string effect_route(const std::string& clip, const char* effect) {

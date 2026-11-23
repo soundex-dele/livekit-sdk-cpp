@@ -1,6 +1,6 @@
 # MediaEngine
 
-`livekit::sdk::client::MediaEngine`（`livekit/media_engine.hpp`，`LiveKit::MediaEngine`）在新同步 Room 上管理媒体流水线。采集、编解码、预览、播放和录制使用既有媒体节点与 GraphEngine；传输桥只使用 client::LocalTrack / RemoteTrack，不使用旧 RoomEngine、Endpoint 或 BlockingRtc。
+`livekit::sdk::client::MediaEngine`（`livekit/media_engine.hpp`，`LiveKit::MediaEngine`）在新同步 Room 上管理媒体流水线。采集、编解码、预览、播放和录制使用类型化媒体节点与 `graphflow::Graph`；传输桥只使用 client::LocalTrack / RemoteTrack，不使用旧 RoomEngine、Endpoint 或 BlockingRtc。
 
 公共接口遵循 Room：connect 返回 bool，创建媒体发布/订阅返回 Result<T>；close、撤销、静音、接收需求、数据发送、成员更新和 Observer 注册返回 void，失败在所在函数直接打印日志。内部可失败操作使用 Result<void>。保留 RoomObserver，事件线程不能重入同步控制；媒体输出回调同样只能查询快照。输出回调是持续媒体数据回调，不是操作完成回调。
 
@@ -28,10 +28,10 @@ statistics 同步返回两条 PeerConnection 的 RTCStatsReport JSON、采样时
 auto options = std::make_shared<client::MediaGraphOptions>();
 options->build = [](client::MediaGraphContext context) {
   auto graph = std::move(context.defaults);
-  auto filter = std::make_shared<MyVideoFilter>("filter"); // 派生 GraphNode
-  const auto type = graphflow::core::detail::prettyName<rtc::nodes::VideoFrameEvent>();
+  auto filter = std::make_shared<MyVideoFilter>("filter"); // 派生 rtc::TrackNode，在 bind 中声明类型化端口
+  const auto type = std::string_view(rtc::TrackPort<rtc::nodes::VideoFrameEvent>::out.name);
   for (auto& edge : graph.connections) {
-    if (edge.from == context.input && edge.dataType == type) {
+    if (edge.from == context.input && edge.type() == type) {
       edge.from = "filter"; // 编码和预览都接收处理后的帧
     }
   }
@@ -45,14 +45,16 @@ auto publication = engine.publish_media(spec);
 
 可编译的水印节点与生成视频发布示例位于 `examples/custom_media_graph/`，目标为 `livekit_custom_media_graph_example`。节点在修改 I420 数据前复制原始像素，保留时间戳、epoch 和其他媒体元数据；不能原地修改其他分支共享的样本。订阅端可用相同方式在 decoder 后插入处理节点。
 
+每条轨道的图在同一控制线程构建、准备、启动和关闭，该线程也负责 Room 读帧与发送反馈。设备和编解码线程通过类型化发送器投递有所有权的事件；接收端使用有界邮箱。发送成功表示接收，不代表已播放或录制落盘。停止先隔离生产者、排空图内投递，再关闭输出和完成文件收尾。
+
 图的约束和生命周期：
 
-- 节点名称唯一、非空，所有节点必须处于 Created 状态且没有其他图的连接边。每次构图返回新实例；初始化过或释放过的节点不能复用。不同 MediaEngine 的节点校验与初始化串行化，避免同时接管同一新节点。应用不得并发把同一实例交给外部 GraphEngine。
+- 节点名称唯一、非空，所有节点必须尚未被任何图接管。每次构图返回新实例；初始化过或释放过的节点不能复用。不同 MediaEngine 的节点校验与初始化串行化，避免同时接管同一新节点。应用不得并发把同一实例交给其他图。
 - 必须保留 context.defaults 中的同一个 Room 端口节点。发布端接收 EncodedFrameEvent、发出 SenderFeedbackEvent；订阅端发出 EncodedFrameEvent、接收 KeyframeRequestEvent。发布图必须接通编码帧与反馈。Room 端口不接受条件路由。
 - 所有连接必须有类型、端点存在且不能重复，节点必须连通至 Room 端口。除 SenderFeedbackEvent/KeyframeRequestEvent 外的数据连接须无环；最多 128 个节点、1024 条连接。实际节点支持的输入/输出事件类型仍由调用方保证。
 - GraphEngine 管理 init/start/stop/release。SDK 自动激活图内的 MediaInputNode，并停止采集、编解码和输出节点。自定义生产者可用 `activate -> bool` 在全图 start 后开始生产，用 `quiesce -> void` 停止接收新工作、取消并等待其后台任务。quiesce 在部分初始化或启动失败时也可能执行，应能处理未启动状态；未通过校验的图不会调用钩子。
 - build、activate、quiesce 和节点回调均不能重入 Room/MediaEngine 生命周期控制，不得抛异常。构图和生命周期钩子要及时返回；quiesce 未返回时 close 不会返回。生产线程上的回调必须快速处理，耗时工作由节点自己的有界队列和线程承担。GraphEngine 接管后，应用不得修改节点、连接、错误处理器或独立驱动节点生命周期。
-- 构图错误直接返回 Failure；发布启动失败会撤销 Room 发布，订阅构图/启动失败会撤销订阅。节点调用 reportError 上报运行期失败，MediaTrackSnapshot.failure 保留诊断并停止媒体图；发布的撤销仍由 unpublish_track/close 管理。所有节点和连接出现在快照中，未知自定义节点的通用计数为零，细分计数可由应用节点自行提供。
+- 构图错误直接返回 Failure；发布启动失败会撤销 Room 发布，订阅构图/启动失败会撤销订阅。节点调用 report_failure 上报运行期失败，MediaTrackSnapshot.failure 保留诊断并停止媒体图；发布的撤销仍由 unpublish_track/close 管理。所有节点和连接出现在快照中，未知自定义节点的通用计数为零，细分计数可由应用节点自行提供。
 - 自定义图固定于这次发布/订阅生命周期，不提供运行中热替换。重新构图通过撤销后重新发布/订阅完成。共享采集句柄属于另一项媒体能力。
 
 ## 自定义图验证记录（2026-11-03，Windows x64 Release）

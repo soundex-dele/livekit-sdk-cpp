@@ -1,6 +1,5 @@
 #pragma once
 #include "livekit/compat/thread.hpp"
-#include "media_graph/failure.hpp"
 #include "livekit/rtc/media_config.hpp"
 #include "livekit/rtc/frame_view.hpp"
 #include "livekit/rtc/video_nodes.hpp"
@@ -16,12 +15,10 @@
 namespace livekit::sdk::rtc::engine {
 // One bounded dispatcher per application branch. Payload ownership is shared;
 // invoking a slow application never occupies a codec/capture worker.
-class ApplicationOutput final : public graphflow::core::GraphNode {
+class ApplicationOutput final : public livekit::sdk::rtc::TrackNode {
  public:
   explicit ApplicationOutput(MediaOutput output, bool internal_inline = false)
-      : GraphNode("application.output", nullptr),
-        output_(std::move(output)),
-        inline_(internal_inline) {
+      : TrackNode("application.output"), output_(std::move(output)), inline_(internal_inline) {
     if (!output_.queue.max_frames || !output_.queue.max_bytes ||
         output_.queue.max_age.count() <= 0) {
       failure_ = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
@@ -31,7 +28,6 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
 
   ~ApplicationOutput() override {
     quiesce();
-    release();
   }
 
   void quiesce() {
@@ -114,7 +110,7 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
       queued_bytes_ = 0;
     }
     changed_.notify_all();
-    reportError(livekit::sdk::detail::graph_error(std::move(failure)));
+    report_failure(std::move(failure));
   }
 
   void push(Sample sample, size_t size) {
@@ -145,22 +141,36 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
     changed_.notify_one();
   }
 
-  bool doInit() override {
-    if (auto valid = status(); !valid) {
-      reportError(livekit::sdk::detail::graph_error(valid.failure_record()));
-      return false;
-    }
-    subscribe<nodes::VideoFrameEvent>([this](const auto& event) {
-      push(event, event.pixels->y.size() + event.pixels->u.size() + event.pixels->v.size());
-    });
-    subscribe<nodes::AudioFrameEvent>([this](const auto& event) {
-      push(event, event.pcm->samples.size() * sizeof(int16_t) +
-                      event.pcm->float_samples.size() * sizeof(float));
-    });
-    return true;
+  void bind(graphflow::Binder& ports) override {
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::VideoFrameEvent>::in,
+                [this](const auto& event) {
+                  if (!event.pixels) {
+                    fail(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                      "Missing I420 video payload"));
+                    return;
+                  }
+                  push(event, track_cost(event).bytes);
+                });
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::AudioFrameEvent>::in,
+                [this](const auto& event) {
+                  if (!event.pcm) {
+                    fail(make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
+                                      "Missing PCM audio payload"));
+                    return;
+                  }
+                  push(event, track_cost(event).bytes);
+                });
   }
 
-  bool doStart() override {
+  livekit::sdk::Result<void> prepare() override {
+    if (auto valid = status(); !valid) {
+      report_failure(valid.failure_record());
+      return start_error();
+    }
+    return livekit::sdk::Result<void>::success();
+  }
+
+  livekit::sdk::Result<void> activate_graph() override {
     active_ = true;
     if (!inline_ && (output_.audio || output_.video || output_.frame)) {
       worker_ = livekit::compat::jthread([this](livekit::compat::stop_token stop) {
@@ -200,10 +210,10 @@ class ApplicationOutput final : public graphflow::core::GraphNode {
         }
       });
     }
-    return true;
+    return livekit::sdk::Result<void>::success();
   }
 
-  void doStop() override {
+  void stop_graph() override {
     quiesce();
   }
 

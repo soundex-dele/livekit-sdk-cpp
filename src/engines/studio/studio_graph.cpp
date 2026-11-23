@@ -1,20 +1,23 @@
 #include "livekit/compat/algorithm.hpp"
 #include "studio_graph.hpp"
+#include "media_nodes/capture/audio_source.hpp"
+#include "recording_session.hpp"
 #include "livekit/player.hpp"
-#include "engine/graph_engine.h"
+#include <graphflow/graph.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <type_traits>
 #include <set>
+#include <condition_variable>
+#include <thread>
 #include <utility>
 
 namespace livekit::sdk::studio_detail {
 namespace {
 using Clock = std::chrono::steady_clock;
 using Time = Clock::time_point;
-using graphflow::core::LifecycleState;
-using graphflow::engine::NodeConnection;
+namespace gf = graphflow;
 
 std::vector<float> take(std::deque<float>& queue, size_t n = 960) {
   std::vector<float> samples(n);
@@ -45,15 +48,14 @@ void clamp(std::vector<float>& samples) {
 
 struct TickData {
   StudioScene scene;
-  StudioAudioSettings audio;
   std::map<std::string, std::shared_ptr<const StudioImage>> remote;
-  bool recording = false, video = false;
-  std::filesystem::path path;
+  bool video = false;
   Time now;
-  std::vector<Time> audio_times;
+
 };
 
-struct Tick : graphflow::core::EventT<Tick> {
+struct Tick {
+  static constexpr const char* port = "Tick";
   std::shared_ptr<const TickData> data;
 };
 
@@ -65,21 +67,29 @@ struct AudioInputData {
 
   Time captured;
   StudioAudioSettings settings;
+  size_t remoteFloatsRead = 0;  // Diagnostic only: excludes padding for missing input.
   std::vector<float> microphone, system, remote;
   std::vector<Media> media;
 };
 
-struct AudioInput : graphflow::core::EventT<AudioInput> {
+struct AudioInput {
+  static constexpr const char* port = "AudioInput";
   std::shared_ptr<const AudioInputData> data;
 };
 
 struct AudioData {
-  Time captured;
+  Time captured, mixed;
   bool monitor = false;
   std::vector<float> local, program, remote;
 };
 
-struct MixedAudio : graphflow::core::EventT<MixedAudio> {
+struct MixedAudio {
+  static constexpr const char* port = "MixedAudio";
+  std::shared_ptr<const AudioData> data;
+};
+
+struct RecordingAudio {
+  static constexpr const char* port = "RecordingAudio";
   std::shared_ptr<const AudioData> data;
 };
 
@@ -88,7 +98,8 @@ struct LayerData {
   std::shared_ptr<const TickData> tick;
 };
 
-struct VideoLayers : graphflow::core::EventT<VideoLayers> {
+struct VideoLayers {
+  static constexpr const char* port = "VideoLayers";
   std::shared_ptr<const LayerData> data;
 };
 
@@ -97,77 +108,118 @@ struct VideoData {
   Time captured;
 };
 
-struct ComposedVideo : graphflow::core::EventT<ComposedVideo> {
+struct ComposedVideo {
+  static constexpr const char* port = "ComposedVideo";
   std::shared_ptr<const VideoData> data;
+};
+
+struct RecordingVideo {
+  static constexpr const char* port = "RecordingVideo";
+  std::shared_ptr<const VideoData> data;
+};
+
+struct PlaybackState {
+  std::mutex mutex;
+  std::optional<media::VideoFrame> video;
+  std::deque<float> audio;
+  std::deque<std::function<void()>> completions;
+  PlayerSnapshot snapshot;
+  uint64_t generation = 0;
+  std::string error;
+  bool pending = true;
+
+  void accept(uint64_t value) {
+    if (generation != value) {
+      generation = value;
+      video.reset();
+      audio.clear();
+    }
+  }
+};
+
+struct AudioTick {
+  static constexpr const char* port = "AudioTick";
+  Time captured;
 };
 
 struct Context {
   StudioGraphState& shared;
   Failure failure;
   std::map<std::string, std::string> source_errors;
+  // Playback registry and recording admission pointer are protected by shared.mutex.
+  std::map<std::string, std::pair<std::string, std::weak_ptr<PlaybackState>>> playback;
+  std::map<std::string, std::string> audio_errors;
   std::string monitor_error;
+  RecordingSession* recording = nullptr;
+  Time recording_origin{};
 };
 
-class Node : public graphflow::core::GraphNode {
- public:
-  Node(const char* name, Context& context) : GraphNode(name, nullptr), context_(context) {}
+gf::Status graph_status(const Result<void>& result) {
+  if (result) {
+    return {};
+  }
+  return {{gf::ErrorCode::NodeFailure, result.error().message, result.failure_record()}};
+}
 
-  uint64_t received = 0, published = 0;
+Result<void> graph_error(const gf::Error& error) {
+  if (error.detail) {
+    // All application details in this private graph originate in graph_status().
+    return failed(std::static_pointer_cast<const FailureInfo>(error.detail));
+  }
+  return failed("studio/graph: " + error.message);
+}
+
+template <class E>
+Result<void> deliver(const gf::Emitter<E>& writer, const E& event, uint64_t& published, const std::string& label = {}) {
+  ++published;
+  auto result = writer.emit(event, label);
+  if (result.status == gf::Admission::Accepted) {
+    return Result<void>::success();
+  }
+  if (result.status == gf::Admission::Failed) {
+    return graph_error(result.error);
+  }
+  return failed("studio/graph: output did not deliver " + std::string(E::port));
+}
+
+class Node : public gf::INode {
+ public:
+  Node(Context& context, uint64_t& published) : context_(context), published_(published) {}
 
  protected:
   Context& context_;
+  uint64_t& published_;
 
   StudioGraphState& shared() {
     return context_.shared;
   }
 
-  template <class Event, class Callback>
-  void listen(Callback callback) {
-    const auto type = graphflow::core::detail::prettyName<Event>();
-    // Nodes such as Recorder consume more than one type. Select only matching
-    // edges; GraphNode::subscribe itself intentionally rejects mixed edge types.
-    for (const auto& edge : getSubEdges())
-      if (edge.dataType() == type) {
-        edge.eventBus()->subscribe<Event>(edge.name(), [this, callback](Event& event) {
-          if (state() != LifecycleState::Running || context_.failure)
-            return;
-          ++received;
-          if constexpr (std::is_void_v<std::invoke_result_t<Callback, Event&>>) {
-            callback(event);
-          } else {
-            auto result = callback(event);
-            if (!result)
-              context_.failure = result.failure_record();
-          }
-        });
-      }
-  }
-
-  template <class Event>
-  void send(const Event& event) {
-    if (context_.failure)
-      return;
-    ++published;
-    // GraphNode::publish selects by condition, so the condition also carries the
-    // type to keep a source's audio and video outputs on their respective edges.
-    publish(event, graphflow::core::detail::prettyName<Event>());
+  template <class E, class F>
+  void listen(gf::Binder& ports, F handle) {
+    ports.input(gf::In<E>{E::port, gf::Connections::ExactlyOne},
+                [handle](const E& event) -> gf::Status {
+                  if constexpr (std::is_void_v<std::invoke_result_t<F, const E&>>) {
+                    handle(event);
+                    return {};
+                  } else {
+                    return graph_status(handle(event));
+                  }
+                });
   }
 };
 
-class ClockNode final : public Node {
+// Video/control clock on the compositor owner. It never generates PCM slots.
+class ClockSource {
  public:
-  explicit ClockNode(Context& context) : Node("studio.clock", context) {}
+  explicit ClockSource(StudioGraphState& state) : state_(state) {}
 
-  void tick(Time now) {
+  Tick tick(Time now) {
     auto data = std::make_shared<TickData>();
     data->now = now;
     {
-      auto& s = shared();
+      auto& s = state_;
       std::lock_guard lock(s.mutex);
       data->scene = s.scene;
-      data->audio = s.settings;
-      data->recording = s.recordWanted;
-      data->path = s.recordPath;
       livekit::compat::erase_if(s.remoteSeen, [&](const auto& entry) {
         if (now - entry.second < std::chrono::seconds(5))
           return false;
@@ -177,79 +229,52 @@ class ClockNode final : public Node {
       });
       data->remote = s.remoteVideo;
     }
-    // Limit catch-up after a stalled source; never flood downstream queues.
-    for (int i = 0; now >= next_audio_ && i < 10; ++i) {
-      data->audio_times.push_back(next_audio_);
-      next_audio_ += std::chrono::milliseconds(10);
-    }
-    if (now - next_audio_ > std::chrono::milliseconds(100))
-      next_audio_ = now;
     if (now >= next_video_) {
       data->video = true;
       next_video_ += video_step_;
       if (now - next_video_ > video_step_) {
-        std::lock_guard lock(shared().mutex);
-        shared().status.dropped += uint64_t((now - next_video_) / video_step_);
+        std::lock_guard lock(state_.mutex);
+        // next_video_ itself is also due and is discarded by the reschedule.
+        state_.status.dropped += 1 + uint64_t((now - next_video_) / video_step_);
         next_video_ = now + video_step_;
       }
     }
     Tick event;
     event.data = std::move(data);
-    send(event);
+    return event;
+  }
+
+  void reset() {
+    next_video_ = Clock::now();
+    video_step_ = std::chrono::microseconds(1000000 / state_.options.fps);
   }
 
  private:
-  Time next_audio_, next_video_;
+  StudioGraphState& state_;
+  Time next_video_;
   std::chrono::microseconds video_step_{};
-
-  bool doStart() override {
-    next_audio_ = next_video_ = Clock::now();
-    video_step_ = std::chrono::microseconds(1000000 / shared().options.fps);
-    return true;
-  }
 };
 
 class SourcesNode final : public Node {
  public:
-  explicit SourcesNode(Context& context) : Node("studio.sources", context) {}
+  using Node::Node;
 
  private:
   // Callbacks retain no scene/node pointer. Keep only the newest image and at
   // most 200 ms of stereo PCM; a slow compositor cannot grow player output.
-  struct PlaybackState {
-    std::mutex mutex;
-    std::optional<media::VideoFrame> video;
-    std::deque<float> audio;
-    std::deque<std::function<void()>> completions;
-    PlayerSnapshot snapshot;
-    uint64_t generation = 0;
-    std::string error;
-    bool pending = true;
-
-    void accept(uint64_t value) {
-      if (generation != value) {
-        generation = value;
-        video.reset();
-        audio.clear();
-      }
-    }
-  };
-
   struct Source {
     StudioSource spec;
     std::unique_ptr<Capture> capture;
     std::shared_ptr<PlaybackState> playback;
     std::shared_ptr<Player> player;
     std::shared_ptr<const StudioImage> image;
-    std::deque<float> audio;
-    uint64_t generation = 0;
+
     std::string error;
     Time attempt = Clock::now();
   };
 
   std::map<std::string, Source> sources_;
-  std::unique_ptr<AudioCapture> microphone_, system_;
-  Time device_retry_{};
+
 
   static auto dispatcher(const std::shared_ptr<PlaybackState>& state) {
     return [weak = std::weak_ptr(state)](std::function<void()> task) -> Result<void> {
@@ -282,20 +307,24 @@ class SourcesNode final : public Node {
                               });
   }
 
-  bool doInit() override {
-    listen<Tick>([this](const Tick& event) { return process(event.data); });
-    return true;
+
+  gf::Emitter<VideoLayers> video_out_;
+
+  void bind(gf::Binder& ports) override {
+
+    video_out_ = ports.output(gf::Out<VideoLayers>{VideoLayers::port, gf::Connections::AtLeastOne});
+    listen<Tick>(ports, [this](const Tick& event) { return process(event.data); });
   }
 
-  void doStop() override {
+  gf::Status stop() override {
     sources_.clear();
-    microphone_.reset();
-    system_.reset();
-    device_retry_ = {};
+    std::lock_guard lock(shared().mutex);
+    context_.playback.clear();
+    return {};
   }
 
-  void doRelease() override {
-    doStop();
+  gf::Status release() override {
+    return stop();
   }
 
   Result<void> create(Source& source, const StudioSource& spec) {
@@ -375,21 +404,6 @@ class SourcesNode final : public Node {
   void update(const TickData& tick) {
     auto& errors = context_.source_errors;
     errors.clear();
-    if (tick.now >= device_retry_) {
-      device_retry_ = tick.now + std::chrono::seconds(5);
-      if (microphone_ && !microphone_->error().empty())
-        microphone_.reset();
-      if (system_ && !system_->error().empty())
-        system_.reset();
-    }
-    if (tick.audio.microphone && !microphone_)
-      microphone_ = std::make_unique<AudioCapture>(false);
-    if (!tick.audio.microphone)
-      microphone_.reset();
-    if (tick.audio.system && !system_)
-      system_ = std::make_unique<AudioCapture>(true);
-    if (!tick.audio.system)
-      system_.reset();
     std::set<std::string> active;
     for (const auto& spec : tick.scene.sources) {
       if (spec.kind == StudioSourceKind::remote || !spec.visible)
@@ -431,16 +445,7 @@ class SourcesNode final : public Node {
         {
           auto& playback = *source.playback;
           std::lock_guard lock(playback.mutex);
-          if (source.generation != playback.generation) {
-            source.generation = playback.generation;
-            source.audio.clear();
-          }
           frame = std::exchange(playback.video, {});
-          source.audio.insert(source.audio.end(), playback.audio.begin(), playback.audio.end());
-          playback.audio.clear();
-          while (source.audio.size() > 19200) {
-            source.audio.pop_front();
-          }
           source.error = playback.error.empty() ? playback.snapshot.error : playback.error;
           replay = playback.snapshot.state == PlayerState::ended && spec.loop && !playback.pending;
           if (replay) {
@@ -479,37 +484,17 @@ class SourcesNode final : public Node {
     }
     livekit::compat::erase_if(sources_,
                               [&](const auto& entry) { return !active.count(entry.first); });
-    if (microphone_ && !microphone_->error().empty())
-      errors["microphone"] = microphone_->error();
-    if (system_ && !system_->error().empty())
-      errors["system"] = system_->error();
+    std::lock_guard lock(shared().mutex);
+    context_.playback.clear();
+    for (const auto& [id, source] : sources_) {
+      if (source.playback) {
+        context_.playback.emplace(id, std::make_pair(source.spec.input, source.playback));
+      }
+    }
   }
 
   Result<void> process(const std::shared_ptr<const TickData>& tick) {
     update(*tick);
-    for (auto time : tick->audio_times) {
-      auto audio = std::make_shared<AudioInputData>();
-      audio->captured = time;
-      audio->settings = tick->audio;
-      audio->microphone = microphone_ ? microphone_->take(480) : std::vector<float>(960);
-      audio->system = system_ ? system_->take(480) : std::vector<float>(960);
-      for (auto& [id, source] : sources_) {
-        auto samples = take(source.audio);
-        if (!source.spec.muted)
-          audio->media.push_back(
-              {std::move(samples), tick->audio.media_volume * source.spec.volume});
-      }
-      audio->remote.resize(960);
-      {
-        auto& s = shared();
-        std::lock_guard lock(s.mutex);
-        for (auto& [id, queue] : s.remoteAudio)
-          LK_STUDIO_TRY(studio_mix(audio->remote, take(queue), tick->audio.remote_volume));
-      }
-      AudioInput event;
-      event.data = std::move(audio);
-      send(event);
-    }
     if (!tick->video)
       return Result<void>::success();
     auto layers = std::make_shared<LayerData>();
@@ -533,18 +518,121 @@ class SourcesNode final : public Node {
     }
     VideoLayers event;
     event.data = std::move(layers);
-    send(event);
-    return Result<void>::success();
+    const auto& trace = shared().traceVideoDispatch;
+    const auto enter = trace ? Clock::now() : Time{};
+    auto status = deliver(video_out_, event, published_);
+    if (trace) {
+      trace(enter, Clock::now());
+    }
+    return status;
+  }
+};
+
+class AudioSourcesNode final : public Node {
+ public:
+  using Node::Node;
+
+ private:
+  std::unique_ptr<AudioCapture> microphone_, system_;
+  Time device_retry_{};
+  gf::Emitter<AudioInput> output_;
+
+  void bind(gf::Binder& ports) override {
+    output_ = ports.output(gf::Out<AudioInput>{AudioInput::port, gf::Connections::ExactlyOne});
+    listen<AudioTick>(ports, [this](const AudioTick& tick) { return collect(tick.captured); });
+  }
+
+  gf::Status stop() override {
+    microphone_.reset();
+    system_.reset();
+    device_retry_ = {};
+    std::lock_guard lock(shared().mutex);
+    context_.audio_errors.clear();
+    return {};
+  }
+
+  Result<void> collect(Time now) {
+    auto audio = std::make_shared<AudioInputData>();
+    audio->captured = now;
+    audio->remote.resize(960);
+    auto& settings = audio->settings;
+    std::vector<std::pair<std::shared_ptr<PlaybackState>, float>> players;
+    {
+      auto& s = shared();
+      std::lock_guard lock(s.mutex);
+      settings = s.settings;
+      for (auto& [id, queue] : s.remoteAudio) {
+        if (s.traceMix) {
+          audio->remoteFloatsRead += (std::min)(queue.size(), audio->remote.size());
+        }
+        LK_STUDIO_TRY(studio_mix(audio->remote, take(queue), settings.remote_volume));
+      }
+      for (const auto& spec : s.scene.sources) {
+        auto it = context_.playback.find(spec.id);
+        if (spec.visible && spec.kind == StudioSourceKind::video && it != context_.playback.end() &&
+            it->second.first == spec.input) {
+          if (auto src = it->second.second.lock()) {
+            players.emplace_back(std::move(src),
+                                 spec.muted ? 0.f : settings.media_volume * spec.volume);
+          }
+        }
+      }
+    }
+    for (auto& [src, gain] : players) {
+      std::lock_guard lock(src->mutex);
+      audio->media.push_back({take(src->audio), gain});
+    }
+    if (now >= device_retry_) {
+      device_retry_ = now + std::chrono::seconds(5);
+      if (microphone_ && !microphone_->error().empty()) {
+        microphone_.reset();
+      }
+      if (system_ && !system_->error().empty()) {
+        system_.reset();
+      }
+    }
+    if (settings.microphone && !microphone_) {
+      microphone_ = std::make_unique<AudioCapture>(false);
+    }
+    if (!settings.microphone) {
+      microphone_.reset();
+    }
+    if (settings.system && !system_) {
+      system_ = std::make_unique<AudioCapture>(true);
+    }
+    if (!settings.system) {
+      system_.reset();
+    }
+    audio->microphone = microphone_ ? microphone_->take(480) : std::vector<float>(960);
+    audio->system = system_ ? system_->take(480) : std::vector<float>(960);
+    {
+      std::lock_guard lock(shared().mutex);
+      auto& errors = context_.audio_errors;
+      errors.clear();
+      if (microphone_ && !microphone_->error().empty()) {
+        errors["microphone"] = microphone_->error();
+      }
+      if (system_ && !system_->error().empty()) {
+        errors["system"] = system_->error();
+      }
+    }
+    return deliver(output_, AudioInput{std::move(audio)}, published_);
   }
 };
 
 class MixerNode final : public Node {
  public:
-  explicit MixerNode(Context& context) : Node("studio.mixer", context) {}
+  using Node::Node;
 
  private:
-  bool doInit() override {
-    listen<AudioInput>([this](const AudioInput& event) -> Result<void> {
+  gf::Emitter<MixedAudio> mixed_out_;
+  gf::Emitter<RecordingAudio> recording_out_;
+
+  void bind(gf::Binder& ports) override {
+    mixed_out_ = ports.output(gf::Out<MixedAudio>{MixedAudio::port, gf::Connections::AtLeastOne});
+    recording_out_ =
+        ports.output(gf::Out<RecordingAudio>{RecordingAudio::port, gf::Connections::AtLeastOne});
+    listen<AudioInput>(ports, [this](const AudioInput& event) -> Result<void> {
       const auto& in = *event.data;
       auto out = std::make_shared<AudioData>();
       out->captured = in.captured;
@@ -559,6 +647,9 @@ class MixerNode final : public Node {
       out->remote = in.remote;
       LK_STUDIO_TRY(studio_mix(out->program, out->remote, 1));
       clamp(out->program);
+      if (shared().traceMix) {
+        shared().traceMix(in.captured, in.remoteFloatsRead, in.remote, out->program);
+      }
       {
         auto& s = shared();
         std::lock_guard lock(s.mutex);
@@ -566,30 +657,41 @@ class MixerNode final : public Node {
         s.status.system_peak = peak(in.system) * in.settings.system_volume;
         s.status.output_peak = peak(out->program);
       }
+      if (shared().traceProgramWrite) {
+        out->mixed = Clock::now();
+      }
       MixedAudio result;
       result.data = std::move(out);
-      send(result);
-      return Result<void>::success();
+      LK_STUDIO_TRY(deliver(mixed_out_, result, published_));
+      RecordingAudio recording;
+      recording.data = result.data;
+      return deliver(recording_out_, recording, published_);
     });
-    return true;
   }
 };
 
 class CompositeNode final : public Node {
  public:
-  explicit CompositeNode(Context& context) : Node("studio.compositor", context) {}
+  using Node::Node;
 
  private:
   std::unique_ptr<Compositor> compositor_;
 
-  bool doInit() override {
+  gf::Status init() override {
     const auto& o = shared().options;
     compositor_ = std::make_unique<Compositor>(o.width, o.height, o.software_gpu);
-    if (auto result = compositor_->status(); !result) {
-      context_.failure = result.failure_record();
-      return false;
-    }
-    listen<VideoLayers>([this](const VideoLayers& event) -> Result<void> {
+    return graph_status(compositor_->status());
+  }
+
+  gf::Emitter<ComposedVideo> composed_out_;
+  gf::Emitter<RecordingVideo> recording_out_;
+
+  void bind(gf::Binder& ports) override {
+    composed_out_ =
+        ports.output(gf::Out<ComposedVideo>{ComposedVideo::port, gf::Connections::AtLeastOne});
+    recording_out_ =
+        ports.output(gf::Out<RecordingVideo>{RecordingVideo::port, gf::Connections::AtLeastOne});
+    listen<VideoLayers>(ports, [this](const VideoLayers& event) -> Result<void> {
       const auto& in = *event.data;
       const auto& tick = *in.tick;
       auto out = std::make_shared<VideoData>();
@@ -625,24 +727,26 @@ class CompositeNode final : public Node {
       }
       ComposedVideo result;
       result.data = std::move(out);
-      send(result);
-      return Result<void>::success();
+      LK_STUDIO_TRY(deliver(composed_out_, result, published_));
+      RecordingVideo recording;
+      recording.data = result.data;
+      return deliver(recording_out_, recording, published_);
     });
-    return true;
   }
 
-  void doRelease() override {
+  gf::Status release() override {
     compositor_.reset();
+    return {};
   }
 };
 
 class VideoOutputNode final : public Node {
  public:
-  explicit VideoOutputNode(Context& context) : Node("studio.video-output", context) {}
+  using Node::Node;
 
  private:
-  bool doInit() override {
-    listen<ComposedVideo>([this](const ComposedVideo& event) -> Result<void> {
+  void bind(gf::Binder& ports) override {
+    listen<ComposedVideo>(ports, [this](const ComposedVideo& event) -> Result<void> {
       const auto& frame = *event.data;
       LK_STUDIO_ASSIGN(video, to_i420(*frame.program));
       auto& s = shared();
@@ -659,72 +763,78 @@ class VideoOutputNode final : public Node {
       }
       return Result<void>::success();
     });
-    return true;
   }
 
-  void doRelease() override {
+  gf::Status release() override {
     shared().programVideo->close();
     shared().localVideo->close();
+    return {};
   }
 };
 
 class AudioOutputNode final : public Node {
  public:
-  explicit AudioOutputNode(Context& context) : Node("studio.audio-output", context) {}
+  using Node::Node;
 
  private:
-  bool doInit() override {
-    listen<MixedAudio>([this](const MixedAudio& event) -> Result<void> {
+  void bind(gf::Binder& ports) override {
+    listen<MixedAudio>(ports, [this](const MixedAudio& event) -> Result<void> {
       const auto& audio = *event.data;
       PcmInputFrame frame;
       frame.capture_time = audio.captured;
       frame.float_samples = audio.local;
       LK_STUDIO_TRY(shared().localAudio->write(frame));
       frame.float_samples = audio.program;
-      LK_STUDIO_TRY(shared().programAudio->write(frame));
+      const auto& trace = shared().traceProgramWrite;
+      const auto enter = trace ? Clock::now() : Time{};
+      LK_STUDIO_ASSIGN(admission, shared().programAudio->write(frame));
+      if (trace) {
+        trace(audio.captured, audio.mixed, enter, Clock::now(), admission);
+      }
       return Result<void>::success();
     });
-    return true;
   }
 
-  void doRelease() override {
+  gf::Status release() override {
     shared().programAudio->close();
     shared().localAudio->close();
+    return {};
   }
 };
 
 class PreviewNode final : public Node {
  public:
-  explicit PreviewNode(Context& context) : Node("studio.preview", context) {}
+  using Node::Node;
 
  private:
-  bool doInit() override {
-    listen<ComposedVideo>([this](const ComposedVideo& event) {
+  void bind(gf::Binder& ports) override {
+    listen<ComposedVideo>(ports, [this](const ComposedVideo& event) {
       auto& s = shared();
       std::lock_guard lock(s.mutex);
       s.status.preview = event.data->program;
       ++s.status.frames;
       s.status.source_errors = context_.source_errors;
+      s.status.source_errors.insert(context_.audio_errors.begin(), context_.audio_errors.end());
       if (!context_.monitor_error.empty())
         s.status.source_errors["monitor"] = context_.monitor_error;
     });
-    return true;
   }
 };
 
 class MonitorNode final : public Node {
  public:
-  explicit MonitorNode(Context& context) : Node("studio.monitor", context) {}
+  using Node::Node;
 
  private:
   std::unique_ptr<Monitor> monitor_;
   Time retry_{};
 
-  bool doInit() override {
-    listen<MixedAudio>([this](const MixedAudio& event) {
+  void bind(gf::Binder& ports) override {
+    listen<MixedAudio>(ports, [this](const MixedAudio& event) {
       const auto& audio = *event.data;
       if (!audio.monitor) {
         monitor_.reset();
+        std::lock_guard lock(shared().mutex);
         context_.monitor_error.clear();
         return;
       }
@@ -736,111 +846,345 @@ class MonitorNode final : public Node {
       if (!monitor_)
         monitor_ = std::make_unique<Monitor>();
       monitor_->write(audio.remote);
+      std::lock_guard lock(shared().mutex);
       context_.monitor_error = monitor_->error();
     });
-    return true;
   }
 
-  void doStop() override {
+  gf::Status stop() override {
     monitor_.reset();
     retry_ = {};
+    std::lock_guard lock(shared().mutex);
     context_.monitor_error.clear();
+    return {};
   }
 
-  void doRelease() override {
-    doStop();
+  gf::Status release() override {
+    return stop();
+  }
+};
+
+class AudioRecordNode final : public Node {
+ public:
+  using Node::Node;
+
+ private:
+  void bind(gf::Binder& ports) override {
+    listen<RecordingAudio>(ports, [this](const RecordingAudio& event) {
+      const auto& audio = *event.data;
+      std::lock_guard lock(shared().mutex);
+      if (shared().recordWanted && context_.recording &&
+          audio.captured >= context_.recording_origin) {
+        context_.recording->audio(audio.program, audio.captured);
+      }
+    });
   }
 };
 
 class RecorderNode final : public Node {
  public:
-  explicit RecorderNode(Context& context) : Node("studio.recorder", context) {}
+  using Node::Node;
 
  private:
-  std::unique_ptr<Recorder> recorder_;
+  std::unique_ptr<RecordingSession> session_;
 
-  void error(Failure failure) {
-    auto& s = shared();
-    std::lock_guard lock(s.mutex);
-    s.status.failure = std::move(failure);
-    s.status.error = s.status.failure->message;
-    s.recordWanted = false;
-  }
-
-  void finish() {
-    if (recorder_) {
-      auto result = recorder_->finish();
-      if (!result)
-        error(result.failure_record());
+  void publishStatus() {
+    if (!session_) {
+      return;
     }
-    recorder_.reset();
-    std::lock_guard lock(shared().mutex);
-    shared().status.recording = false;
+    const auto status = session_->status();
+    auto& s = shared();
+    {
+      std::lock_guard lock(s.mutex);
+      if (status.first) {
+        s.recordWanted = false;
+        s.status.recording = false;
+        s.status.failure = status.first;
+        s.status.error = status.first->message;
+        if (status.cleanup) {
+          s.status.error += "; cleanup: " + status.cleanup->message;
+        }
+      }
+      if (status.done) {
+        context_.recording = nullptr;
+        s.status.recording = false;
+        s.recordBusy = false;
+        s.finalizedRecordEvents = status.admitted;
+      }
+    }
+    if (status.done) {
+      session_.reset();
+    }
   }
 
-  bool doInit() override {
-    listen<Tick>([this](const Tick& event) {
-      const auto& tick = *event.data;
-      if (!tick.recording && recorder_)
-        finish();
-      if (tick.recording && !recorder_) {
-        auto& s = shared();
-        const auto& o = s.options;
-        auto path_text = path8(tick.path);
-        if (!path_text) {
-          error(path_text.failure_record());
+  void control(const TickData& tick) {
+    auto& s = shared();
+    std::filesystem::path path;
+    {
+      std::lock_guard lock(s.mutex);
+      if (!s.recordWanted && session_) {
+        context_.recording = nullptr;
+        session_->stop();  // Signal only; never wait for FFmpeg on a Studio tick.
+      }
+      if (!session_ && s.recordWanted) {
+        path = s.recordPath;
+        auto name = path8(path);
+        if (!name) {
+          s.status.failure = name.failure_record();
+          s.status.error = name.error().message;
+          s.recordWanted = false;
           return;
         }
-        recorder_ = std::make_unique<Recorder>(tick.path, o.width, o.height, o.fps);
-        auto result = recorder_->status();
-        if (!result) {
-          error(result.failure_record());
-          recorder_.reset();
-          return;
+        s.recordBusy = true;
+        s.status.recording_path = std::move(*name);
+      } else if (!session_) {
+        return;
+      }
+    }
+    if (!session_) {
+      if (s.beforeRecordOpen) {
+        s.beforeRecordOpen();
+      }
+      session_ = std::make_unique<RecordingSession>(
+          path, s.options, [requested = tick.now] { return std::max(requested, Clock::now()); },
+          s.beforeRecordWrite, s.traceEncoderAudio);
+      const auto prepared = session_->status();
+      if (prepared.mediaOrigin) {
+        if (s.traceRecordReady) {
+          s.traceRecordReady(tick.now, *prepared.mediaOrigin);
         }
         std::lock_guard lock(s.mutex);
-        s.status.recording = true;
-        s.status.recording_path = std::move(*path_text);
+        context_.recording_origin = *prepared.mediaOrigin;
+        context_.recording = session_.get();
+        s.status.recording = s.recordWanted;
       }
-    });
-    listen<MixedAudio>([this](const MixedAudio& event) {
-      if (recorder_) {
-        auto result = recorder_->audio(event.data->program, event.data->captured);
-        if (!result)
-          error(result.failure_record());
-      }
-    });
-    listen<ComposedVideo>([this](const ComposedVideo& event) {
-      if (recorder_) {
-        auto result = recorder_->video(*event.data->program, event.data->captured);
-        if (!result)
-          error(result.failure_record());
-      }
-    });
-    return true;
+    }
+    publishStatus();
   }
 
-  void doStop() override {
-    finish();
+  void bind(gf::Binder& ports) override {
+    listen<Tick>(ports, [this](const Tick& event) { control(*event.data); });
+    listen<RecordingVideo>(ports, [this](const RecordingVideo& event) {
+      if (session_) {
+        {
+          std::lock_guard lock(shared().mutex);
+          if (shared().recordWanted && context_.recording &&
+              event.data->captured >= context_.recording_origin) {
+            session_->video(event.data->program, event.data->captured);
+          }
+        }
+        publishStatus();
+      }
+    });
   }
 
-  void doRelease() override {
-    finish();
+  gf::Status stop() override {
+    if (session_) {
+      {
+        std::lock_guard lock(shared().mutex);
+        context_.recording = nullptr;
+      }
+      session_->wait();
+      publishStatus();
+    }
+    std::lock_guard lock(shared().mutex);
+    shared().recordWanted = false;
+    return {};
+  }
+
+  gf::Status release() override {
+    return stop();
   }
 };
 
-template <class Event>
-NodeConnection link(const std::shared_ptr<Node>& from, const std::shared_ptr<Node>& to) {
-  auto type = graphflow::core::detail::prettyName<Event>();
-  return {from->getName(), to->getName(), type, type};
+template <class Event, class From, class To>
+void link(gf::Wiring& wiring, const From& from, const To& to) {
+  wiring.connect(from->out(gf::Out<Event>{Event::port}), to->in(gf::In<Event>{Event::port}));
 }
+
+// Both graphs use synchronous delivery. Only the audio owner calls into its graph;
+// control and diagnostics run between slots, never concurrently with PCM callbacks.
+class AudioLane {
+ public:
+  explicit AudioLane(Context& context) : context_(context), worker_([this] { loop(); }) {}
+
+  ~AudioLane() {
+    call([&] {
+      ticking_ = false;
+      engine_.reset();
+      exit_ = true;
+    });
+    worker_.join();
+  }
+
+  void prepare() {
+    call([&] { build(); });
+  }
+
+  Result<void> start() {
+    call([&] {
+      if (failure()) {
+        return;
+      }
+      if (auto status = engine_->start(); !status) {
+        fail(graph_error(status.error));
+        return;
+      }
+      next_ = Clock::now();
+      ticking_ = true;
+      tick();
+    });
+    if (auto f = failure()) {
+      return failed(f);
+    }
+    return Result<void>::success();
+  }
+
+  void stop(bool close) {
+    call([&] {
+      ticking_ = false;
+      if (engine_) {
+        auto status = close ? engine_->close() : engine_->stop();
+        if (!status) {
+          fail(graph_error(status.error));
+        }
+      }
+    });
+  }
+
+  Failure failure() {
+    std::lock_guard lock(mutex_);
+    return failure_;
+  }
+
+  void inspect(std::vector<StudioGraph::NodeInfo>* nodes,
+               std::vector<StudioGraph::Connection>* edges) {
+    call([&] {
+      if (!engine_) {
+        return;
+      }
+      if (auto snapshot = engine_->snapshot()) {
+        if (nodes) {
+          for (const auto& n : snapshot->nodes) {
+            nodes->push_back({n.id, n.accepted, published_.at(n.id)});
+          }
+        }
+        if (edges) {
+          for (const auto& e : snapshot->edges) {
+            edges->push_back({e.from, e.to, e.input});
+          }
+        }
+      }
+    });
+  }
+
+ private:
+  Context& context_;
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::function<void()> command_;
+  bool pending_ = false, exit_ = false, ticking_ = false;
+  Failure failure_;
+  Time next_;
+  std::map<std::string, uint64_t> published_;
+  gf::Emitter<AudioTick> writer_;
+  std::unique_ptr<gf::Graph> engine_;
+  std::thread worker_;
+
+  void fail(Result<void> result) {
+    ticking_ = false;
+    std::lock_guard lock(mutex_);
+    if (!failure_) {
+      failure_ = result.failure_record();
+    }
+  }
+
+  void call(std::function<void()> command) {
+    std::unique_lock lock(mutex_);
+    command_ = std::move(command);
+    pending_ = true;
+    wake_.notify_one();
+    wake_.wait(lock, [&] { return !pending_; });
+  }
+
+  void loop() {
+    std::unique_lock lock(mutex_);
+    while (!exit_) {
+      if (pending_) {
+        auto cmd = std::move(command_);
+        lock.unlock();
+        cmd();
+        lock.lock();
+        pending_ = false;
+        wake_.notify_one();
+      } else if (!ticking_) {
+        wake_.wait(lock, [&] { return pending_; });
+      } else if (!wake_.wait_until(lock, next_, [&] { return pending_; })) {
+        lock.unlock();
+        tick();
+        lock.lock();
+      }
+    }
+  }
+
+  void tick() {
+    // More than the input FIFO horizon cannot be recovered with valid captured media.
+    if (Clock::now() - next_ > std::chrono::milliseconds(200)) {
+      fail(failed("studio/audio-clock: owner missed input buffer horizon",
+                  ErrorCode::resource_exhausted));
+      return;
+    }
+    auto result = deliver(writer_, AudioTick{next_}, published_.at("studio.audio-clock"));
+    next_ += std::chrono::milliseconds(10);
+    if (!result) {
+      fail(std::move(result));
+    }
+  }
+
+  template <class T>
+  auto add(const char* id) {
+    return engine_->add<T>(id, context_, published_[id]);
+  }
+
+  void build() {
+    engine_ = std::make_unique<gf::Graph>(gf::GraphOptions{gf::Dispatch::Inline});
+    auto clock = engine_->ingress<AudioTick>("studio.audio-clock");
+    auto source = add<AudioSourcesNode>("studio.audio-sources");
+    auto mixer = add<MixerNode>("studio.mixer");
+    auto output = add<AudioOutputNode>("studio.audio-output");
+    auto monitor = add<MonitorNode>("studio.monitor");
+    auto recorder = add<AudioRecordNode>("studio.audio-recorder");
+    for (const auto& status : {clock.status(), source.status(), mixer.status(), output.status(),
+                               monitor.status(), recorder.status()}) {
+      if (!status) {
+        fail(graph_error(status.error));
+        return;
+      }
+    }
+    auto wired = engine_->rewire([&](gf::Wiring& w) {
+      w.connect(clock->port, source->in(gf::In<AudioTick>{AudioTick::port}));
+      link<AudioInput>(w, source, mixer);
+      link<MixedAudio>(w, mixer, output);
+      link<MixedAudio>(w, mixer, monitor);
+      link<RecordingAudio>(w, mixer, recorder);
+    });
+    if (!wired) {
+      fail(graph_error(wired.error));
+      return;
+    }
+    writer_ = clock->writer;
+    published_.emplace("studio.audio-clock", 0);
+  }
+};
+
 }  // namespace
 
 StudioGraphState::StudioGraphState(StudioOptions o) : options(o) {
   if ((o.width != 1280 || o.height != 720) && (o.width != 720 || o.height != 1280) &&
-      (o.width != 1920 || o.height != 1080) && (o.width != 1080 || o.height != 1920))
+      (o.width != 1920 || o.height != 1080) && (o.width != 1080 || o.height != 1920)) {
     status.failure = make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
                                   "请选择 720p 或 1080p 横竖屏");
+  }
   if (o.fps != 30)
     status.failure =
         make_failure(ErrorDomain::media, ErrorCode::invalid_argument, "首版帧率为 30 fps");
@@ -855,10 +1199,12 @@ StudioGraphState::StudioGraphState(StudioOptions o) : options(o) {
   localVideo = std::make_shared<I420VideoSource>(video);
   PcmSourceOptions audio;
   audio.channels = 2;
-  audio.max_queue_duration = std::chrono::milliseconds(60);
+  // Capacity is not the startup target. Leave room for a delayed program reader
+  // and catch-up writes without increasing the four-block startup prebuffer.
+  audio.max_queue_duration = std::chrono::milliseconds(120);
   audio.format = AudioSampleFormat::float32;
-  programAudio = std::make_shared<PcmAudioSource>(audio);
-  localAudio = std::make_shared<PcmAudioSource>(audio);
+  programAudio = detail::PcmSourceWriter::studioOutput(audio);
+  localAudio = detail::PcmSourceWriter::studioOutput(audio);
   for (const auto& result : {programVideo->status(), localVideo->status(), programAudio->status(),
                              localAudio->status()}) {
     if (!result) {
@@ -871,93 +1217,152 @@ StudioGraphState::StudioGraphState(StudioOptions o) : options(o) {
 
 struct StudioGraph::Impl {
   Context context;
-  graphflow::engine::GraphEngine engine{1};
-  std::vector<std::shared_ptr<Node>> nodes;
-  std::shared_ptr<ClockNode> clock;
+  std::map<std::string, uint64_t> published;
+  ClockSource clock;
+  AudioLane audio;
+  gf::Emitter<Tick> ticks;
+  bool running = false;
+  // Destroy the graph before the state and counters referenced by its nodes.
+  gf::Graph engine{{gf::Dispatch::Inline}};
 
-  explicit Impl(StudioGraphState& shared) : context{shared, shared.status.failure} {
-    if (context.failure)
-      return;
-    clock = std::make_shared<ClockNode>(context);
-    auto sources = std::make_shared<SourcesNode>(context);
-    auto mixer = std::make_shared<MixerNode>(context);
-    auto compositor = std::make_shared<CompositeNode>(context);
-    auto video = std::make_shared<VideoOutputNode>(context);
-    auto audio = std::make_shared<AudioOutputNode>(context);
-    auto preview = std::make_shared<PreviewNode>(context);
-    auto monitor = std::make_shared<MonitorNode>(context);
-    auto recorder = std::make_shared<RecorderNode>(context);
-    // Downstream subscriptions/resources are ready before the clock starts.
-    // No producer runs during stop/release: step() is synchronous on this owner.
-    nodes = {recorder, monitor, preview, video, audio, compositor, mixer, sources, clock};
-    std::vector<std::shared_ptr<graphflow::core::GraphNode>> lifecycle(nodes.begin(), nodes.end());
-    std::vector<NodeConnection> edges{
-        link<Tick>(clock, recorder),  // Apply recording control before this tick's media.
-        link<Tick>(clock, sources),
-        link<AudioInput>(sources, mixer),
-        link<VideoLayers>(sources, compositor),
-        link<MixedAudio>(mixer, audio),
-        link<MixedAudio>(mixer, monitor),
-        link<MixedAudio>(mixer, recorder),
-        link<ComposedVideo>(compositor, video),
-        link<ComposedVideo>(compositor, preview),
-        link<ComposedVideo>(compositor, recorder)};
-    if (!engine.loadFromNodes(lifecycle, edges))
-      context.failure = make_failure(ErrorDomain::media, ErrorCode::processing_failed,
-                                     "studio/build: graph load failed");
+  template <class T>
+  auto add(const char* name) {
+    auto result = engine.add<T>(name, context, published[name]);
+    if (!result && !context.failure) {
+      context.failure = graph_error(result.status().error).failure_record();
+    }
+    return result;
   }
 
-  ~Impl() {
-    engine.release();
+  explicit Impl(StudioGraphState& shared)
+      : context{shared, shared.status.failure}, clock(shared), audio(context) {
+    if (context.failure) {
+      return;
+    }
+    auto ingress = engine.ingress<Tick>("studio.clock");
+    if (!ingress) {
+      context.failure = graph_error(ingress.status().error).failure_record();
+      return;
+    }
+    published.emplace("studio.clock", 0);
+    ticks = ingress->writer;
+    auto sources = add<SourcesNode>("studio.sources");
+    auto compositor = add<CompositeNode>("studio.compositor");
+    auto video = add<VideoOutputNode>("studio.video-output");
+    auto preview = add<PreviewNode>("studio.preview");
+    auto recorder = add<RecorderNode>("studio.recorder");
+    if (context.failure) {
+      return;
+    }
+    auto wired = engine.rewire([&](gf::Wiring& w) {
+      // Inline fan-out follows connection order: control precedes this tick's media.
+      w.connect(ingress->port, recorder->in(gf::In<Tick>{Tick::port}));
+      w.connect(ingress->port, sources->in(gf::In<Tick>{Tick::port}), "video");
+      link<VideoLayers>(w, sources, compositor);
+      link<ComposedVideo>(w, compositor, video);
+      link<ComposedVideo>(w, compositor, preview);
+      link<RecordingVideo>(w, compositor, recorder);
+    });
+    if (!wired) {
+      context.failure = graph_error(wired.error).failure_record();
+    } else {
+      audio.prepare();  // Bind both real topologies before start; no capture or playout yet.
+      context.failure = audio.failure();
+    }
   }
 };
 
 StudioGraph::StudioGraph(StudioGraphState& state) : impl_(std::make_unique<Impl>(state)) {}
 
-StudioGraph::~StudioGraph() = default;
+StudioGraph::~StudioGraph() {
+  release();
+}
 
 Result<void> StudioGraph::start() {
-  if (impl_->context.failure)
+  if (impl_->context.failure) {
     return failed(impl_->context.failure);
-  if (!impl_->engine.init() || !impl_->engine.start()) {
-    if (impl_->context.failure)
-      return failed(impl_->context.failure);
-    return failed("studio/start: graph is not ready", ErrorCode::invalid_state);
+  }
+  auto status = impl_->engine.start();
+  if (!status) {
+    return graph_error(status.error);
+  }
+  if (!impl_->running) {
+    impl_->clock.reset();
+    // Establish a requested recording before either media owner submits its first slot.
+    auto control = std::make_shared<TickData>();
+    control->now = Clock::now();
+    auto admitted = deliver(impl_->ticks, Tick{control}, impl_->published["studio.clock"]);
+    if (!admitted) {
+      return admitted;
+    }
+    auto audio = impl_->audio.start();
+    if (!audio) {
+      impl_->context.failure = audio.failure_record();
+      stop();
+      return audio;
+    }
+    impl_->running = true;
   }
   return Result<void>::success();
 }
 
 Result<void> StudioGraph::step(Time now) {
-  if (impl_->engine.state() != LifecycleState::Running)
+  if (!impl_->running) {
     return failed("studio/step: graph is not running", ErrorCode::invalid_state);
-  if (impl_->context.failure)
+  }
+  if (impl_->context.failure) {
     return failed(impl_->context.failure);
-  impl_->clock->tick(now);
-  if (impl_->context.failure)
-    return failed(impl_->context.failure);
-  return Result<void>::success();
+  }
+  if (auto f = impl_->audio.failure()) {
+    return failed(f);
+  }
+  auto result =
+      deliver(impl_->ticks, impl_->clock.tick(now), impl_->published["studio.clock"], "video");
+  if (!result) {
+    impl_->context.failure = result.failure_record();
+  }
+  return result;
 }
 
 void StudioGraph::stop() {
-  impl_->engine.stop();
+  impl_->running = false;
+  impl_->audio.stop(false);
+  (void)impl_->engine.stop();
 }
 
 void StudioGraph::release() {
-  impl_->engine.release();
+  impl_->running = false;
+  impl_->audio.stop(true);
+  (void)impl_->engine.close();
+}
+
+Result<gf::GraphState> StudioGraph::state() const {
+  auto view = impl_->engine.snapshot();
+  if (!view) {
+    return failed(graph_error(view.status().error).failure_record());
+  }
+  return Result<gf::GraphState>::success(view->state);
 }
 
 std::vector<StudioGraph::NodeInfo> StudioGraph::nodes() const {
   std::vector<NodeInfo> result;
-  for (const auto& node : impl_->nodes)
-    result.push_back({node->getName(), node->state(), node->received, node->published});
+  if (auto view = impl_->engine.snapshot()) {
+    for (const auto& node : view->nodes) {
+      result.push_back({node.id, node.accepted, impl_->published.at(node.id)});
+    }
+  }
+  impl_->audio.inspect(&result, nullptr);
   return result;
 }
 
 std::vector<StudioGraph::Connection> StudioGraph::connections() const {
   std::vector<Connection> result;
-  for (const auto& node : impl_->nodes)
-    for (const auto& edge : node->getPubEdges())
-      result.push_back({edge.from(), edge.to(), edge.dataType()});
+  if (auto view = impl_->engine.snapshot()) {
+    for (const auto& edge : view->edges) {
+      result.push_back({edge.from, edge.to, edge.input});
+    }
+  }
+  impl_->audio.inspect(nullptr, &result);
   return result;
 }
 }  // namespace livekit::sdk::studio_detail

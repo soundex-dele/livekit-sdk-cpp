@@ -1,14 +1,13 @@
 #include "backends/ffmpeg/ffmpeg_playback.hpp"
 
 namespace livekit::sdk::detail {
-DecoderNode::DecoderNode(const char* name, graphflow::core::EventBus* bus, bool video)
-    : MediaNode(name, bus), video_(video) {}
+DecoderNode::DecoderNode(const char* name, bool video) : MediaNode(name), video_(video) {}
 
 DecoderNode::~DecoderNode() {
   doRelease();
 }
 
-bool DecoderNode::doInit() {
+void DecoderNode::bind(graphflow::Binder& b) {
   const auto accept = [this](const auto& event) -> Result<bool> {
     if (event.format) {
       {
@@ -25,13 +24,13 @@ bool DecoderNode::doInit() {
     input_ = EncodedPacket{event.packet, event.eos};
     return Result<bool>::success(true);
   };
-  auto subscribed =
-      video_ ? subscribe_media<VideoPacket>(accept) : subscribe_media<AudioPacket>(accept);
-  if (!subscribed) {
-    reportError(graph_error(subscribed.failure_record()));
-    return false;
+  if (video_) {
+    subscribe_media<VideoPacket>(b, accept);
+    video_out_ = b.output(graphflow::Out<DecodedVideo>{"out", graphflow::Connections::ExactlyOne});
+  } else {
+    subscribe_media<AudioPacket>(b, accept);
+    audio_out_ = b.output(graphflow::Out<DecodedAudio>{"out", graphflow::Connections::ExactlyOne});
   }
-  return true;
 }
 
 Result<void> DecoderNode::configure(std::shared_ptr<const StreamFormat> format) {
@@ -184,14 +183,14 @@ Result<bool> DecoderNode::pump() {
       if (pending_) {
         event.frame = *pending_;
       }
-      accepted = publish_media(event);
+      accepted = publish_media(video_out_, event);
     } else {
       DecodedAudio event;
       event.eos = !pending_;
       if (pending_) {
         event.frame = *pending_;
       }
-      accepted = publish_media(event);
+      accepted = publish_media(audio_out_, event);
     }
     if (!accepted) {
       return Result<bool>::failure(accepted.failure_record());

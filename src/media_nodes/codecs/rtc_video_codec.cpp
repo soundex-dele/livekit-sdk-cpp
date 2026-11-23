@@ -1,6 +1,5 @@
 #include "livekit/compat/thread.hpp"
 #include "livekit/result.hpp"
-#include "media_graph/failure.hpp"
 #include "media_graph/callback_context.hpp"
 #include "livekit/rtc/video_nodes.hpp"
 #include "api/environment/environment_factory.h"
@@ -131,8 +130,8 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
       discard_locked();
       changed.notify_all();
     }
-    owner.reportError(livekit::sdk::detail::graph_error(
-        with_context(std::move(error), {"codec", descriptor.id, owner.getName(), epoch})));
+    owner.report_failure(
+        with_context(std::move(error), {"codec", descriptor.id, owner.name(), epoch}));
   }
 
   void fail(std::string message) {
@@ -146,7 +145,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
       ++stats.dropped;
     }
     if (!encode)
-      owner.publish(KeyframeRequestEvent{});
+      owner.send(KeyframeRequestEvent{});
   }
 
   void update(const SenderFeedback& value) {
@@ -229,7 +228,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
       }
     }
     if (request)
-      owner.publish(KeyframeRequestEvent{});
+      owner.send(KeyframeRequestEvent{});
   }
 
   void raw(const VideoFrameEvent& value) {
@@ -359,7 +358,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
     }
     if (expired) {
       if (!encode)
-        owner.publish(KeyframeRequestEvent{});
+        owner.send(KeyframeRequestEvent{});
       return livekit::sdk::Result<void>::success();
     }
     if (!encode && codec_epoch != job.timing.epoch) {
@@ -471,7 +470,7 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
       discard_locked();
       lock.unlock();
       if (!encode)
-        owner.publish(KeyframeRequestEvent{});
+        owner.send(KeyframeRequestEvent{});
       return {};
     }
     ++stats.completed;
@@ -480,96 +479,109 @@ struct VideoCodecNode::Impl final : webrtc::EncodedImageCallback, webrtc::Decode
 
   Result OnEncodedImage(const webrtc::EncodedImage& image,
                         const webrtc::CodecSpecificInfo*) override {
-      if (auto timing = completed(image.RtpTimestamp())) {
-        EncodedFrame frame;
-        frame.buffer =
-            EncodedBuffer(std::vector<uint8_t>(image.data(), image.data() + image.size()));
-        frame.epoch = timing->epoch;
-        frame.timestamp = timing->timestamp;
-        frame.captured = timing->captured;
-        frame.keyframe = image._frameType == webrtc::VideoFrameType::kVideoFrameKey;
-        frame.encoding_id = descriptor.encodings.front().id;
-        frame.duration = std::chrono::microseconds(1000000 / options.fps);
-        owner.publish(EncodedFrameEvent(std::move(frame)));
+    if (auto timing = completed(image.RtpTimestamp())) {
+      EncodedFrame frame;
+      frame.buffer = EncodedBuffer(std::vector<uint8_t>(image.data(), image.data() + image.size()));
+      frame.epoch = timing->epoch;
+      frame.timestamp = timing->timestamp;
+      frame.captured = timing->captured;
+      frame.keyframe = image._frameType == webrtc::VideoFrameType::kVideoFrameKey;
+      frame.encoding_id = descriptor.encodings.front().id;
+      frame.duration = std::chrono::microseconds(1000000 / options.fps);
+      owner.send(EncodedFrameEvent(std::move(frame)));
+      if (owner.after_packet_) {
+        owner.after_packet_();
       }
+    }
     return Result(Result::OK);
   }
 
   int32_t Decoded(webrtc::VideoFrame& frame) override {
-      if (auto timing = completed(frame.rtp_timestamp())) {
-        auto i420 = frame.video_frame_buffer()->ToI420();
-        if (!i420 || i420->width() <= 0 || i420->height() <= 0 ||
-            uint32_t(i420->width()) > options.max_width ||
-            uint32_t(i420->height()) > options.max_height) {
-          fail("Decoded dimensions exceed video limits");
-          return WEBRTC_VIDEO_CODEC_ERROR;
-        }
-        const auto decoded_bytes = size_t(i420->width()) * i420->height() +
-                                   2 * size_t((i420->width() + 1) / 2) * ((i420->height() + 1) / 2);
-        if (decoded_bytes > options.max_bytes) {
-          fail("Decoded pixels exceed video byte limit");
-          return WEBRTC_VIDEO_CODEC_ERROR;
-        }
-        auto pixels = std::make_shared<livekit::sdk::VideoFrame>();
-        pixels->track_id = descriptor.id;
-        pixels->width = i420->width();
-        pixels->height = i420->height();
-        pixels->stride_y = pixels->width;
-        pixels->stride_u = pixels->stride_v = (pixels->width + 1) / 2;
-        pixels->timestamp_us = timestamp_us(timing->timestamp);
-        pixels->stream_generation = timing->epoch;
-        const auto copy = [](std::vector<uint8_t>& to, const uint8_t* from, int stride, int width,
-                             int height) {
-          to.resize(size_t(width) * height);
-          for (int y = 0; y < height; ++y)
-            std::copy_n(from + size_t(y) * stride, width, to.data() + size_t(y) * width);
-        };
-        copy(pixels->y, i420->DataY(), i420->StrideY(), pixels->width, pixels->height);
-        copy(pixels->u, i420->DataU(), i420->StrideU(), pixels->stride_u, (pixels->height + 1) / 2);
-        copy(pixels->v, i420->DataV(), i420->StrideV(), pixels->stride_v, (pixels->height + 1) / 2);
-        if (timing->decode_completion) {
-          timing->decode_completion->decoded(pixels);
-        }
-        VideoFrameEvent output;
-        output.pixels = std::move(pixels);
-        output.timestamp = timing->timestamp;
-        output.epoch = timing->epoch;
-        output.captured = timing->captured;
-        output.sender_capture_time_us = timing->sender_capture_time_us;
-        owner.publish(output);
+    if (auto timing = completed(frame.rtp_timestamp())) {
+      auto i420 = frame.video_frame_buffer()->ToI420();
+      if (!i420 || i420->width() <= 0 || i420->height() <= 0 ||
+          uint32_t(i420->width()) > options.max_width ||
+          uint32_t(i420->height()) > options.max_height) {
+        fail("Decoded dimensions exceed video limits");
+        return WEBRTC_VIDEO_CODEC_ERROR;
       }
+      const auto decoded_bytes = size_t(i420->width()) * i420->height() +
+                                 2 * size_t((i420->width() + 1) / 2) * ((i420->height() + 1) / 2);
+      if (decoded_bytes > options.max_bytes) {
+        fail("Decoded pixels exceed video byte limit");
+        return WEBRTC_VIDEO_CODEC_ERROR;
+      }
+      auto pixels = std::make_shared<livekit::sdk::VideoFrame>();
+      pixels->track_id = descriptor.id;
+      pixels->width = i420->width();
+      pixels->height = i420->height();
+      pixels->stride_y = pixels->width;
+      pixels->stride_u = pixels->stride_v = (pixels->width + 1) / 2;
+      pixels->timestamp_us = timestamp_us(timing->timestamp);
+      pixels->stream_generation = timing->epoch;
+      const auto copy = [](std::vector<uint8_t>& to, const uint8_t* from, int stride, int width,
+                           int height) {
+        to.resize(size_t(width) * height);
+        for (int y = 0; y < height; ++y)
+          std::copy_n(from + size_t(y) * stride, width, to.data() + size_t(y) * width);
+      };
+      copy(pixels->y, i420->DataY(), i420->StrideY(), pixels->width, pixels->height);
+      copy(pixels->u, i420->DataU(), i420->StrideU(), pixels->stride_u, (pixels->height + 1) / 2);
+      copy(pixels->v, i420->DataV(), i420->StrideV(), pixels->stride_v, (pixels->height + 1) / 2);
+      if (timing->decode_completion) {
+        timing->decode_completion->decoded(pixels);
+      }
+      VideoFrameEvent output;
+      output.pixels = std::move(pixels);
+      output.timestamp = timing->timestamp;
+      output.epoch = timing->epoch;
+      output.captured = timing->captured;
+      output.sender_capture_time_us = timing->sender_capture_time_us;
+      owner.send(output);
+    }
     return WEBRTC_VIDEO_CODEC_OK;
   }
 };
 
 VideoCodecNode::VideoCodecNode(std::string name, TrackDescriptor descriptor, bool encode,
                                VideoCodecOptions options)
-    : GraphNode(name, nullptr),
+    : TrackNode(name),
       impl_(std::make_unique<Impl>(*this, std::move(descriptor), encode, options)) {}
 
 VideoCodecNode::~VideoCodecNode() {
   quiesce();
-  release();
 }
 
-bool VideoCodecNode::doInit() {
-  if (impl_->initialization_failure) {
-    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
-    return false;
+void VideoCodecNode::bind(graphflow::Binder& ports) {
+  if (impl_->encode) {
+    output<EncodedFrameEvent>(ports);
+  } else {
+    output<VideoFrameEvent>(ports);
+    output<KeyframeRequestEvent>(ports);
   }
   if (impl_->encode) {
-    subscribe<VideoFrameEvent>([this](const auto& value) { impl_->raw(value); });
-    subscribe<SenderFeedbackEvent>([this](const auto& value) { impl_->update(value.feedback); });
+    ports.input(livekit::sdk::rtc::TrackPort<VideoFrameEvent>::in,
+                [this](const auto& value) { impl_->raw(value); });
+    ports.input(livekit::sdk::rtc::TrackPort<SenderFeedbackEvent>::in,
+                [this](const auto& value) { impl_->update(value.feedback); });
   } else
-    subscribe<EncodedFrameEvent>([this](const auto& value) { impl_->encoded(value.frame); });
-  return true;
+    ports.input(livekit::sdk::rtc::TrackPort<EncodedFrameEvent>::in,
+                [this](const auto& value) { impl_->encoded(value.frame); });
 }
 
-bool VideoCodecNode::doStart() {
+livekit::sdk::Result<void> VideoCodecNode::prepare() {
+  if (impl_->initialization_failure) {
+    report_failure(impl_->initialization_failure);
+    return start_error();
+  }
+  return livekit::sdk::Result<void>::success();
+}
+
+livekit::sdk::Result<void> VideoCodecNode::activate_graph() {
   {
     std::lock_guard lock(impl_->mutex);
     if (impl_->closed)
-      return false;
+      return start_error();
     impl_->active = true;
   }
   std::promise<livekit::sdk::Result<void>> ready;
@@ -582,9 +594,9 @@ bool VideoCodecNode::doStart() {
   auto status = result.get();
   if (!status) {
     quiesce();
-    return false;
+    return start_error();
   }
-  return true;
+  return livekit::sdk::Result<void>::success();
 }
 
 void VideoCodecNode::quiesce() {
@@ -600,7 +612,7 @@ void VideoCodecNode::quiesce() {
     impl_->worker.join();
 }
 
-void VideoCodecNode::doStop() {
+void VideoCodecNode::stop_graph() {
   quiesce();
 }
 
@@ -613,8 +625,8 @@ Result<void> VideoCodecNode::status() const {
   if (impl_->initialization_failure) {
     return livekit::sdk::Result<void>::failure(impl_->initialization_failure);
   }
-  if (auto value = error()) {
-    return livekit::sdk::Result<void>::failure(livekit::sdk::detail::graph_failure(*value));
+  if (auto value = last_failure()) {
+    return livekit::sdk::Result<void>::failure(value);
   }
   return livekit::sdk::Result<void>::success();
 }

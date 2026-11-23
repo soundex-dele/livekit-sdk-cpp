@@ -6,7 +6,9 @@
 #include "livekit/rtc/recording_node.hpp"
 #include "engines/media/application_output.hpp"
 #include "engines/media/sync_node.hpp"
-#include "engine/graph_engine.h"
+
+#include <condition_variable>
+#include <future>
 
 namespace livekit::sdk::client::detail {
 class MediaPort;
@@ -30,23 +32,29 @@ class MediaPipeline : public std::enable_shared_from_this<MediaPipeline> {
  private:
   template <class Event, class From, class To>
   void connect(const From& from, const To& to) {
-    edges_.push_back(
-        {from->getName(), to->getName(), graphflow::core::detail::prettyName<Event>(), {}});
+    edges_.push_back(rtc::TrackConnection::between<Event>(from->name(), to->name()));
   }
 
-  void outputs(const std::shared_ptr<graphflow::core::GraphNode>&, MediaOutput,
+  void outputs(const std::shared_ptr<livekit::sdk::rtc::TrackNode>&, MediaOutput,
                const rtc::TrackDescriptor&, std::shared_ptr<rtc::AudioOutputSession>);
   Result<void> build(const std::shared_ptr<const MediaGraphOptions>&, const rtc::TrackDescriptor&);
+  Result<void> initialize_on_owner();
+  Result<void> activate_on_owner();
+  void pump_on_owner();
   void stop_nodes();
   void fail(Failure);
-  mutable std::mutex state_mutex_, lifecycle_;
+  mutable std::mutex state_mutex_;
+  std::mutex control_mutex_, close_mutex_;
+  std::condition_variable control_changed_;
+  std::promise<Result<void>> activation_;
+  bool start_requested_ = false;
   Failure failure_;
   bool publishing_ = false, stopped_ = false;
   std::atomic<bool> stopping_{false};
   std::thread pump_;
-  std::unique_ptr<graphflow::engine::GraphEngine> graph_;
-  std::vector<std::shared_ptr<graphflow::core::GraphNode>> nodes_;
-  std::vector<graphflow::engine::NodeConnection> edges_;
+  std::unique_ptr<graphflow::Graph> graph_;
+  std::vector<std::shared_ptr<livekit::sdk::rtc::TrackNode>> nodes_;
+  std::vector<rtc::TrackConnection> edges_;
   std::shared_ptr<MediaPort> port_;
   std::shared_ptr<rtc::nodes::MediaInputNode> input_;
   std::shared_ptr<rtc::nodes::VideoCodecNode> video_;

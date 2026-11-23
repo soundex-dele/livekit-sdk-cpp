@@ -1,6 +1,5 @@
 #include "livekit/compat/span.hpp"
 #include "livekit/result.hpp"
-#include "media_graph/failure.hpp"
 #include "media_nodes/playout/audio_output_driver.hpp"
 #include "livekit/rtc/audio_processing.hpp"
 #include <algorithm>
@@ -106,6 +105,7 @@ struct AudioOutputSession::Impl {
         }
       }
     } reference{options.echo_reference.get(), output};
+
     const auto begin = cursor.fetch_add(480), end = begin + 480;
     std::unique_lock lock(mutex, std::try_to_lock);
     if (!lock) {
@@ -411,7 +411,7 @@ struct AudioOutputNode::Impl {
 
 AudioOutputNode::AudioOutputNode(std::string name, TrackId id,
                                  std::shared_ptr<AudioOutputSession> session)
-    : GraphNode(name, nullptr), impl_(std::make_unique<Impl>()) {
+    : TrackNode(name), impl_(std::make_unique<Impl>()) {
   if (id.empty() || !session) {
     impl_->initialization_failure =
         make_failure(ErrorDomain::media, ErrorCode::invalid_argument,
@@ -423,39 +423,43 @@ AudioOutputNode::AudioOutputNode(std::string name, TrackId id,
 
 AudioOutputNode::~AudioOutputNode() {
   quiesce();
-  release();
 }
 
-bool AudioOutputNode::doInit() {
-  if (impl_->initialization_failure) {
-    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
-    return false;
-  }
-  subscribe<AudioFrameEvent>([this](const auto& frame) {
+void AudioOutputNode::bind(graphflow::Binder& ports) {
+  ports.input(livekit::sdk::rtc::TrackPort<AudioFrameEvent>::in, [this](const auto& frame) {
     std::lock_guard lock(impl_->mutex);
     if (!impl_->closed && impl_->track) {
       impl_->track->write(frame);
     }
   });
-  return true;
 }
 
-bool AudioOutputNode::doStart() {
+livekit::sdk::Result<void> AudioOutputNode::prepare() {
+  if (impl_->initialization_failure) {
+    report_failure(impl_->initialization_failure);
+    return start_error();
+  }
+  return livekit::sdk::Result<void>::success();
+}
+
+livekit::sdk::Result<void> AudioOutputNode::activate_graph() {
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) {
-    return false;
+    return start_error();
   }
-  auto opened = impl_->session->open_track(impl_->id, [report = errorReporter()](Failure failure) {
-    report(livekit::sdk::detail::graph_error(std::move(failure)));
+  auto opened = impl_->session->open_track(impl_->id, [weak = weak_from_this()](Failure failure) {
+    if (auto node = weak.lock()) {
+      node->report_failure(std::move(failure));
+    }
   });
   if (!opened) {
-    reportError(livekit::sdk::detail::graph_error(opened.failure_record()));
-    return false;
+    report_failure(opened.failure_record());
+    return start_error();
   }
   impl_->track = *std::move(opened);
   (void)impl_->track->set_gain(impl_->gain);
   impl_->track->set_muted(impl_->muted);
-  return true;
+  return livekit::sdk::Result<void>::success();
 }
 
 Result<void> AudioOutputNode::set_gain(float gain) {
@@ -487,7 +491,7 @@ void AudioOutputNode::quiesce() {
   }
 }
 
-void AudioOutputNode::doStop() {
+void AudioOutputNode::stop_graph() {
   quiesce();
 }
 

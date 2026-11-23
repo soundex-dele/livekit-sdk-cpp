@@ -1,96 +1,8 @@
 #include "backends/ffmpeg/ffmpeg_playback.hpp"
 #include <algorithm>
 #include <limits>
-#include <cstring>
 
 namespace livekit::sdk::detail {
-DemuxerNode::DemuxerNode(graphflow::core::EventBus* bus, std::atomic<bool>& cancel,
-                         std::chrono::milliseconds timeout)
-    : MediaNode("file.demuxer", bus), cancel_(cancel), timeout_(timeout) {}
-
-DemuxerNode::~DemuxerNode() {
-  doRelease();
-}
-
-Result<int64_t> DemuxerNode::request_io(FileIORequest request) {
-  m_eventBus->publish(source_topic_, request);
-  if (request.error) {
-    return Result<int64_t>::failure(request.error);
-  }
-  if (!request.handled) {
-    return Result<int64_t>::failure(
-        playback_failure("playback/file.demuxer: source IO service missing"));
-  }
-  return Result<int64_t>::success(request.result);
-}
-
-Result<void> DemuxerNode::begin_io() {
-  deadline_ = std::chrono::steady_clock::now() + timeout_;
-  io_error_ = nullptr;
-  {
-    auto checked = request_io(FileIORequest{});
-    if (!checked) {
-      return Result<void>::failure(checked.failure_record());
-    }
-  }
-  return Result<void>::success();
-}
-
-int DemuxerNode::interrupt(void* self) {
-  const auto& node = *static_cast<DemuxerNode*>(self);
-  return node.cancel_.load() || std::chrono::steady_clock::now() >= node.deadline_;
-}
-
-int DemuxerNode::read_bytes(void* self, uint8_t* buffer, int size) {
-  auto& node = *static_cast<DemuxerNode*>(self);
-  node.read_target_ = buffer;
-  node.read_capacity_ = size;
-  FileIORequest request;
-  request.kind = FileIORequest::read;
-  request.size = size;
-  auto requested = node.request_io(request);
-  if (!requested) {
-    node.io_error_ = requested.failure_record();
-  }
-  const int result = requested ? static_cast<int>(*requested) : AVERROR_EXIT;
-  node.read_target_ = nullptr;
-  node.read_capacity_ = 0;
-  return result;
-}
-
-int64_t DemuxerNode::seek_bytes(void* self, int64_t offset, int whence) {
-  auto& node = *static_cast<DemuxerNode*>(self);
-  FileIORequest request;
-  request.kind = FileIORequest::seek;
-  request.offset = offset;
-  request.whence = whence;
-  auto requested = node.request_io(request);
-  if (!requested) {
-    node.io_error_ = requested.failure_record();
-    return AVERROR_EXIT;
-  }
-  return *requested;
-}
-
-bool DemuxerNode::doInit() {
-  auto subscribed =
-      subscribe_media<SeekableBytes>([this](const SeekableBytes& event) -> Result<bool> {
-        if (!read_target_ || !event.bytes ||
-            event.bytes->size() > static_cast<size_t>(read_capacity_)) {
-          return Result<bool>::failure(
-              playback_failure("playback/file.demuxer: unsolicited source bytes"));
-        }
-        std::memcpy(read_target_, event.bytes->data(), event.bytes->size());
-        return Result<bool>::success(true);
-      });
-  if (!subscribed) {
-    reportError(graph_error(subscribed.failure_record()));
-    return false;
-  }
-  source_topic_ = getSubEdges().front().from() + ".io";
-  return true;
-}
-
 Result<void> DemuxerNode::open_input() {
   {
     auto checked = begin_io();
@@ -233,11 +145,11 @@ Result<void> DemuxerNode::prepare() {
   video.format = std::move(*video_format);
   AudioPacket audio;
   audio.format = std::move(*audio_format);
-  auto video_sent = publish_media(video, "video");
+  auto video_sent = publish_media(video_out_, video);
   if (!video_sent) {
     return Result<void>::failure(video_sent.failure_record());
   }
-  auto audio_sent = publish_media(audio, "audio");
+  auto audio_sent = publish_media(audio_out_, audio);
   if (!audio_sent) {
     return Result<void>::failure(audio_sent.failure_record());
   }
@@ -279,6 +191,13 @@ Result<void> DemuxerNode::seek(int64_t position, int64_t preroll) {
       return Result<void>::failure(checked.failure_record());
     }
   }
+  // A seek command can interrupt the previous AVIO read. FFmpeg retains its
+  // error on the AVIOContext, even after a successful buffered seek. Only
+  // clear that superseded interrupt, not genuine read errors or normal EOF.
+  if (io_->error == AVERROR_EXIT) {
+    io_->error = 0;
+    io_->eof_reached = 0;
+  }
   // The first keyframe DTS can precede the container's first presentation PTS
   // (notably MPEG-TS with B frames). Allow preroll before normalized zero.
   const int64_t latest = position + origin_;
@@ -296,17 +215,6 @@ Result<void> DemuxerNode::seek(int64_t position, int64_t preroll) {
   }
   av_packet_unref(packet_);
   return Result<void>::success();
-}
-
-void DemuxerNode::doRelease() {
-  pending_.reset();
-  av_packet_free(&packet_);
-  avformat_close_input(&format_);
-  if (io_) {
-    av_freep(&io_->buffer);
-    avio_context_free(&io_);
-  }
-  video_ = audio_ = -1;
 }
 
 Result<void> DemuxerNode::on_reset(int64_t position) {
@@ -327,11 +235,11 @@ Result<bool> DemuxerNode::pump() {
     if (pending_->stream_index == video_) {
       VideoPacket event;
       event.packet = pending_;
-      accepted = publish_media(event, "video");
+      accepted = publish_media(video_out_, event);
     } else {
       AudioPacket event;
       event.packet = pending_;
-      accepted = publish_media(event, "audio");
+      accepted = publish_media(audio_out_, event);
     }
     if (!accepted) {
       return Result<bool>::failure(accepted.failure_record());
@@ -346,7 +254,7 @@ Result<bool> DemuxerNode::pump() {
     if (!video_eos_) {
       VideoPacket event;
       event.eos = true;
-      auto published = publish_media(event, "video");
+      auto published = publish_media(video_out_, event);
       if (!published) {
         return Result<bool>::failure(published.failure_record());
       }
@@ -355,7 +263,7 @@ Result<bool> DemuxerNode::pump() {
     if (!audio_eos_) {
       AudioPacket event;
       event.eos = true;
-      auto published = publish_media(event, "audio");
+      auto published = publish_media(audio_out_, event);
       if (!published) {
         return Result<bool>::failure(published.failure_record());
       }

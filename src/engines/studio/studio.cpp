@@ -260,7 +260,7 @@ Result<void> Studio::start_recording(std::filesystem::path p) {
   if (p.extension() != L".mp4")
     return failed("录制文件需要 .mp4 扩展名", ErrorCode::invalid_argument);
   std::lock_guard lock(impl_->mutex);
-  if (impl_->recordWanted || impl_->status.recording)
+  if (impl_->recordWanted || impl_->recordBusy)
     return failed("正在录制", ErrorCode::busy);
   impl_->status.error.clear();
   impl_->status.failure.reset();

@@ -1,5 +1,4 @@
 #include "livekit/result.hpp"
-#include "media_graph/failure.hpp"
 #include "livekit/rtc/recording_node.hpp"
 #include <condition_variable>
 #include <cstdio>
@@ -58,8 +57,7 @@ struct RecordingNode::Impl {
       stats.queued_bytes = stats.queued_frames = 0;
       changed.notify_all();
     }
-    owner.reportError(livekit::sdk::detail::graph_error(
-        with_context(std::move(error), {"record", id, owner.getName(), 0})));
+    owner.report_failure(with_context(std::move(error), {"record", id, owner.name(), 0}));
   }
 
   void fail(std::string message) {
@@ -220,21 +218,16 @@ struct RecordingNode::Impl {
 
 RecordingNode::RecordingNode(std::string name, std::filesystem::path directory, TrackId id,
                              MediaKind kind)
-    : GraphNode(name, nullptr),
+    : TrackNode(name),
       impl_(std::make_unique<Impl>(*this, std::move(directory), std::move(id), kind)) {}
 
 RecordingNode::~RecordingNode() {
   quiesce();
-  release();
 }
 
-bool RecordingNode::doInit() {
-  if (impl_->initialization_failure) {
-    reportError(livekit::sdk::detail::graph_error(impl_->initialization_failure));
-    return false;
-  }
+void RecordingNode::bind(graphflow::Binder& ports) {
   if (impl_->kind == MediaKind::audio)
-    subscribe<AudioFrameEvent>([this](const auto& event) {
+    ports.input(livekit::sdk::rtc::TrackPort<AudioFrameEvent>::in, [this](const auto& event) {
       if (!event.pcm || !event.epoch)
         return;
       const auto& pcm = *event.pcm;
@@ -248,7 +241,7 @@ bool RecordingNode::doInit() {
       impl_->enqueue({event, pcm.samples.size() * 2});
     });
   else
-    subscribe<VideoFrameEvent>([this](const auto& event) {
+    ports.input(livekit::sdk::rtc::TrackPort<VideoFrameEvent>::in, [this](const auto& event) {
       if (!event.pixels || !event.epoch)
         return;
       const auto& p = *event.pixels;
@@ -264,23 +257,30 @@ bool RecordingNode::doInit() {
       }
       impl_->enqueue({event, p.y.size() + p.u.size() + p.v.size()});
     });
-  return true;
 }
 
-bool RecordingNode::doStart() {
+livekit::sdk::Result<void> RecordingNode::prepare() {
+  if (impl_->initialization_failure) {
+    report_failure(impl_->initialization_failure);
+    return start_error();
+  }
+  return livekit::sdk::Result<void>::success();
+}
+
+livekit::sdk::Result<void> RecordingNode::activate_graph() {
   std::unique_lock lock(impl_->mutex);
   if (impl_->closed)
-    return false;
+    return start_error();
   std::error_code error;
   std::filesystem::create_directories(impl_->directory, error);
   if (error) {
     lock.unlock();
     impl_->fail("Cannot create recording directory: " + error.message());
-    return false;
+    return start_error();
   }
   impl_->active = true;
   impl_->worker = std::thread([this] { impl_->run(); });
-  return true;
+  return livekit::sdk::Result<void>::success();
 }
 
 void RecordingNode::quiesce() {
@@ -294,7 +294,7 @@ void RecordingNode::quiesce() {
     impl_->worker.join();
 }
 
-void RecordingNode::doStop() {
+void RecordingNode::stop_graph() {
   quiesce();
 }
 
@@ -307,8 +307,8 @@ Result<void> RecordingNode::status() const {
   if (impl_->initialization_failure) {
     return livekit::sdk::Result<void>::failure(impl_->initialization_failure);
   }
-  if (auto value = error()) {
-    return livekit::sdk::Result<void>::failure(livekit::sdk::detail::graph_failure(*value));
+  if (auto value = last_failure()) {
+    return livekit::sdk::Result<void>::failure(value);
   }
   return livekit::sdk::Result<void>::success();
 }

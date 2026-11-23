@@ -95,6 +95,8 @@ with (root / 'server.log').open('w', encoding='utf-8') as log:
                 time.sleep(.1)
         run_pair('video', ('livekit_video_source_example', ['{url}', '{token}']),
                  ('livekit_video_stream_example', []), r'frames=(\d+)')
+        run_pair('typed-watermark', ('livekit_custom_media_graph_example', ['{url}', '{token}']),
+                 ('livekit_video_stream_example', []), r'frames=(\d+)')
         run_pair('audio', ('livekit_audio_source_example', ['{url}', '{token}']),
                  ('livekit_audio_stream_example', []), r'samples/channel=(\d+)')
         run_pair('encoded', ('livekit_sdk_example', ['{url}', 'publish', '5']),

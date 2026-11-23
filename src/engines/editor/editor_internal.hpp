@@ -9,6 +9,12 @@ inline Failure failure(std::string text, ErrorCode code = ErrorCode::processing_
   return make_failure(ErrorDomain::media, code, "freecut/" + text);
 }
 
+inline bool valid_color(const EditorColor& color) {
+  return color.brightness >= -2 && color.brightness <= 2 && color.contrast >= 0 &&
+         color.contrast <= 3 && color.saturation >= 0 && color.saturation <= 3 &&
+         color.temperature >= -1 && color.temperature <= 1;
+}
+
 Result<void> atomic_replace(const std::filesystem::path& from, const std::filesystem::path& to);
 Result<EditorProbe> probe(const std::string& path, std::atomic<bool>& cancel);
 
@@ -20,7 +26,7 @@ struct RenderGraphStats {
 
   struct Node {
     std::string id;
-    uintptr_t instance = 0;
+    uintptr_t instance = 0;  // Processor identity; ingress has no processor.
     std::vector<std::string> outputs;
   };
 
@@ -31,7 +37,7 @@ class RenderGraph {
  public:
   RenderGraph(const EditorProject& project, std::atomic<bool>& cancel);
   ~RenderGraph();
-  // Owner worker only, between synchronous renders. Retains stages/unchanged algorithm nodes
+  // Owner worker only, between synchronous renders. Retains unchanged processor state
   // and unchanged asset decoders; invalidates project-derived frame caches.
   Result<void> update_project(EditorProject project);
   RenderGraphStats stats() const;

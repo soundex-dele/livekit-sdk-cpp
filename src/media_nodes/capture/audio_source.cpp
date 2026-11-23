@@ -17,6 +17,7 @@ struct PcmAudioSource::Impl {
   mutable std::mutex mutex;
   livekit::compat::condition_variable_any changed;
   AudioSourceStats stats;
+  bool studio_playout = false;
   std::list<detail::PcmSourceBlock> queue;
   std::vector<int16_t> remainder;
   std::chrono::steady_clock::time_point remainder_time{};
@@ -224,6 +225,12 @@ void PcmAudioSource::close() {
 }
 
 namespace detail {
+std::shared_ptr<PcmAudioSource> PcmSourceWriter::studioOutput(PcmSourceOptions options) {
+  auto source = std::make_shared<PcmAudioSource>(options);
+  source->impl_->studio_playout = true;
+  return source;
+}
+
 PcmSourceReader::PcmSourceReader(std::shared_ptr<PcmAudioSource> source)
     : source_(std::move(source)) {
   if (!source_) {
@@ -297,8 +304,21 @@ std::optional<PcmSourceBlock> PcmSourceReader::read(livekit::compat::stop_token 
                  [&] { return !s.stats.accepting || s.next_capture || !s.queue.empty(); });
   if (stop.stop_requested() || !s.stats.accepting)
     return {};
-  if (!s.next_capture)
+  if (!s.next_capture) {
+    // At startup only. Allow a short/ending source to return its first available block;
+    // stop, close or a new attachment generation must not deliver the old session.
+    if (s.studio_playout) {
+      const auto generation = s.stats.generation;
+      s.changed.wait_for(lock, stop, 40ms, [&] {
+        return !s.stats.accepting || s.stats.generation != generation || s.queue.size() >= 4;
+      });
+      if (stop.stop_requested() || !s.stats.accepting || s.stats.generation != generation ||
+          s.queue.empty()) {
+        return {};
+      }
+    }
     s.next_capture = s.queue.front().captured;
+  }
   const auto captured = *s.next_capture;
   // Quantize capture-time jitter to the nearest 10ms slot. Late blocks never
   // pull the outgoing sample clock backwards or silently stretch the timeline.

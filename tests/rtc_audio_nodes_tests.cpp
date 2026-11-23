@@ -25,16 +25,22 @@ void eventually(F f, const char* message) {
   }
 }
 
-class Input : public graphflow::core::GraphNode {
+class Input : public livekit::sdk::rtc::TrackNode {
  public:
-  Input() : GraphNode("input", nullptr) {}
+  void bind(graphflow::Binder& ports) override {
+    output<nodes::AudioFrameEvent>(ports);
+    output<nodes::EncodedFrameEvent>(ports);
+    output<nodes::SenderFeedbackEvent>(ports);
+  }
+
+  Input() : TrackNode("input") {}
 
   void raw(nodes::AudioFrameEvent frame) {
-    publish(frame);
+    send(frame);
   }
 
   void encoded(EncodedFrame frame) {
-    publish(nodes::EncodedFrameEvent(std::move(frame)));
+    send(nodes::EncodedFrameEvent(std::move(frame)));
   }
 
   void feedback(Epoch epoch, uint64_t revision = 1, bool active = true, uint64_t generation = 0) {
@@ -43,13 +49,13 @@ class Input : public graphflow::core::GraphNode {
     f.revision = revision;
     f.encodings[""] = {64000, active, false, 0};
     f.media_generation = generation;
-    publish(nodes::SenderFeedbackEvent(f));
+    send(nodes::SenderFeedbackEvent(f));
   }
 };
 
-class Output : public graphflow::core::GraphNode {
+class Output : public livekit::sdk::rtc::TrackNode {
  public:
-  Output() : GraphNode("output", nullptr) {}
+  Output() : TrackNode("output") {}
 
   std::mutex mutex;
   std::condition_variable changed;
@@ -64,23 +70,20 @@ class Output : public graphflow::core::GraphNode {
   }
 
  protected:
-  bool doInit() override {
-    subscribe<nodes::EncodedFrameEvent>([this](const auto& event) {
-      std::unique_lock lock(mutex);
-      packets.push_back(event.frame);
-      entered = true;
-      changed.notify_all();
-      changed.wait(lock, [&] { return !block; });
-    });
-    subscribe<nodes::AudioFrameEvent>([this](const auto& event) {
-      std::lock_guard lock(mutex);
-      frames.push_back(event);
-    });
-    return true;
+  void bind(graphflow::Binder& ports) override {
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::EncodedFrameEvent>::in,
+                [this](const auto& event) {
+                  std::unique_lock lock(mutex);
+                  packets.push_back(event.frame);
+                  changed.notify_all();
+                });
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::AudioFrameEvent>::in,
+                [this](const auto& event) {
+                  std::lock_guard lock(mutex);
+                  frames.push_back(event);
+                });
   }
 };
-
-
 
 void roundtrip(uint16_t channels, uint32_t rate, bool floating) {
   auto input = std::make_shared<Input>();
@@ -88,16 +91,18 @@ void roundtrip(uint16_t channels, uint32_t rate, bool floating) {
   auto d = rtc_audio_test::descriptor("tone", channels);
   auto encoder = std::make_shared<nodes::AudioCodecNode>("encoder", d, true);
   auto decoder = std::make_shared<nodes::AudioCodecNode>("decoder", d, false);
-  graphflow::engine::GraphEngine graph{1};
-  check(graph.loadFromNodes({output, decoder, encoder, input},
-                            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(input, encoder),
-                             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(input, encoder),
-                             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, decoder),
-                             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, output),
-                             livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
-            graph.init() && graph.start(),
+  graphflow::Graph graph{{graphflow::Dispatch::Queued, 128}};
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {output, decoder, encoder, input},
+            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(input, encoder),
+             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(input, encoder),
+             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, decoder),
+             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, output),
+             livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
+            graph.start(),
         "Audio graph start failed");
   input->feedback(1);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   const uint64_t origin = 0xfffffe20ULL;  // Packet and PCM timing crosses RTP's 32-bit wrap.
   for (int packet = 0; packet < 12; ++packet) {
     for (int i = 0; i < 2; ++i)
@@ -112,8 +117,7 @@ void roundtrip(uint16_t channels, uint32_t rate, bool floating) {
   }
   encoder->quiesce();
   decoder->quiesce();
-  graph.stop();
-  graph.release();
+  (void)graph.close();
   media_result(encoder->status());
   media_result(decoder->status());
   std::lock_guard lock(output->mutex);
@@ -142,14 +146,16 @@ void jitter_loss_and_reordering() {
   auto packets = std::make_shared<Output>();
   auto descriptor = rtc_audio_test::descriptor("jitter");
   auto encoder = std::make_shared<nodes::AudioCodecNode>("encoder", descriptor, true);
-  graphflow::engine::GraphEngine encoding{1};
-  check(encoding.loadFromNodes({packets, encoder, source},
-                               {livekit::sdk::test::connect<nodes::AudioFrameEvent>(source, encoder),
-                                livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(source, encoder),
-                                livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, packets)}) &&
-            encoding.init() && encoding.start(),
+  graphflow::Graph encoding;
+  check(livekit::sdk::rtc::wire_track_graph(
+            encoding, {packets, encoder, source},
+            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(source, encoder),
+             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(source, encoder),
+             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, packets)}) &&
+            encoding.start(),
         "Jitter fixture encoder failed");
   source->feedback(1);
+  livekit::sdk::test::wait_receiver(encoding, "encoder");
   for (int packet = 0; packet < 16; ++packet) {
     source->raw(rtc_audio_test::tone(1, packet * 960, 48000, 1, false));
     source->raw(rtc_audio_test::tone(1, packet * 960 + 480, 48000, 1, false));
@@ -161,19 +167,19 @@ void jitter_loss_and_reordering() {
         "Opus fixture failed to produce a packet");
   }
   encoder->quiesce();
-  encoding.stop();
-  encoding.release();
+  (void)encoding.close();
   auto input = std::make_shared<Input>();
   auto output = std::make_shared<Output>();
   AudioCodecOptions options;
   options.jitter_buffer = true;
   auto decoder =
       std::make_shared<nodes::AudioCodecNode>("jitter.decoder", descriptor, false, options);
-  graphflow::engine::GraphEngine graph{1};
-  check(graph.loadFromNodes({output, decoder, input},
-                            {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(input, decoder),
-                             livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
-            graph.init() && graph.start(),
+  graphflow::Graph graph{{graphflow::Dispatch::Queued, 128}};
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {output, decoder, input},
+            {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(input, decoder),
+             livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, output)}) &&
+            graph.start(),
         "Jitter graph failed");
   const auto send = [&](int i, Epoch epoch = 1) {
     auto packet = packets->packets.at(size_t(i));
@@ -211,8 +217,7 @@ void jitter_loss_and_reordering() {
       },
       "Jitter decoder did not reset after rejoin");
   decoder->quiesce();
-  graph.stop();
-  graph.release();
+  (void)graph.close();
   media_result(decoder->status());
 }
 
@@ -224,12 +229,19 @@ void overload_and_epoch() {
   options.max_frames = 2;
   auto encoder = std::make_shared<nodes::AudioCodecNode>(
       "encoder", rtc_audio_test::descriptor("bounded"), true, options);
-  graphflow::engine::GraphEngine graph{1};
-  check(graph.loadFromNodes({out, encoder, in},
-                            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(in, encoder),
-                             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(in, encoder),
-                             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, out)}) &&
-            graph.init() && graph.start(),
+  livekit::sdk::test::CodecWorkerProbe::after_packet(*encoder, [out] {
+    std::unique_lock lock(out->mutex);
+    out->entered = true;
+    out->changed.notify_all();
+    out->changed.wait(lock, [&] { return !out->block; });
+  });
+  graphflow::Graph graph{{graphflow::Dispatch::Queued, 128}};
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {out, encoder, in},
+            {livekit::sdk::test::connect<nodes::AudioFrameEvent>(in, encoder),
+             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(in, encoder),
+             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(encoder, out)}) &&
+            graph.start(),
         "Bounded audio graph start failed");
 
   struct Unblock {
@@ -241,6 +253,7 @@ void overload_and_epoch() {
   } cleanup{out};
 
   in->feedback(1);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   in->raw(rtc_audio_test::tone(1, 0));
   in->raw(rtc_audio_test::tone(1, 480));
   eventually(
@@ -251,23 +264,33 @@ void overload_and_epoch() {
       "Audio worker gate not reached");
   for (int i = 2; i < 50; ++i)
     in->raw(rtc_audio_test::tone(1, i * 480));
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().queued_frames <= 2 && encoder->snapshot().dropped > 0,
         "Audio worker queue is unbounded");
   in->feedback(1, 2, false, 1);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().queued_frames == 0, "Audio mute retained queued PCM");
   const auto muted_admissions = encoder->snapshot().admitted;
   in->raw(rtc_audio_test::tone(1, 25000));
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().admitted == muted_admissions, "Inactive audio codec admitted PCM");
   in->feedback(1, 3, true, 2);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   in->raw(rtc_audio_test::tone(1, 26000));
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().queued_frames == 1, "Audio unmute did not resume admission");
   auto held = rtc_audio_test::tone(1, 28000);
-  in->feedback(1, 4, true, 4);  // A complete mute/unmute occurred between engine polls.
+  in->feedback(1, 4, true, 4);
+  livekit::sdk::test::wait_receiver(
+      graph, "encoder");  // A complete mute/unmute occurred between engine polls.
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().queued_frames == 0, "Audio codec missed a mute boundary between polls");
   const auto admissions = encoder->snapshot().admitted;
   in->raw(held);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().admitted == admissions, "PCM held across mute was retagged as fresh");
   in->feedback(2);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().queued_frames == 0, "Epoch retained queued PCM");
   auto before = encoder->snapshot().dropped;
   in->raw(rtc_audio_test::tone(1, 30000));
@@ -276,6 +299,7 @@ void overload_and_epoch() {
   pcm->float_samples[0] = std::numeric_limits<float>::quiet_NaN();
   invalid.pcm = pcm;
   in->raw(invalid);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(encoder->snapshot().dropped == before + 2, "Stale or nonfinite PCM admitted");
   out->unblock();
   in->raw(rtc_audio_test::tone(2, 0));
@@ -287,7 +311,7 @@ void overload_and_epoch() {
       },
       "New epoch did not recover Opus");
   encoder->quiesce();
-  graph.stop();
+  (void)graph.stop();
   media_result(encoder->status());
   std::lock_guard lock(out->mutex);
   check(out->packets.back().epoch == 2 && out->packets.back().timestamp == 0,
@@ -299,12 +323,13 @@ void decode_gaps() {
   auto out = std::make_shared<Output>();
   auto decoder = std::make_shared<nodes::AudioCodecNode>(
       "decoder", rtc_audio_test::descriptor("receive"), false);
-  graphflow::engine::GraphEngine graph{1};
-  check(
-      graph.loadFromNodes({out, decoder, in}, {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, decoder),
-                                               livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, out)}) &&
-          graph.init() && graph.start(),
-      "Receive graph failed");
+  graphflow::Graph graph{{graphflow::Dispatch::Queued, 128}};
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {out, decoder, in},
+            {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, decoder),
+             livekit::sdk::test::connect<nodes::AudioFrameEvent>(decoder, out)}) &&
+            graph.start(),
+        "Receive graph failed");
   const auto send = [&](Epoch epoch, uint64_t timestamp,
                         std::vector<uint8_t> data = {0xf8, 0xff, 0xfe}) {
     EncodedFrame f;
@@ -341,8 +366,7 @@ void decode_gaps() {
       },
       "Decoder did not recover after malformed Opus");
   decoder->quiesce();
-  graph.stop();
-  graph.release();
+  (void)graph.close();
   media_result(decoder->status());
   std::lock_guard lock(out->mutex);
   check(!out->frames[1].discontinuity && out->frames[2].discontinuity &&

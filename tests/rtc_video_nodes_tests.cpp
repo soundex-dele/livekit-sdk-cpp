@@ -35,9 +35,9 @@ TrackDescriptor video() {
   return d;
 }
 
-class Input : public graphflow::core::GraphNode {
+class Input : public livekit::sdk::rtc::TrackNode {
  public:
-  Input() : GraphNode("input", nullptr) {}
+  Input() : TrackNode("input") {}
 
   std::atomic<int> plis{0};
 
@@ -47,7 +47,7 @@ class Input : public graphflow::core::GraphNode {
     f.revision = revision;
     f.encodings[""] = {400000, active, true, 1};
     f.media_generation = generation;
-    publish(nodes::SenderFeedbackEvent(f));
+    send(nodes::SenderFeedbackEvent(f));
   }
 
   void raw(Epoch epoch, uint64_t timestamp, bool invalid = false, int width = 64,
@@ -66,7 +66,7 @@ class Input : public graphflow::core::GraphNode {
     value.timestamp = timestamp;
     if (captured)
       value.captured = *captured;
-    publish(value);
+    send(value);
   }
 
   void encoded(Epoch epoch, uint64_t timestamp, bool key = true) {
@@ -75,19 +75,23 @@ class Input : public graphflow::core::GraphNode {
     frame.timestamp = timestamp;
     frame.epoch = epoch;
     frame.keyframe = key;
-    publish(nodes::EncodedFrameEvent(std::move(frame)));
+    send(nodes::EncodedFrameEvent(std::move(frame)));
   }
 
  protected:
-  bool doInit() override {
-    subscribe<nodes::KeyframeRequestEvent>([this](const auto&) { ++plis; });
-    return true;
+  void bind(graphflow::Binder& ports) override {
+    output<nodes::VideoFrameEvent>(ports);
+    output<nodes::EncodedFrameEvent>(ports);
+    output<nodes::SenderFeedbackEvent>(ports);
+
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::KeyframeRequestEvent>::in,
+                [this](const auto&) { ++plis; });
   }
 };
 
-class Output : public graphflow::core::GraphNode {
+class Output : public livekit::sdk::rtc::TrackNode {
  public:
-  Output() : GraphNode("output", nullptr) {}
+  Output() : TrackNode("output") {}
 
   std::mutex mutex;
   std::condition_variable changed;
@@ -102,20 +106,19 @@ class Output : public graphflow::core::GraphNode {
   }
 
  protected:
-  bool doInit() override {
-    subscribe<nodes::EncodedFrameEvent>([this](const auto& event) {
-      std::unique_lock lock(mutex);
-      encoded.push_back(event.frame);
-      entered = true;
-      changed.notify_all();
-      changed.wait(lock, [&] { return !block; });
-    });
-    subscribe<nodes::VideoFrameEvent>([this](const auto& event) {
-      std::lock_guard lock(mutex);
-      raw.push_back(event);
-      changed.notify_all();
-    });
-    return true;
+  void bind(graphflow::Binder& ports) override {
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::EncodedFrameEvent>::in,
+                [this](const auto& event) {
+                  std::unique_lock lock(mutex);
+                  encoded.push_back(event.frame);
+                  changed.notify_all();
+                });
+    ports.input(livekit::sdk::rtc::TrackPort<nodes::VideoFrameEvent>::in,
+                [this](const auto& event) {
+                  std::lock_guard lock(mutex);
+                  raw.push_back(event);
+                  changed.notify_all();
+                });
   }
 };
 
@@ -124,12 +127,20 @@ void encoder_queue() {
   auto out = std::make_shared<Output>();
   out->block = true;
   auto codec = std::make_shared<nodes::VideoCodecNode>("encoder", video(), true);
-  graphflow::engine::GraphEngine graph{1};
+  livekit::sdk::test::CodecWorkerProbe::after_packet(*codec, [out] {
+    std::unique_lock lock(out->mutex);
+    out->entered = true;
+    out->changed.notify_all();
+    out->changed.wait(lock, [&] { return !out->block; });
+  });
+  graphflow::Graph graph{{graphflow::Dispatch::Queued, 128}};
 
-  check(graph.loadFromNodes({out, codec, in}, {livekit::sdk::test::connect<nodes::VideoFrameEvent>(in, codec),
-                                               livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(in, codec),
-                                               livekit::sdk::test::connect<nodes::EncodedFrameEvent>(codec, out)}) &&
-            graph.init() && graph.start(),
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {out, codec, in},
+            {livekit::sdk::test::connect<nodes::VideoFrameEvent>(in, codec),
+             livekit::sdk::test::connect<nodes::SenderFeedbackEvent>(in, codec),
+             livekit::sdk::test::connect<nodes::EncodedFrameEvent>(codec, out)}) &&
+            graph.start(),
         "Encoder graph start failed");
 
   // Always release the deliberately blocked callback, including assertion failure.
@@ -142,6 +153,7 @@ void encoder_queue() {
   } cleanup{out};
 
   in->feedback(1);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   in->raw(1, 3001);
   eventually(
       [&] {
@@ -151,30 +163,39 @@ void encoder_queue() {
       "Encoder callback never arrived");
   for (int i = 2; i < 40; ++i)
     in->raw(1, uint64_t(i) * 3001);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   auto stats = codec->snapshot();
   check(stats.queued_frames <= 2 && stats.queued_bytes <= 32 * 1024 * 1024 && stats.dropped > 0,
         "Slow codec output escaped queue bounds");
   in->feedback(1, 2, false, 1);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(codec->snapshot().queued_frames == 0, "Video mute retained queued pixels");
   const auto muted_admissions = codec->snapshot().admitted;
   in->raw(1, 150000);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(codec->snapshot().admitted == muted_admissions, "Inactive video codec admitted pixels");
   in->feedback(1, 3, true, 2);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   in->raw(1, 160000);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(codec->snapshot().queued_frames == 1, "Video unmute did not resume admission");
   const auto held_capture = SteadyClock::now();
   in->feedback(1, 4, true, 4);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(codec->snapshot().queued_frames == 0, "Video codec missed a mute boundary between polls");
   const auto admissions = codec->snapshot().admitted;
   in->raw(1, 170000, false, 64, held_capture);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(codec->snapshot().admitted == admissions,
         "Video input held across mute was retagged as fresh");
   in->feedback(2);
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(codec->snapshot().queued_frames == 0, "New epoch retained old raw input");
   const auto dropped = codec->snapshot().dropped;
   in->raw(1, 900000);
   in->raw(2, 3001, true);
   in->raw(2, 3001, false, std::numeric_limits<int>::max());
+  livekit::sdk::test::wait_receiver(graph, "encoder");
   check(codec->snapshot().dropped == dropped + 3, "Stale/invalid raw media accepted");
   out->unblock();
   in->raw(2, 6002);
@@ -185,7 +206,7 @@ void encoder_queue() {
       },
       "Encoder did not recover after overload/epoch change");
   codec->quiesce();
-  graph.stop();
+  (void)graph.stop();
   media_result(codec->status());
   {
     std::lock_guard lock(out->mutex);
@@ -196,22 +217,24 @@ void encoder_queue() {
   const auto count = codec->snapshot().admitted;
   in->raw(2, 9003);
   check(codec->snapshot().admitted == count, "Stopped codec admitted raw input");
-  graph.release();
+  (void)graph.close();
 }
 
 void decoder_recovery() {
   auto in = std::make_shared<Input>();
   auto out = std::make_shared<Output>();
   auto codec = std::make_shared<nodes::VideoCodecNode>("decoder", video(), false);
-  graphflow::engine::GraphEngine graph{1};
+  graphflow::Graph graph{{graphflow::Dispatch::Queued, 128}};
 
-  check(
-      graph.loadFromNodes({out, in, codec}, {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, codec),
-                                             livekit::sdk::test::connect<nodes::VideoFrameEvent>(codec, out),
-                                             livekit::sdk::test::connect<nodes::KeyframeRequestEvent>(codec, in)}) &&
-          graph.init() && graph.start(),
-      "Decoder graph start failed");
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {out, in, codec},
+            {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, codec),
+             livekit::sdk::test::connect<nodes::VideoFrameEvent>(codec, out),
+             livekit::sdk::test::connect<nodes::KeyframeRequestEvent>(codec, in)}) &&
+            graph.start(),
+        "Decoder graph start failed");
   in->encoded(1, 3001, false);
+  check(bool(graph.drain()), "feedback delivered");
   check(in->plis == 1, "Decoder did not request initial keyframe");
   in->encoded(1, 6002);
   eventually(
@@ -221,6 +244,7 @@ void decoder_recovery() {
       },
       "Decoder did not deliver pixels");
   in->encoded(2, 9003, false);
+  check(bool(graph.drain()), "feedback delivered");
   check(in->plis == 2, "Decoder epoch did not reset dependency chain");
   in->encoded(2, 12004);
   eventually(
@@ -230,8 +254,7 @@ void decoder_recovery() {
       },
       "Decoder epoch recovery failed");
   codec->quiesce();
-  graph.stop();
-  graph.release();
+  (void)graph.close();
   media_result(codec->status());
   std::lock_guard lock(out->mutex);
   const auto& frame = out->raw.back();
@@ -246,18 +269,19 @@ void decoded_output_bound() {
   VideoCodecOptions options;
   options.max_bytes = 2000;
   auto codec = std::make_shared<nodes::VideoCodecNode>("decoder", video(), false, options);
-  graphflow::engine::GraphEngine graph{1};
+  graphflow::Graph graph{{graphflow::Dispatch::Queued, 128}};
 
-  check(graph.loadFromNodes({out, codec, in}, {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, codec),
-                                               livekit::sdk::test::connect<nodes::VideoFrameEvent>(codec, out)}) &&
-            graph.init() && graph.start(),
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {out, codec, in},
+            {livekit::sdk::test::connect<nodes::EncodedFrameEvent>(in, codec),
+             livekit::sdk::test::connect<nodes::VideoFrameEvent>(codec, out)}) &&
+            graph.start(),
         "Bounded decoder start failed");
   in->encoded(1, 3001);
   eventually([&] { return !codec->snapshot().error.empty(); },
              "Oversized decoded pixels were not rejected");
   codec->quiesce();
-  graph.stop();
-  graph.release();
+  (void)graph.close();
   std::lock_guard lock(out->mutex);
   check(out->raw.empty(), "Oversized pixels escaped decoder output budget");
 }

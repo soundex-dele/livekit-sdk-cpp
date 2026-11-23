@@ -214,16 +214,21 @@ void failures_and_barrier() {
   check(surfaced && !fresh->write(pcm(0, 123)), "Device failure was hidden from graph polling");
 }
 
-class Source : public graphflow::core::GraphNode {
+class Source : public livekit::sdk::rtc::TrackNode {
  public:
-  Source() : GraphNode("source", nullptr) {}
+  void bind(graphflow::Binder& ports) override {
+    output<nodes::AudioFrameEvent>(ports);
+    output<nodes::VideoFrameEvent>(ports);
+  }
+
+  Source() : TrackNode("source") {}
 
   void push(const nodes::AudioFrameEvent& frame) {
-    publish(frame);
+    send(frame);
   }
 
   void push(const nodes::VideoFrameEvent& frame) {
-    publish(frame);
+    send(frame);
   }
 };
 
@@ -231,20 +236,20 @@ void graph_sink() {
   Fixture f;
   auto source = std::make_shared<Source>();
   auto output = std::make_shared<nodes::AudioOutputNode>("output", "track", f.session);
-  graphflow::engine::GraphEngine graph{1};
-  check(graph.loadFromNodes(
-            {output, source},
+  graphflow::Graph graph;
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {output, source},
             {livekit::sdk::test::connect<nodes::AudioFrameEvent>(source, output)}) &&
-            graph.init() && graph.start(),
+            graph.start(),
         "Output graph startup failed");
   source->push(pcm(0, 4000));
+  check(bool(graph.drain()), "PCM delivered to playout");
   check(all(f.device->pull(), 4000), "Graph output sink did not enqueue decoded PCM");
   output->quiesce();
   source->push(pcm(480, 5000));
   check(output->snapshot().closed && all(f.device->pull(), 0),
         "Graph quiescence allowed late decoded audio");
-  graph.stop();
-  graph.release();
+  (void)graph.close();
 }
 
 void native_callback() {
@@ -324,12 +329,12 @@ void recording() {
       std::make_shared<nodes::RecordingNode>("audio", directory, "audio", MediaKind::audio);
   auto video =
       std::make_shared<nodes::RecordingNode>("video", directory, "video", MediaKind::video);
-  graphflow::engine::GraphEngine graph{1};
-  check(graph.loadFromNodes(
-            {audio, video, source},
+  graphflow::Graph graph;
+  check(livekit::sdk::rtc::wire_track_graph(
+            graph, {audio, video, source},
             {livekit::sdk::test::connect<nodes::AudioFrameEvent>(source, audio),
              livekit::sdk::test::connect<nodes::VideoFrameEvent>(source, video)}) &&
-            graph.init() && graph.start(),
+            graph.start(),
         "Recording graph failed");
   source->push(pcm(0, -1234, 960));
   source->push(pcm(960, 2345, 480));
@@ -345,10 +350,10 @@ void recording() {
   frame.pixels = pixels;
   frame.epoch = 1;
   source->push(frame);
+  check(bool(graph.drain()), "recording frames delivered");
   audio->quiesce();
   video->quiesce();
-  graph.stop();
-  graph.release();
+  (void)graph.close();
   media_result(audio->status());
   media_result(video->status());
   const auto wav = read("audio-0.wav"), next = read("audio-1.wav"), y4m = read("video-0.y4m");
@@ -366,16 +371,16 @@ void recording() {
   auto collision =
       std::make_shared<nodes::RecordingNode>("collision", directory, "audio", MediaKind::audio);
   auto second = std::make_shared<Source>();
-  graphflow::engine::GraphEngine duplicate{1};
-  check(duplicate.loadFromNodes(
-            {collision, second},
+  graphflow::Graph duplicate;
+  check(livekit::sdk::rtc::wire_track_graph(
+            duplicate, {collision, second},
             {livekit::sdk::test::connect<nodes::AudioFrameEvent>(second, collision)}) &&
-            duplicate.init() && duplicate.start(),
+            duplicate.start(),
         "Collision graph failed before recording");
   second->push(pcm(0, 0));
+  check(bool(duplicate.drain()), "collision input delivered");
   collision->quiesce();
-  duplicate.stop();
-  duplicate.release();
+  (void)duplicate.close();
   check(!collision->snapshot().error.empty() && read("audio-0.wav") == wav,
         "Recording overwrote an existing file");
 }

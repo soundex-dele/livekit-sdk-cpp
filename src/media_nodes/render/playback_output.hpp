@@ -2,7 +2,7 @@
 #include "livekit/player.hpp"
 #include "media_graph/channel.hpp"
 #include "media_graph/media_flow.hpp"
-#include "media_graph/failure.hpp"
+
 #include <mutex>
 
 namespace livekit::sdk::detail {
@@ -11,9 +11,8 @@ namespace livekit::sdk::detail {
 template <class T>
 class PlaybackOutputNode final : public MediaNode {
  public:
-  PlaybackOutputNode(const char* name, graphflow::core::EventBus* bus, size_t capacity,
-                     size_t bytes)
-      : MediaNode(name, bus), channel_(capacity, bytes) {}
+  PlaybackOutputNode(const char* name, size_t capacity, size_t bytes)
+      : MediaNode(name), channel_(capacity, bytes) {}
 
   int64_t end_us() const {
     return end_;
@@ -60,15 +59,16 @@ class PlaybackOutputNode final : public MediaNode {
   }
 
  protected:
-  bool doInit() override {
+  void bind(graphflow::Binder& b) override {
     using E = std::conditional_t<std::is_same_v<T, media::VideoFrame>, RGBA8, StereoFloat48k>;
-    auto subscribed = subscribe_media<E>([this](E& event) -> Result<bool> {
+    subscribe_media<E>(b, [this](const E& event) -> Result<bool> {
       if (event.eos) {
         finished_ = true;
         return Result<bool>::success(true);
       }
       const auto end = event.frame.timestamp_us + event.frame.duration_us;
-      auto pushed = push(event.frame);
+      auto frame = event.frame;
+      auto pushed = push(frame);
       if (!pushed) {
         return pushed;
       }
@@ -78,11 +78,6 @@ class PlaybackOutputNode final : public MediaNode {
       end_ = std::max(end_, end);
       return Result<bool>::success(true);
     });
-    if (!subscribed) {
-      reportError(graph_error(subscribed.failure_record()));
-      return false;
-    }
-    return true;
   }
 
   Result<void> on_reset(int64_t position) override {
@@ -109,11 +104,11 @@ using VideoFrameOutputNode = PlaybackOutputNode<media::VideoFrame>;
 using AudioFrameOutputNode = PlaybackOutputNode<media::AudioFrame>;
 
 struct PlaybackOutputs {
-  PlaybackOutputs(graphflow::core::EventBus* bus, const PlayerOptions& options)
-      : video(std::make_shared<VideoFrameOutputNode>(
-            "video.output", bus, options.video_queue_frames, options.queue_bytes)),
-        audio(std::make_shared<AudioFrameOutputNode>(
-            "audio.output", bus, options.audio_queue_frames, options.queue_bytes)) {}
+  PlaybackOutputs(const PlayerOptions& options)
+      : video(std::make_shared<VideoFrameOutputNode>("video.output", options.video_queue_frames,
+                                                     options.queue_bytes)),
+        audio(std::make_shared<AudioFrameOutputNode>("audio.output", options.audio_queue_frames,
+                                                     options.queue_bytes)) {}
 
   void flush(uint64_t generation) {
     video->flush(generation);

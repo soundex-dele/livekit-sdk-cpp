@@ -5,20 +5,15 @@ VideoConverterNode::~VideoConverterNode() {
   doRelease();
 }
 
-bool VideoConverterNode::doInit() {
-  auto subscribed =
-      subscribe_media<DecodedVideo>([this](const DecodedVideo& event) -> Result<bool> {
-        if (input_ || finished_) {
-          return Result<bool>::success(false);
-        }
-        input_ = event;
-        return Result<bool>::success(true);
-      });
-  if (!subscribed) {
-    reportError(graph_error(subscribed.failure_record()));
-    return false;
-  }
-  return true;
+void VideoConverterNode::bind(graphflow::Binder& b) {
+  output_ = b.output(graphflow::Out<RGBA8>{"out", graphflow::Connections::ExactlyOne});
+  subscribe_media<DecodedVideo>(b, [this](const DecodedVideo& event) -> Result<bool> {
+    if (input_ || finished_) {
+      return Result<bool>::success(false);
+    }
+    input_ = event;
+    return Result<bool>::success(true);
+  });
 }
 
 void VideoConverterNode::doRelease() {
@@ -98,7 +93,7 @@ Result<bool> VideoConverterNode::pump() {
     return Result<bool>::success(false);
   }
   if (pending_) {
-    auto published = publish_media(*pending_);
+    auto published = publish_media(output_, *pending_);
     if (!published) {
       return Result<bool>::failure(published.failure_record());
     }

@@ -1,8 +1,7 @@
 #include "service_test_result.hpp"
 #include "engines/player/playback_graph.hpp"
-#include "engine/graph_builder.h"
-#include "engine/graph_engine.h"
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <set>
@@ -24,52 +23,29 @@ void fails(F operation) {
   require(!operation(), "expected operation to fail");
 }
 
-void state_is(const PlaybackGraph& graph, graphflow::core::LifecycleState expected) {
+void state_is(const PlaybackGraph& graph, MediaState expected) {
   for (const auto& node : graph.nodes()) {
     require(node.state == expected, "node lifecycle mismatch");
   }
 }
 
-void check_builder_transports() {
-  using namespace graphflow;
-  core::EventBus bus{1};
-  engine::GraphBuilder builder;
-  builder.setEventBus(&bus);
-  auto a = std::make_shared<core::GraphNode>("a", &bus);
-  auto b = std::make_shared<core::GraphNode>("b", &bus);
-  auto c = std::make_shared<core::GraphNode>("c", &bus);
-  require(
-      builder.registerNode("a", a) && builder.registerNode("b", b) && builder.registerNode("c", c),
-      "builder registration");
-  using Specs = std::vector<engine::PathNodeSpec>;
-  constexpr auto external = engine::GraphBuilder::EdgeTransport::External;
-  engine::GraphEngine invalid_graph(1);
-  require(!invalid_graph.loadFromNodes(
-              {a, b}, {{"a", "b", "bytes", ""}, {"b", "missing", "packet", ""}}, external),
-          "invalid graph endpoint was accepted");
-  require(a->getPubEdges().empty() && b->getSubEdges().empty(),
-          "invalid path partially attached edges");
-  auto input = builder.build(Specs{{"a", "bytes", ""}, {"b", "", ""}}, external);
-  auto branch =
-      builder.build(Specs{{"a", "bytes", ""}, {"b", "packet", "video"}, {"c", "", ""}}, external);
-  require(input->eventBusesSnapshot().empty() && branch->eventBusesSnapshot().empty(),
-          "external edges allocated buses");
-  require(
-      a->getPubEdges().size() == 1 && b->getSubEdges().size() == 1 && b->getPubEdges().size() == 1,
-      "builder did not deduplicate shared external edge");
-  require(!b->getPubEdges().front().eventBus() && b->getPubEdges().front().condition() == "video",
-          "external routing metadata");
-  require(!invalid_graph.loadFromNodes({a, b}, {{"a", "b", "bytes", ""}}),
-          "graph accepted previously wired external nodes");
-  auto control = builder.build(Specs{{"a", "command", ""}, {"c", "", ""}});
-  require(control->eventBusesSnapshot().size() == 1 && a->getPubEdges().back().eventBus(),
-          "default EventBus transport changed");
-  require(!invalid_graph.loadFromNodes({a, c}, {{"a", "c", "command", ""}}, external),
-          "graph accepted previously wired event-bus nodes");
-  builder.reset();
-  require(!control->eventBusesSnapshot().front()->isClosed(), "builder reset invalidated path bus");
-  require(a->state() == core::LifecycleState::Created,
-          "builder released nodes during construction");
+// open() negotiates both branches, including a description for an absent stream.
+// It must not run the packet/frame pipeline just to configure the decoders.
+void check_open_delivery(const PlaybackGraph& graph) {
+  state_is(graph, MediaState::Initialized);
+  require(graph.outputs()->empty(), "open produced output frames");
+  std::set<std::string> receivers;
+  for (const auto& node : graph.nodes()) {
+    if (node.name == "file.demuxer") {
+      require(node.received == 0 && node.published == 2, "expected two stream descriptions");
+    } else if (node.name == "video.decoder" || node.name == "audio.decoder") {
+      require(node.received == 1 && node.published == 0, "decoder did not accept just its format");
+      receivers.insert(node.name);
+    } else {
+      require(node.received == 0 && node.published == 0, "media reached downstream before start");
+    }
+  }
+  require(receivers.size() == 2, "missing decoder branch during open");
 }
 
 int drain(PlaybackGraph& graph, uint64_t generation, int64_t lower_bound) {
@@ -99,7 +75,6 @@ int drain(PlaybackGraph& graph, uint64_t generation, int64_t lower_bound) {
 
 int main(int argc, char** argv) {
   require(argc == 2, "fixture directory required");
-  check_builder_transports();
   const std::filesystem::path fixtures = argv[1];
   auto file = [&](const char* name) {
     auto path = (fixtures / name).u8string();
@@ -113,52 +88,49 @@ int main(int argc, char** argv) {
   std::shared_ptr<PlaybackOutputs> released_outputs;
   {
     PlaybackGraph graph(cancelled, options);
-    require(graph.nodes().size() == 8 && graph.edges().size() == 7,
-            "expected eight real nodes and seven media connections");
+    require(graph.nodes().size() == 7 && graph.edges().size() == 6,
+            "expected seven real nodes and six media connections");
     std::set<std::string> names;
     for (const auto& node : graph.nodes()) {
       names.insert(node.name);
     }
-    require(names == std::set<std::string>{"file.source", "file.demuxer", "video.decoder",
-                                           "audio.decoder", "video.rgba", "audio.resampler",
-                                           "video.output", "audio.output"},
+    require(names == std::set<std::string>{"file.demuxer", "video.decoder", "audio.decoder",
+                                           "video.rgba", "audio.resampler", "video.output",
+                                           "audio.output"},
             "node identities mismatch");
     for (const auto& edge : graph.edges()) {
-      require(names.count(edge.from()) && names.count(edge.to()), "dangling graph edge");
-      require(!edge.dataType().empty() && edge.eventBus(),
+      require(names.count(edge.from) && names.count(edge.to), "dangling graph edge");
+      require(!edge.type.empty() && !edge.port.empty(),
               "media edge must carry typed pub/sub events");
-      if (edge.from() == "file.demuxer") {
-        require(edge.condition() == (edge.to() == "video.decoder" ? "video" : "audio"),
+      if (edge.from == "file.demuxer") {
+        require(edge.port == (edge.to == "video.decoder" ? "video" : "audio"),
                 "demux output route mismatch");
       }
     }
     using Edge = std::tuple<std::string, std::string, std::string>;
     std::set<Edge> actual_edges;
     for (const auto& edge : graph.edges()) {
-      actual_edges.emplace(edge.from(), edge.to(), edge.dataType());
+      actual_edges.emplace(edge.from, edge.to, edge.type);
     }
-    require(actual_edges == std::set<Edge>{{"file.source", "file.demuxer", "SeekableBytes"},
-                                           {"file.demuxer", "video.decoder", "VideoPacket"},
+    require(actual_edges == std::set<Edge>{{"file.demuxer", "video.decoder", "VideoPacket"},
                                            {"file.demuxer", "audio.decoder", "AudioPacket"},
                                            {"video.decoder", "video.rgba", "DecodedVideo"},
                                            {"audio.decoder", "audio.resampler", "DecodedAudio"},
                                            {"video.rgba", "video.output", "RGBA8"},
                                            {"audio.resampler", "audio.output", "StereoFloat48k"}},
             "builder connected the wrong playback branches");
-    state_is(graph, graphflow::core::LifecycleState::Created);
+    state_is(graph, MediaState::Created);
     fails([&] { return graph.start(); });
-    state_is(graph, graphflow::core::LifecycleState::Created);
+    fails([&] { return graph.seek(0); });
+    state_is(graph, MediaState::Created);
     auto info = service_value(graph.open(file("av.mp4")));
     require(info.has_video && info.has_audio, "demux probe");
-    for (const auto& edge : graph.edges()) {
-      require(edge.eventBus()->handlerCount(edge.name()) == 1, "missing media subscriber");
-    }
-    state_is(graph, graphflow::core::LifecycleState::Initialized);
+    check_open_delivery(graph);
     fails([&] { return graph.step(); });
     auto output = graph.outputs();
     output->flush(10);
     service_value(graph.start());
-    state_is(graph, graphflow::core::LifecycleState::Running);
+    state_is(graph, MediaState::Running);
     bool blocked = false;
     for (int i = 0; i < 1000; ++i) {
       if (service_value(graph.step()) == PlaybackGraph::Step::backpressured) {
@@ -171,7 +143,7 @@ int main(int argc, char** argv) {
     retained = output->video->take_due(std::numeric_limits<int64_t>::max(), 10);
     require(retained && !retained->rgba->empty(), "missing retained video buffer");
     service_value(graph.pause());
-    state_is(graph, graphflow::core::LifecycleState::Stopped);
+    state_is(graph, MediaState::Stopped);
     fails([&] { return graph.step(); });
     service_value(graph.seek(1800000));
     output->flush(11);
@@ -186,8 +158,8 @@ int main(int argc, char** argv) {
     require(drain(graph, 12, 0) == 60, "flush/replay lost frames");
     const auto diagnostics = graph.nodes();
     for (const auto& node : diagnostics) {
-      if (node.name == "file.source") {
-        require(node.published > 0, "source did not publish file bytes");
+      if (node.name == "file.demuxer") {
+        require(node.received == 0, "file demuxer must be the graph source");
       } else {
         require(node.received > 0, "node did not receive media events");
       }
@@ -198,18 +170,42 @@ int main(int argc, char** argv) {
     released_outputs = output;
   }
   require(retained->rgba->size() == 160 * 90 * 4, "buffer invalidated on graph release");
-  require(released_outputs->empty() &&
-              released_outputs->video->state() == graphflow::core::LifecycleState::Released,
+  require(released_outputs->empty() && released_outputs->video->state() == MediaState::Released,
           "output nodes not released with graph");
   fails([&] {
     auto copy = *retained;
     return released_outputs->video->push(copy);
   });
-  // Demux failure happens after preparing the file source. Roll back all nodes.
+  for (bool video_only : {false, true}) {
+    PlaybackGraph graph(cancelled, options);
+    auto info = service_value(graph.open(file(video_only ? "video.mp4" : "audio.wav")));
+    require(info.has_video == video_only && info.has_audio == !video_only, "single-stream probe");
+    check_open_delivery(graph);
+  }
+  // Valid mono WAVE container, deliberately unassigned codec tag. Probing succeeds;
+  // the audio decoder's rejection must reach open(), not a later start()/step().
+  {
+    const unsigned char wave[] = {'R',  'I',  'F', 'F', 40,   0,    0, 0, 'W',  'A',  'V', 'E',
+                                  'f',  'm',  't', ' ', 16,   0,    0, 0, 0xfe, 0xca, 1,   0,
+                                  0x40, 0x1f, 0,   0,   0x80, 0x3e, 0, 0, 2,    0,    16,  0,
+                                  'd',  'a',  't', 'a', 4,    0,    0, 0, 0,    0,    0,   0};
+    std::ofstream fixture(fixtures / "unsupported-codec.wav", std::ios::binary);
+    fixture.write(reinterpret_cast<const char*>(wave), sizeof(wave));
+    fixture.close();
+    require(bool(fixture), "could not write unsupported codec fixture");
+    PlaybackGraph graph(cancelled, options);
+    auto result = graph.open(file("unsupported-codec.wav"));
+    require(!result && result.error().message == "playback/audio.decoder: unsupported codec",
+            "open lost the decoder's setup failure");
+    require(graph.outputs()->empty(), "failed open produced media");
+    state_is(graph, MediaState::Released);
+    fails([&] { return graph.start(); });
+  }
+  // Demux failure happens after opening the local file. Roll back all nodes.
   {
     PlaybackGraph graph(cancelled, options);
     fails([&] { return graph.open(file("invalid.mp4")); });
-    state_is(graph, graphflow::core::LifecycleState::Released);
+    state_is(graph, MediaState::Released);
     fails([&] { return graph.start(); });
     fails([&] { return graph.step(); });
   }
@@ -217,8 +213,12 @@ int main(int argc, char** argv) {
   // and releases every node (including subscribers initialized downstream).
   {
     PlaybackGraph graph(cancelled, options);
-    fails([&] { return graph.open(file("missing-file.mp4")); });
-    state_is(graph, graphflow::core::LifecycleState::Released);
+    auto missing = graph.open(file("missing-file.mp4"));
+    require(!missing && missing.error().message ==
+                            "playback/file.demuxer/io: expected a local regular file",
+            "open lost the file node init failure");
+    fails([&] { return graph.seek(0); });
+    state_is(graph, MediaState::Released);
   }
   {
     PlaybackGraph graph(cancelled, options);

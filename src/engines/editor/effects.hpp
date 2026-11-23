@@ -1,39 +1,29 @@
 #pragma once
+#include "editor_internal.hpp"
 #include "render_events.hpp"
-#include "engine/graph_builder.h"
-#include <functional>
-#include <memory>
-#include <string>
-#include <vector>
 
 namespace livekit::sdk::editor_detail {
-// Publication is compiled at the external-library exception boundary.
-class FlowNode : public graphflow::core::GraphNode {
- public:
-  using GraphNode::GraphNode;
-  bool send_layer(const Layer& layer, const std::string& route = "");
-};
+bool render_text(EditorImage& image, const EditorText& text, std::string& error) noexcept;
 
-// A topology plan only. Nodes schedule downstream processing through graph edges.
-class EffectNodes {
+// A complete candidate graph is built and started before replacing the live graph.
+// Only immutable settings and reusable processor/cache state cross that boundary;
+// bindings, emitters and INodes belong exclusively to one Graph.
+class RenderPipeline {
  public:
-  static Result<std::unique_ptr<EffectNodes>> prepare(const EditorProject& project,
-                                                      graphflow::core::EventBus* bus,
-                                                      std::function<void(Work&)> finish_audio,
-                                                      const EffectNodes* previous = nullptr);
-  ~EffectNodes();
-  void append_to(std::vector<std::shared_ptr<graphflow::core::GraphNode>>& nodes,
-                 std::vector<graphflow::engine::NodeConnection>& connections) const;
-  size_t reused_nodes() const;
-  // Owner worker, after every synchronous frame, including errors. Releases any
-  // backend event correlations whose branch failed to produce an output.
-  void finish_frame();
+  struct Callbacks {
+    std::function<void(Work&)> decode, composite, mix, finish_audio;
+  };
+
+  static Result<std::unique_ptr<RenderPipeline>> build(const EditorProject& project,
+                                                       const Callbacks& callbacks,
+                                                       const RenderPipeline* previous);
+  ~RenderPipeline();
+  void render(const std::shared_ptr<Work>& work);
+  void inspect(RenderGraphStats& stats) const;
 
  private:
-  EffectNodes();
-  class Impl;
+  RenderPipeline();
+  struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-
-bool render_text(EditorImage& image, const EditorText& text, std::string& error) noexcept;
 }  // namespace livekit::sdk::editor_detail

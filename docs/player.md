@@ -15,6 +15,8 @@ cmake --build out/player-engine --config Release --parallel 4
 ctest --test-dir out/player-engine -C Release --output-on-failure
 ```
 
+Player 私有链接 `GraphFlow::core`。默认使用相邻的 `graphflow-cpp-refactor` 源码目录，可用 `LIVEKIT_TYPED_GRAPHFLOW_ROOT` 指定位置；这不替换其他 SDK 模块的旧 GraphFlow 依赖。
+
 需要匹配的 FFmpeg 头文件、库和运行时；可用 `LIVEKIT_FFMPEG_INCLUDE` 指定独立头文件目录。`LIVEKIT_PLAYER_BUILD_TESTS=OFF` 关闭引擎测试后不需要 ffmpeg 可执行文件。`LIVEKIT_BUILD_PLAYER` 默认关闭；目前仅提供源码集成，尚未提供安装包/C ABI。
 
 ## 分层与执行
@@ -22,30 +24,29 @@ ctest --test-dir out/player-engine -C Release --output-on-failure
 | 目录 / target | 职责 |
 | --- | --- |
 | `include/livekit/media_core` / `LiveKit::MediaCore` | SDK 自有 RGBA/PCM 帧、共享只读 Buffer、微秒时间戳、generation、steady clock |
-| `src/media_nodes` / `livekit_media_nodes_ffmpeg` | 独立的文件源、解封装、音视频解码、视频转换、音频重采样节点 |
-| `src/engines/player/playback_graph.*` / `LiveKit::Player` | GraphEngine::loadFromNodes 装配、引擎生命周期和播放控制 |
+| `src/media_nodes` / `livekit_media_nodes_ffmpeg` | 文件读取与解封装一体的源节点，以及音视频解码、视频转换、音频重采样节点 |
+| `src/engines/player/playback_graph.*` / `LiveKit::Player` | 类型化 Inline 图装配、引擎生命周期和播放控制 |
 | `src/media_graph/media_flow.hpp` | 通用图执行器、类型化发布/订阅、接收确认、背压、epoch 和错误回传 |
 | `src/media_nodes/render/playback_output.hpp` / `LiveKit::Player` | 图内音视频输出节点，各自拥有有界 MediaChannel，支持跨线程拉取 |
 | `src/engines/player` / `LiveKit::Player` | 场景状态机、命令队列、播放时钟和按时取帧 |
 | `../livekit-app/apps/player/desktop/main.cpp` | Qt6 应用入口、命令行、隔离设置和无窗口运行 |
 | `../livekit-app/apps/player/desktop/controller.*`、`window.*` | SDK 公共 API 消费者；异步会话控制、音视频输出、中文播放器界面 |
 
-Player 独占内部图。`PlaybackGraph` 包含 **8 个实际 GraphNode 和 7 条带类型的媒体连接**：
+Player 独占内部图。`PlaybackGraph` 包含 **7 个图节点 和 6 条带类型的媒体连接**：
 
 ```text
-FileSourceNode → DemuxerNode
-                   ├→ VideoDecoderNode → VideoConverterNode → VideoFrameOutputNode
-                   └→ AudioDecoderNode → AudioResamplerNode → AudioFrameOutputNode
+DemuxerNode（本地文件源）
+    ├→ VideoDecoderNode → VideoConverterNode → VideoFrameOutputNode
+    └→ AudioDecoderNode → AudioResamplerNode → AudioFrameOutputNode
 ```
 
-图通过 `graphflow::engine::GraphEngine::loadFromNodes(nodes, connections)` 一次性加载 8 个节点和 7 条 `NodeConnection`。播放器不再手工注册 GraphBuilder 节点、创建 GraphPath 或持有独立控制总线。GraphEngine 负责绑定控制总线、创建带类型的 EventBus 连接、持有节点和路径，并统一执行 `init/start/stop/release`。Demuxer 的 `video` / `audio` 路由分别连接两个解码器，媒体事件仍沿图边实际传递。
+图由 `graphflow::Graph` 以 `Dispatch::Inline` 模式运行。节点在 `add()` 时绑定类型化端口，在一次 `rewire()` 中安装六条边；只有接线成功才记录执行器和诊断使用的连接。`file.demuxer` 的 `video` / `audio` 输出分别连到对应解码器，不经过旧 EventBus。
 
-`loadFromNodes` 按传入节点顺序驱动生命周期，因此播放器传入下游到上游的节点顺序，让订阅者先初始化、启动，也让文件源最后释放。`engine.init()` 完成后，再按媒体拓扑顺序调用 `prepare()`，此时源文件已打开、所有订阅已建立，Demuxer 才执行探测并发布流参数。准备阶段发生错误时调用 `engine.release()` 回滚整图。
+`open()` 调用 `start(PrepareOnly)`。所有节点初始化成功后，图内输出开放，但不会启动播放或接受外部输入。Demuxer 通过同一对媒体端口发送格式；两支解码器均同步确认后 `open()` 才成功（不存在的流也有一份空描述）。格式确认失败，保留原始错误并关闭整图。此时不执行 `pump()`，所以不会输出帧。
 
 | 节点 ID | 实现文件 | 所有权与职责 |
 | --- | --- | --- |
-| `file.source` | `src/media_nodes/capture/file_source.cpp` | 文件句柄；按 IO 请求读取并发布 SeekableBytes，处理 Seek、取消/超时 |
-| `file.demuxer` | `src/media_nodes/demux/ffmpeg_demuxer.cpp` | 自定义 AVIO、容器上下文；订阅字节，发布流参数、VideoPacket / AudioPacket 和 EOS |
+| `file.demuxer` | `src/media_nodes/demux/ffmpeg_file_io.cpp`、`ffmpeg_demuxer.cpp` | 同一图节点持有文件句柄、AVIO 和容器上下文，处理读、seek、取消和超时，发布流参数、音视频包和 EOS |
 | `video.decoder` / `audio.decoder` | `src/media_nodes/codecs/ffmpeg_decoder.cpp` | 订阅流参数/编码包，持有各自解码器，发布 DecodedVideo / DecodedAudio 和 EOS |
 | `video.rgba` | `src/media_nodes/process/ffmpeg_video_converter.cpp` | swscale 上下文；RGBA 转换、过滤 Seek 目标之前的帧 |
 | `audio.resampler` | `src/media_nodes/process/ffmpeg_audio_resampler.cpp` | swresample 上下文；48 kHz 双声道 PCM、Seek 裁剪、重采样尾部排空 |
@@ -53,13 +54,13 @@ FileSourceNode → DemuxerNode
 
 `MediaExecutor` 根据实际连接计算拓扑顺序，每次从下游向上游执行一轮节点 `pump()`。执行器不识别 FFmpeg 节点类型，`PlaybackGraph::step()` 不再调用 read/send/receive/convert。节点通过 `subscribe_media<T>()` 接收事件，在自己的有界输入槽中保存数据，处理后通过 `publish_media<T>()` 沿图边发布。
 
-发布/订阅在 Player 工作线程内同步派发，接收回调负责接收数据和返回确认，常规解码与转换在后续调度中完成。节点满载时返回拒收，上游保留自己的待发布事件，下轮重试；每条输出端口只允许一个订阅者，避免重试导致分支重复投递。当前不调用 EventBus 的无界异步入队接口，也不为每个节点创建线程。整轮无进展时执行器返回 `backpressured`，Player 让出执行处理命令或等待输出被消费。
+发布/订阅在 Player 工作线程内同步派发，接收回调负责接收数据和返回确认，常规解码与转换在后续调度中完成。节点满载时返回拒收，上游保留自己的待发布事件，下轮重试；每条输出端口只允许一个订阅者，避免重试导致分支重复投递。当前不使用异步队列，也不为每个节点创建线程。整轮无进展时执行器返回 `backpressured`，Player 让出执行处理命令或等待输出被消费。
 
-文件字节读取适配 FFmpeg 的同步 AVIO 契约：Demuxer 在 AVIO 回调里通过控制总线向源节点请求读取，FileSource 发布最多 32 KiB 的 `SeekableBytes`，Demuxer 的订阅回调将数据填入 AVIO 缓冲。Seek/文件大小查询走同一 IO 控制接口。源节点和解封装器之间没有直接的方法调用。所有节点完成初始化和订阅后，Demuxer 发布含自有编解码参数的准备事件，解码器据此打开编解码上下文；解码器不持有 Demuxer 引用。
+FFmpeg 的 AVIO 回调在 `file.demuxer` 节点内部同步读取本地文件，直接填充 FFmpeg 缓冲区；seek 和文件大小查询也在该节点内完成。文件读取仍由图节点承载，但节点内部不再发布字节事件。Player 工作线程直接调用图的启动、暂停和 seek，不在事件投递回调内切换生命周期。所有节点完成初始化和订阅后，Demuxer 发布含自有编解码参数的准备事件，解码器据此打开编解码上下文；解码器不持有 Demuxer 引用。
 
 编码包通过 `av_packet_clone`、解码帧通过 `av_frame_clone` 持有 FFmpeg 引用计数缓冲，发布事件复制共享引用，不复制完整像素/PCM。背压时事件可以跨多个调度轮次保留。输出为共享只读 SDK Buffer，进入输出节点的有界 MediaChannel，再由独立交付线程调用应用回调。
 
-节点初始化、启动、停止和释放统一由 GraphEngine 按下游到上游顺序执行，媒体准备按上游到下游顺序执行。初始化或准备失败都释放整图。Seek 递增内部 epoch，并清空各节点的输入/待发布事件、解码器、重采样器和输出队列；旧 epoch 事件会被丢弃。EOS 沿媒体边传播，解码器和重采样器完成尾部排空后才向下游发布 EOS，所有节点完成后图才返回 `end`。纯音频/纯视频仍保留固定拓扑，未使用的分支只转发 EOS。订阅回调的异常通过投递确认显式回传，避免 EventBus 日志捕获导致静默失败。`nodes()` / `edges()` 提供内部拓扑、生命周期和实际收发计数。
+图按下游到上游初始化和启动，停止和释放时先处理上游。媒体准备按上游到下游顺序执行。初始化或准备失败都释放整图。Seek 递增内部 epoch，并清空各节点的输入/待发布事件、解码器、重采样器和输出队列；旧 epoch 事件会被丢弃。EOS 沿媒体边传播，解码器和重采样器完成尾部排空后才向下游发布 EOS，所有节点完成后图才返回 `end`。纯音频/纯视频仍保留固定拓扑，未使用的分支在准备后只转发 EOS。业务失败随投递确认显式回传，不把端口接纳等同于处理成功。`nodes()` / `edges()` 提供内部拓扑、生命周期和实际收发计数。
 
 播放器时钟仍由 Player 场景引擎管理；Qt 图像呈现和音频设备提交仍在界面线程，消费图的输出节点。这里的输出节点是 SDK 帧出口，不是 Qt 设备节点。本次没有开放通用高级图 API、Runtime 设备管理或动态拓扑。
 
@@ -102,7 +103,7 @@ player.set_callbacks({});
 - `stop` 定位到零并回到 `ready`；`ended` 上调用 `play` 自动从头播放。
 - 解封装 EOF 后排空两个解码器和重采样器；输出队列取空且最后一帧时间结束后才进入 `ended`。
 - `close` 释放图和媒体资源，幂等，之后可再次 open。析构取消 I/O 并等待源工作线程和回调交付线程退出。
-- FFmpeg I/O 支持中断和默认 10 秒操作超时；`cancel_pending_io()` 可显式中断当前操作。open/close 会请求中断正在进行的 I/O。Seek/stop 按命令队列串行执行，不取消前一个 Seek 的完成结果。无法中断不检查 interrupt callback 的底层内核调用或单次 codec 运算。
+- FFmpeg I/O 支持中断和默认 10 秒操作超时；`cancel_pending_io()` 可显式中断当前操作。open/close 会请求中断正在进行的 I/O。Seek/stop 按命令队列串行执行，不取消前一个 Seek 的完成结果。Windows 自定义 AVIO 现在以带偏移量的重叠 I/O 读普通文件。若读取挂起，以 10 ms 等待片段轮询既有取消标记及单次 I/O 截止时间；只取消该笔操作，并等待内核完成后才归还缓冲区。该周期不是退出耗时保证：路径/打开、没有返回控制权的内核或驱动调用、取消完成等待、单次 codec 运算仍不能被强杀。文件仍由 `file.demuxer` 独占管理，不接受命名管道作为 Player 输入。
 
 ## 输出契约与首版边界
 
@@ -118,7 +119,7 @@ pause/seek/stop/close 完成前会等待正在执行的媒体回调结束；seek
 
 ## 验证
 
-当前回调和设备需求重构尚未编译或运行测试；以下历史记录不证明本次改动已通过验证。
+2026-11-19：Player 切换到重构版 `GraphFlow::core` 后，在 Windows x64 / MSVC Release / FFmpeg 7.1 下，SDK 四项 CTest 各连续通过三次。测试覆盖准备态格式确认、解码器拒绝格式时 `open()` 返回原始错误、背压、Seek、EOS 和释放。Windows Qt6 播放器重新链接后，`player_app_fixtures` 和无窗口的 `local_player_output` 两项通过。未做真实扬声器、显示器或音画同步的人工验收。
 
 以下 2026-10-26 记录为历史 Windows/SDL 验证。当前 Qt6 应用的构建方法和自动化测试归属见应用 README；历史结果不代表 Qt6 Windows 版本已经验收。
 

@@ -6,8 +6,6 @@ import sys
 root = Path(__file__).resolve().parents[1]
 # Keep only the external-library adapters exception-enabled.
 boundaries = {
-    # Private nndeploy/OpenCV boundary returns explicit errors to the exception-free editor.
-    "src/engines/editor/effects.cpp": ("std::exception",),
     "tools/cli/main.cpp": ("CLI::ParseError",),
     "src/engines/studio/capture_windows.cpp": ("hresult_error",),
     # Existing exception-enabled logging initialization adapter, separate from Client.

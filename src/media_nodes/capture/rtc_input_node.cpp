@@ -1,6 +1,5 @@
 #include "livekit/compat/thread.hpp"
 #include "livekit/compat/algorithm.hpp"
-#include "media_graph/failure.hpp"
 #include "media_graph/callback_context.hpp"
 #include "livekit/rtc/input_node.hpp"
 #include "media_graph/raw_frame_queue.hpp"
@@ -315,7 +314,7 @@ struct MediaInputNode::Impl {
     event.captured = captured;
     event.epoch = binding.epoch;
     event.timestamp = ticks(captured);
-    owner.publish(event);
+    owner.send(event);
   }
 
   Result<void> device_frame(const webrtc::VideoFrame& frame) {
@@ -359,7 +358,7 @@ struct MediaInputNode::Impl {
         return processed;
       }
     }
-    owner.publish(event);
+    owner.send(event);
     return Result<void>::success();
   }
 
@@ -483,7 +482,7 @@ struct MediaInputNode::Impl {
         frame.captured = input->captured;
         frame.epoch = binding.epoch;
         frame.keyframe = input->keyframe;
-        owner.publish(EncodedFrameEvent(std::move(frame)));
+        owner.send(EncodedFrameEvent(std::move(frame)));
       }
     }
     return Result<void>::success();
@@ -688,12 +687,12 @@ struct MediaInputNode::Impl {
     }();
     if (!completed && !stop) {
       const auto failure =
-          with_context(completed.failure_record(), {"capture", descriptor.id, owner.getName(), 0});
+          with_context(completed.failure_record(), {"capture", descriptor.id, owner.name(), 0});
       {
         std::lock_guard lock(mutex);
         stats.error = failure->message;
       }
-      owner.reportError(livekit::sdk::detail::graph_error(failure));
+      owner.report_failure(failure);
     }
     if (options.microphone) {
       options.microphone->stop();
@@ -711,39 +710,44 @@ struct MediaInputNode::Impl {
       stop_readers();
     }
     if (device_error) {
-      owner.reportError(livekit::sdk::detail::graph_error(device_error));
+      owner.report_failure(device_error);
     }
   }
 };
 
 MediaInputNode::MediaInputNode(std::string name, TrackDescriptor d, MediaInputOptions options)
-    : GraphNode(name, nullptr),
-      impl_(std::make_unique<Impl>(*this, std::move(d), std::move(options))) {}
+    : TrackNode(name), impl_(std::make_unique<Impl>(*this, std::move(d), std::move(options))) {}
 
 MediaInputNode::~MediaInputNode() {
   quiesce();
-  release();
 }
 
-bool MediaInputNode::doInit() {
-  if (auto valid = status(); !valid) {
-    reportError(livekit::sdk::detail::graph_error(valid.failure_record()));
-    return false;
-  }
-  subscribe<SenderFeedbackEvent>([this](const auto& value) {
+void MediaInputNode::bind(graphflow::Binder& ports) {
+  output<EncodedFrameEvent>(ports);
+  output<VideoFrameEvent>(ports);
+  output<AudioFrameEvent>(ports);
+
+  ports.input(livekit::sdk::rtc::TrackPort<SenderFeedbackEvent>::in, [this](const auto& value) {
     if (auto updated = impl_->update(value.feedback); !updated) {
-      reportError(livekit::sdk::detail::graph_error(updated.failure_record()));
+      report_failure(updated.failure_record());
     }
   });
-  return true;
 }
 
-bool MediaInputNode::doStart() {
+livekit::sdk::Result<void> MediaInputNode::prepare() {
+  if (auto valid = status(); !valid) {
+    report_failure(valid.failure_record());
+    return start_error();
+  }
+  return livekit::sdk::Result<void>::success();
+}
+
+livekit::sdk::Result<void> MediaInputNode::activate_graph() {
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed)
-    return false;
+    return start_error();
   impl_->started = true;
-  return true;
+  return livekit::sdk::Result<void>::success();
 }
 
 Result<void> MediaInputNode::activate() {
@@ -761,8 +765,10 @@ Result<void> MediaInputNode::activate() {
     return started;
   }
   if (impl_->options.microphone) {
-    impl_->options.microphone->set_failure_handler([report = errorReporter()](Failure failure) {
-      report(livekit::sdk::detail::graph_error(std::move(failure)));
+    impl_->options.microphone->set_failure_handler([weak = weak_from_this()](Failure failure) {
+      if (auto node = weak.lock()) {
+        node->report_failure(std::move(failure));
+      }
     });
     impl_->microphone_reporter = true;
   }
@@ -800,7 +806,7 @@ void MediaInputNode::quiesce() {
   impl_->process.reset();
 }
 
-void MediaInputNode::doStop() {
+void MediaInputNode::stop_graph() {
   quiesce();
 }
 
@@ -813,8 +819,8 @@ Result<void> MediaInputNode::status() const {
   if (impl_->initialization_failure) {
     return Result<void>::failure(impl_->initialization_failure);
   }
-  if (auto reported = error()) {
-    return Result<void>::failure(livekit::sdk::detail::graph_failure(*reported));
+  if (auto reported = last_failure()) {
+    return Result<void>::failure(reported);
   }
   return Result<void>::success();
 }

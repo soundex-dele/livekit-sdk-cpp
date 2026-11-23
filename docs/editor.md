@@ -19,12 +19,22 @@ rejects malformed versions/types/ranges. Relinking replaces an asset while keepi
 its ID; validation rejects replacements too short for existing clips. Missing media
 is reported when an affected clip is rendered. Files are not embedded in projects.
 
-`EditorSession` owns a worker and a GraphEngine. The timeline sends active clip work
+`EditorSession` owns a worker and a typed inline GraphFlow graph. The timeline sends active clip work
 through decode, composition, mixing and output nodes using synchronous typed graph
 edges on that worker. FFmpeg demuxers and decoders are local-file adapters; they are
 not exposed to applications. Decoder entries use LRU eviction (up to eight stream
 decoders, estimated decoded-image cache budget 256 MiB). Decoder threads are limited
 to two per stream. Input and output images are limited to 4096×4096.
+
+Color correction runs in a per-clip inline `graphflow::Graph` from `graphflow-cpp-refactor`.
+The grade node applies an exposure/temperature lookup table; the saturation/contrast node
+consumes its quantized RGB values. Both operate on one private RGBA copy, preserving alpha
+and the decoded input. A project edit with unchanged color settings reuses that clip's
+graph. Time stretch uses the graph-independent phase vocoder; transitions join the two
+layer transactions before processing RGBA. There is no EventBus or legacy graph fallback.
+Project updates start a complete candidate graph on the render worker and only then
+replace the active graph. Unchanged processor state and decoder caches are retained;
+no emitter, node binding or active callback is transferred between graphs.
 
 Controls enqueue at most 64 commands. Pending seeks coalesce, with cancelled results
 for superseded requests. Replacing a project pauses playback; a generation tags all

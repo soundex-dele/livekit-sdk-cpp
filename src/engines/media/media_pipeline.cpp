@@ -1,5 +1,4 @@
 #include "engines/media/media_pipeline.hpp"
-#include "media_graph/failure.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -7,7 +6,7 @@
 
 namespace livekit::sdk::client::detail {
 namespace {
-Result<void> validate_graph(const MediaGraph& graph, const graphflow::core::GraphNode* port,
+Result<void> validate_graph(const MediaGraph& graph, const livekit::sdk::rtc::TrackNode* port,
                             bool publishing) {
   auto invalid = [](std::string reason) {
     return Result<void>::failure(
@@ -20,17 +19,9 @@ Result<void> validate_graph(const MediaGraph& graph, const graphflow::core::Grap
   size_t port_index = graph.nodes.size();
   for (size_t i = 0; i < graph.nodes.size(); ++i) {
     const auto& node = graph.nodes[i];
-    if (!node || node->state() != graphflow::core::LifecycleState::Created ||
-        node->getName().empty() || node->getName().size() > 256 ||
-        !ids.emplace(node->getName(), i).second) {
+    if (!node || node->claimed() || node->name().empty() || node->name().size() > 256 ||
+        !ids.emplace(node->name(), i).second) {
       return invalid("Media graph nodes must be fresh with unique nonempty names");
-    }
-    const auto attached = [](const auto& edges) {
-      return std::any_of(edges.begin(), edges.end(),
-                         [](const auto& edge) { return edge.isConnection(); });
-    };
-    if (attached(node->getSubEdges()) || attached(node->getPubEdges())) {
-      return invalid("Media graph node already belongs to another graph: " + node->getName());
     }
     if (node.get() == port) {
       port_index = i;
@@ -39,34 +30,34 @@ Result<void> validate_graph(const MediaGraph& graph, const graphflow::core::Grap
   if (port_index == graph.nodes.size()) {
     return invalid("Media graph must keep the supplied Room port");
   }
-  const auto encoded = graphflow::core::detail::prettyName<rtc::nodes::EncodedFrameEvent>();
-  const auto feedback = graphflow::core::detail::prettyName<rtc::nodes::SenderFeedbackEvent>();
-  const auto keyframe = graphflow::core::detail::prettyName<rtc::nodes::KeyframeRequestEvent>();
+  const auto encoded = std::string_view(rtc::TrackPort<rtc::nodes::EncodedFrameEvent>::out.name);
+  const auto feedback = std::string_view(rtc::TrackPort<rtc::nodes::SenderFeedbackEvent>::out.name);
+  const auto keyframe =
+      std::string_view(rtc::TrackPort<rtc::nodes::KeyframeRequestEvent>::out.name);
   std::vector<std::vector<size_t>> neighbors(graph.nodes.size()), media(graph.nodes.size());
   std::vector<size_t> incoming(graph.nodes.size());
-  std::set<std::tuple<std::string, std::string, std::string, std::string>> edges;
+  std::set<std::tuple<std::string, std::string, std::string>> edges;
   bool media_port = false, feedback_port = !publishing;
   for (const auto& edge : graph.connections) {
     const auto from = ids.find(edge.from), to = ids.find(edge.to);
-    if (from == ids.end() || to == ids.end() || edge.dataType.empty() ||
-        !edges.emplace(edge.from, edge.to, edge.dataType, edge.condition).second) {
+    if (from == ids.end() || to == ids.end() ||
+        !edges.emplace(edge.from, edge.to, edge.type()).second) {
       return invalid("Media graph contains an unknown endpoint, untyped or duplicate connection");
     }
     const auto a = from->second, b = to->second;
     if (a == port_index || b == port_index) {
-      if (!edge.condition.empty() ||
-          (publishing && ((b == port_index && edge.dataType != encoded) ||
-                          (a == port_index && edge.dataType != feedback))) ||
-          (!publishing && ((a == port_index && edge.dataType != encoded) ||
-                           (b == port_index && edge.dataType != keyframe)))) {
+      if ((publishing && ((b == port_index && edge.type() != encoded) ||
+                          (a == port_index && edge.type() != feedback))) ||
+          (!publishing && ((a == port_index && edge.type() != encoded) ||
+                           (b == port_index && edge.type() != keyframe)))) {
         return invalid("Media graph Room port has an invalid event direction or condition");
       }
-      media_port |= edge.dataType == encoded;
-      feedback_port |= edge.dataType == feedback;
+      media_port |= edge.type() == encoded;
+      feedback_port |= edge.type() == feedback;
     }
     neighbors[a].push_back(b);
     neighbors[b].push_back(a);
-    if (edge.dataType != feedback && edge.dataType != keyframe) {
+    if (edge.type() != feedback && edge.type() != keyframe) {
       media[a].push_back(b);
       ++incoming[b];
     }
@@ -150,11 +141,11 @@ To frame_copy(const From& value) {
 }  // namespace
 
 // The only transport bridge: Room handles, never legacy Endpoint/RoomEngine.
-class MediaPort final : public graphflow::core::GraphNode {
+class MediaPort final : public livekit::sdk::rtc::TrackNode {
  public:
-  explicit MediaPort(LocalTrack track) : GraphNode("room.port", nullptr), local(std::move(track)) {}
+  explicit MediaPort(LocalTrack track) : TrackNode("room.port"), local(std::move(track)) {}
 
-  MediaPort() : GraphNode("room.port", nullptr) {}
+  MediaPort() : TrackNode("room.port") {}
 
   LocalTrack local;
   std::atomic<bool> keyframe{false};
@@ -163,7 +154,7 @@ class MediaPort final : public graphflow::core::GraphNode {
   void receive(EncodedFrame value) {
     ++frames;
     bytes += value.buffer.size();
-    publish(rtc::nodes::EncodedFrameEvent(frame_copy<rtc::EncodedFrame>(value)));
+    send(rtc::nodes::EncodedFrameEvent(frame_copy<rtc::EncodedFrame>(value)));
   }
 
   void feedback(uint64_t revision) {
@@ -178,22 +169,29 @@ class MediaPort final : public graphflow::core::GraphNode {
                              e.active && state.state == TrackState::ready && !state.muted,
                              e.keyframe_required, e.keyframe_requests};
     }
-    publish(rtc::nodes::SenderFeedbackEvent(std::move(value)));
+    send(rtc::nodes::SenderFeedbackEvent(std::move(value)));
   }
 
  private:
-  bool doInit() override {
+  void bind(graphflow::Binder& ports) override {
     if (local) {
-      subscribe<rtc::nodes::EncodedFrameEvent>([this](const auto& event) {
-        if (local.try_write(frame_copy<EncodedFrame>(event.frame)) == WriteStatus::accepted) {
-          ++frames;
-          bytes += event.frame.buffer.size();
-        }
-      });
+      output<rtc::nodes::SenderFeedbackEvent>(ports);
     } else {
-      subscribe<rtc::nodes::KeyframeRequestEvent>([this](const auto&) { keyframe = true; });
+      output<rtc::nodes::EncodedFrameEvent>(ports);
     }
-    return true;
+    if (local) {
+      ports.input(
+          livekit::sdk::rtc::TrackPort<rtc::nodes::EncodedFrameEvent>::in,
+          [this](const auto& event) {
+            if (local.try_write(frame_copy<EncodedFrame>(event.frame)) == WriteStatus::accepted) {
+              ++frames;
+              bytes += event.frame.buffer.size();
+            }
+          });
+    } else {
+      ports.input(livekit::sdk::rtc::TrackPort<rtc::nodes::KeyframeRequestEvent>::in,
+                  [this](const auto&) { keyframe = true; });
+    }
   }
 };
 
@@ -208,7 +206,7 @@ void MediaPipeline::fail(Failure failure) {
   }
 }
 
-void MediaPipeline::outputs(const std::shared_ptr<graphflow::core::GraphNode>& source,
+void MediaPipeline::outputs(const std::shared_ptr<livekit::sdk::rtc::TrackNode>& source,
                             MediaOutput options, const rtc::TrackDescriptor& d,
                             std::shared_ptr<rtc::AudioOutputSession> device) {
   output_ = std::make_shared<rtc::engine::ApplicationOutput>(options);
@@ -221,6 +219,8 @@ void MediaPipeline::outputs(const std::shared_ptr<graphflow::core::GraphNode>& s
     }
   };
   wire(output_);
+  // A delayed application preview must not reject a simultaneous recorder input.
+  edges_.back().options = {graphflow::DeliveryPolicy::Latest, 2};
   if (options.playout) {
     speaker_ = std::make_shared<rtc::nodes::AudioOutputNode>("speaker", d.id, std::move(device));
     nodes_.push_back(speaker_);
@@ -247,10 +247,10 @@ Result<void> MediaPipeline::build(const std::shared_ptr<const MediaGraphOptions>
     MediaGraphContext context;
     context.publishing = publishing_;
     context.track = descriptor;
-    context.port = port_->getName();
-    context.input = input_ ? input_->getName() : "";
-    context.codec = video_ ? video_->getName() : audio_ ? audio_->getName() : "";
-    context.output = output_ ? output_->getName() : "";
+    context.port = port_->name();
+    context.input = input_ ? input_->name() : "";
+    context.codec = video_ ? video_->name() : audio_ ? audio_->name() : "";
+    context.output = output_ ? output_->name() : "";
     context.defaults = std::move(candidate);
     rtc::detail::CallbackScope callback_scope;
     auto result = options->build(std::move(context));
@@ -284,21 +284,57 @@ Result<void> MediaPipeline::build(const std::shared_ptr<const MediaGraphOptions>
   for (auto& node : nodes_) {
     FailureContext context;
     context.track_id = descriptor.id;
-    context.node = node->getName();
-    node->setErrorHandler([weak = weak_from_this(), context](const auto& error) {
+    context.node = node->name();
+    node->set_failure_handler([weak = weak_from_this(), context](const auto& error) {
       if (auto self = weak.lock()) {
-        self->fail(livekit::sdk::detail::graph_failure(error, context));
+        self->fail(with_context(error, context));
       }
     });
   }
-  graph_ = std::make_unique<graphflow::engine::GraphEngine>(1);
+  // This is also the Room pump thread. Prepare and start acknowledge the owner
+  // synchronously, without moving graph lifecycle operations between callers.
+  std::promise<Result<void>> initialization;
+  auto prepared = initialization.get_future();
+  pump_ = std::thread([this, initialization = std::move(initialization)]() mutable {
+    auto result = initialize_on_owner();
+    const bool ready = bool(result);
+    initialization.set_value(std::move(result));
+    if (ready) {
+      std::unique_lock lock(control_mutex_);
+      control_changed_.wait(lock, [this] { return start_requested_ || stopping_; });
+      const bool start = start_requested_;
+      lock.unlock();
+      if (start) {
+        auto activated = activate_on_owner();
+        const bool run = bool(activated);
+        activation_.set_value(std::move(activated));
+        if (run) {
+          pump_on_owner();
+        }
+      }
+    }
+    stopping_ = true;
+    stop_nodes();
+    graph_.reset();
+  });
+  return prepared.get();
+}
+
+Result<void> MediaPipeline::initialize_on_owner() {
+  graph_ = std::make_unique<graphflow::Graph>();
   rtc::detail::CallbackScope callback_scope;
-  if (!graph_->loadFromNodes(nodes_, edges_) || !graph_->init()) {
-    auto value = snapshot().failure;
-    return Result<void>::failure(value ? value
+  auto wired = rtc::wire_track_graph(*graph_, nodes_, edges_);
+  if (!wired) {
+    return Result<void>::failure(
+        make_failure(ErrorDomain::media, ErrorCode::invalid_argument, wired.error.message));
+  }
+  auto prepared = graph_->start(graphflow::StartMode::PrepareOnly);
+  if (!prepared) {
+    auto error = snapshot().failure;
+    return Result<void>::failure(error ? error
                                        : make_failure(ErrorDomain::media,
                                                       ErrorCode::processing_failed,
-                                                      "Cannot initialize media graph"));
+                                                      prepared.error.message));
   }
   return Result<void>::success();
 }
@@ -363,7 +399,7 @@ Result<void> MediaPipeline::prepare(const MediaSubscribeSpec& spec, const Remote
   subscription = spec.publication;
   port_ = std::make_shared<MediaPort>();
   nodes_.push_back(port_);
-  std::shared_ptr<graphflow::core::GraphNode> raw;
+  std::shared_ptr<livekit::sdk::rtc::TrackNode> raw;
   if (d.kind == rtc::MediaKind::video) {
     raw = video_ = std::make_shared<rtc::nodes::VideoCodecNode>("decoder", d, false, spec.video);
     connect<rtc::nodes::KeyframeRequestEvent>(video_, port_);
@@ -387,6 +423,19 @@ Result<void> MediaPipeline::prepare(const MediaSubscribeSpec& spec, const Remote
 }
 
 Result<void> MediaPipeline::start() {
+  std::unique_lock lock(control_mutex_);
+  if (start_requested_ || stopping_) {
+    return Result<void>::failure(make_failure(ErrorDomain::lifecycle, ErrorCode::invalid_state,
+                                              "Media pipeline already started or closed"));
+  }
+  auto result = activation_.get_future();
+  start_requested_ = true;
+  lock.unlock();
+  control_changed_.notify_one();
+  return result.get();
+}
+
+Result<void> MediaPipeline::activate_on_owner() {
   rtc::detail::CallbackScope callback_scope;
   if (!graph_->start()) {
     auto error = snapshot().failure;
@@ -412,48 +461,45 @@ Result<void> MediaPipeline::start() {
   if (auto error = snapshot().failure) {
     return Result<void>::failure(error);
   }
-  pump_ = std::thread([this] {
-    uint64_t revision = 0;
-    auto last_keyframe = SteadyClock::time_point{};
-    while (!stopping_) {
-      const auto state = publishing_ ? local.snapshot() : remote.snapshot();
-      Failure failure;
-      {
-        std::lock_guard lock(state_mutex_);
-        failure = failure_;
-      }
-      if (state.state == TrackState::closed || state.state == TrackState::failed || failure) {
-        break;
-      }
-      if (publishing_) {
-        port_->feedback(++revision);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      } else {
-        auto value = remote.read({std::chrono::milliseconds(20), {}});
-        if (value.status == ReadStatus::frame) {
-          port_->receive(std::move(*value.frame));
-        } else if (value.status == ReadStatus::failed) {
-          fail(value.failure);
-          break;
-        } else if (value.status == ReadStatus::suspended) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        if (port_->keyframe &&
-            SteadyClock::now() - last_keyframe > std::chrono::milliseconds(500)) {
-          port_->keyframe = false;
-          remote.request_keyframe();
-          last_keyframe = SteadyClock::now();
-        }
-      }
-    }
-    stopping_ = true;
-    stop_nodes();
-  });
   return Result<void>::success();
 }
 
+void MediaPipeline::pump_on_owner() {
+  uint64_t revision = 0;
+  auto last_keyframe = SteadyClock::time_point{};
+  while (!stopping_) {
+    const auto state = publishing_ ? local.snapshot() : remote.snapshot();
+    Failure failure;
+    {
+      std::lock_guard lock(state_mutex_);
+      failure = failure_;
+    }
+    if (state.state == TrackState::closed || state.state == TrackState::failed || failure) {
+      break;
+    }
+    if (publishing_) {
+      port_->feedback(++revision);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } else {
+      auto value = remote.read({std::chrono::milliseconds(20), {}});
+      if (value.status == ReadStatus::frame) {
+        port_->receive(std::move(*value.frame));
+      } else if (value.status == ReadStatus::failed) {
+        fail(value.failure);
+        break;
+      } else if (value.status == ReadStatus::suspended) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      if (port_->keyframe && SteadyClock::now() - last_keyframe > std::chrono::milliseconds(500)) {
+        port_->keyframe = false;
+        remote.request_keyframe();
+        last_keyframe = SteadyClock::now();
+      }
+    }
+  }
+}
+
 void MediaPipeline::stop_nodes() {
-  std::lock_guard lock(lifecycle_);
   if (stopped_) {
     return;
   }
@@ -467,6 +513,20 @@ void MediaPipeline::stop_nodes() {
   if (custom_quiesce_) {
     custom_quiesce_();
   }
+  // Device workers and graph mailboxes have separate queues. Deliver admitted
+  // events before closing a receiver, in particular before finalizing a recording.
+  auto settle = [&] {
+    if (graph_) {
+      auto view = graph_->snapshot();
+      if (view && view->state == graphflow::GraphState::Running) {
+        if (auto status = graph_->drain(); !status) {
+          fail(
+              make_failure(ErrorDomain::media, ErrorCode::processing_failed, status.error.message));
+        }
+      }
+    }
+  };
+  settle();
   for (const auto& node : nodes_) {
     if (auto video = std::dynamic_pointer_cast<rtc::nodes::VideoCodecNode>(node)) {
       video->quiesce();
@@ -475,6 +535,7 @@ void MediaPipeline::stop_nodes() {
       audio->quiesce();
     }
   }
+  settle();
   for (const auto& node : nodes_) {
     if (auto output = std::dynamic_pointer_cast<rtc::engine::ApplicationOutput>(node)) {
       output->quiesce();
@@ -487,17 +548,22 @@ void MediaPipeline::stop_nodes() {
     }
   }
   if (graph_) {
-    graph_->stop();
-    graph_->release();
+    if (auto closed = graph_->close(); !closed) {
+      fail(make_failure(ErrorDomain::media, ErrorCode::processing_failed, closed.error.message));
+    }
   }
 }
 
 void MediaPipeline::close() {
-  stopping_ = true;
+  std::lock_guard close_lock(close_mutex_);
+  {
+    std::lock_guard lock(control_mutex_);
+    stopping_ = true;
+  }
+  control_changed_.notify_one();
   if (pump_.joinable()) {
     pump_.join();
   }
-  stop_nodes();
 }
 
 MediaTrackSnapshot MediaPipeline::snapshot() const {
@@ -506,7 +572,7 @@ MediaTrackSnapshot MediaPipeline::snapshot() const {
   value.frames = port_ ? port_->frames.load() : 0;
   value.bytes = port_ ? port_->bytes.load() : 0;
   auto row = [&](const auto& node, const char* kind, uint64_t in, uint64_t out, uint64_t dropped) {
-    value.nodes.push_back({node->getName(), kind, in, out, dropped, 0});
+    value.nodes.push_back({node->name(), kind, in, out, dropped + node->delivery_drops(), 0});
   };
   if (input_) {
     auto s = input_->snapshot();
@@ -540,13 +606,13 @@ MediaTrackSnapshot MediaPipeline::snapshot() const {
   }
   for (const auto& node : nodes_) {
     if (std::none_of(value.nodes.begin(), value.nodes.end(),
-                     [&](const auto& item) { return item.name == node->getName(); })) {
-      row(node, "GraphNode", 0, 0, 0);
-      value.nodes.back().errors = node->error() ? 1 : 0;
+                     [&](const auto& item) { return item.name == node->name(); })) {
+      row(node, "TrackNode", 0, 0, 0);
+      value.nodes.back().errors = node->last_failure() ? 1 : 0;
     }
   }
   for (const auto& edge : edges_) {
-    value.edges.push_back({edge.from, edge.to, edge.dataType});
+    value.edges.push_back({edge.from, edge.to, edge.type()});
   }
   std::lock_guard lock(state_mutex_);
   value.failure = failure_ ? failure_ : value.transport.failure;

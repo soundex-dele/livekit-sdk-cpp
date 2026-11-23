@@ -1,10 +1,8 @@
-#include "livekit/compat/thread.hpp"
 #include "livekit/compat/span.hpp"
 #include "internal.hpp"
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
-#include <thread>
+#include <optional>
 #include <limits>
 #include "support/utf8.hpp"
 #ifdef _WIN32
@@ -55,6 +53,25 @@ Result<std::string> path8(const std::filesystem::path& path) {
 #endif
 }
 
+// On Windows the file protocol normally truncates an existing path. Claim each
+// staging name before FFmpeg opens it, and pin the directory entry across that open.
+static Result<void> openStage(AVIOContext** io, const std::filesystem::path& path,
+                              const std::string& utf8) {
+#ifdef _WIN32
+  HANDLE claim = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (claim == INVALID_HANDLE_VALUE) {
+    const auto code = GetLastError();
+    return failed("Cannot create new recording file: " + utf8, ErrorCode::processing_failed, code);
+  }
+  const int result = avio_open(io, utf8.c_str(), AVIO_FLAG_WRITE);
+  CloseHandle(claim);
+  return check(result);
+#else
+  return check(avio_open(io, utf8.c_str(), AVIO_FLAG_WRITE));
+#endif
+}
+
 struct Encoder {
   std::filesystem::path path, mkv;
   AVFormatContext* format = nullptr;
@@ -66,9 +83,21 @@ struct Encoder {
   int64_t video_pts = 0, audio_pts = 0;
   bool done = false;
   Failure failure;
-  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  // Independent mailboxes can submit later-captured audio before earlier video
+  // (and vice versa). Studio supplies the source clock epoch. Standalone serial
+  // producers without that information retain their first-media origin.
+  std::optional<std::chrono::steady_clock::time_point> start;
 
-  Encoder(const std::filesystem::path& p, int w, int h, int fps) : path(p), mkv(p) {
+  int64_t elapsedUs(std::chrono::steady_clock::time_point captured) {
+    if (!start) {
+      start = captured;
+    }
+    return std::chrono::duration_cast<std::chrono::microseconds>(captured - *start).count();
+  }
+
+  Encoder(const std::filesystem::path& p, int w, int h, int fps,
+          std::optional<std::chrono::steady_clock::time_point> origin)
+      : path(p), mkv(p), start(origin) {
     auto initialized = initialize(w, h, fps);
     if (!initialized) {
       failure = initialized.failure_record();
@@ -147,7 +176,7 @@ struct Encoder {
       as->time_base = audio->time_base;
       LK_STUDIO_TRY(check(avcodec_parameters_from_context(vs->codecpar, video)));
       LK_STUDIO_TRY(check(avcodec_parameters_from_context(as->codecpar, audio)));
-      LK_STUDIO_TRY(check(avio_open(&format->pb, mkv_name.c_str(), AVIO_FLAG_WRITE)));
+      LK_STUDIO_TRY(openStage(&format->pb, mkv, mkv_name));
       LK_STUDIO_TRY(check(avformat_write_header(format, nullptr)));
       vf = av_frame_alloc();
       af = av_frame_alloc();
@@ -169,7 +198,6 @@ struct Encoder {
                              nullptr, nullptr);
       if (!scale)
         return failed("录制颜色转换失败");
-      start = std::chrono::steady_clock::now();
     }
     return Result<void>::success();
   }
@@ -234,7 +262,7 @@ struct Encoder {
     int stride = i.width * 4;
     if (sws_scale(scale, &data, &stride, 0, i.height, vf->data, vf->linesize) != vf->height)
       return failed("Recording color conversion failed");
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(captured - start).count();
+    auto elapsed = elapsedUs(captured);
     int64_t tick = av_rescale_q(elapsed, {1, 1000000}, video->time_base);
     vf->pts = std::max(video_pts, tick);
     video_pts = vf->pts + 1;
@@ -245,7 +273,7 @@ struct Encoder {
                           std::chrono::steady_clock::time_point captured) {
     if (samples.size() % 2 || samples.size() > 96000)
       return failed("Invalid recorder audio frame", ErrorCode::invalid_argument);
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(captured - start).count();
+    auto elapsed = elapsedUs(captured);
     int64_t target = elapsed * 48000 / 1000000;
     int64_t queued = audio_pts + av_audio_fifo_size(fifo);
     size_t count = samples.size() / 2;
@@ -343,7 +371,7 @@ struct Encoder {
         s->codecpar->codec_tag = 0;
         s->time_base = in->streams[i]->time_base;
       }
-      LK_STUDIO_TRY(check(avio_open(&out->pb, temp_name.c_str(), AVIO_FLAG_WRITE)));
+      LK_STUDIO_TRY(openStage(&out->pb, temp, temp_name));
       LK_STUDIO_TRY(check(avformat_write_header(out, nullptr)));
       p = av_packet_alloc();
       if (!p)
@@ -364,126 +392,83 @@ struct Encoder {
       avformat_close_input(&in);
       avformat_free_context(out);
       out = nullptr;
+#ifdef _WIN32
+      // A different session may have published this name since initialize().
+      if (!MoveFileW(temp.c_str(), path.c_str())) {
+        const auto code = GetLastError();
+        return failed("Cannot publish recording without replacing the destination",
+                      ErrorCode::processing_failed, code);
+      }
+#else
       std::error_code ec;
       std::filesystem::rename(temp, path, ec);
       if (ec) {
         return failed(ec.message(), ErrorCode::processing_failed, ec.value());
       }
+#endif
     }
     return Result<void>::success();
   }
 };
 
 struct Recorder::Impl {
-  struct Packet {
-    std::shared_ptr<StudioImage> image;
-    std::vector<float> audio;
-    std::chrono::steady_clock::time_point time;
-  };
-
   Encoder encoder;
-  mutable std::mutex mutex;
-  std::condition_variable wake;
-  std::deque<Packet> queue;
-  livekit::compat::jthread worker;
   bool closing = false;
-  size_t videos = 0;
   Failure error;
 
-  Impl(const std::filesystem::path& p, int w, int h, int fps) : encoder(p, w, h, fps) {
-    if (encoder.failure) {
-      error = encoder.failure;
-      closing = true;
-      return;
-    }
-    worker = livekit::compat::jthread([this] {
-      auto run = [&]() -> Result<void> {
-        for (;;) {
-          Packet packet;
-          {
-            std::unique_lock lock(mutex);
-            wake.wait(lock, [&] { return closing || !queue.empty(); });
-            if (queue.empty()) {
-              break;
-            }
-            packet = std::move(queue.front());
-            queue.pop_front();
-            if (packet.image) {
-              --videos;
-            }
-          }
-          if (packet.image) {
-            LK_STUDIO_TRY(encoder.writeVideo(*packet.image, packet.time));
-          } else {
-            LK_STUDIO_TRY(encoder.writeAudio(packet.audio, packet.time));
-          }
-        }
-        return encoder.finish();
-      };
-      auto completed = run();
-      if (!completed) {
-        std::lock_guard lock(mutex);
-        error = completed.failure_record();
-        queue.clear();
-        closing = true;
-      }
-    });
-  }
+  Impl(const std::filesystem::path& path, int width, int height, int fps,
+       std::optional<std::chrono::steady_clock::time_point> origin)
+      : encoder(path, width, height, fps, origin), error(encoder.failure) {}
 
   ~Impl() {
     (void)finish();
   }
 
-  Result<void> push(Packet packet) {
-    std::lock_guard lock(mutex);
+  template <class Write>
+  Result<void> write_here(Write&& write) {
     if (error)
       return failed(error);
     if (closing)
       return failed("Recorder is closed");
-    // Preserve bounded best-effort video admission; audio backlog remains fatal.
-    if (packet.image && videos >= 6)
-      return Result<void>::success();
-    if (queue.size() >= 256)
-      return failed("Recording storage cannot keep up; MKV retained",
-                    ErrorCode::resource_exhausted);
-    if (packet.image)
-      ++videos;
-    queue.push_back(std::move(packet));
-    wake.notify_one();
-    return Result<void>::success();
+    auto result = write();
+    if (!result)
+      error = result.failure_record();
+    return result;
   }
 
   Result<void> finish() {
-    {
-      std::lock_guard lock(mutex);
-      closing = true;
+    if (!closing && !error) {
+      auto result = encoder.finish();
+      if (!result) {
+        error = result.failure_record();
+      }
     }
-    wake.notify_one();
-    if (worker.joinable())
-      worker.join();
-    if (error)
-      return failed(error);
-    return Result<void>::success();
+    closing = true;
+    return error ? Result<void>::failure(error) : Result<void>::success();
   }
 };
 
-Recorder::Recorder(const std::filesystem::path& p, int w, int h, int fps)
-    : impl_(std::make_unique<Impl>(p, w, h, fps)) {}
+Recorder::Recorder(const std::filesystem::path& p, int w, int h, int fps,
+                   std::optional<std::chrono::steady_clock::time_point> origin)
+    : impl_(std::make_unique<Impl>(p, w, h, fps, origin)) {}
 
 Recorder::~Recorder() = default;
 
+void Recorder::setMediaOrigin(std::chrono::steady_clock::time_point origin) {
+  impl_->encoder.start = origin;
+}
+
 Result<void> Recorder::status() const {
-  std::lock_guard lock(impl_->mutex);
   return impl_->error ? Result<void>::failure(impl_->error) : Result<void>::success();
 }
 
 Result<void> Recorder::video(const StudioImage& i, std::chrono::steady_clock::time_point captured) {
-  return impl_->push({std::make_shared<StudioImage>(i), {}, captured});
+  return impl_->write_here([&] { return impl_->encoder.writeVideo(i, captured); });
 }
 
 Result<void> Recorder::audio(livekit::compat::span<const float> s,
                              std::chrono::steady_clock::time_point captured) {
-  return impl_->push({{}, std::vector<float>(s.begin(), s.end()), captured});
+  return impl_->write_here([&] { return impl_->encoder.writeAudio(s, captured); });
 }
 
 Result<void> Recorder::finish() {
